@@ -14,31 +14,80 @@
 
 pub mod body;
 pub mod collider;
-pub mod joint;
-pub mod world;
-pub mod query;
-pub mod material;
-pub mod force;
-pub mod event;
 pub mod config;
+pub mod event;
+pub mod force;
+pub mod joint;
+pub mod material;
+pub mod query;
 #[cfg(feature = "serialize")]
 pub mod serialize;
 pub mod units;
+pub mod world;
 
 mod error;
 pub use error::ImpetusError;
 
-pub use body::{BodyDesc, BodyHandle, BodyType};
+// Body
+pub use body::{BodyDesc, BodyHandle, BodyState, BodyType};
+
+// Collider
 pub use collider::{ColliderDesc, ColliderHandle, ColliderShape};
+
+// Config
 pub use config::WorldConfig;
-pub use event::CollisionEvent;
-pub use force::{Force, Impulse};
+
+// Events
+pub use event::{CollisionEvent, ContactData, ContactPoint};
+
+// Forces
+pub use force::{Force, Impulse, Torque};
+
+// Joints
 pub use joint::{JointDesc, JointHandle, JointType};
+
+// Material
 pub use material::PhysicsMaterial;
-pub use query::RayHit;
+
+// Queries
+pub use query::{PointQuery, RayHit};
+
+// Units
+pub use units::{PhysicsUnit, Quantity};
+
+// World
 pub use world::PhysicsWorld;
 
 pub type Result<T> = std::result::Result<T, ImpetusError>;
+
+// Compile-time Send + Sync assertions for public types.
+const _: () = {
+    #[allow(dead_code)]
+    fn assert_send_sync<T: Send + Sync>() {}
+    #[allow(dead_code)]
+    fn assertions() {
+        assert_send_sync::<PhysicsWorld>();
+        assert_send_sync::<WorldConfig>();
+        assert_send_sync::<BodyDesc>();
+        assert_send_sync::<BodyHandle>();
+        assert_send_sync::<BodyState>();
+        assert_send_sync::<ColliderDesc>();
+        assert_send_sync::<ColliderHandle>();
+        assert_send_sync::<CollisionEvent>();
+        assert_send_sync::<ContactData>();
+        assert_send_sync::<ContactPoint>();
+        assert_send_sync::<Force>();
+        assert_send_sync::<Impulse>();
+        assert_send_sync::<Torque>();
+        assert_send_sync::<JointDesc>();
+        assert_send_sync::<JointHandle>();
+        assert_send_sync::<PhysicsMaterial>();
+        assert_send_sync::<RayHit>();
+        assert_send_sync::<PointQuery>();
+        assert_send_sync::<Quantity>();
+        assert_send_sync::<ImpetusError>();
+    }
+};
 
 #[cfg(test)]
 mod tests {

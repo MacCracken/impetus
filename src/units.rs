@@ -15,31 +15,19 @@ pub struct Quantity {
 /// Physics-relevant units (subset of abaco-core UnitCategory).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PhysicsUnit {
-    // Length
     Meters,
-    // Mass
     Kilograms,
-    // Time
     Seconds,
-    // Velocity
     MetersPerSecond,
-    // Acceleration
     MetersPerSecondSquared,
-    // Force
     Newtons,
-    // Torque
     NewtonMeters,
-    // Energy
     Joules,
-    // Angle
     Radians,
     Degrees,
-    // Angular velocity
     RadiansPerSecond,
-    // Density
     KgPerCubicMeter,
     KgPerSquareMeter,
-    // Pressure
     Pascals,
 }
 
@@ -68,6 +56,12 @@ impl Quantity {
     }
     pub fn degrees(value: f64) -> Self {
         Self::new(value, PhysicsUnit::Degrees)
+    }
+    pub fn meters_per_second(value: f64) -> Self {
+        Self::new(value, PhysicsUnit::MetersPerSecond)
+    }
+    pub fn pascals(value: f64) -> Self {
+        Self::new(value, PhysicsUnit::Pascals)
     }
 
     /// Convert degrees to radians.
@@ -114,9 +108,41 @@ mod tests {
     }
 
     #[test]
+    fn quantity_display_all_units() {
+        let cases = vec![
+            (Quantity::kilograms(1.0), "1 kg"),
+            (Quantity::seconds(2.5), "2.5 s"),
+            (Quantity::meters_per_second(10.0), "10 m/s"),
+            (Quantity::new(9.81, PhysicsUnit::MetersPerSecondSquared), "9.81 m/s\u{b2}"),
+            (Quantity::new(5.0, PhysicsUnit::NewtonMeters), "5 N\u{b7}m"),
+            (Quantity::joules(100.0), "100 J"),
+            (Quantity::radians(2.5), "2.5 rad"),
+            (Quantity::new(1.0, PhysicsUnit::RadiansPerSecond), "1 rad/s"),
+            (Quantity::new(1000.0, PhysicsUnit::KgPerCubicMeter), "1000 kg/m\u{b3}"),
+            (Quantity::new(500.0, PhysicsUnit::KgPerSquareMeter), "500 kg/m\u{b2}"),
+            (Quantity::pascals(101325.0), "101325 Pa"),
+        ];
+        for (q, expected) in cases {
+            assert_eq!(q.to_string(), expected);
+        }
+    }
+
+    #[test]
     fn degrees_to_radians() {
         let q = Quantity::degrees(180.0);
         assert!((q.to_radians() - std::f64::consts::PI).abs() < 1e-10);
+    }
+
+    #[test]
+    fn degrees_to_radians_90() {
+        let q = Quantity::degrees(90.0);
+        assert!((q.to_radians() - std::f64::consts::FRAC_PI_2).abs() < 1e-10);
+    }
+
+    #[test]
+    fn degrees_to_radians_zero() {
+        let q = Quantity::degrees(0.0);
+        assert_eq!(q.to_radians(), 0.0);
     }
 
     #[test]
@@ -126,11 +152,23 @@ mod tests {
     }
 
     #[test]
+    fn non_angle_to_radians_passthrough() {
+        let q = Quantity::meters(5.0);
+        assert_eq!(q.to_radians(), 5.0);
+    }
+
+    #[test]
     fn quantity_serde() {
         let q = Quantity::newtons(42.0);
         let json = serde_json::to_string(&q).unwrap();
         let back: Quantity = serde_json::from_str(&json).unwrap();
         assert_eq!(back.value, 42.0);
         assert_eq!(back.unit, PhysicsUnit::Newtons);
+    }
+
+    #[test]
+    fn physics_unit_equality() {
+        assert_eq!(PhysicsUnit::Meters, PhysicsUnit::Meters);
+        assert_ne!(PhysicsUnit::Meters, PhysicsUnit::Seconds);
     }
 }

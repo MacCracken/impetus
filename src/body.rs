@@ -18,7 +18,7 @@ pub enum BodyType {
 }
 
 /// Descriptor for creating a rigid body.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BodyDesc {
     pub body_type: BodyType,
     pub position: [f64; 2],
@@ -27,18 +27,14 @@ pub struct BodyDesc {
     pub linear_velocity: [f64; 2],
     #[serde(default)]
     pub angular_velocity: f64,
-    #[serde(default = "default_damping")]
+    #[serde(default)]
     pub linear_damping: f64,
-    #[serde(default = "default_damping")]
+    #[serde(default)]
     pub angular_damping: f64,
     #[serde(default)]
     pub fixed_rotation: bool,
     #[serde(default)]
     pub gravity_scale: Option<f64>,
-}
-
-fn default_damping() -> f64 {
-    0.0
 }
 
 impl Default for BodyDesc {
@@ -58,7 +54,7 @@ impl Default for BodyDesc {
 }
 
 /// Runtime state of a body (read from simulation).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BodyState {
     pub handle: BodyHandle,
     pub body_type: BodyType,
@@ -78,6 +74,11 @@ mod tests {
         let desc = BodyDesc::default();
         assert_eq!(desc.body_type, BodyType::Dynamic);
         assert_eq!(desc.position, [0.0, 0.0]);
+        assert_eq!(desc.rotation, 0.0);
+        assert_eq!(desc.linear_damping, 0.0);
+        assert_eq!(desc.angular_damping, 0.0);
+        assert!(!desc.fixed_rotation);
+        assert_eq!(desc.gravity_scale, None);
     }
 
     #[test]
@@ -90,13 +91,58 @@ mod tests {
         };
         let json = serde_json::to_string(&desc).unwrap();
         let back: BodyDesc = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.body_type, BodyType::Static);
-        assert_eq!(back.position, [5.0, 3.0]);
+        assert_eq!(desc, back);
+    }
+
+    #[test]
+    fn body_desc_kinematic_serde() {
+        let desc = BodyDesc {
+            body_type: BodyType::Kinematic,
+            position: [1.0, 2.0],
+            linear_velocity: [3.0, 4.0],
+            angular_velocity: 0.5,
+            fixed_rotation: true,
+            gravity_scale: Some(0.5),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&desc).unwrap();
+        let back: BodyDesc = serde_json::from_str(&json).unwrap();
+        assert_eq!(desc, back);
     }
 
     #[test]
     fn body_handle_eq() {
         assert_eq!(BodyHandle(1), BodyHandle(1));
         assert_ne!(BodyHandle(1), BodyHandle(2));
+    }
+
+    #[test]
+    fn body_state_serde() {
+        let state = BodyState {
+            handle: BodyHandle(42),
+            body_type: BodyType::Dynamic,
+            position: [1.0, 2.0],
+            rotation: 0.5,
+            linear_velocity: [3.0, 4.0],
+            angular_velocity: 1.0,
+            is_sleeping: false,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: BodyState = serde_json::from_str(&json).unwrap();
+        assert_eq!(state, back);
+    }
+
+    #[test]
+    fn body_state_sleeping() {
+        let state = BodyState {
+            handle: BodyHandle(0),
+            body_type: BodyType::Static,
+            position: [0.0, 0.0],
+            rotation: 0.0,
+            linear_velocity: [0.0, 0.0],
+            angular_velocity: 0.0,
+            is_sleeping: true,
+        };
+        assert!(state.is_sleeping);
     }
 }

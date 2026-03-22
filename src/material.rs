@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Physics material properties.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PhysicsMaterial {
     /// Coefficient of friction (0.0 = ice, 1.0+ = rubber).
     pub friction: f64,
@@ -71,6 +71,7 @@ mod tests {
         let mat = PhysicsMaterial::default();
         assert_eq!(mat.friction, 0.5);
         assert_eq!(mat.restitution, 0.0);
+        assert_eq!(mat.density, 1.0);
     }
 
     #[test]
@@ -81,10 +82,28 @@ mod tests {
     }
 
     #[test]
+    fn preset_values() {
+        let ice = PhysicsMaterial::ice();
+        assert_eq!(ice.friction, 0.05);
+        assert_eq!(ice.restitution, 0.1);
+        assert_eq!(ice.density, 0.9);
+
+        let rubber = PhysicsMaterial::rubber();
+        assert_eq!(rubber.friction, 1.0);
+        assert_eq!(rubber.restitution, 0.8);
+    }
+
+    #[test]
     fn material_serde() {
         let mat = PhysicsMaterial::rubber();
         let json = serde_json::to_string(&mat).unwrap();
         let back: PhysicsMaterial = serde_json::from_str(&json).unwrap();
-        assert_eq!(mat.friction, back.friction);
+        assert_eq!(mat, back);
+    }
+
+    #[test]
+    fn material_equality() {
+        assert_eq!(PhysicsMaterial::steel(), PhysicsMaterial::steel());
+        assert_ne!(PhysicsMaterial::ice(), PhysicsMaterial::rubber());
     }
 }

@@ -1,9 +1,9 @@
-//! Forces and impulses.
+//! Forces, impulses, and torques.
 
 use serde::{Deserialize, Serialize};
 
 /// A continuous force applied over time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Force {
     /// Force vector [x, y] in Newtons.
     pub vector: [f64; 2],
@@ -38,7 +38,7 @@ impl Force {
 }
 
 /// An instantaneous impulse (changes velocity directly).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Impulse {
     /// Impulse vector [x, y] in Newton-seconds.
     pub vector: [f64; 2],
@@ -53,13 +53,31 @@ impl Impulse {
             point: None,
         }
     }
+
+    pub fn at_point(x: f64, y: f64, px: f64, py: f64) -> Self {
+        Self {
+            vector: [x, y],
+            point: Some([px, py]),
+        }
+    }
+
+    /// Magnitude of the impulse.
+    pub fn magnitude(&self) -> f64 {
+        (self.vector[0].powi(2) + self.vector[1].powi(2)).sqrt()
+    }
 }
 
 /// A torque (rotational force).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Torque {
     /// Torque in Newton-meters (positive = counter-clockwise).
     pub value: f64,
+}
+
+impl Torque {
+    pub fn new(value: f64) -> Self {
+        Self { value }
+    }
 }
 
 #[cfg(test)]
@@ -73,6 +91,13 @@ mod tests {
     }
 
     #[test]
+    fn force_zero() {
+        let f = Force::new(0.0, 0.0);
+        assert_eq!(f.magnitude(), 0.0);
+        assert_eq!(f.point, None);
+    }
+
+    #[test]
     fn gravity_force() {
         let f = Force::gravity(10.0, 9.81);
         assert!((f.vector[1] - (-98.1)).abs() < 1e-10);
@@ -82,6 +107,56 @@ mod tests {
     #[test]
     fn force_at_point() {
         let f = Force::at_point(1.0, 0.0, 0.5, 0.5);
-        assert!(f.point.is_some());
+        assert_eq!(f.point, Some([0.5, 0.5]));
+        assert_eq!(f.vector, [1.0, 0.0]);
+    }
+
+    #[test]
+    fn force_serde() {
+        let f = Force::at_point(3.0, 4.0, 1.0, 2.0);
+        let json = serde_json::to_string(&f).unwrap();
+        let back: Force = serde_json::from_str(&json).unwrap();
+        assert_eq!(f, back);
+    }
+
+    #[test]
+    fn impulse_new() {
+        let i = Impulse::new(5.0, 10.0);
+        assert_eq!(i.vector, [5.0, 10.0]);
+        assert_eq!(i.point, None);
+    }
+
+    #[test]
+    fn impulse_at_point() {
+        let i = Impulse::at_point(1.0, 2.0, 0.5, 0.5);
+        assert_eq!(i.point, Some([0.5, 0.5]));
+    }
+
+    #[test]
+    fn impulse_magnitude() {
+        let i = Impulse::new(3.0, 4.0);
+        assert!((i.magnitude() - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn impulse_serde() {
+        let i = Impulse::at_point(1.0, 2.0, 3.0, 4.0);
+        let json = serde_json::to_string(&i).unwrap();
+        let back: Impulse = serde_json::from_str(&json).unwrap();
+        assert_eq!(i, back);
+    }
+
+    #[test]
+    fn torque_new() {
+        let t = Torque::new(5.0);
+        assert_eq!(t.value, 5.0);
+    }
+
+    #[test]
+    fn torque_serde() {
+        let t = Torque::new(-3.5);
+        let json = serde_json::to_string(&t).unwrap();
+        let back: Torque = serde_json::from_str(&json).unwrap();
+        assert_eq!(t, back);
     }
 }

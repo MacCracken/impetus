@@ -7,7 +7,6 @@ use crate::event::CollisionEvent;
 use crate::force::{Force, Impulse, Torque};
 use crate::joint::{JointDesc, JointHandle};
 use crate::query::RayHit;
-use crate::ImpetusError;
 
 /// The physics world — owns all bodies, colliders, joints, and the simulation pipeline.
 pub struct PhysicsWorld {
@@ -94,7 +93,7 @@ impl PhysicsWorld {
     }
 
     /// Remove a body and its attached colliders.
-    pub fn remove_body(&mut self, _handle: BodyHandle) -> std::result::Result<(), ImpetusError> {
+    pub fn remove_body(&mut self, _handle: BodyHandle) -> crate::Result<()> {
         self.body_count = self.body_count.saturating_sub(1);
         // TODO: Remove from rapier
         Ok(())
@@ -132,6 +131,7 @@ mod tests {
     use super::*;
     use crate::body::{BodyDesc, BodyType};
     use crate::collider::{ColliderDesc, ColliderShape};
+    use crate::joint::JointType;
     use crate::material::PhysicsMaterial;
 
     #[test]
@@ -178,9 +178,97 @@ mod tests {
     fn force_application() {
         let mut world = PhysicsWorld::new(WorldConfig::default());
         let body = world.add_body(BodyDesc::default());
-        // Should not panic
         world.apply_force(body, Force::new(10.0, 0.0));
         world.apply_impulse(body, Impulse::new(0.0, 5.0));
+        world.apply_torque(body, Torque::new(1.0));
         world.step();
+    }
+
+    #[test]
+    fn multiple_bodies() {
+        let mut world = PhysicsWorld::new(WorldConfig::default());
+        for _ in 0..50 {
+            world.add_body(BodyDesc::default());
+        }
+        assert_eq!(world.body_count(), 50);
+    }
+
+    #[test]
+    fn add_joint() {
+        let mut world = PhysicsWorld::new(WorldConfig::default());
+        let a = world.add_body(BodyDesc::default());
+        let b = world.add_body(BodyDesc::default());
+        let _joint = world.add_joint(JointDesc {
+            body_a: a,
+            body_b: b,
+            joint_type: JointType::Fixed,
+            local_anchor_a: [0.0, 0.0],
+            local_anchor_b: [0.0, 0.0],
+        });
+        world.step();
+    }
+
+    #[test]
+    fn raycast_returns_none() {
+        let world = PhysicsWorld::new(WorldConfig::default());
+        assert!(world.raycast([0.0, 0.0], [1.0, 0.0], 100.0).is_none());
+    }
+
+    #[test]
+    fn collision_events_empty_after_step() {
+        let mut world = PhysicsWorld::new(WorldConfig::default());
+        world.step();
+        assert!(world.collision_events().is_empty());
+    }
+
+    #[test]
+    fn config_accessors() {
+        let config = WorldConfig {
+            timestep: 1.0 / 120.0,
+            ..Default::default()
+        };
+        let world = PhysicsWorld::new(config);
+        assert_eq!(world.timestep(), 1.0 / 120.0);
+        assert_eq!(world.config().gravity, [0.0, -9.81]);
+    }
+
+    #[test]
+    fn remove_more_than_added() {
+        let mut world = PhysicsWorld::new(WorldConfig::default());
+        let body = world.add_body(BodyDesc::default());
+        world.remove_body(body).unwrap();
+        // Saturating sub prevents underflow
+        world.remove_body(BodyHandle(999)).unwrap();
+        assert_eq!(world.body_count(), 0);
+    }
+
+    #[test]
+    fn unique_handles() {
+        let mut world = PhysicsWorld::new(WorldConfig::default());
+        let a = world.add_body(BodyDesc::default());
+        let b = world.add_body(BodyDesc::default());
+        assert_ne!(a, b);
+
+        let c1 = world.add_collider(
+            a,
+            ColliderDesc {
+                shape: ColliderShape::Ball { radius: 1.0 },
+                offset: [0.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+            },
+        );
+        let c2 = world.add_collider(
+            b,
+            ColliderDesc {
+                shape: ColliderShape::Ball { radius: 1.0 },
+                offset: [0.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+            },
+        );
+        assert_ne!(c1, c2);
     }
 }

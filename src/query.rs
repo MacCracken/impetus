@@ -4,7 +4,7 @@ use crate::collider::ColliderHandle;
 use serde::{Deserialize, Serialize};
 
 /// Result of a raycast query.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RayHit {
     pub collider: ColliderHandle,
     pub point: [f64; 2],
@@ -13,7 +13,7 @@ pub struct RayHit {
 }
 
 /// Result of a point query.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PointQuery {
     pub collider: ColliderHandle,
     pub distance: f64,
@@ -34,6 +34,32 @@ mod tests {
         };
         let json = serde_json::to_string(&hit).unwrap();
         let back: RayHit = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.distance, 3.5);
+        assert_eq!(hit, back);
+    }
+
+    #[test]
+    fn point_query_inside() {
+        let pq = PointQuery {
+            collider: ColliderHandle(2),
+            distance: 0.0,
+            is_inside: true,
+        };
+        let json = serde_json::to_string(&pq).unwrap();
+        let back: PointQuery = serde_json::from_str(&json).unwrap();
+        assert_eq!(pq, back);
+        assert!(back.is_inside);
+    }
+
+    #[test]
+    fn point_query_outside() {
+        let pq = PointQuery {
+            collider: ColliderHandle(3),
+            distance: 1.5,
+            is_inside: false,
+        };
+        let json = serde_json::to_string(&pq).unwrap();
+        let back: PointQuery = serde_json::from_str(&json).unwrap();
+        assert_eq!(pq, back);
+        assert!(!back.is_inside);
     }
 }

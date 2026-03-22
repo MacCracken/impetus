@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub struct ColliderHandle(pub u64);
 
 /// Collider shape.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ColliderShape {
     /// Axis-aligned box.
     Box { half_extents: [f64; 2] },
@@ -33,7 +33,7 @@ pub enum ColliderShape {
 }
 
 /// Descriptor for creating a collider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColliderDesc {
     pub shape: ColliderShape,
     #[serde(default)]
@@ -51,7 +51,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn collider_shapes() {
+    fn collider_shapes_serde() {
         let shapes = vec![
             ColliderShape::Box {
                 half_extents: [1.0, 1.0],
@@ -64,8 +64,52 @@ mod tests {
         ];
         for shape in &shapes {
             let json = serde_json::to_string(shape).unwrap();
-            assert!(!json.is_empty());
+            let back: ColliderShape = serde_json::from_str(&json).unwrap();
+            assert_eq!(shape, &back);
         }
+    }
+
+    #[test]
+    fn convex_hull_serde() {
+        let shape = ColliderShape::ConvexHull {
+            points: vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+        };
+        let json = serde_json::to_string(&shape).unwrap();
+        let back: ColliderShape = serde_json::from_str(&json).unwrap();
+        assert_eq!(shape, back);
+    }
+
+    #[test]
+    fn trimesh_serde() {
+        let shape = ColliderShape::TriMesh {
+            vertices: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            indices: vec![[0, 1, 2]],
+        };
+        let json = serde_json::to_string(&shape).unwrap();
+        let back: ColliderShape = serde_json::from_str(&json).unwrap();
+        assert_eq!(shape, back);
+    }
+
+    #[test]
+    fn heightfield_serde() {
+        let shape = ColliderShape::Heightfield {
+            heights: vec![0.0, 1.0, 0.5, 2.0],
+            scale: [1.0, 1.0],
+        };
+        let json = serde_json::to_string(&shape).unwrap();
+        let back: ColliderShape = serde_json::from_str(&json).unwrap();
+        assert_eq!(shape, back);
+    }
+
+    #[test]
+    fn segment_serde() {
+        let shape = ColliderShape::Segment {
+            a: [0.0, 0.0],
+            b: [5.0, 5.0],
+        };
+        let json = serde_json::to_string(&shape).unwrap();
+        let back: ColliderShape = serde_json::from_str(&json).unwrap();
+        assert_eq!(shape, back);
     }
 
     #[test]
@@ -78,5 +122,21 @@ mod tests {
             mass: None,
         };
         assert!(desc.is_sensor);
+    }
+
+    #[test]
+    fn collider_desc_serde() {
+        let desc = ColliderDesc {
+            shape: ColliderShape::Box {
+                half_extents: [2.0, 3.0],
+            },
+            offset: [1.0, 1.0],
+            material: PhysicsMaterial::steel(),
+            is_sensor: false,
+            mass: Some(10.0),
+        };
+        let json = serde_json::to_string(&desc).unwrap();
+        let back: ColliderDesc = serde_json::from_str(&json).unwrap();
+        assert_eq!(desc, back);
     }
 }

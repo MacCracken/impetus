@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub struct JointHandle(pub u64);
 
 /// Joint type.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum JointType {
     /// Fixed joint — bodies maintain relative position/rotation.
     Fixed,
@@ -33,7 +33,7 @@ pub enum JointType {
 }
 
 /// Descriptor for creating a joint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JointDesc {
     pub body_a: BodyHandle,
     pub body_b: BodyHandle,
@@ -47,7 +47,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn spring_joint() {
+    fn fixed_joint_serde() {
+        let desc = JointDesc {
+            body_a: BodyHandle(0),
+            body_b: BodyHandle(1),
+            joint_type: JointType::Fixed,
+            local_anchor_a: [0.0, 0.0],
+            local_anchor_b: [1.0, 0.0],
+        };
+        let json = serde_json::to_string(&desc).unwrap();
+        let back: JointDesc = serde_json::from_str(&json).unwrap();
+        assert_eq!(desc, back);
+    }
+
+    #[test]
+    fn spring_joint_serde() {
         let desc = JointDesc {
             body_a: BodyHandle(0),
             body_b: BodyHandle(1),
@@ -60,7 +74,8 @@ mod tests {
             local_anchor_b: [0.0, 0.0],
         };
         let json = serde_json::to_string(&desc).unwrap();
-        assert!(json.contains("Spring"));
+        let back: JointDesc = serde_json::from_str(&json).unwrap();
+        assert_eq!(desc, back);
     }
 
     #[test]
@@ -70,6 +85,43 @@ mod tests {
             limits: Some([-1.57, 1.57]),
         };
         let json = serde_json::to_string(&jt).unwrap();
-        assert!(json.contains("Revolute"));
+        let back: JointType = serde_json::from_str(&json).unwrap();
+        assert_eq!(jt, back);
+    }
+
+    #[test]
+    fn revolute_without_limits() {
+        let jt = JointType::Revolute {
+            anchor: [0.0, 0.0],
+            limits: None,
+        };
+        let json = serde_json::to_string(&jt).unwrap();
+        let back: JointType = serde_json::from_str(&json).unwrap();
+        assert_eq!(jt, back);
+    }
+
+    #[test]
+    fn prismatic_joint_serde() {
+        let jt = JointType::Prismatic {
+            axis: [1.0, 0.0],
+            limits: Some([-5.0, 5.0]),
+        };
+        let json = serde_json::to_string(&jt).unwrap();
+        let back: JointType = serde_json::from_str(&json).unwrap();
+        assert_eq!(jt, back);
+    }
+
+    #[test]
+    fn distance_joint_serde() {
+        let jt = JointType::Distance { length: 3.0 };
+        let json = serde_json::to_string(&jt).unwrap();
+        let back: JointType = serde_json::from_str(&json).unwrap();
+        assert_eq!(jt, back);
+    }
+
+    #[test]
+    fn joint_handle_eq() {
+        assert_eq!(JointHandle(0), JointHandle(0));
+        assert_ne!(JointHandle(0), JointHandle(1));
     }
 }

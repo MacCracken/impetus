@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Physics world configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorldConfig {
     /// Fixed timestep in seconds (default: 1/60).
     pub timestep: f64,
@@ -42,6 +42,9 @@ mod tests {
         assert_eq!(config.timestep, 1.0 / 60.0);
         assert_eq!(config.gravity, [0.0, -9.81]);
         assert!(config.deterministic);
+        assert_eq!(config.velocity_iterations, 4);
+        assert_eq!(config.position_iterations, 1);
+        assert_eq!(config.step, 0);
     }
 
     #[test]
@@ -49,6 +52,30 @@ mod tests {
         let config = WorldConfig::default();
         let json = serde_json::to_string(&config).unwrap();
         let back: WorldConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(config.timestep, back.timestep);
+        assert_eq!(config, back);
+    }
+
+    #[test]
+    fn custom_config_serde() {
+        let config = WorldConfig {
+            timestep: 1.0 / 120.0,
+            gravity: [0.0, -10.0],
+            velocity_iterations: 8,
+            position_iterations: 3,
+            deterministic: false,
+            step: 0,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: WorldConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config, back);
+    }
+
+    #[test]
+    fn zero_gravity_config() {
+        let config = WorldConfig {
+            gravity: [0.0, 0.0],
+            ..Default::default()
+        };
+        assert_eq!(config.gravity, [0.0, 0.0]);
     }
 }
