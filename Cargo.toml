@@ -13,8 +13,8 @@ categories = ["simulation", "game-engines"]
 
 [features]
 default = ["2d"]
-2d = ["dep:rapier2d"]
-3d = ["dep:rapier3d"]
+2d = ["dep:ganit"]
+3d = []
 serialize = ["dep:bincode"]
 full = ["2d", "3d", "serialize"]
 
@@ -22,9 +22,8 @@ full = ["2d", "3d", "serialize"]
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 
-# Physics backends (optional)
-rapier2d = { version = "0.22", optional = true }
-rapier3d = { version = "0.22", optional = true }
+# Physics backend — native, built on ganit math
+ganit = { version = "0.1", optional = true }
 
 # Serialization (optional)
 bincode = { version = "2", optional = true }
