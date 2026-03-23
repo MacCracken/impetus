@@ -422,6 +422,48 @@ impl PhysicsWorld {
         }
     }
 
+    /// Find all colliders overlapping a sphere at the given position.
+    pub fn overlap_sphere(&self, center: [f64; 3], radius: f64) -> Vec<ColliderHandle> {
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
+        {
+            self.backend_2d.overlap_sphere(center, radius)
+        }
+
+        #[cfg(feature = "3d")]
+        {
+            // 3D overlap not implemented yet
+            let _ = (center, radius);
+            vec![]
+        }
+
+        #[cfg(not(any(feature = "2d", feature = "3d")))]
+        {
+            let _ = (center, radius);
+            vec![]
+        }
+    }
+
+    /// Find all colliders overlapping an AABB.
+    pub fn overlap_aabb(&self, min: [f64; 3], max: [f64; 3]) -> Vec<ColliderHandle> {
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
+        {
+            self.backend_2d.overlap_aabb(min, max)
+        }
+
+        #[cfg(feature = "3d")]
+        {
+            // 3D overlap not implemented yet
+            let _ = (min, max);
+            vec![]
+        }
+
+        #[cfg(not(any(feature = "2d", feature = "3d")))]
+        {
+            let _ = (min, max);
+            vec![]
+        }
+    }
+
     /// Get collision events from the last step.
     #[must_use]
     pub fn collision_events(&self) -> &[CollisionEvent] {
@@ -560,6 +602,8 @@ impl PhysicsWorld {
                         material: c.material.clone(),
                         is_sensor: c.is_sensor,
                         mass: c.mass,
+                        collision_layer: c.collision_layer,
+                        collision_mask: c.collision_mask,
                     },
                 });
             }
@@ -617,6 +661,8 @@ impl PhysicsWorld {
                         material: c.material.clone(),
                         is_sensor: c.is_sensor,
                         mass: c.mass,
+                        collision_layer: c.collision_layer,
+                        collision_mask: c.collision_mask,
                     },
                 });
             }
@@ -901,6 +947,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
 
@@ -999,6 +1047,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
         let c2 = world.add_collider(
@@ -1009,6 +1059,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
         assert_ne!(c1, c2);
@@ -1035,6 +1087,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
 
@@ -1065,6 +1119,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
 
@@ -1097,6 +1153,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
 
@@ -1114,6 +1172,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
 
@@ -1149,6 +1209,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
 
@@ -1243,6 +1305,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
 

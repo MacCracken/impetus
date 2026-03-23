@@ -16,6 +16,15 @@ use crate::query::RayHit;
 use crate::ImpetusError;
 
 // ---------------------------------------------------------------------------
+// Sleep / deactivation thresholds
+// ---------------------------------------------------------------------------
+
+/// Bodies with both linear and angular speed below this are candidates for sleep.
+const SLEEP_VELOCITY_THRESHOLD: f64 = 0.01;
+/// How many seconds of low motion before a body is put to sleep.
+const SLEEP_TIME_THRESHOLD: f64 = 0.5;
+
+// ---------------------------------------------------------------------------
 // Internal body representation
 // ---------------------------------------------------------------------------
 
@@ -38,6 +47,9 @@ pub(crate) struct RigidBody2d {
     pub inv_mass: f64,
     pub inertia: f64,
     pub inv_inertia: f64,
+    // Sleep state
+    pub is_sleeping: bool,
+    pub sleep_timer: f64,
 }
 
 impl RigidBody2d {
@@ -59,6 +71,8 @@ impl RigidBody2d {
             inv_mass: 0.0,
             inertia: 0.0,
             inv_inertia: 0.0,
+            is_sleeping: false,
+            sleep_timer: 0.0,
         }
     }
 
@@ -72,6 +86,10 @@ impl RigidBody2d {
 
     fn integrate_velocities(&mut self, gravity: [f64; 2], dt: f64) {
         if !self.is_dynamic() || self.inv_mass == 0.0 {
+            return;
+        }
+        // Sleeping bodies skip integration
+        if self.is_sleeping {
             return;
         }
 
@@ -131,6 +149,8 @@ pub(crate) struct Collider2d {
     pub material: PhysicsMaterial,
     pub is_sensor: bool,
     pub mass: Option<f64>,
+    pub collision_layer: u32,
+    pub collision_mask: u32,
 }
 
 impl Collider2d {
@@ -143,6 +163,8 @@ impl Collider2d {
             material: desc.material.clone(),
             is_sensor: desc.is_sensor,
             mass: desc.mass,
+            collision_layer: desc.collision_layer,
+            collision_mask: desc.collision_mask,
         }
     }
 
@@ -483,6 +505,9 @@ impl PhysicsState2d {
 
     pub fn apply_force(&mut self, body: BodyHandle, force: &Force) {
         if let Some(rb) = self.bodies.get_mut(&body) {
+            // Wake the body
+            rb.is_sleeping = false;
+            rb.sleep_timer = 0.0;
             rb.force_accumulator[0] += force.vector[0];
             rb.force_accumulator[1] += force.vector[1];
             if let Some(point) = force.point {
@@ -496,6 +521,9 @@ impl PhysicsState2d {
             && rb.is_dynamic()
             && rb.inv_mass > 0.0
         {
+            // Wake the body
+            rb.is_sleeping = false;
+            rb.sleep_timer = 0.0;
             rb.linear_velocity[0] += impulse.vector[0] * rb.inv_mass;
             rb.linear_velocity[1] += impulse.vector[1] * rb.inv_mass;
             if let Some(point) = impulse.point {
@@ -508,6 +536,9 @@ impl PhysicsState2d {
 
     pub fn apply_torque(&mut self, body: BodyHandle, torque: &Torque) {
         if let Some(rb) = self.bodies.get_mut(&body) {
+            // Wake the body
+            rb.is_sleeping = false;
+            rb.sleep_timer = 0.0;
             rb.torque_accumulator += torque.value;
         }
     }
@@ -542,7 +573,7 @@ impl PhysicsState2d {
             rotation: rb.rotation,
             linear_velocity: [rb.linear_velocity[0], rb.linear_velocity[1], 0.0],
             angular_velocity: rb.angular_velocity,
-            is_sleeping: false,
+            is_sleeping: rb.is_sleeping,
         })
     }
 
@@ -569,26 +600,78 @@ impl PhysicsState2d {
         // 3. Narrowphase
         let contacts = self.narrowphase(&broad_pairs);
 
-        // 4. Solve velocity constraints
+        // 4. Wake sleeping bodies on contact with non-sleeping moving bodies
+        for contact in &contacts {
+            let a_sleeping = self.bodies.get(&contact.body_a).map_or(false, |b| b.is_sleeping);
+            let b_sleeping = self.bodies.get(&contact.body_b).map_or(false, |b| b.is_sleeping);
+            let a_moving = self.bodies.get(&contact.body_a).map_or(false, |b| {
+                !b.is_sleeping
+                    && b.is_dynamic()
+                    && (b.linear_velocity[0].abs() > SLEEP_VELOCITY_THRESHOLD
+                        || b.linear_velocity[1].abs() > SLEEP_VELOCITY_THRESHOLD
+                        || b.angular_velocity.abs() > SLEEP_VELOCITY_THRESHOLD)
+            });
+            let b_moving = self.bodies.get(&contact.body_b).map_or(false, |b| {
+                !b.is_sleeping
+                    && b.is_dynamic()
+                    && (b.linear_velocity[0].abs() > SLEEP_VELOCITY_THRESHOLD
+                        || b.linear_velocity[1].abs() > SLEEP_VELOCITY_THRESHOLD
+                        || b.angular_velocity.abs() > SLEEP_VELOCITY_THRESHOLD)
+            });
+            if a_sleeping && b_moving {
+                if let Some(ba) = self.bodies.get_mut(&contact.body_a) {
+                    ba.is_sleeping = false;
+                    ba.sleep_timer = 0.0;
+                }
+            }
+            if b_sleeping && a_moving {
+                if let Some(bb) = self.bodies.get_mut(&contact.body_b) {
+                    bb.is_sleeping = false;
+                    bb.sleep_timer = 0.0;
+                }
+            }
+        }
+
+        // 5. Solve velocity constraints
         self.solve_contacts(&contacts, velocity_iterations);
 
-        // 5. Solve joint constraints
+        // 6. Solve joint constraints
         self.solve_joints(dt, velocity_iterations);
 
-        // 6. Positional correction
+        // 7. Positional correction
         self.solve_positions(&contacts, position_iterations);
 
-        // 7. Integrate positions
+        // 8. Integrate positions
         for rb in self.bodies.values_mut() {
             rb.integrate_positions(dt);
         }
 
-        // 8. Clear forces
+        // 9. Sleep check: put nearly-stationary dynamic bodies to sleep
+        for rb in self.bodies.values_mut() {
+            if !rb.is_dynamic() || rb.inv_mass == 0.0 {
+                continue;
+            }
+            let lin_speed = (rb.linear_velocity[0] * rb.linear_velocity[0]
+                + rb.linear_velocity[1] * rb.linear_velocity[1])
+            .sqrt();
+            let ang_speed = rb.angular_velocity.abs();
+            if lin_speed < SLEEP_VELOCITY_THRESHOLD && ang_speed < SLEEP_VELOCITY_THRESHOLD {
+                rb.sleep_timer += dt;
+                if rb.sleep_timer >= SLEEP_TIME_THRESHOLD {
+                    rb.is_sleeping = true;
+                }
+            } else {
+                rb.sleep_timer = 0.0;
+                rb.is_sleeping = false;
+            }
+        }
+
+        // 10. Clear forces
         for rb in self.bodies.values_mut() {
             rb.clear_forces();
         }
 
-        // 9. Generate collision events
+        // 11. Generate collision events
         self.generate_events(&contacts)
     }
 
@@ -644,6 +727,12 @@ impl PhysicsState2d {
             }
             // Skip sensor-sensor
             if ca.is_sensor && cb.is_sensor {
+                continue;
+            }
+            // Skip if collision layers don't match
+            if (ca.collision_layer & cb.collision_mask) == 0
+                && (cb.collision_layer & ca.collision_mask) == 0
+            {
                 continue;
             }
             // Verify AABB overlap (spatial hash cells are conservative)
@@ -1244,6 +1333,104 @@ impl PhysicsState2d {
             normal: [normal[0], normal[1], 0.0],
             distance,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // Overlap queries (brute-force)
+    // -----------------------------------------------------------------------
+
+    /// Find all colliders overlapping a sphere (circle in 2D) at the given position.
+    pub fn overlap_sphere(&self, center: [f64; 3], radius: f64) -> Vec<ColliderHandle> {
+        let center_2d = [center[0], center[1]];
+        let sphere_aabb = Aabb2d {
+            min: [center_2d[0] - radius, center_2d[1] - radius],
+            max: [center_2d[0] + radius, center_2d[1] + radius],
+        };
+
+        let mut results = Vec::new();
+
+        for collider in self.colliders.values() {
+            let rb = match self.bodies.get(&collider.body) {
+                Some(b) => b,
+                None => continue,
+            };
+
+            let col_aabb = collider.world_aabb(rb.position, rb.rotation);
+
+            // Quick AABB rejection
+            if !sphere_aabb.overlaps(&col_aabb) {
+                continue;
+            }
+
+            // Precise sphere-vs-shape check
+            let pos = world_pos(rb.position, rb.rotation, collider.offset);
+            let overlaps = match &collider.shape {
+                ColliderShape::Ball {
+                    radius: shape_radius,
+                } => {
+                    let dx = center_2d[0] - pos[0];
+                    let dy = center_2d[1] - pos[1];
+                    let dist_sq = dx * dx + dy * dy;
+                    let sum_r = radius + shape_radius;
+                    dist_sq < sum_r * sum_r
+                }
+                ColliderShape::Box { half_extents } => {
+                    let dx = center_2d[0] - pos[0];
+                    let dy = center_2d[1] - pos[1];
+                    let cx = dx.clamp(-half_extents[0], half_extents[0]);
+                    let cy = dy.clamp(-half_extents[1], half_extents[1]);
+                    let diff_x = dx - cx;
+                    let diff_y = dy - cy;
+                    let dist_sq = diff_x * diff_x + diff_y * diff_y;
+                    dist_sq < radius * radius
+                }
+                ColliderShape::Capsule {
+                    half_height,
+                    radius: cap_radius,
+                } => {
+                    let (ep_a, ep_b) = capsule_endpoints(pos, rb.rotation, *half_height);
+                    let (closest, _) = closest_point_on_segment(ep_a, ep_b, center_2d);
+                    let dx = center_2d[0] - closest[0];
+                    let dy = center_2d[1] - closest[1];
+                    let dist_sq = dx * dx + dy * dy;
+                    let sum_r = radius + cap_radius;
+                    dist_sq < sum_r * sum_r
+                }
+                // For other shapes, fall back to AABB overlap (already passed)
+                _ => true,
+            };
+
+            if overlaps {
+                results.push(collider.handle);
+            }
+        }
+
+        results
+    }
+
+    /// Find all colliders overlapping an AABB.
+    pub fn overlap_aabb(&self, min: [f64; 3], max: [f64; 3]) -> Vec<ColliderHandle> {
+        let query_aabb = Aabb2d {
+            min: [min[0], min[1]],
+            max: [max[0], max[1]],
+        };
+
+        let mut results = Vec::new();
+
+        for collider in self.colliders.values() {
+            let rb = match self.bodies.get(&collider.body) {
+                Some(b) => b,
+                None => continue,
+            };
+
+            let col_aabb = collider.world_aabb(rb.position, rb.rotation);
+
+            if query_aabb.overlaps(&col_aabb) {
+                results.push(collider.handle);
+            }
+        }
+
+        results
     }
 }
 
@@ -1894,6 +2081,8 @@ mod tests {
                 material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
         let m = c.compute_mass();
@@ -1911,6 +2100,8 @@ mod tests {
                 material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
         assert!((c.compute_mass() - 4.0).abs() < EPS);
@@ -1927,6 +2118,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
         assert!(c.compute_mass() > 0.0);
@@ -1943,6 +2136,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: Some(42.0),
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
         assert!((c.compute_mass() - 42.0).abs() < EPS);
@@ -1960,6 +2155,8 @@ mod tests {
             material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
             is_sensor: false,
             mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
         });
         let mass_after_first = state.bodies[&bh].mass;
 
@@ -1969,6 +2166,8 @@ mod tests {
             material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
             is_sensor: false,
             mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
         });
         let mass_after_second = state.bodies[&bh].mass;
 
@@ -2086,6 +2285,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
         let aabb = c.world_aabb([5.0, 3.0], 0.0);
@@ -2106,6 +2307,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
         // 90 degree rotation swaps extents
@@ -2126,6 +2329,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
         let aabb = c.world_aabb([0.0, 0.0], 0.0);
@@ -2152,6 +2357,8 @@ mod tests {
             material: PhysicsMaterial::default(),
             is_sensor: true, // Sensor!
             mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
         });
 
         // Dynamic ball overlapping the sensor
@@ -2167,6 +2374,8 @@ mod tests {
             material: PhysicsMaterial::default(),
             is_sensor: false,
             mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
         });
 
         let vel_before = state.bodies[&ball].linear_velocity;
@@ -2221,6 +2430,8 @@ mod tests {
             material: PhysicsMaterial::default(),
             is_sensor: false,
             mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
         });
 
         let b = BodyHandle(1);
@@ -2235,6 +2446,8 @@ mod tests {
             material: PhysicsMaterial::default(),
             is_sensor: false,
             mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
         });
 
         // Step to generate collision pairs
@@ -2346,5 +2559,586 @@ mod tests {
         // Should find closest pair — any point pair with dist=2
         let dist = ((p2[0] - p1[0]).powi(2) + (p2[1] - p1[1]).powi(2)).sqrt();
         assert!((dist - 2.0).abs() < 0.01);
+    }
+
+    // =======================================================================
+    // Feature 1: Sleep / deactivation tests
+    // =======================================================================
+
+    #[test]
+    fn body_falls_asleep_when_stationary() {
+        let mut state = PhysicsState2d::new();
+        let bh = BodyHandle(0);
+        state.add_body(bh, &BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        // Zero gravity, zero velocity — body should go to sleep after SLEEP_TIME_THRESHOLD
+        let dt = 1.0 / 60.0;
+        let steps_needed = (SLEEP_TIME_THRESHOLD / dt).ceil() as usize + 10;
+        for _ in 0..steps_needed {
+            state.step([0.0, 0.0, 0.0], dt, 4, 1);
+        }
+
+        assert!(state.bodies[&bh].is_sleeping, "body should be sleeping after sitting still");
+    }
+
+    #[test]
+    fn sleeping_body_skips_integration() {
+        let mut state = PhysicsState2d::new();
+        let bh = BodyHandle(0);
+        state.add_body(bh, &BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        // Manually put to sleep
+        state.bodies.get_mut(&bh).unwrap().is_sleeping = true;
+
+        let pos_before = state.bodies[&bh].position;
+        // Step with gravity — sleeping body should not move
+        state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1);
+
+        let pos_after = state.bodies[&bh].position;
+        assert!(
+            (pos_after[0] - pos_before[0]).abs() < EPS
+                && (pos_after[1] - pos_before[1]).abs() < EPS,
+            "sleeping body should not have moved"
+        );
+    }
+
+    #[test]
+    fn force_wakes_sleeping_body() {
+        let mut state = PhysicsState2d::new();
+        let bh = BodyHandle(0);
+        state.add_body(bh, &BodyDesc::default());
+        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        // Put to sleep
+        state.bodies.get_mut(&bh).unwrap().is_sleeping = true;
+        state.bodies.get_mut(&bh).unwrap().sleep_timer = 1.0;
+
+        // Apply force should wake it
+        state.apply_force(bh, &Force::new(10.0, 0.0, 0.0));
+        assert!(!state.bodies[&bh].is_sleeping);
+        assert!((state.bodies[&bh].sleep_timer).abs() < EPS);
+    }
+
+    #[test]
+    fn impulse_wakes_sleeping_body() {
+        let mut state = PhysicsState2d::new();
+        let bh = BodyHandle(0);
+        state.add_body(bh, &BodyDesc::default());
+        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        state.bodies.get_mut(&bh).unwrap().is_sleeping = true;
+        state.apply_impulse(bh, &Impulse::new(10.0, 0.0, 0.0));
+        assert!(!state.bodies[&bh].is_sleeping);
+    }
+
+    #[test]
+    fn torque_wakes_sleeping_body() {
+        let mut state = PhysicsState2d::new();
+        let bh = BodyHandle(0);
+        state.add_body(bh, &BodyDesc::default());
+        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        state.bodies.get_mut(&bh).unwrap().is_sleeping = true;
+        state.apply_torque(bh, &Torque::new(5.0));
+        assert!(!state.bodies[&bh].is_sleeping);
+    }
+
+    #[test]
+    fn moving_body_does_not_sleep() {
+        let mut state = PhysicsState2d::new();
+        let bh = BodyHandle(0);
+        state.add_body(bh, &BodyDesc {
+            body_type: BodyType::Dynamic,
+            linear_velocity: [5.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        // Step many times — body is moving so should not sleep
+        for _ in 0..100 {
+            state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1);
+        }
+        assert!(!state.bodies[&bh].is_sleeping);
+    }
+
+    #[test]
+    fn get_body_state_reports_sleeping() {
+        let mut state = PhysicsState2d::new();
+        let bh = BodyHandle(0);
+        state.add_body(bh, &BodyDesc::default());
+        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        assert!(!state.get_body_state(bh).unwrap().is_sleeping);
+
+        state.bodies.get_mut(&bh).unwrap().is_sleeping = true;
+        assert!(state.get_body_state(bh).unwrap().is_sleeping);
+    }
+
+    #[test]
+    fn contact_wakes_sleeping_body() {
+        let mut state = PhysicsState2d::new();
+
+        // A sleeping body at origin
+        let a = BodyHandle(0);
+        state.add_body(a, &BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(0), a, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+        state.bodies.get_mut(&a).unwrap().is_sleeping = true;
+
+        // A moving body heading toward it
+        let b = BodyHandle(1);
+        state.add_body(b, &BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [3.0, 0.0, 0.0],
+            linear_velocity: [-5.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(1), b, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        // Step until contact
+        for _ in 0..60 {
+            state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1);
+        }
+
+        // The sleeping body should have been woken by the impact
+        assert!(!state.bodies[&a].is_sleeping, "sleeping body should wake on contact");
+    }
+
+    // =======================================================================
+    // Feature 2: Collision layer filtering tests
+    // =======================================================================
+
+    #[test]
+    fn collision_layers_prevent_collision() {
+        let mut state = PhysicsState2d::new();
+
+        // Two overlapping bodies on different layers
+        let a = BodyHandle(0);
+        state.add_body(a, &BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(0), a, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0x01,  // layer 1
+            collision_mask: 0x01,   // only collide with layer 1
+        });
+
+        let b = BodyHandle(1);
+        state.add_body(b, &BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.5, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(1), b, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0x02,  // layer 2
+            collision_mask: 0x02,   // only collide with layer 2
+        });
+
+        // Step — no collision events should be generated
+        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1);
+        assert!(events.is_empty(), "different collision layers should not generate events");
+    }
+
+    #[test]
+    fn collision_layers_allow_same_layer() {
+        let mut state = PhysicsState2d::new();
+
+        // Two overlapping bodies on the same layer
+        let a = BodyHandle(0);
+        state.add_body(a, &BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(0), a, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0x01,
+            collision_mask: 0x01,
+        });
+
+        let b = BodyHandle(1);
+        state.add_body(b, &BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.5, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(1), b, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0x01,
+            collision_mask: 0x01,
+        });
+
+        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1);
+        assert!(!events.is_empty(), "same collision layer should generate events");
+    }
+
+    #[test]
+    fn collision_layers_asymmetric_mask() {
+        let mut state = PhysicsState2d::new();
+
+        // A can see B's layer, but B cannot see A's layer
+        let a = BodyHandle(0);
+        state.add_body(a, &BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(0), a, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0x01,
+            collision_mask: 0x03, // sees layer 1 and 2
+        });
+
+        let b = BodyHandle(1);
+        state.add_body(b, &BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.5, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(1), b, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0x02,
+            collision_mask: 0x02, // only sees layer 2
+        });
+
+        // A's mask includes B's layer (0x02 & 0x03 != 0), so collision should happen
+        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1);
+        assert!(!events.is_empty(), "asymmetric mask should still allow collision when one side matches");
+    }
+
+    #[test]
+    fn collision_layers_default_collide_everything() {
+        // Default layers (0xFFFF_FFFF) should collide with everything
+        let mut state = PhysicsState2d::new();
+
+        let a = BodyHandle(0);
+        state.add_body(a, &BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(0), a, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        let b = BodyHandle(1);
+        state.add_body(b, &BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.5, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(1), b, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1);
+        assert!(!events.is_empty(), "default layers should collide");
+    }
+
+    // =======================================================================
+    // Feature 3: Overlap query tests
+    // =======================================================================
+
+    #[test]
+    fn overlap_sphere_finds_ball() {
+        let mut state = PhysicsState2d::new();
+        let bh = BodyHandle(0);
+        state.add_body(bh, &BodyDesc {
+            body_type: BodyType::Static,
+            position: [5.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        let ch = ColliderHandle(0);
+        state.add_collider(ch, bh, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        // Sphere query overlapping the ball
+        let hits = state.overlap_sphere([5.0, 0.0, 0.0], 0.5);
+        assert!(hits.contains(&ch), "should find overlapping ball");
+
+        // Sphere query far away
+        let misses = state.overlap_sphere([100.0, 0.0, 0.0], 0.5);
+        assert!(misses.is_empty(), "should not find distant ball");
+    }
+
+    #[test]
+    fn overlap_sphere_finds_box() {
+        let mut state = PhysicsState2d::new();
+        let bh = BodyHandle(0);
+        state.add_body(bh, &BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        let ch = ColliderHandle(0);
+        state.add_collider(ch, bh, &ColliderDesc {
+            shape: ColliderShape::Box { half_extents: [2.0, 2.0, 0.0] },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        let hits = state.overlap_sphere([2.3, 0.0, 0.0], 0.5);
+        assert!(hits.contains(&ch), "sphere near box edge should overlap");
+
+        let misses = state.overlap_sphere([10.0, 0.0, 0.0], 0.5);
+        assert!(misses.is_empty(), "distant sphere should not overlap");
+    }
+
+    #[test]
+    fn overlap_sphere_misses_distant() {
+        let mut state = PhysicsState2d::new();
+        let bh = BodyHandle(0);
+        state.add_body(bh, &BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        let results = state.overlap_sphere([10.0, 10.0, 0.0], 0.5);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn overlap_aabb_finds_colliders() {
+        let mut state = PhysicsState2d::new();
+
+        let b1 = BodyHandle(0);
+        state.add_body(b1, &BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        let c1 = ColliderHandle(0);
+        state.add_collider(c1, b1, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        let b2 = BodyHandle(1);
+        state.add_body(b2, &BodyDesc {
+            body_type: BodyType::Static,
+            position: [10.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        let c2 = ColliderHandle(1);
+        state.add_collider(c2, b2, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        // AABB covering only the first collider
+        let hits = state.overlap_aabb([-2.0, -2.0, 0.0], [2.0, 2.0, 0.0]);
+        assert!(hits.contains(&c1), "should find collider at origin");
+        assert!(!hits.contains(&c2), "should not find collider at x=10");
+
+        // AABB covering both
+        let all_hits = state.overlap_aabb([-2.0, -2.0, 0.0], [12.0, 2.0, 0.0]);
+        assert!(all_hits.contains(&c1));
+        assert!(all_hits.contains(&c2));
+    }
+
+    #[test]
+    fn overlap_aabb_empty() {
+        let mut state = PhysicsState2d::new();
+        let bh = BodyHandle(0);
+        state.add_body(bh, &BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        let results = state.overlap_aabb([50.0, 50.0, 0.0], [60.0, 60.0, 0.0]);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn overlap_sphere_finds_capsule() {
+        let mut state = PhysicsState2d::new();
+        let bh = BodyHandle(0);
+        state.add_body(bh, &BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        let ch = ColliderHandle(0);
+        state.add_collider(ch, bh, &ColliderDesc {
+            shape: ColliderShape::Capsule { half_height: 2.0, radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        // Query near the capsule endpoint
+        let hits = state.overlap_sphere([0.0, 2.3, 0.0], 0.5);
+        assert!(hits.contains(&ch), "sphere near capsule endpoint should overlap");
+
+        let misses = state.overlap_sphere([5.0, 0.0, 0.0], 0.5);
+        assert!(misses.is_empty(), "distant sphere should not overlap capsule");
     }
 }

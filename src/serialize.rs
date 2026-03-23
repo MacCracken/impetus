@@ -106,6 +106,8 @@ mod tests {
                 material: PhysicsMaterial::rubber(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
 
@@ -124,6 +126,8 @@ mod tests {
                 material: PhysicsMaterial::wood(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
 
@@ -159,6 +163,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
 
@@ -204,6 +210,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
 

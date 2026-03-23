@@ -45,6 +45,20 @@ pub struct ColliderDesc {
     pub is_sensor: bool,
     #[serde(default)]
     pub mass: Option<f64>,
+    /// Which collision layer(s) this collider belongs to (bitmask).
+    #[serde(default = "default_layer")]
+    pub collision_layer: u32,
+    /// Which collision layer(s) this collider can interact with (bitmask).
+    #[serde(default = "default_mask")]
+    pub collision_mask: u32,
+}
+
+fn default_layer() -> u32 {
+    0xFFFF_FFFF
+}
+
+fn default_mask() -> u32 {
+    0xFFFF_FFFF
 }
 
 #[cfg(test)]
@@ -121,6 +135,8 @@ mod tests {
             material: PhysicsMaterial::default(),
             is_sensor: true,
             mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
         };
         assert!(desc.is_sensor);
     }
@@ -135,6 +151,8 @@ mod tests {
             material: PhysicsMaterial::steel(),
             is_sensor: false,
             mass: Some(10.0),
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
         };
         let json = serde_json::to_string(&desc).unwrap();
         let back: ColliderDesc = serde_json::from_str(&json).unwrap();

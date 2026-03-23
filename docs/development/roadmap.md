@@ -9,33 +9,31 @@
 | 3 | 3D backend (DVec3/DQuat), bincode serialization, `[f64;3]` API |
 | 4 | Standalone spring API for Aethersafha |
 | 5 | Kiran ECS bridge (kiran-physics crate) |
+| 6 | Production hardening — `#[non_exhaustive]`, `#[must_use]`, docs, CI, supply-chain |
 
-## Next — Production Hardening
+## Recently Completed (from backlog)
 
-Focus on bugs, missing features, and infrastructure parity with other AGNOS crates.
+- [x] Fix TriMesh AABB in 3D backend (was zero-volume)
+- [x] Sleep/deactivation system (2D backend)
+- [x] Collision layers/masks (broadphase filtering)
+- [x] Overlap queries (sphere + AABB)
+- [x] `cargo semver-checks` in CI
+- [x] `supply-chain/` with cargo-vet config
+- [x] Cross-platform CI (ubuntu + macos + windows)
+- [x] `docs/` directory (architecture, roadmap, testing guide)
 
 ## Engineering Backlog
 
-### Critical
-
-- [ ] Fix TriMesh AABB returning zero-volume (never broadphases)
-- [ ] Fix joint solver cloning all joints every iteration (O(J) alloc per frame)
-
 ### High — Missing Features
 
-- [ ] Sleep/deactivation system (field exists, logic not implemented)
 - [ ] Particle spatial hashing (currently O(P*C) per frame)
-- [ ] Overlap queries (sphere/AABB cast, not just raycast)
-- [ ] Broad-phase filtering API (collision layers/masks)
 - [ ] Constraint motors (revolute/prismatic driven motion)
 - [ ] OBB (oriented bounding box) rotation-aware contacts
+- [ ] Sleep system for 3D backend (done in 2D only)
 
 ### High — Production Readiness
 
 - [ ] Fuzz testing targets (contact generation, serialization)
-- [ ] `cargo semver-checks` in CI
-- [ ] `supply-chain/` with `cargo vet` config
-- [ ] Cross-platform CI (ubuntu + macos + windows)
 
 ### Medium — Performance
 

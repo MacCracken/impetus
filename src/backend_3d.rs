@@ -134,6 +134,8 @@ pub(crate) struct Collider3d {
     pub material: PhysicsMaterial,
     pub is_sensor: bool,
     pub mass: Option<f64>,
+    pub collision_layer: u32,
+    pub collision_mask: u32,
 }
 
 impl Collider3d {
@@ -146,6 +148,8 @@ impl Collider3d {
             material: desc.material.clone(),
             is_sensor: desc.is_sensor,
             mass: desc.mass,
+            collision_layer: desc.collision_layer,
+            collision_mask: desc.collision_mask,
         }
     }
 
@@ -193,7 +197,40 @@ impl Collider3d {
                     max: wp + axis.abs() + r,
                 }
             }
-            _ => Aabb3d { min: wp, max: wp },
+            ColliderShape::TriMesh { vertices, .. } => {
+                let mut min = DVec3::splat(f64::INFINITY);
+                let mut max = DVec3::splat(f64::NEG_INFINITY);
+                for v in vertices {
+                    let wv = wp + body_rot * DVec3::from_array(*v);
+                    min = min.min(wv);
+                    max = max.max(wv);
+                }
+                if min.x > max.x { Aabb3d { min: wp, max: wp } } else { Aabb3d { min, max } }
+            }
+            ColliderShape::ConvexHull { points } => {
+                let mut min = DVec3::splat(f64::INFINITY);
+                let mut max = DVec3::splat(f64::NEG_INFINITY);
+                for p in points {
+                    let wv = wp + body_rot * DVec3::new(p[0], p[1], p[2]);
+                    min = min.min(wv);
+                    max = max.max(wv);
+                }
+                if min.x > max.x { Aabb3d { min: wp, max: wp } } else { Aabb3d { min, max } }
+            }
+            ColliderShape::Segment { a, b } => {
+                let wa = wp + body_rot * DVec3::from_array(*a);
+                let wb = wp + body_rot * DVec3::from_array(*b);
+                Aabb3d { min: wa.min(wb), max: wa.max(wb) }
+            }
+            ColliderShape::Heightfield { heights, scale } => {
+                let w = scale[0] * (heights.len().max(1) - 1) as f64;
+                let h_min = heights.iter().copied().fold(f64::INFINITY, f64::min);
+                let h_max = heights.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                Aabb3d {
+                    min: DVec3::new(wp.x, wp.y + h_min * scale[1], wp.z),
+                    max: DVec3::new(wp.x + w, wp.y + h_max * scale[1], wp.z + scale[2]),
+                }
+            }
         }
     }
 
@@ -1409,6 +1446,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
 
@@ -1443,6 +1482,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
 
@@ -1464,6 +1505,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
 
@@ -1499,6 +1542,8 @@ mod tests {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
 
@@ -1529,6 +1574,8 @@ mod tests {
                 material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
         let m = c.compute_mass();
@@ -1547,6 +1594,8 @@ mod tests {
                 material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
         assert!((c.compute_mass() - 8.0).abs() < EPS);
@@ -1564,6 +1613,8 @@ mod tests {
             material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
             is_sensor: false,
             mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
         });
         let mass_first = state.bodies[&bh].mass;
 
@@ -1573,6 +1624,8 @@ mod tests {
             material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
             is_sensor: false,
             mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
         });
         assert!((state.bodies[&bh].mass - 2.0 * mass_first).abs() < EPS);
     }
@@ -1599,6 +1652,8 @@ mod tests {
             material: PhysicsMaterial::default(),
             is_sensor: false,
             mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
         });
 
         state.apply_impulse(bh, &Impulse::new(10.0, 0.0, 0.0));
@@ -1621,6 +1676,8 @@ mod tests {
             material: PhysicsMaterial::default(),
             is_sensor: false,
             mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
         });
 
         let b = BodyHandle(1);
@@ -1635,6 +1692,8 @@ mod tests {
             material: PhysicsMaterial::default(),
             is_sensor: false,
             mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
         });
 
         state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1);
@@ -1665,6 +1724,8 @@ mod tests {
             material: PhysicsMaterial::default(),
             is_sensor: false,
             mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
         });
         state.add_joint(JointHandle(0), &JointDesc {
             body_a: a,

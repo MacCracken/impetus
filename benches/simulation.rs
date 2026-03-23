@@ -39,6 +39,8 @@ fn bench_world(c: &mut Criterion) {
                     material: PhysicsMaterial::default(),
                     is_sensor: false,
                     mass: None,
+                    collision_layer: 0xFFFF_FFFF,
+                    collision_mask: 0xFFFF_FFFF,
                 },
             );
         }
@@ -61,6 +63,8 @@ fn bench_world(c: &mut Criterion) {
                     material: PhysicsMaterial::default(),
                     is_sensor: false,
                     mass: None,
+                    collision_layer: 0xFFFF_FFFF,
+                    collision_mask: 0xFFFF_FFFF,
                 },
             );
         }
@@ -83,6 +87,8 @@ fn bench_world(c: &mut Criterion) {
                     material: PhysicsMaterial::default(),
                     is_sensor: false,
                     mass: None,
+                    collision_layer: 0xFFFF_FFFF,
+                    collision_mask: 0xFFFF_FFFF,
                 },
             );
         }
@@ -130,6 +136,8 @@ fn bench_bodies(c: &mut Criterion) {
                     material: PhysicsMaterial::default(),
                     is_sensor: false,
                     mass: None,
+                    collision_layer: 0xFFFF_FFFF,
+                    collision_mask: 0xFFFF_FFFF,
                 }),
             );
         })
@@ -258,6 +266,8 @@ fn bench_serde(c: &mut Criterion) {
             material: PhysicsMaterial::rubber(),
             is_sensor: false,
             mass: Some(5.0),
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
         };
         b.iter(|| {
             let json = serde_json::to_string(black_box(&desc)).unwrap();
@@ -338,6 +348,8 @@ fn bench_particles(c: &mut Criterion) {
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
             },
         );
         for i in 0..100 {
@@ -401,6 +413,8 @@ fn bench_serialize(c: &mut Criterion) {
                     material: PhysicsMaterial::default(),
                     is_sensor: false,
                     mass: None,
+                    collision_layer: 0xFFFF_FFFF,
+                    collision_mask: 0xFFFF_FFFF,
                 },
             );
         }
@@ -423,6 +437,8 @@ fn bench_serialize(c: &mut Criterion) {
                     material: PhysicsMaterial::default(),
                     is_sensor: false,
                     mass: None,
+                    collision_layer: 0xFFFF_FFFF,
+                    collision_mask: 0xFFFF_FFFF,
                 },
             );
         }

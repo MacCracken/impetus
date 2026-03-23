@@ -34,6 +34,8 @@ fn main() {
             material: PhysicsMaterial::wood(),
             is_sensor: false,
             mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
         },
     );
 
@@ -51,6 +53,8 @@ fn main() {
             material: PhysicsMaterial::bouncy(),
             is_sensor: false,
             mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
         },
     );
 
