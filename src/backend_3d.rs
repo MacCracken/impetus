@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use hisab::{DQuat, DVec3};
 
 use crate::body::{BodyDesc, BodyHandle, BodyState, BodyType};
+use crate::spatial_hash::SpatialHashGrid;
 use crate::collider::{ColliderDesc, ColliderHandle, ColliderShape};
 use crate::event::CollisionEvent;
 use crate::force::{Force, Impulse, Torque};
@@ -93,7 +94,7 @@ impl RigidBody3d {
         self.body_type == BodyType::Static
     }
 
-    fn integrate_velocities(&mut self, gravity: DVec3, dt: f64) {
+    fn integrate_velocities(&mut self, gravity: DVec3, dt: f64, max_velocity: f64) {
         if !self.is_dynamic() || self.inv_mass == 0.0 {
             return;
         }
@@ -113,6 +114,13 @@ impl RigidBody3d {
         self.linear_velocity *= damp;
         let adamp = 1.0 / (1.0 + dt * self.angular_damping);
         self.angular_velocity *= adamp;
+
+        // CCD: clamp velocity magnitude to prevent tunneling
+        let speed_sq = self.linear_velocity.dot(self.linear_velocity);
+        if speed_sq > max_velocity * max_velocity {
+            let scale = max_velocity / speed_sq.sqrt();
+            self.linear_velocity *= scale;
+        }
     }
 
     fn integrate_positions(&mut self, dt: f64) {
@@ -300,13 +308,30 @@ impl Collider3d {
                 half_height,
                 radius,
             } => {
-                // Approximate as cylinder
-                let r2 = radius * radius;
-                let h = 2.0 * half_height;
-                let ix = mass * (3.0 * r2 + h * h) / 12.0;
-                let iy = ix;
-                let iz = mass * r2 / 2.0;
-                DVec3::new(ix, iy, iz)
+                // Proper capsule inertia: cylinder + two hemispheres with parallel axis theorem
+                let r = *radius;
+                let hh = *half_height;
+                let r2 = r * r;
+                let r3 = r2 * r;
+                let h = 2.0 * hh;
+
+                let cyl_vol = std::f64::consts::PI * r2 * h;
+                let sphere_vol = (4.0 / 3.0) * std::f64::consts::PI * r3;
+                let total_vol = cyl_vol + sphere_vol;
+                let cyl_frac = cyl_vol / total_vol;
+                let cyl_mass = mass * cyl_frac;
+                let sph_mass = mass * (1.0 - cyl_frac);
+
+                // Cylinder (axis along Y): Ixx = Izz = m*(3r²+h²)/12, Iyy = m*r²/2
+                let ix_cyl = cyl_mass * (3.0 * r2 + h * h) / 12.0;
+                let iy_cyl = cyl_mass * r2 / 2.0;
+
+                // Two hemispheres: I_cm = 2/5 * m * r², offset from center by (hh + 3r/8)
+                let offset = hh + 3.0 * r / 8.0;
+                let ix_sph = sph_mass * (2.0 * r2 / 5.0 + offset * offset);
+                let iy_sph = sph_mass * 2.0 * r2 / 5.0;
+
+                DVec3::new(ix_cyl + ix_sph, iy_cyl + iy_sph, ix_cyl + ix_sph)
             }
             _ => DVec3::splat(mass),
         };
@@ -351,75 +376,8 @@ impl Aabb3d {
 }
 
 // ---------------------------------------------------------------------------
-// Spatial hash (3D cells)
+// Spatial hash broadphase — uses shared SpatialHashGrid from spatial_hash.rs
 // ---------------------------------------------------------------------------
-
-struct SpatialHash3d {
-    inv_cell_size: f64,
-    cells: HashMap<(i32, i32, i32), Vec<ColliderHandle>>,
-}
-
-impl SpatialHash3d {
-    fn new(cell_size: f64) -> Self {
-        Self {
-            inv_cell_size: 1.0 / cell_size,
-            cells: HashMap::new(),
-        }
-    }
-
-    fn auto_cell_size(aabbs: &[(ColliderHandle, Aabb3d)]) -> f64 {
-        if aabbs.is_empty() {
-            return 1.0;
-        }
-        let total: f64 = aabbs
-            .iter()
-            .map(|(_, aabb)| {
-                let size = aabb.max - aabb.min;
-                size.x.max(size.y).max(size.z)
-            })
-            .sum();
-        (total / aabbs.len() as f64 * 2.0).max(0.1)
-    }
-
-    fn cell(&self, x: f64, y: f64, z: f64) -> (i32, i32, i32) {
-        (
-            (x * self.inv_cell_size).floor() as i32,
-            (y * self.inv_cell_size).floor() as i32,
-            (z * self.inv_cell_size).floor() as i32,
-        )
-    }
-
-    fn insert(&mut self, handle: ColliderHandle, aabb: &Aabb3d) {
-        let (min_cx, min_cy, min_cz) = self.cell(aabb.min.x, aabb.min.y, aabb.min.z);
-        let (max_cx, max_cy, max_cz) = self.cell(aabb.max.x, aabb.max.y, aabb.max.z);
-
-        for cx in min_cx..=max_cx {
-            for cy in min_cy..=max_cy {
-                for cz in min_cz..=max_cz {
-                    self.cells.entry((cx, cy, cz)).or_default().push(handle);
-                }
-            }
-        }
-    }
-
-    fn query_pairs(&self) -> HashSet<(ColliderHandle, ColliderHandle)> {
-        let mut pairs = HashSet::new();
-        for cell in self.cells.values() {
-            for i in 0..cell.len() {
-                for j in (i + 1)..cell.len() {
-                    let a = cell[i];
-                    let b = cell[j];
-                    if a.0 < b.0 {
-                        pairs.insert((a, b));
-                    } else {
-                        pairs.insert((b, a));
-                    }
-                }
-            }
-        }
-        pairs
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Contact
@@ -580,10 +538,52 @@ impl PhysicsState3d {
         })
     }
 
+    pub fn set_body_state(&mut self, handle: BodyHandle, state: &BodyState) -> Result<(), ImpetusError> {
+        let rb = self.bodies.get_mut(&handle)
+            .ok_or_else(|| ImpetusError::BodyNotFound(format!("{:?}", handle)))?;
+        rb.position = DVec3::from_array(state.position);
+        rb.rotation = DQuat::from_rotation_z(state.rotation);
+        rb.linear_velocity = DVec3::from_array(state.linear_velocity);
+        rb.angular_velocity = DVec3::new(0.0, 0.0, state.angular_velocity);
+        rb.is_sleeping = false;
+        rb.sleep_timer = 0.0;
+        Ok(())
+    }
+
+    pub fn set_body_type(&mut self, handle: BodyHandle, body_type: BodyType) -> Result<(), ImpetusError> {
+        let rb = self.bodies.get_mut(&handle)
+            .ok_or_else(|| ImpetusError::BodyNotFound(format!("{:?}", handle)))?;
+        rb.body_type = body_type;
+        match body_type {
+            BodyType::Static | BodyType::Kinematic => {
+                rb.inv_mass = 0.0;
+                rb.inv_inertia = DVec3::ZERO;
+                rb.linear_velocity = DVec3::ZERO;
+                rb.angular_velocity = DVec3::ZERO;
+            }
+            BodyType::Dynamic => {
+                if rb.mass > 0.0 {
+                    rb.inv_mass = 1.0 / rb.mass;
+                    rb.inv_inertia = if rb.fixed_rotation {
+                        DVec3::ZERO
+                    } else {
+                        DVec3::new(
+                            1.0 / rb.inertia.x,
+                            1.0 / rb.inertia.y,
+                            1.0 / rb.inertia.z,
+                        )
+                    };
+                }
+            }
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Step
     // -----------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
         gravity: [f64; 3],
@@ -592,11 +592,12 @@ impl PhysicsState3d {
         position_iterations: u32,
         slop: f64,
         correction: f64,
+        max_velocity: f64,
     ) -> Vec<CollisionEvent> {
         let g = DVec3::from_array(gravity);
         // 1. Integrate velocities
         for rb in self.bodies.values_mut() {
-            rb.integrate_velocities(g, dt);
+            rb.integrate_velocities(g, dt, max_velocity);
         }
 
         // 2-3. Broadphase + narrowphase
@@ -696,10 +697,16 @@ impl PhysicsState3d {
             })
             .collect();
 
-        let cell_size = SpatialHash3d::auto_cell_size(&collider_aabbs);
-        let mut grid = SpatialHash3d::new(cell_size);
+        let cell_size = SpatialHashGrid::<ColliderHandle>::auto_cell_size(
+            collider_aabbs.iter().map(|(_, aabb)| {
+                let size = aabb.max - aabb.min;
+                size.x.max(size.y).max(size.z)
+            }),
+            collider_aabbs.len(),
+        );
+        let mut grid = SpatialHashGrid::new(cell_size);
         for (handle, aabb) in &collider_aabbs {
-            grid.insert(*handle, aabb);
+            grid.insert_3d(*handle, aabb.min.to_array(), aabb.max.to_array());
         }
 
         let candidates = grid.query_pairs();
@@ -770,7 +777,7 @@ impl PhysicsState3d {
             let pos_b = bb.position + bb.rotation * cb.offset;
 
             if let Some((normal, depth, point)) =
-                generate_contact_3d(&ca.shape, pos_a, &cb.shape, pos_b)
+                generate_contact_3d(&ca.shape, pos_a, ba.rotation, &cb.shape, pos_b, bb.rotation)
             {
                 contacts.push(Contact3d {
                     collider_a: *ha,
@@ -1220,27 +1227,44 @@ impl PhysicsState3d {
 // Narrowphase contact generation
 // ---------------------------------------------------------------------------
 
+fn is_identity_quat(q: DQuat) -> bool {
+    (q.x.abs() < EPSILON) && (q.y.abs() < EPSILON) && (q.z.abs() < EPSILON) && ((q.w.abs() - 1.0).abs() < EPSILON)
+}
+
 fn generate_contact_3d(
     shape_a: &ColliderShape,
     pos_a: DVec3,
+    rot_a: DQuat,
     shape_b: &ColliderShape,
     pos_b: DVec3,
+    rot_b: DQuat,
 ) -> Option<(DVec3, f64, DVec3)> {
     match (shape_a, shape_b) {
+        // Ball vs Ball
         (ColliderShape::Ball { radius: ra }, ColliderShape::Ball { radius: rb }) => {
             sphere_sphere(pos_a, *ra, pos_b, *rb)
         }
+        // Ball vs Box
         (ColliderShape::Ball { radius }, ColliderShape::Box { half_extents }) => {
-            sphere_aabb(pos_a, *radius, pos_b, DVec3::from_array(*half_extents))
+            sphere_obb(pos_a, *radius, pos_b, rot_b, DVec3::from_array(*half_extents))
         }
         (ColliderShape::Box { half_extents }, ColliderShape::Ball { radius }) => {
-            sphere_aabb(pos_b, *radius, pos_a, DVec3::from_array(*half_extents))
+            sphere_obb(pos_b, *radius, pos_a, rot_a, DVec3::from_array(*half_extents))
                 .map(|(n, d, p)| (-n, d, p))
         }
+        // Box vs Box — OBB when rotated, AABB fast path otherwise
         (
             ColliderShape::Box { half_extents: he_a },
             ColliderShape::Box { half_extents: he_b },
-        ) => aabb_aabb_3d(pos_a, DVec3::from_array(*he_a), pos_b, DVec3::from_array(*he_b)),
+        ) => {
+            let hea = DVec3::from_array(*he_a);
+            let heb = DVec3::from_array(*he_b);
+            if is_identity_quat(rot_a) && is_identity_quat(rot_b) {
+                aabb_aabb_3d(pos_a, hea, pos_b, heb)
+            } else {
+                obb_obb_3d(pos_a, rot_a, hea, pos_b, rot_b, heb)
+            }
+        }
         // Capsule vs Sphere
         (
             ColliderShape::Capsule {
@@ -1248,7 +1272,7 @@ fn generate_contact_3d(
                 radius: cr,
             },
             ColliderShape::Ball { radius: br },
-        ) => capsule_sphere_3d(pos_a, *half_height, *cr, pos_b, *br),
+        ) => capsule_sphere_3d(pos_a, rot_a, *half_height, *cr, pos_b, *br),
         (
             ColliderShape::Ball { radius: br },
             ColliderShape::Capsule {
@@ -1256,7 +1280,60 @@ fn generate_contact_3d(
                 radius: cr,
             },
         ) => {
-            capsule_sphere_3d(pos_b, *half_height, *cr, pos_a, *br)
+            capsule_sphere_3d(pos_b, rot_b, *half_height, *cr, pos_a, *br)
+                .map(|(n, d, p)| (-n, d, p))
+        }
+        // Capsule vs Capsule
+        (
+            ColliderShape::Capsule {
+                half_height: hh_a,
+                radius: cr_a,
+            },
+            ColliderShape::Capsule {
+                half_height: hh_b,
+                radius: cr_b,
+            },
+        ) => capsule_capsule_3d(pos_a, rot_a, *hh_a, *cr_a, pos_b, rot_b, *hh_b, *cr_b),
+        // Capsule vs Box
+        (
+            ColliderShape::Capsule {
+                half_height,
+                radius: cr,
+            },
+            ColliderShape::Box { half_extents },
+        ) => capsule_box_3d(pos_a, rot_a, *half_height, *cr, pos_b, rot_b, DVec3::from_array(*half_extents)),
+        (
+            ColliderShape::Box { half_extents },
+            ColliderShape::Capsule {
+                half_height,
+                radius: cr,
+            },
+        ) => {
+            capsule_box_3d(pos_b, rot_b, *half_height, *cr, pos_a, rot_a, DVec3::from_array(*half_extents))
+                .map(|(n, d, p)| (-n, d, p))
+        }
+        // Segment vs Ball
+        (ColliderShape::Segment { a, b }, ColliderShape::Ball { radius }) => {
+            segment_sphere_3d(pos_a, rot_a, DVec3::from_array(*a), DVec3::from_array(*b), pos_b, *radius)
+        }
+        (ColliderShape::Ball { radius }, ColliderShape::Segment { a, b }) => {
+            segment_sphere_3d(pos_b, rot_b, DVec3::from_array(*a), DVec3::from_array(*b), pos_a, *radius)
+                .map(|(n, d, p)| (-n, d, p))
+        }
+        // Segment vs Box
+        (ColliderShape::Segment { a, b }, ColliderShape::Box { half_extents }) => {
+            segment_box_3d(pos_a, rot_a, DVec3::from_array(*a), DVec3::from_array(*b), pos_b, rot_b, DVec3::from_array(*half_extents))
+        }
+        (ColliderShape::Box { half_extents }, ColliderShape::Segment { a, b }) => {
+            segment_box_3d(pos_b, rot_b, DVec3::from_array(*a), DVec3::from_array(*b), pos_a, rot_a, DVec3::from_array(*half_extents))
+                .map(|(n, d, p)| (-n, d, p))
+        }
+        // ConvexHull vs Ball
+        (ColliderShape::ConvexHull { points }, ColliderShape::Ball { radius }) => {
+            convex_hull_sphere_3d(points, pos_a, rot_a, pos_b, *radius)
+        }
+        (ColliderShape::Ball { radius }, ColliderShape::ConvexHull { points }) => {
+            convex_hull_sphere_3d(points, pos_b, rot_b, pos_a, *radius)
                 .map(|(n, d, p)| (-n, d, p))
         }
         _ => None,
@@ -1288,15 +1365,20 @@ fn sphere_sphere(
     Some((normal, depth, point))
 }
 
-fn sphere_aabb(
+/// Sphere vs OBB (oriented bounding box): transform sphere into box-local space.
+fn sphere_obb(
     sphere_pos: DVec3,
     radius: f64,
     box_pos: DVec3,
+    box_rot: DQuat,
     half_extents: DVec3,
 ) -> Option<(DVec3, f64, DVec3)> {
-    let d = sphere_pos - box_pos;
-    let closest = d.clamp(-half_extents, half_extents);
-    let diff = d - closest;
+    // Transform sphere center into box-local space
+    let inv_rot = box_rot.inverse();
+    let local_sphere = inv_rot * (sphere_pos - box_pos);
+
+    let closest = local_sphere.clamp(-half_extents, half_extents);
+    let diff = local_sphere - closest;
     let dist_sq = diff.dot(diff);
 
     if dist_sq >= radius * radius {
@@ -1304,11 +1386,12 @@ fn sphere_aabb(
     }
 
     let dist = dist_sq.sqrt();
-    let (normal, depth) = if dist < EPSILON {
+    let (local_normal, depth) = if dist < EPSILON {
+        // Sphere center inside box — push out along minimum-penetration face
         let face_dists = DVec3::new(
-            half_extents.x - d.x.abs(),
-            half_extents.y - d.y.abs(),
-            half_extents.z - d.z.abs(),
+            half_extents.x - local_sphere.x.abs(),
+            half_extents.y - local_sphere.y.abs(),
+            half_extents.z - local_sphere.z.abs(),
         );
         let min_axis = if face_dists.x <= face_dists.y && face_dists.x <= face_dists.z {
             0
@@ -1318,13 +1401,15 @@ fn sphere_aabb(
             2
         };
         let mut n = DVec3::ZERO;
-        n[min_axis] = if d[min_axis] >= 0.0 { 1.0 } else { -1.0 };
+        n[min_axis] = if local_sphere[min_axis] >= 0.0 { 1.0 } else { -1.0 };
         (n, face_dists[min_axis] + radius)
     } else {
         (diff / dist, radius - dist)
     };
 
-    let point = box_pos + closest;
+    // Transform normal and contact point back to world space
+    let normal = box_rot * local_normal;
+    let point = box_rot * closest + box_pos;
     Some((normal, depth, point))
 }
 
@@ -1376,18 +1461,376 @@ fn closest_point_on_segment_3d(a: DVec3, b: DVec3, p: DVec3) -> DVec3 {
     a + ab * t
 }
 
+/// Capsule endpoints in world space given position, rotation, and half-height.
+fn capsule_endpoints_3d(pos: DVec3, rot: DQuat, half_height: f64) -> (DVec3, DVec3) {
+    let axis = rot * DVec3::new(0.0, half_height, 0.0);
+    (pos - axis, pos + axis)
+}
+
 fn capsule_sphere_3d(
     cap_pos: DVec3,
+    cap_rot: DQuat,
     half_height: f64,
     cap_radius: f64,
     sphere_pos: DVec3,
     sphere_radius: f64,
 ) -> Option<(DVec3, f64, DVec3)> {
-    // Capsule axis along Y in local space (no rotation transform here — pos is world center)
-    let ep_a = cap_pos + DVec3::new(0.0, -half_height, 0.0);
-    let ep_b = cap_pos + DVec3::new(0.0, half_height, 0.0);
+    let (ep_a, ep_b) = capsule_endpoints_3d(cap_pos, cap_rot, half_height);
     let closest = closest_point_on_segment_3d(ep_a, ep_b, sphere_pos);
     sphere_sphere(closest, cap_radius, sphere_pos, sphere_radius)
+}
+
+/// Closest points between two 3D line segments. Returns (point_on_ab, point_on_cd).
+fn closest_points_segments_3d(a: DVec3, b: DVec3, c: DVec3, d: DVec3) -> (DVec3, DVec3) {
+    let r = b - a; // direction of segment 1
+    let s = d - c; // direction of segment 2
+    let w = a - c;
+
+    let rr = r.dot(r); // |r|^2
+    let ss = s.dot(s); // |s|^2
+    let rs = r.dot(s);
+    let rw = r.dot(w);
+    let sw = s.dot(w);
+
+    let denom = rr * ss - rs * rs;
+
+    let (sc, tc);
+
+    if denom.abs() < EPSILON_SQ {
+        // Nearly parallel
+        sc = 0.0;
+        tc = if ss.abs() < EPSILON_SQ { 0.0 } else { (sw / ss).clamp(0.0, 1.0) };
+    } else {
+        let sn = (rs * sw - ss * rw) / denom;
+        let tn = (rr * sw - rs * rw) / denom;
+
+        if sn < 0.0 {
+            let t = if ss.abs() < EPSILON_SQ { 0.0 } else { (sw / ss).clamp(0.0, 1.0) };
+            sc = 0.0;
+            tc = t;
+        } else if sn > 1.0 {
+            let t = if ss.abs() < EPSILON_SQ { 0.0 } else { ((sw + rs) / ss).clamp(0.0, 1.0) };
+            sc = 1.0;
+            tc = t;
+        } else if tn < 0.0 {
+            tc = 0.0;
+            sc = if rr.abs() < EPSILON_SQ { 0.0 } else { (-rw / rr).clamp(0.0, 1.0) };
+        } else if tn > 1.0 {
+            tc = 1.0;
+            sc = if rr.abs() < EPSILON_SQ { 0.0 } else { ((rs - rw) / rr).clamp(0.0, 1.0) };
+        } else {
+            sc = sn;
+            tc = tn;
+        }
+    }
+
+    (a + r * sc, c + s * tc)
+}
+
+/// Capsule vs Capsule: closest points between two segments, then sphere-sphere test.
+#[allow(clippy::too_many_arguments)]
+fn capsule_capsule_3d(
+    pos_a: DVec3,
+    rot_a: DQuat,
+    hh_a: f64,
+    cr_a: f64,
+    pos_b: DVec3,
+    rot_b: DQuat,
+    hh_b: f64,
+    cr_b: f64,
+) -> Option<(DVec3, f64, DVec3)> {
+    let (a1, a2) = capsule_endpoints_3d(pos_a, rot_a, hh_a);
+    let (b1, b2) = capsule_endpoints_3d(pos_b, rot_b, hh_b);
+    let (pa, pb) = closest_points_segments_3d(a1, a2, b1, b2);
+    sphere_sphere(pa, cr_a, pb, cr_b)
+}
+
+/// Capsule vs Box: find closest point on capsule segment to box, then sphere-OBB test.
+fn capsule_box_3d(
+    cap_pos: DVec3,
+    cap_rot: DQuat,
+    half_height: f64,
+    cap_radius: f64,
+    box_pos: DVec3,
+    box_rot: DQuat,
+    half_extents: DVec3,
+) -> Option<(DVec3, f64, DVec3)> {
+    let (ep_a, ep_b) = capsule_endpoints_3d(cap_pos, cap_rot, half_height);
+
+    // Transform capsule endpoints into box-local space
+    let inv_rot = box_rot.inverse();
+    let local_a = inv_rot * (ep_a - box_pos);
+    let local_b = inv_rot * (ep_b - box_pos);
+
+    // Find the point on the capsule segment closest to the box in local space.
+    // We find the closest point on the segment to the box by clamping.
+    let ab = local_b - local_a;
+    let len_sq = ab.dot(ab);
+
+    // Sample along the segment and find the parameter t that minimizes distance to the box
+    let best_t = if len_sq < EPSILON_SQ {
+        0.0
+    } else {
+        // Analytical: project box center (origin in local space) onto segment, clamp
+        let t_center = (-local_a).dot(ab) / len_sq;
+        t_center.clamp(0.0, 1.0)
+    };
+
+    let closest_on_seg = local_a + ab * best_t;
+    // The closest point on the capsule segment in world space
+    let world_seg_pt = box_rot * closest_on_seg + box_pos;
+
+    // Now do a sphere-OBB test with the sphere centered at the closest segment point
+    sphere_obb(world_seg_pt, cap_radius, box_pos, box_rot, half_extents)
+}
+
+/// OBB vs OBB using SAT with 6 face normals (3 per box).
+fn obb_obb_3d(
+    pos_a: DVec3,
+    rot_a: DQuat,
+    he_a: DVec3,
+    pos_b: DVec3,
+    rot_b: DQuat,
+    he_b: DVec3,
+) -> Option<(DVec3, f64, DVec3)> {
+    // Get the 3 local axes for each box
+    let axes_a = [rot_a * DVec3::X, rot_a * DVec3::Y, rot_a * DVec3::Z];
+    let axes_b = [rot_b * DVec3::X, rot_b * DVec3::Y, rot_b * DVec3::Z];
+    let he_a_arr = [he_a.x, he_a.y, he_a.z];
+    let he_b_arr = [he_b.x, he_b.y, he_b.z];
+
+    let d = pos_b - pos_a;
+
+    let mut min_overlap = f64::INFINITY;
+    let mut best_axis = DVec3::ZERO;
+
+    // Test 6 face normals (3 per box)
+    // Test all 6 face normals (3 per box)
+    let all_axes = [axes_a[0], axes_a[1], axes_a[2], axes_b[0], axes_b[1], axes_b[2]];
+
+    for axis in &all_axes {
+        // Project half-extents of both boxes onto this axis
+        let proj_a = he_a_arr[0] * axes_a[0].dot(*axis).abs()
+            + he_a_arr[1] * axes_a[1].dot(*axis).abs()
+            + he_a_arr[2] * axes_a[2].dot(*axis).abs();
+        let proj_b = he_b_arr[0] * axes_b[0].dot(*axis).abs()
+            + he_b_arr[1] * axes_b[1].dot(*axis).abs()
+            + he_b_arr[2] * axes_b[2].dot(*axis).abs();
+
+        let dist = d.dot(*axis).abs();
+        let overlap = proj_a + proj_b - dist;
+
+        if overlap <= 0.0 {
+            return None; // Separating axis found
+        }
+
+        if overlap < min_overlap {
+            min_overlap = overlap;
+            best_axis = *axis;
+            // Ensure normal points from A to B
+            if d.dot(best_axis) < 0.0 {
+                best_axis = -best_axis;
+            }
+        }
+    }
+
+    // Contact point: midpoint of the overlap region projected onto the separating axis
+    let point = pos_a + best_axis * (he_a.x * axes_a[0].dot(best_axis).abs()
+        + he_a.y * axes_a[1].dot(best_axis).abs()
+        + he_a.z * axes_a[2].dot(best_axis).abs());
+
+    // Better contact point: average of the face centers along the normal
+    let face_a = pos_a + best_axis * (he_a.x * axes_a[0].dot(best_axis)
+        + he_a.y * axes_a[1].dot(best_axis)
+        + he_a.z * axes_a[2].dot(best_axis));
+    let face_b = pos_b - best_axis * (he_b.x * axes_b[0].dot(best_axis)
+        + he_b.y * axes_b[1].dot(best_axis)
+        + he_b.z * axes_b[2].dot(best_axis));
+    let contact_point = (face_a + face_b) * 0.5;
+
+    let _ = point;
+
+    Some((best_axis, min_overlap, contact_point))
+}
+
+/// Segment vs Sphere: closest point on segment to sphere center.
+fn segment_sphere_3d(
+    seg_pos: DVec3,
+    seg_rot: DQuat,
+    local_a: DVec3,
+    local_b: DVec3,
+    sphere_pos: DVec3,
+    radius: f64,
+) -> Option<(DVec3, f64, DVec3)> {
+    let wa = seg_pos + seg_rot * local_a;
+    let wb = seg_pos + seg_rot * local_b;
+    let closest = closest_point_on_segment_3d(wa, wb, sphere_pos);
+    // Treat segment as zero-radius, then test against sphere
+    sphere_sphere(closest, 0.0, sphere_pos, radius)
+}
+
+/// Segment vs Box: closest point on segment to box surface.
+fn segment_box_3d(
+    seg_pos: DVec3,
+    seg_rot: DQuat,
+    local_a: DVec3,
+    local_b: DVec3,
+    box_pos: DVec3,
+    box_rot: DQuat,
+    half_extents: DVec3,
+) -> Option<(DVec3, f64, DVec3)> {
+    let wa = seg_pos + seg_rot * local_a;
+    let wb = seg_pos + seg_rot * local_b;
+
+    // Transform segment into box-local space
+    let inv_rot = box_rot.inverse();
+    let la = inv_rot * (wa - box_pos);
+    let lb = inv_rot * (wb - box_pos);
+
+    // Find closest point on segment to box (clamped to box surface)
+    let ab = lb - la;
+    let len_sq = ab.dot(ab);
+
+    // Sample several points along the segment to find best contact
+    let steps = 8;
+    let mut best_depth = f64::NEG_INFINITY;
+    let mut best_normal = DVec3::ZERO;
+    let mut best_point = DVec3::ZERO;
+
+    for i in 0..=steps {
+        let t = i as f64 / steps as f64;
+        let seg_pt = la + ab * t;
+        let clamped = seg_pt.clamp(-half_extents, half_extents);
+        let diff = seg_pt - clamped;
+        let dist_sq = diff.dot(diff);
+
+        if dist_sq < EPSILON_SQ {
+            // Point is inside the box
+            let face_dists = DVec3::new(
+                half_extents.x - seg_pt.x.abs(),
+                half_extents.y - seg_pt.y.abs(),
+                half_extents.z - seg_pt.z.abs(),
+            );
+            let min_axis = if face_dists.x <= face_dists.y && face_dists.x <= face_dists.z {
+                0
+            } else if face_dists.y <= face_dists.z {
+                1
+            } else {
+                2
+            };
+            let depth = face_dists[min_axis];
+            if depth > best_depth {
+                best_depth = depth;
+                let mut n = DVec3::ZERO;
+                n[min_axis] = if seg_pt[min_axis] >= 0.0 { 1.0 } else { -1.0 };
+                best_normal = n;
+                best_point = clamped;
+            }
+        } else {
+            let dist = dist_sq.sqrt();
+            // Negative depth means penetration — segment point is outside
+            let depth = -dist;
+            if depth > best_depth && dist_sq < EPSILON {
+                best_depth = depth;
+            }
+        }
+    }
+
+    // Also check: closest point on segment to box center
+    let t_center = if len_sq < EPSILON_SQ {
+        0.0
+    } else {
+        (-la).dot(ab) / len_sq
+    };
+    let t_center = t_center.clamp(0.0, 1.0);
+    let seg_at_center = la + ab * t_center;
+    let clamped = seg_at_center.clamp(-half_extents, half_extents);
+    let diff = seg_at_center - clamped;
+    let dist_sq = diff.dot(diff);
+
+    if dist_sq < EPSILON_SQ {
+        let face_dists = DVec3::new(
+            half_extents.x - seg_at_center.x.abs(),
+            half_extents.y - seg_at_center.y.abs(),
+            half_extents.z - seg_at_center.z.abs(),
+        );
+        let min_axis = if face_dists.x <= face_dists.y && face_dists.x <= face_dists.z {
+            0
+        } else if face_dists.y <= face_dists.z {
+            1
+        } else {
+            2
+        };
+        let depth = face_dists[min_axis];
+        if depth > best_depth {
+            best_depth = depth;
+            let mut n = DVec3::ZERO;
+            n[min_axis] = if seg_at_center[min_axis] >= 0.0 { 1.0 } else { -1.0 };
+            best_normal = n;
+            best_point = clamped;
+        }
+    }
+
+    if best_depth <= 0.0 {
+        return None;
+    }
+
+    // Transform back to world space
+    let normal = box_rot * best_normal;
+    let point = box_rot * best_point + box_pos;
+    Some((normal, best_depth, point))
+}
+
+/// ConvexHull vs Sphere: closest point on hull surface to sphere center.
+fn convex_hull_sphere_3d(
+    hull_points: &[[f64; 3]],
+    hull_pos: DVec3,
+    hull_rot: DQuat,
+    sphere_pos: DVec3,
+    radius: f64,
+) -> Option<(DVec3, f64, DVec3)> {
+    if hull_points.len() < 3 {
+        return None;
+    }
+
+    // Transform hull points to world space
+    let world_pts: Vec<DVec3> = hull_points
+        .iter()
+        .map(|p| hull_pos + hull_rot * DVec3::from_array(*p))
+        .collect();
+
+    // Find closest point on hull to sphere center.
+    // For a convex hull, we test all edges (treating the hull as a wireframe).
+    // This is a v1.0 approximation — works well for sphere tests.
+    let n = world_pts.len();
+    let mut best_dist_sq = f64::INFINITY;
+    let mut best_closest = world_pts[0];
+
+    for i in 0..n {
+        let a = world_pts[i];
+        let b = world_pts[(i + 1) % n];
+        let closest = closest_point_on_segment_3d(a, b, sphere_pos);
+        let dist_sq = (sphere_pos - closest).dot(sphere_pos - closest);
+        if dist_sq < best_dist_sq {
+            best_dist_sq = dist_sq;
+            best_closest = closest;
+        }
+    }
+
+    if best_dist_sq >= radius * radius {
+        return None;
+    }
+
+    let diff = sphere_pos - best_closest;
+    let dist = best_dist_sq.sqrt();
+
+    let (normal, depth) = if dist < EPSILON {
+        (DVec3::Y, radius)
+    } else {
+        (diff / dist, radius - dist)
+    };
+
+    Some((normal, depth, best_closest))
 }
 
 // ---------------------------------------------------------------------------
@@ -1498,25 +1941,43 @@ mod tests {
     }
 
     #[test]
-    fn sphere_aabb_overlap() {
-        let r = sphere_aabb(
+    fn sphere_obb_overlap() {
+        let r = sphere_obb(
             DVec3::new(1.8, 0.0, 0.0),
             0.5,
             DVec3::ZERO,
+            DQuat::IDENTITY,
             DVec3::new(1.5, 1.0, 1.0),
         );
         assert!(r.is_some());
     }
 
     #[test]
-    fn sphere_aabb_miss() {
-        assert!(sphere_aabb(
+    fn sphere_obb_miss() {
+        assert!(sphere_obb(
             DVec3::new(5.0, 0.0, 0.0),
             0.5,
             DVec3::ZERO,
+            DQuat::IDENTITY,
             DVec3::new(1.0, 1.0, 1.0),
         )
         .is_none());
+    }
+
+    #[test]
+    fn sphere_obb_rotated() {
+        // Box rotated 45° around Z — a sphere that would miss an AABB should hit the rotated box
+        let rot = DQuat::from_rotation_z(std::f64::consts::FRAC_PI_4);
+        // Box half_extents [2, 0.5, 1], rotated 45° around Z.
+        // The corner extends to sqrt(2^2 + 0.5^2) ≈ 2.06 along the diagonal.
+        let r = sphere_obb(
+            DVec3::new(1.5, 1.5, 0.0),
+            0.5,
+            DVec3::ZERO,
+            rot,
+            DVec3::new(2.0, 0.5, 1.0),
+        );
+        assert!(r.is_some());
     }
 
     #[test]
@@ -1617,7 +2078,7 @@ mod tests {
         );
 
         for _ in 0..60 {
-            state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
+            state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
         }
 
         assert!(state.bodies[&bh].position.y < 10.0, "body should fall");
@@ -1677,7 +2138,7 @@ mod tests {
 
         let mut found_event = false;
         for _ in 0..120 {
-            let events = state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
+            let events = state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
             if !events.is_empty() {
                 found_event = true;
                 break;
@@ -1797,13 +2258,13 @@ mod tests {
 
     #[test]
     fn capsule_sphere_3d_overlap() {
-        let r = capsule_sphere_3d(DVec3::ZERO, 1.0, 0.5, DVec3::new(0.8, 0.0, 0.0), 0.5);
+        let r = capsule_sphere_3d(DVec3::ZERO, DQuat::IDENTITY, 1.0, 0.5, DVec3::new(0.8, 0.0, 0.0), 0.5);
         assert!(r.is_some());
     }
 
     #[test]
     fn capsule_sphere_3d_miss() {
-        assert!(capsule_sphere_3d(DVec3::ZERO, 1.0, 0.5, DVec3::new(5.0, 0.0, 0.0), 0.5).is_none());
+        assert!(capsule_sphere_3d(DVec3::ZERO, DQuat::IDENTITY, 1.0, 0.5, DVec3::new(5.0, 0.0, 0.0), 0.5).is_none());
     }
 
     #[test]
@@ -1861,7 +2322,7 @@ mod tests {
             collision_mask: 0xFFFF_FFFF,
         });
 
-        state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
+        state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
         assert!(!state.prev_collision_pairs.is_empty());
 
         state.remove_body(b);
@@ -1903,7 +2364,7 @@ mod tests {
         });
 
         for _ in 0..10 {
-            state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
+            state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
         }
         // Joint should prevent body from falling far
         assert!(state.bodies[&b].position.y > 2.0);
@@ -1911,30 +2372,327 @@ mod tests {
 
     #[test]
     fn spatial_hash_3d_finds_pair() {
-        let mut grid = SpatialHash3d::new(2.0);
-        grid.insert(ColliderHandle(0), &Aabb3d {
-            min: DVec3::ZERO,
-            max: DVec3::ONE,
-        });
-        grid.insert(ColliderHandle(1), &Aabb3d {
-            min: DVec3::splat(0.5),
-            max: DVec3::splat(1.5),
-        });
+        let mut grid: SpatialHashGrid<ColliderHandle> = SpatialHashGrid::new(2.0);
+        grid.insert_3d(ColliderHandle(0), [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        grid.insert_3d(ColliderHandle(1), [0.5, 0.5, 0.5], [1.5, 1.5, 1.5]);
         let pairs = grid.query_pairs();
         assert!(pairs.contains(&(ColliderHandle(0), ColliderHandle(1))));
     }
 
     #[test]
     fn spatial_hash_3d_no_false_pair() {
-        let mut grid = SpatialHash3d::new(1.0);
-        grid.insert(ColliderHandle(0), &Aabb3d {
-            min: DVec3::ZERO,
-            max: DVec3::splat(0.5),
-        });
-        grid.insert(ColliderHandle(1), &Aabb3d {
-            min: DVec3::splat(10.0),
-            max: DVec3::splat(10.5),
-        });
+        let mut grid: SpatialHashGrid<ColliderHandle> = SpatialHashGrid::new(1.0);
+        grid.insert_3d(ColliderHandle(0), [0.0, 0.0, 0.0], [0.5, 0.5, 0.5]);
+        grid.insert_3d(ColliderHandle(1), [10.0, 10.0, 10.0], [10.5, 10.5, 10.5]);
         assert!(grid.query_pairs().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // set_body_state / set_body_type tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn set_body_state_teleports() {
+        let mut state = PhysicsState3d::new();
+        let bh = BodyHandle(0);
+        state.add_body(bh, &BodyDesc::default());
+        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        let new_state = BodyState {
+            handle: bh,
+            body_type: BodyType::Dynamic,
+            position: [10.0, 20.0, 30.0],
+            rotation: 1.0,
+            linear_velocity: [1.0, 2.0, 3.0],
+            angular_velocity: 0.5,
+            is_sleeping: false,
+        };
+        state.set_body_state(bh, &new_state).unwrap();
+
+        let rb = &state.bodies[&bh];
+        assert!((rb.position.x - 10.0).abs() < EPS);
+        assert!((rb.position.y - 20.0).abs() < EPS);
+        assert!((rb.position.z - 30.0).abs() < EPS);
+        assert!(!rb.is_sleeping);
+    }
+
+    #[test]
+    fn set_body_state_not_found() {
+        let mut state = PhysicsState3d::new();
+        let result = state.set_body_state(BodyHandle(999), &BodyState {
+            handle: BodyHandle(999),
+            body_type: BodyType::Dynamic,
+            position: [0.0, 0.0, 0.0],
+            rotation: 0.0,
+            linear_velocity: [0.0, 0.0, 0.0],
+            angular_velocity: 0.0,
+            is_sleeping: false,
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn set_body_type_dynamic_to_static() {
+        let mut state = PhysicsState3d::new();
+        let bh = BodyHandle(0);
+        state.add_body(bh, &BodyDesc {
+            body_type: BodyType::Dynamic,
+            linear_velocity: [5.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        state.set_body_type(bh, BodyType::Static).unwrap();
+        let rb = &state.bodies[&bh];
+        assert_eq!(rb.body_type, BodyType::Static);
+        assert_eq!(rb.inv_mass, 0.0);
+        assert_eq!(rb.linear_velocity, DVec3::ZERO);
+    }
+
+    #[test]
+    fn set_body_type_static_to_dynamic() {
+        let mut state = PhysicsState3d::new();
+        let bh = BodyHandle(0);
+        state.add_body(bh, &BodyDesc {
+            body_type: BodyType::Dynamic,
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        let mass_before = state.bodies[&bh].mass;
+        assert!(mass_before > 0.0);
+
+        // Switch to static and back
+        state.set_body_type(bh, BodyType::Static).unwrap();
+        state.set_body_type(bh, BodyType::Dynamic).unwrap();
+        let rb = &state.bodies[&bh];
+        assert!(rb.inv_mass > 0.0);
+        assert_eq!(rb.body_type, BodyType::Dynamic);
+    }
+
+    // -----------------------------------------------------------------------
+    // OBB-OBB tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn obb_obb_aligned_overlap() {
+        // Two axis-aligned boxes overlapping
+        let r = obb_obb_3d(
+            DVec3::ZERO, DQuat::IDENTITY, DVec3::ONE,
+            DVec3::new(1.5, 0.0, 0.0), DQuat::IDENTITY, DVec3::ONE,
+        );
+        assert!(r.is_some());
+        let (n, d, _) = r.unwrap();
+        assert!((n.x - 1.0).abs() < EPS);
+        assert!((d - 0.5).abs() < EPS);
+    }
+
+    #[test]
+    fn obb_obb_no_overlap() {
+        assert!(obb_obb_3d(
+            DVec3::ZERO, DQuat::IDENTITY, DVec3::ONE,
+            DVec3::new(5.0, 0.0, 0.0), DQuat::IDENTITY, DVec3::ONE,
+        ).is_none());
+    }
+
+    #[test]
+    fn obb_obb_rotated_overlap() {
+        // One box rotated 45° around Z
+        let rot = DQuat::from_rotation_z(std::f64::consts::FRAC_PI_4);
+        let r = obb_obb_3d(
+            DVec3::ZERO, DQuat::IDENTITY, DVec3::ONE,
+            DVec3::new(1.5, 0.0, 0.0), rot, DVec3::ONE,
+        );
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn obb_obb_rotated_separated() {
+        // One box rotated, far enough apart to not overlap
+        let rot = DQuat::from_rotation_z(std::f64::consts::FRAC_PI_4);
+        assert!(obb_obb_3d(
+            DVec3::ZERO, DQuat::IDENTITY, DVec3::new(0.5, 0.5, 0.5),
+            DVec3::new(3.0, 0.0, 0.0), rot, DVec3::new(0.5, 0.5, 0.5),
+        ).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Capsule-Capsule tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn capsule_capsule_overlap() {
+        let r = capsule_capsule_3d(
+            DVec3::ZERO, DQuat::IDENTITY, 1.0, 0.5,
+            DVec3::new(0.8, 0.0, 0.0), DQuat::IDENTITY, 1.0, 0.5,
+        );
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn capsule_capsule_miss() {
+        assert!(capsule_capsule_3d(
+            DVec3::ZERO, DQuat::IDENTITY, 1.0, 0.5,
+            DVec3::new(5.0, 0.0, 0.0), DQuat::IDENTITY, 1.0, 0.5,
+        ).is_none());
+    }
+
+    #[test]
+    fn capsule_capsule_crossed() {
+        // Two capsules crossing at right angles
+        let rot_x = DQuat::from_rotation_x(std::f64::consts::FRAC_PI_2);
+        let r = capsule_capsule_3d(
+            DVec3::ZERO, DQuat::IDENTITY, 2.0, 0.3,
+            DVec3::new(0.0, 0.0, 0.0), rot_x, 2.0, 0.3,
+        );
+        assert!(r.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Capsule-Box tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn capsule_box_overlap() {
+        let r = capsule_box_3d(
+            DVec3::new(0.0, 0.0, 0.0), DQuat::IDENTITY, 1.0, 0.5,
+            DVec3::new(1.0, 0.0, 0.0), DQuat::IDENTITY, DVec3::ONE,
+        );
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn capsule_box_miss() {
+        assert!(capsule_box_3d(
+            DVec3::new(0.0, 0.0, 0.0), DQuat::IDENTITY, 1.0, 0.5,
+            DVec3::new(5.0, 0.0, 0.0), DQuat::IDENTITY, DVec3::ONE,
+        ).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Segment tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn segment_sphere_overlap() {
+        let r = segment_sphere_3d(
+            DVec3::ZERO, DQuat::IDENTITY,
+            DVec3::new(-2.0, 0.0, 0.0), DVec3::new(2.0, 0.0, 0.0),
+            DVec3::new(0.0, 0.3, 0.0), 0.5,
+        );
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn segment_sphere_miss() {
+        assert!(segment_sphere_3d(
+            DVec3::ZERO, DQuat::IDENTITY,
+            DVec3::new(-2.0, 0.0, 0.0), DVec3::new(2.0, 0.0, 0.0),
+            DVec3::new(0.0, 5.0, 0.0), 0.5,
+        ).is_none());
+    }
+
+    #[test]
+    fn segment_box_overlap() {
+        // Segment passing through the center of a box
+        let r = segment_box_3d(
+            DVec3::ZERO, DQuat::IDENTITY,
+            DVec3::new(-0.5, 0.0, 0.0), DVec3::new(0.5, 0.0, 0.0),
+            DVec3::ZERO, DQuat::IDENTITY, DVec3::ONE,
+        );
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn segment_box_miss() {
+        assert!(segment_box_3d(
+            DVec3::ZERO, DQuat::IDENTITY,
+            DVec3::new(-0.5, 0.0, 0.0), DVec3::new(0.5, 0.0, 0.0),
+            DVec3::new(5.0, 5.0, 5.0), DQuat::IDENTITY, DVec3::ONE,
+        ).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // ConvexHull vs Sphere tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn convex_hull_sphere_overlap() {
+        // Triangle hull near sphere
+        let points = vec![
+            [-1.0, -1.0, 0.0],
+            [1.0, -1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        let r = convex_hull_sphere_3d(
+            &points,
+            DVec3::ZERO, DQuat::IDENTITY,
+            DVec3::new(0.0, 1.2, 0.0), 0.5,
+        );
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn convex_hull_sphere_miss() {
+        let points = vec![
+            [-1.0, -1.0, 0.0],
+            [1.0, -1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        assert!(convex_hull_sphere_3d(
+            &points,
+            DVec3::ZERO, DQuat::IDENTITY,
+            DVec3::new(0.0, 5.0, 0.0), 0.5,
+        ).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Closest points between segments
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn closest_points_parallel_segments() {
+        let (p1, p2) = closest_points_segments_3d(
+            DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0), DVec3::new(1.0, 1.0, 0.0),
+        );
+        // Closest points should be on the same x coordinate
+        assert!((p1.y).abs() < EPS);
+        assert!((p2.y - 1.0).abs() < EPS);
+    }
+
+    #[test]
+    fn closest_points_crossing_segments() {
+        let (p1, p2) = closest_points_segments_3d(
+            DVec3::new(-1.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(0.0, -1.0, 1.0), DVec3::new(0.0, 1.0, 1.0),
+        );
+        // p1 should be at origin (0,0,0) and p2 at (0,0,1)
+        assert!((p1 - DVec3::new(0.0, 0.0, 0.0)).length() < EPS);
+        assert!((p2 - DVec3::new(0.0, 0.0, 1.0)).length() < EPS);
     }
 }

@@ -1,12 +1,13 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use impetus::{
-    body::{BodyDesc, BodyType},
+    body::{BodyDesc, BodyState, BodyType},
     collider::{ColliderDesc, ColliderShape},
     config::WorldConfig,
     force::{Force, Impulse},
     joint::{JointDesc, JointType},
     material::PhysicsMaterial,
     particle::{Particle, ParticleEmitter},
+    spring::{Spring, Spring2d},
     units::{PhysicsUnit, Quantity},
     PhysicsWorld,
 };
@@ -457,6 +458,170 @@ fn bench_serialize(c: &mut Criterion) {
 #[cfg(not(feature = "serialize"))]
 fn bench_serialize(_c: &mut Criterion) {}
 
+// ---------------------------------------------------------------------------
+// Queries
+// ---------------------------------------------------------------------------
+
+fn bench_queries(c: &mut Criterion) {
+    let mut group = c.benchmark_group("queries");
+
+    // Raycast
+    group.bench_function("raycast_100_bodies", |b| {
+        let mut world = PhysicsWorld::new(WorldConfig {
+            gravity: [0.0, 0.0, 0.0],
+            ..Default::default()
+        });
+        for i in 0..100 {
+            let body = world.add_body(BodyDesc {
+                body_type: BodyType::Static,
+                position: [(i % 10) as f64 * 3.0, (i / 10) as f64 * 3.0, 0.0],
+                ..Default::default()
+            });
+            world.add_collider(body, ColliderDesc {
+                shape: ColliderShape::Ball { radius: 1.0 },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
+            });
+        }
+        b.iter(|| world.raycast(black_box([0.0, 0.0, 0.0]), black_box([1.0, 0.0, 0.0]), 100.0))
+    });
+
+    // Overlap sphere
+    group.bench_function("overlap_sphere_100_bodies", |b| {
+        let mut world = PhysicsWorld::new(WorldConfig {
+            gravity: [0.0, 0.0, 0.0],
+            ..Default::default()
+        });
+        for i in 0..100 {
+            let body = world.add_body(BodyDesc {
+                body_type: BodyType::Static,
+                position: [(i % 10) as f64 * 3.0, (i / 10) as f64 * 3.0, 0.0],
+                ..Default::default()
+            });
+            world.add_collider(body, ColliderDesc {
+                shape: ColliderShape::Ball { radius: 1.0 },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
+            });
+        }
+        b.iter(|| world.overlap_sphere(black_box([15.0, 15.0, 0.0]), black_box(5.0)))
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Body mutation
+// ---------------------------------------------------------------------------
+
+fn bench_mutation(c: &mut Criterion) {
+    let mut group = c.benchmark_group("mutation");
+
+    group.bench_function("get_body_state", |b| {
+        let mut world = PhysicsWorld::new(WorldConfig::default());
+        let body = world.add_body(BodyDesc::default());
+        world.add_collider(body, ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+        b.iter(|| world.get_body_state(black_box(body)).unwrap())
+    });
+
+    group.bench_function("set_body_state", |b| {
+        let mut world = PhysicsWorld::new(WorldConfig::default());
+        let body = world.add_body(BodyDesc::default());
+        world.add_collider(body, ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+        let state = BodyState {
+            handle: body,
+            body_type: BodyType::Dynamic,
+            position: [5.0, 10.0, 0.0],
+            rotation: 0.5,
+            linear_velocity: [1.0, 2.0, 0.0],
+            angular_velocity: 0.1,
+            is_sleeping: false,
+        };
+        b.iter(|| world.set_body_state(black_box(body), black_box(&state)).unwrap())
+    });
+
+    group.bench_function("set_body_type", |b| {
+        let mut world = PhysicsWorld::new(WorldConfig::default());
+        let body = world.add_body(BodyDesc::default());
+        world.add_collider(body, ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+        let mut toggle = true;
+        b.iter(|| {
+            let t = if toggle { BodyType::Static } else { BodyType::Dynamic };
+            toggle = !toggle;
+            world.set_body_type(black_box(body), black_box(t)).unwrap()
+        })
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Springs
+// ---------------------------------------------------------------------------
+
+fn bench_springs(c: &mut Criterion) {
+    let mut group = c.benchmark_group("springs");
+
+    group.bench_function("spring_1d_step", |b| {
+        let mut s = Spring::new(0.0, 100.0, 300.0, 15.0);
+        b.iter(|| s.step(black_box(1.0 / 60.0)))
+    });
+
+    group.bench_function("spring_2d_step", |b| {
+        let mut s = Spring2d::new([0.0, 0.0], [100.0, 200.0], 300.0, 15.0);
+        b.iter(|| s.step(black_box(1.0 / 60.0)))
+    });
+
+    group.bench_function("spring_settle_frames", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let mut s = Spring::critically_damped(0.0, 100.0, 300.0);
+                let start = std::time::Instant::now();
+                while !s.is_settled() {
+                    s.step(1.0 / 60.0);
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_world,
@@ -466,5 +631,8 @@ criterion_group!(
     bench_serde,
     bench_particles,
     bench_serialize,
+    bench_queries,
+    bench_mutation,
+    bench_springs,
 );
 criterion_main!(benches);

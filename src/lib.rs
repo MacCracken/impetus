@@ -32,6 +32,8 @@ mod backend_2d;
 #[cfg(feature = "3d")]
 mod backend_3d;
 
+mod spatial_hash;
+
 mod error;
 pub use error::ImpetusError;
 

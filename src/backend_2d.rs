@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::body::{BodyDesc, BodyHandle, BodyState, BodyType};
+use crate::spatial_hash::SpatialHashGrid;
 use crate::collider::{ColliderDesc, ColliderHandle, ColliderShape};
 use crate::event::CollisionEvent;
 use crate::force::{Force, Impulse, Torque};
@@ -92,7 +93,7 @@ impl RigidBody2d {
         self.body_type == BodyType::Static
     }
 
-    fn integrate_velocities(&mut self, gravity: [f64; 2], dt: f64) {
+    fn integrate_velocities(&mut self, gravity: [f64; 2], dt: f64, max_velocity: f64) {
         if !self.is_dynamic() || self.inv_mass == 0.0 {
             return;
         }
@@ -118,6 +119,15 @@ impl RigidBody2d {
         self.linear_velocity[0] *= 1.0 / (1.0 + dt * self.linear_damping);
         self.linear_velocity[1] *= 1.0 / (1.0 + dt * self.linear_damping);
         self.angular_velocity *= 1.0 / (1.0 + dt * self.angular_damping);
+
+        // CCD: clamp velocity magnitude to prevent tunneling
+        let speed_sq =
+            self.linear_velocity[0].powi(2) + self.linear_velocity[1].powi(2);
+        if speed_sq > max_velocity * max_velocity {
+            let scale = max_velocity / speed_sq.sqrt();
+            self.linear_velocity[0] *= scale;
+            self.linear_velocity[1] *= scale;
+        }
     }
 
     fn integrate_positions(&mut self, dt: f64) {
@@ -355,78 +365,8 @@ impl Aabb2d {
 }
 
 // ---------------------------------------------------------------------------
-// Spatial hash broadphase
+// Spatial hash broadphase — uses shared SpatialHashGrid from spatial_hash.rs
 // ---------------------------------------------------------------------------
-
-struct SpatialHash {
-    inv_cell_size: f64,
-    cells: HashMap<(i32, i32), Vec<ColliderHandle>>,
-}
-
-impl SpatialHash {
-    fn new(cell_size: f64) -> Self {
-        Self {
-            inv_cell_size: 1.0 / cell_size,
-            cells: HashMap::new(),
-        }
-    }
-
-    /// Auto-compute cell size from collider AABBs. Uses 2x the average AABB max dimension.
-    fn auto_cell_size(aabbs: &[(ColliderHandle, Aabb2d)]) -> f64 {
-        if aabbs.is_empty() {
-            return 1.0;
-        }
-        let total: f64 = aabbs
-            .iter()
-            .map(|(_, aabb)| {
-                let w = aabb.max[0] - aabb.min[0];
-                let h = aabb.max[1] - aabb.min[1];
-                w.max(h)
-            })
-            .sum();
-        let avg = total / aabbs.len() as f64;
-        (avg * 2.0).max(0.1) // at least 0.1 to avoid degenerate cells
-    }
-
-    fn cell(&self, x: f64, y: f64) -> (i32, i32) {
-        (
-            (x * self.inv_cell_size).floor() as i32,
-            (y * self.inv_cell_size).floor() as i32,
-        )
-    }
-
-    fn insert(&mut self, handle: ColliderHandle, aabb: &Aabb2d) {
-        let (min_cx, min_cy) = self.cell(aabb.min[0], aabb.min[1]);
-        let (max_cx, max_cy) = self.cell(aabb.max[0], aabb.max[1]);
-
-        for cx in min_cx..=max_cx {
-            for cy in min_cy..=max_cy {
-                self.cells.entry((cx, cy)).or_default().push(handle);
-            }
-        }
-    }
-
-    fn query_pairs(&self) -> HashSet<(ColliderHandle, ColliderHandle)> {
-        let mut pairs = HashSet::new();
-
-        for cell in self.cells.values() {
-            for i in 0..cell.len() {
-                for j in (i + 1)..cell.len() {
-                    let a = cell[i];
-                    let b = cell[j];
-                    // Canonical ordering for dedup
-                    if a.0 < b.0 {
-                        pairs.insert((a, b));
-                    } else {
-                        pairs.insert((b, a));
-                    }
-                }
-            }
-        }
-
-        pairs
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Contact for narrowphase
@@ -589,10 +529,46 @@ impl PhysicsState2d {
         })
     }
 
+    pub fn set_body_state(&mut self, handle: BodyHandle, state: &BodyState) -> Result<(), ImpetusError> {
+        let rb = self.bodies.get_mut(&handle)
+            .ok_or_else(|| ImpetusError::BodyNotFound(format!("{:?}", handle)))?;
+        rb.position = [state.position[0], state.position[1]];
+        rb.rotation = state.rotation;
+        rb.linear_velocity = [state.linear_velocity[0], state.linear_velocity[1]];
+        rb.angular_velocity = state.angular_velocity;
+        rb.is_sleeping = false; // wake on teleport
+        rb.sleep_timer = 0.0;
+        Ok(())
+    }
+
+    pub fn set_body_type(&mut self, handle: BodyHandle, body_type: BodyType) -> Result<(), ImpetusError> {
+        let rb = self.bodies.get_mut(&handle)
+            .ok_or_else(|| ImpetusError::BodyNotFound(format!("{:?}", handle)))?;
+        rb.body_type = body_type;
+        // Reset mass properties if switching to/from static
+        match body_type {
+            BodyType::Static | BodyType::Kinematic => {
+                rb.inv_mass = 0.0;
+                rb.inv_inertia = 0.0;
+                rb.linear_velocity = [0.0, 0.0];
+                rb.angular_velocity = 0.0;
+            }
+            BodyType::Dynamic => {
+                // Recompute from colliders if mass is zero
+                if rb.mass > 0.0 {
+                    rb.inv_mass = 1.0 / rb.mass;
+                    rb.inv_inertia = if rb.fixed_rotation { 0.0 } else { 1.0 / rb.inertia };
+                }
+            }
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Simulation step
     // -----------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
         gravity: [f64; 3],
@@ -601,11 +577,12 @@ impl PhysicsState2d {
         position_iterations: u32,
         slop: f64,
         correction: f64,
+        max_velocity: f64,
     ) -> Vec<CollisionEvent> {
         let gravity_2d = [gravity[0], gravity[1]];
         // 1. Integrate velocities
         for rb in self.bodies.values_mut() {
-            rb.integrate_velocities(gravity_2d, dt);
+            rb.integrate_velocities(gravity_2d, dt, max_velocity);
         }
 
         // 2. Broadphase
@@ -713,10 +690,17 @@ impl PhysicsState2d {
             .collect();
 
         // Build spatial hash
-        let cell_size = SpatialHash::auto_cell_size(&collider_aabbs);
-        let mut grid = SpatialHash::new(cell_size);
+        let cell_size = SpatialHashGrid::<ColliderHandle>::auto_cell_size(
+            collider_aabbs.iter().map(|(_, aabb)| {
+                let w = aabb.max[0] - aabb.min[0];
+                let h = aabb.max[1] - aabb.min[1];
+                w.max(h)
+            }),
+            collider_aabbs.len(),
+        );
+        let mut grid = SpatialHashGrid::new(cell_size);
         for (handle, aabb) in &collider_aabbs {
-            grid.insert(*handle, aabb);
+            grid.insert_2d(*handle, aabb.min, aabb.max);
         }
 
         // Collect candidate pairs from shared cells
@@ -1734,6 +1718,36 @@ fn generate_contact(
             convex_hull_circle(points, pos_b, rot_b, pos_a, *radius)
                 .map(|(n, d, p)| ([-n[0], -n[1]], d, p))
         }
+        // ConvexHull vs ConvexHull
+        (
+            ColliderShape::ConvexHull { points: pts_a },
+            ColliderShape::ConvexHull { points: pts_b },
+        ) => convex_convex_contact(pts_a, pos_a, rot_a, pts_b, pos_b, rot_b),
+        // ConvexHull vs Box (treat box as 4-vertex convex hull)
+        (ColliderShape::ConvexHull { points }, ColliderShape::Box { half_extents }) => {
+            let box_pts = box_to_convex_points(*half_extents);
+            convex_convex_contact(points, pos_a, rot_a, &box_pts, pos_b, rot_b)
+        }
+        (ColliderShape::Box { half_extents }, ColliderShape::ConvexHull { points }) => {
+            let box_pts = box_to_convex_points(*half_extents);
+            convex_convex_contact(&box_pts, pos_a, rot_a, points, pos_b, rot_b)
+        }
+        // Segment vs Ball
+        (ColliderShape::Segment { a, b }, ColliderShape::Ball { radius }) => {
+            segment_circle(pos_a, rot_a, *a, *b, pos_b, *radius)
+        }
+        (ColliderShape::Ball { radius }, ColliderShape::Segment { a, b }) => {
+            segment_circle(pos_b, rot_b, *a, *b, pos_a, *radius)
+                .map(|(n, d, p)| ([-n[0], -n[1]], d, p))
+        }
+        // Segment vs Box
+        (ColliderShape::Segment { a, b }, ColliderShape::Box { half_extents }) => {
+            segment_box(pos_a, rot_a, *a, *b, pos_b, rot_b, [half_extents[0], half_extents[1]])
+        }
+        (ColliderShape::Box { half_extents }, ColliderShape::Segment { a, b }) => {
+            segment_box(pos_b, rot_b, *a, *b, pos_a, rot_a, [half_extents[0], half_extents[1]])
+                .map(|(n, d, p)| ([-n[0], -n[1]], d, p))
+        }
         _ => None,
     }
 }
@@ -2287,6 +2301,236 @@ fn ray_capsule(
 }
 
 // ---------------------------------------------------------------------------
+// ConvexHull-vs-ConvexHull (2D SAT)
+// ---------------------------------------------------------------------------
+
+/// Convert a box (half_extents) into 4 convex hull points in local space (CCW).
+fn box_to_convex_points(half_extents: [f64; 3]) -> Vec<[f64; 3]> {
+    let hx = half_extents[0];
+    let hy = half_extents[1];
+    vec![
+        [-hx, -hy, 0.0],
+        [hx, -hy, 0.0],
+        [hx, hy, 0.0],
+        [-hx, hy, 0.0],
+    ]
+}
+
+/// Transform hull points from local to world 2D.
+fn transform_hull(points: &[[f64; 3]], pos: [f64; 2], rot: f64) -> Vec<[f64; 2]> {
+    let (sin, cos) = rot.sin_cos();
+    points
+        .iter()
+        .map(|p| {
+            [
+                pos[0] + cos * p[0] - sin * p[1],
+                pos[1] + sin * p[0] + cos * p[1],
+            ]
+        })
+        .collect()
+}
+
+/// 2D SAT (Separating Axis Theorem) for two convex polygons.
+/// Returns (normal_from_a_to_b, penetration_depth, contact_point).
+fn convex_convex_contact(
+    points_a: &[[f64; 3]],
+    pos_a: [f64; 2],
+    rot_a: f64,
+    points_b: &[[f64; 3]],
+    pos_b: [f64; 2],
+    rot_b: f64,
+) -> Option<([f64; 2], f64, [f64; 2])> {
+    let world_a = transform_hull(points_a, pos_a, rot_a);
+    let world_b = transform_hull(points_b, pos_b, rot_b);
+
+    if world_a.len() < 2 || world_b.len() < 2 {
+        return None;
+    }
+
+    let mut min_overlap = f64::INFINITY;
+    let mut best_axis = [0.0f64; 2];
+
+    // Centre-to-centre direction for consistent normal orientation
+    let center_d = [pos_b[0] - pos_a[0], pos_b[1] - pos_a[1]];
+
+    // Test edge normals from both polygons
+    for hull in [&world_a, &world_b] {
+        let n = hull.len();
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let edge = [hull[j][0] - hull[i][0], hull[j][1] - hull[i][1]];
+            let len = (edge[0] * edge[0] + edge[1] * edge[1]).sqrt();
+            if len < EPSILON {
+                continue;
+            }
+            // Outward normal (perpendicular to edge)
+            let axis = [-edge[1] / len, edge[0] / len];
+
+            // Project both hulls onto this axis
+            let (min_a, max_a) = project_hull(&world_a, axis);
+            let (min_b, max_b) = project_hull(&world_b, axis);
+
+            let overlap = (max_a.min(max_b)) - (min_a.max(min_b));
+            if overlap <= 0.0 {
+                return None; // Separating axis found
+            }
+
+            if overlap < min_overlap {
+                min_overlap = overlap;
+                // Ensure normal points from A to B
+                let dot = center_d[0] * axis[0] + center_d[1] * axis[1];
+                if dot >= 0.0 {
+                    best_axis = axis;
+                } else {
+                    best_axis = [-axis[0], -axis[1]];
+                }
+            }
+        }
+    }
+
+    // Contact point: average of support points
+    let cp_a = support_point_poly(&world_a, best_axis);
+    let cp_b = support_point_poly(&world_b, [-best_axis[0], -best_axis[1]]);
+    let point = [(cp_a[0] + cp_b[0]) * 0.5, (cp_a[1] + cp_b[1]) * 0.5];
+
+    Some((best_axis, min_overlap, point))
+}
+
+/// Project all points of a 2D polygon onto an axis, return (min, max).
+fn project_hull(points: &[[f64; 2]], axis: [f64; 2]) -> (f64, f64) {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for p in points {
+        let proj = p[0] * axis[0] + p[1] * axis[1];
+        min = min.min(proj);
+        max = max.max(proj);
+    }
+    (min, max)
+}
+
+/// Find the vertex of a 2D polygon furthest in a given direction.
+fn support_point_poly(points: &[[f64; 2]], dir: [f64; 2]) -> [f64; 2] {
+    let mut best = points[0];
+    let mut best_dot = best[0] * dir[0] + best[1] * dir[1];
+    for p in &points[1..] {
+        let d = p[0] * dir[0] + p[1] * dir[1];
+        if d > best_dot {
+            best_dot = d;
+            best = *p;
+        }
+    }
+    best
+}
+
+// ---------------------------------------------------------------------------
+// Segment narrowphase contacts
+// ---------------------------------------------------------------------------
+
+/// Segment-vs-Ball: find closest point on segment to ball center, test distance vs radius.
+/// The segment endpoints are in the segment body's local space.
+fn segment_circle(
+    seg_pos: [f64; 2],
+    seg_rot: f64,
+    seg_a: [f64; 3],
+    seg_b: [f64; 3],
+    circle_pos: [f64; 2],
+    circle_radius: f64,
+) -> Option<([f64; 2], f64, [f64; 2])> {
+    let (sin, cos) = seg_rot.sin_cos();
+    let wa = [
+        seg_pos[0] + cos * seg_a[0] - sin * seg_a[1],
+        seg_pos[1] + sin * seg_a[0] + cos * seg_a[1],
+    ];
+    let wb = [
+        seg_pos[0] + cos * seg_b[0] - sin * seg_b[1],
+        seg_pos[1] + sin * seg_b[0] + cos * seg_b[1],
+    ];
+    let (closest, _) = closest_point_on_segment(wa, wb, circle_pos);
+    // Segment has zero radius, so it's like a capsule_circle with r=0
+    let dx = circle_pos[0] - closest[0];
+    let dy = circle_pos[1] - closest[1];
+    let dist_sq = dx * dx + dy * dy;
+
+    if dist_sq >= circle_radius * circle_radius {
+        return None;
+    }
+
+    let dist = dist_sq.sqrt();
+    let (normal, depth) = if dist < EPSILON {
+        // Degenerate: circle center is on the segment
+        ([0.0, 1.0], circle_radius)
+    } else {
+        ([dx / dist, dy / dist], circle_radius - dist)
+    };
+
+    Some((normal, depth, closest))
+}
+
+/// Segment-vs-Box: find overlap between a line segment and an axis-aligned box.
+#[allow(clippy::too_many_arguments)]
+fn segment_box(
+    seg_pos: [f64; 2],
+    seg_rot: f64,
+    seg_a: [f64; 3],
+    seg_b: [f64; 3],
+    box_pos: [f64; 2],
+    _box_rot: f64,
+    half_extents: [f64; 2],
+) -> Option<([f64; 2], f64, [f64; 2])> {
+    // Transform segment to world space
+    let (sin, cos) = seg_rot.sin_cos();
+    let wa = [
+        seg_pos[0] + cos * seg_a[0] - sin * seg_a[1],
+        seg_pos[1] + sin * seg_a[0] + cos * seg_a[1],
+    ];
+    let wb = [
+        seg_pos[0] + cos * seg_b[0] - sin * seg_b[1],
+        seg_pos[1] + sin * seg_b[0] + cos * seg_b[1],
+    ];
+
+    // Find closest point on segment to box center
+    let (closest_on_seg, _) = closest_point_on_segment(wa, wb, box_pos);
+
+    // Clamp that point to box bounds to find closest point on box
+    let dx = closest_on_seg[0] - box_pos[0];
+    let dy = closest_on_seg[1] - box_pos[1];
+    let cx = dx.clamp(-half_extents[0], half_extents[0]);
+    let cy = dy.clamp(-half_extents[1], half_extents[1]);
+    let box_closest = [box_pos[0] + cx, box_pos[1] + cy];
+
+    // Now find closest point on segment to that box point
+    let (seg_closest, _) = closest_point_on_segment(wa, wb, box_closest);
+
+    let diff_x = seg_closest[0] - box_closest[0];
+    let diff_y = seg_closest[1] - box_closest[1];
+    let dist_sq = diff_x * diff_x + diff_y * diff_y;
+
+    // Segment has zero radius — we need the segment point to be inside the box
+    // or touching it. Check if segment point is inside the box.
+    let rel_x = seg_closest[0] - box_pos[0];
+    let rel_y = seg_closest[1] - box_pos[1];
+
+    if rel_x.abs() <= half_extents[0] && rel_y.abs() <= half_extents[1] {
+        // Segment point is inside the box — push out along minimum penetration axis
+        let pen_x = half_extents[0] - rel_x.abs();
+        let pen_y = half_extents[1] - rel_y.abs();
+        if pen_x < pen_y {
+            let sign = if rel_x >= 0.0 { 1.0 } else { -1.0 };
+            Some(([sign, 0.0], pen_x, seg_closest))
+        } else {
+            let sign = if rel_y >= 0.0 { 1.0 } else { -1.0 };
+            Some(([0.0, sign], pen_y, seg_closest))
+        }
+    } else if dist_sq < EPSILON_SQ {
+        // Touching but not inside — very shallow contact
+        None
+    } else {
+        // Not overlapping
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2737,7 +2981,7 @@ mod tests {
         });
 
         let vel_before = state.bodies[&ball].linear_velocity;
-        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
+        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
 
         // Should generate events
         assert!(!events.is_empty());
@@ -2761,7 +3005,7 @@ mod tests {
         });
 
         let dt = 1.0 / 60.0;
-        state.step([0.0, -9.81, 0.0], dt, 4, 1, 0.01, 0.2);
+        state.step([0.0, -9.81, 0.0], dt, 4, 1, 0.01, 0.2, 100.0);
 
         let rb = &state.bodies[&bh];
         // Should have moved from velocity
@@ -2809,7 +3053,7 @@ mod tests {
         });
 
         // Step to generate collision pairs
-        state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
+        state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
         assert!(!state.prev_collision_pairs.is_empty());
 
         // Remove body b — should clean pairs
@@ -2817,56 +3061,37 @@ mod tests {
         assert!(state.prev_collision_pairs.is_empty());
     }
 
-    // -- Spatial hash tests --
-
-    #[test]
-    fn spatial_hash_single_insert() {
-        let mut grid = SpatialHash::new(1.0);
-        grid.insert(ColliderHandle(0), &Aabb2d { min: [0.0, 0.0], max: [0.5, 0.5] });
-        assert!(grid.cells.contains_key(&(0, 0)));
-        assert_eq!(grid.cells[&(0, 0)].len(), 1);
-    }
-
-    #[test]
-    fn spatial_hash_spanning_cells() {
-        let mut grid = SpatialHash::new(1.0);
-        // AABB spans 4 cells: (0,0), (0,1), (1,0), (1,1)
-        grid.insert(ColliderHandle(0), &Aabb2d { min: [0.5, 0.5], max: [1.5, 1.5] });
-        assert!(grid.cells.len() >= 4);
-    }
+    // -- Spatial hash tests (delegated to spatial_hash module, but verify integration) --
 
     #[test]
     fn spatial_hash_finds_nearby_pair() {
-        let mut grid = SpatialHash::new(2.0);
-        grid.insert(ColliderHandle(0), &Aabb2d { min: [0.0, 0.0], max: [1.0, 1.0] });
-        grid.insert(ColliderHandle(1), &Aabb2d { min: [0.5, 0.5], max: [1.5, 1.5] });
+        let mut grid: SpatialHashGrid<ColliderHandle> = SpatialHashGrid::new(2.0);
+        grid.insert_2d(ColliderHandle(0), [0.0, 0.0], [1.0, 1.0]);
+        grid.insert_2d(ColliderHandle(1), [0.5, 0.5], [1.5, 1.5]);
         let pairs = grid.query_pairs();
         assert!(pairs.contains(&(ColliderHandle(0), ColliderHandle(1))));
     }
 
     #[test]
     fn spatial_hash_no_false_pair() {
-        let mut grid = SpatialHash::new(1.0);
-        grid.insert(ColliderHandle(0), &Aabb2d { min: [0.0, 0.0], max: [0.5, 0.5] });
-        grid.insert(ColliderHandle(1), &Aabb2d { min: [10.0, 10.0], max: [10.5, 10.5] });
+        let mut grid: SpatialHashGrid<ColliderHandle> = SpatialHashGrid::new(1.0);
+        grid.insert_2d(ColliderHandle(0), [0.0, 0.0], [0.5, 0.5]);
+        grid.insert_2d(ColliderHandle(1), [10.0, 10.0], [10.5, 10.5]);
         let pairs = grid.query_pairs();
         assert!(pairs.is_empty());
     }
 
     #[test]
     fn spatial_hash_auto_cell_size() {
-        let aabbs = vec![
-            (ColliderHandle(0), Aabb2d { min: [0.0, 0.0], max: [1.0, 1.0] }),
-            (ColliderHandle(1), Aabb2d { min: [0.0, 0.0], max: [2.0, 2.0] }),
-        ];
-        let size = SpatialHash::auto_cell_size(&aabbs);
+        let dims = vec![1.0_f64, 2.0];
+        let size = SpatialHashGrid::<ColliderHandle>::auto_cell_size(dims.into_iter(), 2);
         // avg max dimension = (1+2)/2 = 1.5, *2 = 3.0
         assert!((size - 3.0).abs() < EPS);
     }
 
     #[test]
     fn spatial_hash_empty() {
-        let size = SpatialHash::auto_cell_size(&[]);
+        let size = SpatialHashGrid::<ColliderHandle>::auto_cell_size(std::iter::empty(), 0);
         assert!((size - 1.0).abs() < EPS);
     }
 
@@ -2946,7 +3171,7 @@ mod tests {
         let dt = 1.0 / 60.0;
         let steps_needed = (SLEEP_TIME_THRESHOLD / dt).ceil() as usize + 10;
         for _ in 0..steps_needed {
-            state.step([0.0, 0.0, 0.0], dt, 4, 1, 0.01, 0.2);
+            state.step([0.0, 0.0, 0.0], dt, 4, 1, 0.01, 0.2, 100.0);
         }
 
         assert!(state.bodies[&bh].is_sleeping, "body should be sleeping after sitting still");
@@ -2976,7 +3201,7 @@ mod tests {
 
         let pos_before = state.bodies[&bh].position;
         // Step with gravity — sleeping body should not move
-        state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
+        state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
 
         let pos_after = state.bodies[&bh].position;
         assert!(
@@ -3072,7 +3297,7 @@ mod tests {
 
         // Step many times — body is moving so should not sleep
         for _ in 0..100 {
-            state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
+            state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
         }
         assert!(!state.bodies[&bh].is_sleeping);
     }
@@ -3140,7 +3365,7 @@ mod tests {
 
         // Step until contact
         for _ in 0..60 {
-            state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
+            state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
         }
 
         // The sleeping body should have been woken by the impact
@@ -3189,7 +3414,7 @@ mod tests {
         });
 
         // Step — no collision events should be generated
-        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
+        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
         assert!(events.is_empty(), "different collision layers should not generate events");
     }
 
@@ -3230,7 +3455,7 @@ mod tests {
             collision_mask: 0x01,
         });
 
-        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
+        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
         assert!(!events.is_empty(), "same collision layer should generate events");
     }
 
@@ -3272,7 +3497,7 @@ mod tests {
         });
 
         // A's mask includes B's layer (0x02 & 0x03 != 0), so collision should happen
-        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
+        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
         assert!(!events.is_empty(), "asymmetric mask should still allow collision when one side matches");
     }
 
@@ -3313,7 +3538,7 @@ mod tests {
             collision_mask: 0xFFFF_FFFF,
         });
 
-        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
+        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
         assert!(!events.is_empty(), "default layers should collide");
     }
 

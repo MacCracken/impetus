@@ -71,6 +71,7 @@ impl PhysicsWorld {
                 self.config.position_iterations,
                 self.config.position_slop,
                 self.config.position_correction,
+                self.config.max_velocity,
             );
         }
 
@@ -83,6 +84,7 @@ impl PhysicsWorld {
                 self.config.position_iterations,
                 self.config.position_slop,
                 self.config.position_correction,
+                self.config.max_velocity,
             );
         }
 
@@ -547,6 +549,44 @@ impl PhysicsWorld {
 
         #[cfg(not(any(feature = "2d", feature = "3d")))]
         {
+            Err(ImpetusError::BodyNotFound(format!("{:?}", handle)))
+        }
+    }
+
+    /// Set the state of a body (teleport, change velocity, etc.).
+    pub fn set_body_state(&mut self, handle: BodyHandle, state: &BodyState) -> crate::Result<()> {
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
+        {
+            self.backend_2d.set_body_state(handle, state)
+        }
+
+        #[cfg(feature = "3d")]
+        {
+            self.backend_3d.set_body_state(handle, state)
+        }
+
+        #[cfg(not(any(feature = "2d", feature = "3d")))]
+        {
+            let _ = (handle, state);
+            Err(ImpetusError::BodyNotFound(format!("{:?}", handle)))
+        }
+    }
+
+    /// Change the body type (Static, Dynamic, Kinematic).
+    pub fn set_body_type(&mut self, handle: BodyHandle, body_type: crate::body::BodyType) -> crate::Result<()> {
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
+        {
+            self.backend_2d.set_body_type(handle, body_type)
+        }
+
+        #[cfg(feature = "3d")]
+        {
+            self.backend_3d.set_body_type(handle, body_type)
+        }
+
+        #[cfg(not(any(feature = "2d", feature = "3d")))]
+        {
+            let _ = (handle, body_type);
             Err(ImpetusError::BodyNotFound(format!("{:?}", handle)))
         }
     }

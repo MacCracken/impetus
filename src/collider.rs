@@ -4,7 +4,7 @@ use crate::material::PhysicsMaterial;
 use serde::{Deserialize, Serialize};
 
 /// Unique handle to a collider.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ColliderHandle(pub u64);
 
 /// Collider shape.

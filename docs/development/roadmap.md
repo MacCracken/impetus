@@ -1,6 +1,6 @@
 # Roadmap
 
-## Completed
+## Completed (0.22.3)
 
 | Phase | Description |
 |-------|-------------|
@@ -9,36 +9,58 @@
 | 3 | 3D backend (DVec3/DQuat), bincode serialization, `[f64;3]` API |
 | 4 | Standalone spring API for Aethersafha |
 | 5 | Kiran ECS bridge |
-| 6 | Production hardening — `#[non_exhaustive]`, `#[must_use]`, docs, CI, supply-chain |
-| 7 | Engineering backlog — see below |
+| 6 | Production hardening |
+| 7 | Engineering backlog — all items resolved |
 
-## Completed from Backlog
+## Road to v1.0
 
-- [x] Fix TriMesh AABB in 3D backend
-- [x] Sleep/deactivation system (2D + 3D)
-- [x] Collision layers/masks (broadphase filtering)
-- [x] Overlap queries (sphere + AABB)
-- [x] Constraint motors (revolute + prismatic)
-- [x] OBB rotation-aware contacts (2D SAT)
-- [x] Fuzz testing targets (contacts + serialization)
-- [x] Configurable Baumgarte constants (position_slop, position_correction)
-- [x] Named constants replacing magic numbers
-- [x] NaN guard in spring/distance joint normalization
-- [x] Joint damping
-- [x] ConvexHull-vs-Ball narrowphase
-- [x] u64 ID wrapping overflow handling
-- [x] Particle AABB pre-filtering
-- [x] `cargo semver-checks` in CI
-- [x] `supply-chain/` with cargo-vet config
-- [x] Cross-platform CI (ubuntu + macos + windows)
-- [x] `docs/` directory (architecture, roadmap, testing guide)
+### Scope
 
-## Remaining — Low Priority
+Impetus is a **rigid body + particle physics engine**. The following are explicitly out of scope and belong in separate AGNOS crates:
 
-- [ ] Continuous collision detection (tunneling prevention for fast small objects)
-- [ ] Capsule inertia tensor accuracy (3D uses cylinder approximation)
-- [ ] Extract common spatial hash into shared module (300+ LOC duplicated 2D/3D)
-- [ ] Split `solve_contacts` into smaller functions (<50 lines each)
-- [ ] ConvexHull-vs-ConvexHull narrowphase (SAT with N axes)
-- [ ] Segment narrowphase contact generation
-- [ ] Cache AABBs per body (avoid recomputing sin_cos every frame)
+- Fluid simulation (SPH, Navier-Stokes) → fluidity crate
+- Soft body / deformable meshes → separate crate
+- Cloth / rope (mass-spring networks) → separate crate
+- Electromagnetism, optics, quantum → separate science crates
+
+### v1.0 Requirements
+
+#### 3D Feature Parity
+- [ ] 3D Revolute joint solver with limits and motor
+- [ ] 3D Prismatic joint solver with limits and motor
+- [ ] 3D OBB contacts (rotation-aware box-vs-box)
+- [ ] 3D capsule-capsule, capsule-box narrowphase
+- [ ] 3D ConvexHull narrowphase (GJK/EPA or SAT)
+- [ ] 3D segment narrowphase
+
+#### API Completeness
+- [ ] `set_body_state()` — teleport bodies, set velocity externally
+- [ ] `set_body_type()` — change Static/Dynamic/Kinematic at runtime
+- [ ] Raycast with collision layer filter
+- [ ] Compound colliders — multiple shapes per body with combined inertia
+- [ ] Trigger events: Enter/Exit/Stay (not just Started/Stopped)
+- [ ] Remove individual collider (currently only remove_body removes all)
+- [ ] Remove joint by handle
+
+#### Determinism
+- [ ] Documented determinism guarantee (same platform, same inputs = same output)
+- [ ] HashMap iteration order stability (use IndexMap or sorted iteration)
+- [ ] Step-exact serialization roundtrip test (serialize at step N, restore, step 100 more, compare)
+
+#### Documentation
+- [ ] API documentation on all public types and methods (cargo doc clean)
+- [ ] Usage examples: platformer, top-down, 3D scene
+- [ ] Performance guide (body count limits, spatial hash tuning, sleep thresholds)
+
+#### Testing
+- [ ] Property-based tests (arbitrary body configurations, verify energy conservation)
+- [ ] Stress tests (10k bodies, stability over 10k steps)
+- [ ] Cross-feature-path integration tests (2D serialize roundtrip, 3D serialize roundtrip)
+
+### Nice to Have (post v1.0)
+
+- Continuous collision detection (swept tests, not just velocity clamp)
+- GPU-accelerated broadphase
+- Network-synchronized deterministic replay
+- Performance profiling API (step timing breakdown)
+- Body groups (disable collision between groups of bodies)

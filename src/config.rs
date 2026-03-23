@@ -23,6 +23,9 @@ pub struct WorldConfig {
     /// Baumgarte positional correction: fraction of penetration corrected per iteration (default: 0.2).
     #[serde(default = "default_correction")]
     pub position_correction: f64,
+    /// Maximum velocity magnitude for CCD — clamps velocity to prevent tunneling (default: 100.0).
+    #[serde(default = "default_max_velocity")]
+    pub max_velocity: f64,
 }
 
 fn default_slop() -> f64 {
@@ -31,6 +34,10 @@ fn default_slop() -> f64 {
 
 fn default_correction() -> f64 {
     0.2
+}
+
+fn default_max_velocity() -> f64 {
+    100.0
 }
 
 impl Default for WorldConfig {
@@ -44,6 +51,7 @@ impl Default for WorldConfig {
             step: 0,
             position_slop: default_slop(),
             position_correction: default_correction(),
+            max_velocity: default_max_velocity(),
         }
     }
 }
@@ -82,6 +90,7 @@ mod tests {
             step: 0,
             position_slop: 0.02,
             position_correction: 0.3,
+            max_velocity: 100.0,
         };
         let json = serde_json::to_string(&config).unwrap();
         let back: WorldConfig = serde_json::from_str(&json).unwrap();
