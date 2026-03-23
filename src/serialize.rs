@@ -56,15 +56,13 @@ pub struct JointSnapshot {
 /// Serialize world state to bytes.
 pub fn serialize_world(world: &PhysicsWorld) -> Result<Vec<u8>, ImpetusError> {
     let snapshot = world.snapshot();
-    bincode::serde::encode_to_vec(&snapshot, bincode::config::standard())
-        .map_err(|e| ImpetusError::Serialize(e.to_string()))
+    bitcode::serialize(&snapshot).map_err(|e| ImpetusError::Serialize(e.to_string()))
 }
 
 /// Deserialize world state from bytes and restore it.
 pub fn deserialize_world(world: &mut PhysicsWorld, data: &[u8]) -> Result<(), ImpetusError> {
-    let (snapshot, _): (WorldSnapshot, _) =
-        bincode::serde::decode_from_slice(data, bincode::config::standard())
-            .map_err(|e| ImpetusError::Deserialize(e.to_string()))?;
+    let snapshot: WorldSnapshot =
+        bitcode::deserialize(data).map_err(|e| ImpetusError::Deserialize(e.to_string()))?;
     world.restore(&snapshot);
     Ok(())
 }
