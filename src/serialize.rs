@@ -10,6 +10,7 @@ use crate::body::{BodyDesc, BodyHandle};
 use crate::collider::{ColliderDesc, ColliderHandle};
 use crate::config::WorldConfig;
 use crate::joint::{JointDesc, JointHandle};
+use crate::particle::{Particle, ParticleEmitter};
 use crate::ImpetusError;
 use crate::PhysicsWorld;
 
@@ -20,9 +21,13 @@ pub struct WorldSnapshot {
     pub next_body_id: u64,
     pub next_collider_id: u64,
     pub next_joint_id: u64,
+    pub next_particle_id: u64,
+    pub next_emitter_id: u64,
     pub bodies: Vec<BodySnapshot>,
     pub colliders: Vec<ColliderSnapshot>,
     pub joints: Vec<JointSnapshot>,
+    pub particles: Vec<Particle>,
+    pub emitters: Vec<ParticleEmitter>,
 }
 
 /// Serializable body state (position, velocity, etc.).
@@ -229,9 +234,13 @@ mod tests {
             next_body_id: 5,
             next_collider_id: 3,
             next_joint_id: 1,
+            next_particle_id: 0,
+            next_emitter_id: 0,
             bodies: vec![],
             colliders: vec![],
             joints: vec![],
+            particles: vec![],
+            emitters: vec![],
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         let back: WorldSnapshot = serde_json::from_str(&json).unwrap();

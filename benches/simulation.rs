@@ -6,6 +6,7 @@ use impetus::{
     force::{Force, Impulse},
     joint::{JointDesc, JointType},
     material::PhysicsMaterial,
+    particle::{Particle, ParticleEmitter},
     units::{PhysicsUnit, Quantity},
     PhysicsWorld,
 };
@@ -267,6 +268,177 @@ fn bench_serde(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Particles
+// ---------------------------------------------------------------------------
+
+fn bench_particles(c: &mut Criterion) {
+    let mut group = c.benchmark_group("particles");
+
+    group.bench_function("step_100_particles", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let mut world = PhysicsWorld::new(WorldConfig::default());
+                for i in 0..100 {
+                    world.spawn_particle(
+                        Particle::new(
+                            [(i % 10) as f64, (i / 10) as f64 * 2.0 + 5.0],
+                            [0.0, 0.0],
+                            100.0,
+                        )
+                        .with_radius(0.05),
+                    );
+                }
+                let start = std::time::Instant::now();
+                world.step();
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    group.bench_function("step_1000_particles", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let mut world = PhysicsWorld::new(WorldConfig::default());
+                for i in 0..1000 {
+                    world.spawn_particle(
+                        Particle::new(
+                            [(i % 32) as f64, (i / 32) as f64 * 2.0 + 5.0],
+                            [0.0, 0.0],
+                            100.0,
+                        )
+                        .with_radius(0.05),
+                    );
+                }
+                let start = std::time::Instant::now();
+                world.step();
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    group.bench_function("step_100_particles_with_floor", |b| {
+        let mut world = PhysicsWorld::new(WorldConfig::default());
+        let floor = world.add_body(BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 0.0],
+            ..Default::default()
+        });
+        world.add_collider(
+            floor,
+            ColliderDesc {
+                shape: ColliderShape::Box {
+                    half_extents: [50.0, 0.5],
+                },
+                offset: [0.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+            },
+        );
+        for i in 0..100 {
+            world.spawn_particle(
+                Particle::new(
+                    [(i % 10) as f64, (i / 10) as f64 + 1.0],
+                    [0.0, -2.0],
+                    10.0,
+                )
+                .with_radius(0.05)
+                .with_restitution(0.5),
+            );
+        }
+        b.iter(|| world.step())
+    });
+
+    group.bench_function("spawn_particle", |b| {
+        let mut world = PhysicsWorld::new(WorldConfig::default());
+        b.iter(|| {
+            world.spawn_particle(black_box(Particle::new([0.0, 0.0], [1.0, 2.0], 3.0)));
+        })
+    });
+
+    group.bench_function("emitter_step", |b| {
+        let mut world = PhysicsWorld::new(WorldConfig::default());
+        world.add_emitter(
+            ParticleEmitter::new([0.0, 0.0], [0.0, 10.0], 100.0).with_lifetime(0.5),
+        );
+        b.iter(|| world.step())
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Serialization
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "serialize")]
+fn bench_serialize(c: &mut Criterion) {
+    let mut group = c.benchmark_group("snapshot");
+
+    group.bench_function("serialize_empty", |b| {
+        let world = PhysicsWorld::new(WorldConfig::default());
+        b.iter(|| impetus::serialize::serialize_world(black_box(&world)).unwrap())
+    });
+
+    group.bench_function("serialize_100_bodies", |b| {
+        let mut world = PhysicsWorld::new(WorldConfig::default());
+        for i in 0..100 {
+            let body = world.add_body(BodyDesc {
+                body_type: BodyType::Dynamic,
+                position: [(i % 10) as f64, (i / 10) as f64],
+                ..Default::default()
+            });
+            world.add_collider(
+                body,
+                ColliderDesc {
+                    shape: ColliderShape::Ball { radius: 0.5 },
+                    offset: [0.0, 0.0],
+                    material: PhysicsMaterial::default(),
+                    is_sensor: false,
+                    mass: None,
+                },
+            );
+        }
+        b.iter(|| impetus::serialize::serialize_world(black_box(&world)).unwrap())
+    });
+
+    group.bench_function("roundtrip_100_bodies", |b| {
+        let mut world = PhysicsWorld::new(WorldConfig::default());
+        for i in 0..100 {
+            let body = world.add_body(BodyDesc {
+                body_type: BodyType::Dynamic,
+                position: [(i % 10) as f64, (i / 10) as f64],
+                ..Default::default()
+            });
+            world.add_collider(
+                body,
+                ColliderDesc {
+                    shape: ColliderShape::Ball { radius: 0.5 },
+                    offset: [0.0, 0.0],
+                    material: PhysicsMaterial::default(),
+                    is_sensor: false,
+                    mass: None,
+                },
+            );
+        }
+        let data = impetus::serialize::serialize_world(&world).unwrap();
+        b.iter(|| {
+            let mut w = PhysicsWorld::new(WorldConfig::default());
+            impetus::serialize::deserialize_world(&mut w, black_box(&data)).unwrap();
+        })
+    });
+
+    group.finish();
+}
+
+#[cfg(not(feature = "serialize"))]
+fn bench_serialize(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_world,
@@ -274,5 +446,7 @@ criterion_group!(
     bench_forces,
     bench_materials,
     bench_serde,
+    bench_particles,
+    bench_serialize,
 );
 criterion_main!(benches);

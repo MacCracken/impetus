@@ -6,6 +6,7 @@ use crate::config::WorldConfig;
 use crate::event::CollisionEvent;
 use crate::force::{Force, Impulse, Torque};
 use crate::joint::{JointDesc, JointHandle};
+use crate::particle::{EmitterHandle, Particle, ParticleEmitter, ParticleHandle};
 use crate::query::RayHit;
 #[cfg(not(any(feature = "2d", feature = "3d")))]
 use crate::ImpetusError;
@@ -16,7 +17,11 @@ pub struct PhysicsWorld {
     next_body_id: u64,
     next_collider_id: u64,
     next_joint_id: u64,
+    next_particle_id: u64,
+    next_emitter_id: u64,
     collision_events: Vec<CollisionEvent>,
+    particles: Vec<Particle>,
+    emitters: Vec<ParticleEmitter>,
 
     #[cfg(feature = "2d")]
     backend: crate::backend_2d::PhysicsState2d,
@@ -33,7 +38,11 @@ impl PhysicsWorld {
             next_body_id: 0,
             next_collider_id: 0,
             next_joint_id: 0,
+            next_particle_id: 0,
+            next_emitter_id: 0,
             collision_events: vec![],
+            particles: Vec::new(),
+            emitters: Vec::new(),
 
             #[cfg(feature = "2d")]
             backend: crate::backend_2d::PhysicsState2d::new(),
@@ -60,6 +69,127 @@ impl PhysicsWorld {
         #[cfg(not(any(feature = "2d", feature = "3d")))]
         {
             self.collision_events.clear();
+        }
+
+        // Step particles
+        self.step_particles();
+    }
+
+    fn step_particles(&mut self) {
+        let dt = self.config.timestep;
+        let gravity = self.config.gravity;
+
+        // Spawn from emitters — low-discrepancy sequence for spread
+        let mut new_particles = Vec::new();
+        for emitter in &mut self.emitters {
+            if !emitter.active {
+                continue;
+            }
+            emitter.accumulator += dt;
+            let interval = 1.0 / emitter.rate;
+            while emitter.accumulator >= interval {
+                emitter.accumulator -= interval;
+                // Golden ratio based spread for both axes
+                let sx = (self.next_particle_id as f64 * 0.618033).fract() * 2.0 - 1.0;
+                let sy = (self.next_particle_id as f64 * 0.381966).fract() * 2.0 - 1.0;
+                let vx = emitter.velocity[0] + emitter.velocity_spread[0] * sx;
+                let vy = emitter.velocity[1] + emitter.velocity_spread[1] * sy;
+
+                let mut p = Particle::new(emitter.position, [vx, vy], emitter.particle_lifetime)
+                    .with_radius(emitter.particle_radius)
+                    .with_restitution(emitter.particle_restitution)
+                    .with_gravity_scale(emitter.particle_gravity_scale)
+                    .with_damping(emitter.particle_damping);
+                p.handle = ParticleHandle(self.next_particle_id);
+                self.next_particle_id += 1;
+                new_particles.push(p);
+            }
+        }
+        self.particles.extend(new_particles);
+
+        // Integrate particles
+        for p in &mut self.particles {
+            if !p.is_alive() {
+                continue;
+            }
+
+            // Gravity
+            p.velocity[0] += gravity[0] * p.gravity_scale * dt;
+            p.velocity[1] += gravity[1] * p.gravity_scale * dt;
+
+            // Quadratic drag (proportional to speed²)
+            if p.drag > 0.0 {
+                let speed_sq = p.velocity[0] * p.velocity[0] + p.velocity[1] * p.velocity[1];
+                if speed_sq > 1e-20 {
+                    let speed = speed_sq.sqrt();
+                    let drag_force = p.drag * speed_sq;
+                    let factor = (drag_force * dt / speed).min(speed); // clamp to not reverse
+                    p.velocity[0] -= (p.velocity[0] / speed) * factor;
+                    p.velocity[1] -= (p.velocity[1] / speed) * factor;
+                }
+            }
+
+            // Linear damping
+            p.velocity[0] *= 1.0 / (1.0 + dt * p.damping);
+            p.velocity[1] *= 1.0 / (1.0 + dt * p.damping);
+
+            // Integrate position
+            p.position[0] += p.velocity[0] * dt;
+            p.position[1] += p.velocity[1] * dt;
+
+            // Decay lifetime
+            p.lifetime -= dt;
+        }
+
+        // Collide particles with rigid body colliders
+        #[cfg(feature = "2d")]
+        self.collide_particles();
+
+        // Remove dead particles
+        self.particles.retain(|p| p.is_alive());
+    }
+
+    #[cfg(feature = "2d")]
+    fn collide_particles(&mut self) {
+        for p in &mut self.particles {
+            if !p.is_alive() || p.radius <= 0.0 {
+                continue;
+            }
+
+            for collider in self.backend.colliders.values() {
+                if collider.is_sensor {
+                    continue;
+                }
+                let rb = match self.backend.bodies.get(&collider.body) {
+                    Some(b) => b,
+                    None => continue,
+                };
+
+                let (sin, cos) = rb.rotation.sin_cos();
+                let cx = rb.position[0] + cos * collider.offset[0] - sin * collider.offset[1];
+                let cy = rb.position[1] + sin * collider.offset[0] + cos * collider.offset[1];
+
+                let contact = particle_vs_collider(
+                    p.position,
+                    p.radius,
+                    &collider.shape,
+                    [cx, cy],
+                    rb.rotation,
+                );
+
+                if let Some((normal, depth)) = contact {
+                    // Separate particle from collider
+                    p.position[0] += normal[0] * depth;
+                    p.position[1] += normal[1] * depth;
+
+                    // Reflect velocity
+                    let vel_dot_n = p.velocity[0] * normal[0] + p.velocity[1] * normal[1];
+                    if vel_dot_n < 0.0 {
+                        p.velocity[0] -= (1.0 + p.restitution) * vel_dot_n * normal[0];
+                        p.velocity[1] -= (1.0 + p.restitution) * vel_dot_n * normal[1];
+                    }
+                }
+            }
         }
     }
 
@@ -226,6 +356,49 @@ impl PhysicsWorld {
         }
     }
 
+    /// Spawn a particle. Returns its handle.
+    pub fn spawn_particle(&mut self, mut particle: Particle) -> ParticleHandle {
+        let handle = ParticleHandle(self.next_particle_id);
+        self.next_particle_id += 1;
+        particle.handle = handle;
+        self.particles.push(particle);
+        handle
+    }
+
+    /// Add a particle emitter. Returns its handle.
+    pub fn add_emitter(&mut self, mut emitter: ParticleEmitter) -> EmitterHandle {
+        let handle = EmitterHandle(self.next_emitter_id);
+        self.next_emitter_id += 1;
+        emitter.handle = handle;
+        self.emitters.push(emitter);
+        handle
+    }
+
+    /// Remove a particle emitter by handle.
+    pub fn remove_emitter(&mut self, handle: EmitterHandle) {
+        self.emitters.retain(|e| e.handle != handle);
+    }
+
+    /// Get all live particles (read-only).
+    pub fn particles(&self) -> &[Particle] {
+        &self.particles
+    }
+
+    /// Number of live particles.
+    pub fn particle_count(&self) -> usize {
+        self.particles.len()
+    }
+
+    /// Remove all particles.
+    pub fn clear_particles(&mut self) {
+        self.particles.clear();
+    }
+
+    /// Remove all emitters.
+    pub fn clear_emitters(&mut self) {
+        self.emitters.clear();
+    }
+
     /// Capture a snapshot of the current world state for serialization.
     #[cfg(feature = "serialize")]
     pub fn snapshot(&self) -> crate::serialize::WorldSnapshot {
@@ -291,9 +464,13 @@ impl PhysicsWorld {
             next_body_id: self.next_body_id,
             next_collider_id: self.next_collider_id,
             next_joint_id: self.next_joint_id,
+            next_particle_id: self.next_particle_id,
+            next_emitter_id: self.next_emitter_id,
             bodies,
             colliders,
             joints,
+            particles: self.particles.clone(),
+            emitters: self.emitters.clone(),
         }
     }
 
@@ -304,7 +481,11 @@ impl PhysicsWorld {
         self.next_body_id = snapshot.next_body_id;
         self.next_collider_id = snapshot.next_collider_id;
         self.next_joint_id = snapshot.next_joint_id;
+        self.next_particle_id = snapshot.next_particle_id;
+        self.next_emitter_id = snapshot.next_emitter_id;
         self.collision_events.clear();
+        self.particles = snapshot.particles.clone();
+        self.emitters = snapshot.emitters.clone();
 
         #[cfg(feature = "2d")]
         {
@@ -333,6 +514,86 @@ impl PhysicsWorld {
         {
             self.body_count = snapshot.bodies.len();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Particle-vs-collider overlap (circle vs shape)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "2d")]
+fn particle_vs_collider(
+    pos: [f64; 2],
+    radius: f64,
+    shape: &crate::collider::ColliderShape,
+    shape_pos: [f64; 2],
+    shape_rot: f64,
+) -> Option<([f64; 2], f64)> {
+    use crate::collider::ColliderShape;
+
+    match shape {
+        ColliderShape::Ball {
+            radius: shape_radius,
+        } => {
+            let dx = pos[0] - shape_pos[0];
+            let dy = pos[1] - shape_pos[1];
+            let dist = (dx * dx + dy * dy).sqrt();
+            let overlap = (radius + shape_radius) - dist;
+            if overlap > 0.0 && dist > 1e-10 {
+                Some(([dx / dist, dy / dist], overlap))
+            } else {
+                None
+            }
+        }
+        ColliderShape::Box { half_extents } => {
+            let dx = pos[0] - shape_pos[0];
+            let dy = pos[1] - shape_pos[1];
+            let cx = dx.clamp(-half_extents[0], half_extents[0]);
+            let cy = dy.clamp(-half_extents[1], half_extents[1]);
+            let diff_x = dx - cx;
+            let diff_y = dy - cy;
+            let dist = (diff_x * diff_x + diff_y * diff_y).sqrt();
+            if dist < radius && dist > 1e-10 {
+                Some(([diff_x / dist, diff_y / dist], radius - dist))
+            } else {
+                None
+            }
+        }
+        ColliderShape::Capsule {
+            half_height,
+            radius: cap_radius,
+        } => {
+            // Capsule = segment with radius. Find closest point on segment to particle.
+            let (sin, cos) = shape_rot.sin_cos();
+            let ep_a = [
+                shape_pos[0] + sin * half_height,
+                shape_pos[1] - cos * half_height,
+            ];
+            let ep_b = [
+                shape_pos[0] - sin * half_height,
+                shape_pos[1] + cos * half_height,
+            ];
+            let ab = [ep_b[0] - ep_a[0], ep_b[1] - ep_a[1]];
+            let len_sq = ab[0] * ab[0] + ab[1] * ab[1];
+            let closest = if len_sq < 1e-20 {
+                ep_a
+            } else {
+                let t =
+                    ((pos[0] - ep_a[0]) * ab[0] + (pos[1] - ep_a[1]) * ab[1]) / len_sq;
+                let t = t.clamp(0.0, 1.0);
+                [ep_a[0] + ab[0] * t, ep_a[1] + ab[1] * t]
+            };
+            let dx = pos[0] - closest[0];
+            let dy = pos[1] - closest[1];
+            let dist = (dx * dx + dy * dy).sqrt();
+            let overlap = (radius + cap_radius) - dist;
+            if overlap > 0.0 && dist > 1e-10 {
+                Some(([dx / dist, dy / dist], overlap))
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -618,5 +879,126 @@ mod tests {
         assert!(hit.is_some(), "ray should hit the ball");
         let hit = hit.unwrap();
         assert!((hit.distance - 4.0).abs() < 0.1, "should hit at distance ~4 (5 - radius 1)");
+    }
+
+    // -----------------------------------------------------------------------
+    // Particle tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn spawn_particle() {
+        let mut world = PhysicsWorld::new(WorldConfig {
+            gravity: [0.0, 0.0],
+            ..Default::default()
+        });
+        let p = Particle::new([0.0, 0.0], [1.0, 0.0], 1.0);
+        let handle = world.spawn_particle(p);
+        assert_eq!(world.particle_count(), 1);
+        assert_eq!(world.particles()[0].handle, handle);
+    }
+
+    #[test]
+    fn particle_falls_with_gravity() {
+        let mut world = PhysicsWorld::new(WorldConfig::default());
+        world.spawn_particle(Particle::new([0.0, 10.0], [0.0, 0.0], 5.0));
+
+        for _ in 0..60 {
+            world.step();
+        }
+
+        assert_eq!(world.particle_count(), 1);
+        assert!(world.particles()[0].position[1] < 10.0, "particle should fall");
+    }
+
+    #[test]
+    fn particle_expires() {
+        let mut world = PhysicsWorld::new(WorldConfig {
+            gravity: [0.0, 0.0],
+            ..Default::default()
+        });
+        // Lifetime of 0.5 seconds = 30 frames at 60fps
+        world.spawn_particle(Particle::new([0.0, 0.0], [0.0, 0.0], 0.5));
+        assert_eq!(world.particle_count(), 1);
+
+        for _ in 0..60 {
+            world.step();
+        }
+
+        assert_eq!(world.particle_count(), 0, "particle should have expired");
+    }
+
+    #[test]
+    fn emitter_spawns_particles() {
+        let mut world = PhysicsWorld::new(WorldConfig {
+            gravity: [0.0, 0.0],
+            ..Default::default()
+        });
+        // 60 particles per second
+        world.add_emitter(ParticleEmitter::new([0.0, 0.0], [0.0, 5.0], 60.0));
+
+        // Step 1 second
+        for _ in 0..60 {
+            world.step();
+        }
+
+        // Should have spawned ~60 particles, minus any that expired
+        assert!(world.particle_count() > 0, "emitter should have spawned particles");
+    }
+
+    #[cfg(feature = "2d")]
+    #[test]
+    fn particle_bounces_off_floor() {
+        let mut world = PhysicsWorld::new(WorldConfig::default());
+
+        // Static floor
+        let floor = world.add_body(BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 0.0],
+            ..Default::default()
+        });
+        world.add_collider(
+            floor,
+            ColliderDesc {
+                shape: ColliderShape::Box {
+                    half_extents: [50.0, 0.5],
+                },
+                offset: [0.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+            },
+        );
+
+        // Particle falling toward floor
+        world.spawn_particle(
+            Particle::new([0.0, 2.0], [0.0, -5.0], 5.0)
+                .with_radius(0.1)
+                .with_restitution(0.8),
+        );
+
+        for _ in 0..120 {
+            world.step();
+        }
+
+        // Particle should still be alive and above the floor
+        assert_eq!(world.particle_count(), 1);
+        assert!(
+            world.particles()[0].position[1] > -1.0,
+            "particle should have bounced, not fallen through"
+        );
+    }
+
+    #[test]
+    fn clear_particles() {
+        let mut world = PhysicsWorld::new(WorldConfig {
+            gravity: [0.0, 0.0],
+            ..Default::default()
+        });
+        world.spawn_particle(Particle::new([0.0, 0.0], [0.0, 0.0], 10.0));
+        world.spawn_particle(Particle::new([1.0, 0.0], [0.0, 0.0], 10.0));
+        assert_eq!(world.particle_count(), 2);
+
+        world.clear_particles();
+        assert_eq!(world.particle_count(), 0);
     }
 }

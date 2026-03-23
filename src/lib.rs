@@ -1,14 +1,13 @@
 //! # Impetus — Physics Engine for AGNOS
 //!
-//! Impetus (Latin: driving force — the medieval theory of why objects keep
-//! moving) provides 2D/3D rigid body physics simulation for the AGNOS
-//! ecosystem. It wraps [rapier](https://rapier.rs/) with AGNOS-specific
-//! integration: deterministic stepping, serializable state, TOML scene
-//! loading, and unit-aware quantities.
+//! Impetus (Latin: *impetus* — driving force) provides 2D/3D rigid body
+//! physics simulation for the AGNOS ecosystem. Built on
+//! [hisab](https://crates.io/crates/hisab) for math — no external physics
+//! engine dependencies.
 //!
 //! ## Consumers
 //!
-//! - **Joshua** — game engine (ECS + physics)
+//! - **Kiran** — game engine (ECS + physics)
 //! - **Aethersafha** — desktop compositor (window animations, spring physics)
 //! - **Simulation workloads** — headless agent training environments
 
@@ -19,6 +18,7 @@ pub mod event;
 pub mod force;
 pub mod joint;
 pub mod material;
+pub mod particle;
 pub mod query;
 #[cfg(feature = "serialize")]
 pub mod serialize;
@@ -51,6 +51,9 @@ pub use joint::{JointDesc, JointHandle, JointType};
 
 // Material
 pub use material::PhysicsMaterial;
+
+// Particles
+pub use particle::{EmitterHandle, Particle, ParticleEmitter, ParticleHandle};
 
 // Queries
 pub use query::{PointQuery, RayHit};
@@ -88,6 +91,10 @@ const _: () = {
         assert_send_sync::<RayHit>();
         assert_send_sync::<PointQuery>();
         assert_send_sync::<Quantity>();
+        assert_send_sync::<Particle>();
+        assert_send_sync::<ParticleHandle>();
+        assert_send_sync::<ParticleEmitter>();
+        assert_send_sync::<EmitterHandle>();
         assert_send_sync::<ImpetusError>();
     }
 };

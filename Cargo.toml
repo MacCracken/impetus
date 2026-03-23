@@ -23,8 +23,7 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 
 # Physics backend — native, built on hisab math
-# TODO: switch to version dep before publish
-hisab = { path = "../hisab", optional = true }
+hisab = { version = "0.22", optional = true }
 
 # Serialization (optional)
 bincode = { version = "2", features = ["serde"], optional = true }
