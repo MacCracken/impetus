@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Unique handle to a rigid body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BodyHandle(pub u64);
 
 /// Body type.

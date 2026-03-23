@@ -4,7 +4,7 @@
 //! generation), and a sequential impulse constraint solver with friction and
 //! angular response. All geometry uses f64 precision.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::arena::{Arena, ArenaHandle};
 use crate::body::{BodyDesc, BodyHandle, BodyState, BodyType};
@@ -409,8 +409,8 @@ pub(crate) struct PhysicsState2d {
     pub bodies: Arena<RigidBody2d>,
     pub colliders: Arena<Collider2d>,
     pub joints: Arena<Joint2d>,
-    pub body_colliders: HashMap<BodyHandle, Vec<ColliderHandle>>,
-    prev_collision_pairs: HashSet<(ColliderHandle, ColliderHandle)>,
+    pub body_colliders: BTreeMap<BodyHandle, Vec<ColliderHandle>>,
+    prev_collision_pairs: BTreeSet<(ColliderHandle, ColliderHandle)>,
 }
 
 impl PhysicsState2d {
@@ -419,8 +419,8 @@ impl PhysicsState2d {
             bodies: Arena::new(),
             colliders: Arena::new(),
             joints: Arena::new(),
-            body_colliders: HashMap::new(),
-            prev_collision_pairs: HashSet::new(),
+            body_colliders: BTreeMap::new(),
+            prev_collision_pairs: BTreeSet::new(),
         }
     }
 
@@ -772,7 +772,7 @@ impl PhysicsState2d {
         let candidates = grid.query_pairs();
 
         // Build AABB lookup for overlap verification
-        let aabb_map: HashMap<ColliderHandle, Aabb2d> =
+        let aabb_map: BTreeMap<ColliderHandle, Aabb2d> =
             collider_aabbs.into_iter().collect();
 
         // Filter candidates
@@ -870,7 +870,7 @@ impl PhysicsState2d {
     // -----------------------------------------------------------------------
 
     fn solve_contacts(&mut self, contacts: &[Contact], iterations: u32) {
-        // Pre-extract material properties to avoid repeated HashMap lookups
+        // Pre-extract material properties to avoid repeated BTreeMap lookups
         struct ContactMaterial {
             restitution: f64,
             friction: f64,
@@ -1488,7 +1488,7 @@ impl PhysicsState2d {
     fn generate_events(&mut self, contacts: &[Contact]) -> Vec<CollisionEvent> {
         let mut events = Vec::new();
 
-        let current_pairs: HashSet<(ColliderHandle, ColliderHandle)> = contacts
+        let current_pairs: BTreeSet<(ColliderHandle, ColliderHandle)> = contacts
             .iter()
             .map(|c| {
                 if c.collider_a.0 < c.collider_b.0 {

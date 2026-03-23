@@ -3,18 +3,18 @@
 //! Uses `(i32, i32, i32)` cell keys so the same structure works for both
 //! 2D (z = 0) and 3D grids.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) struct SpatialHashGrid<K: Copy + Eq + std::hash::Hash> {
+pub(crate) struct SpatialHashGrid<K: Copy + Eq + Ord> {
     inv_cell_size: f64,
-    cells: HashMap<(i32, i32, i32), Vec<K>>,
+    cells: BTreeMap<(i32, i32, i32), Vec<K>>,
 }
 
-impl<K: Copy + Eq + std::hash::Hash + Ord> SpatialHashGrid<K> {
+impl<K: Copy + Eq + Ord> SpatialHashGrid<K> {
     pub fn new(cell_size: f64) -> Self {
         Self {
             inv_cell_size: 1.0 / cell_size,
-            cells: HashMap::new(),
+            cells: BTreeMap::new(),
         }
     }
 
@@ -66,8 +66,8 @@ impl<K: Copy + Eq + std::hash::Hash + Ord> SpatialHashGrid<K> {
 
     /// Return all unique pairs of keys that share at least one cell.
     /// Pairs are canonically ordered (smaller < larger).
-    pub fn query_pairs(&self) -> HashSet<(K, K)> {
-        let mut pairs = HashSet::new();
+    pub fn query_pairs(&self) -> BTreeSet<(K, K)> {
+        let mut pairs = BTreeSet::new();
 
         for cell in self.cells.values() {
             for i in 0..cell.len() {

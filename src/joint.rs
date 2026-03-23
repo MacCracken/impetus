@@ -4,7 +4,7 @@ use crate::body::BodyHandle;
 use serde::{Deserialize, Serialize};
 
 /// Unique handle to a joint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct JointHandle(pub u64);
 
 /// Joint type.

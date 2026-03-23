@@ -248,4 +248,113 @@ mod tests {
         let back: WorldSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back.next_particle_id, 0);
     }
+
+    /// Step-exact determinism: serialize at step N, restore, step 100 more,
+    /// compare against a world that was never serialized.
+    #[cfg(feature = "2d")]
+    #[test]
+    fn step_exact_determinism() {
+        let config = WorldConfig::default();
+
+        // World A: run 50 steps, serialize, restore, run 100 more
+        let mut world_a = PhysicsWorld::new(config.clone());
+        let ball_a = world_a.add_body(BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [3.0, 15.0, 0.0],
+            linear_velocity: [1.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        world_a.add_collider(ball_a, ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::rubber(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+        let floor_a = world_a.add_body(BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        world_a.add_collider(floor_a, ColliderDesc {
+            shape: ColliderShape::Box { half_extents: [50.0, 0.5, 0.0] },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::wood(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+        for _ in 0..50 {
+            world_a.step();
+        }
+        let data = serialize_world(&world_a).unwrap();
+        let mut world_a_restored = PhysicsWorld::new(WorldConfig::default());
+        deserialize_world(&mut world_a_restored, &data).unwrap();
+        for _ in 0..100 {
+            world_a_restored.step();
+        }
+
+        // World B: run 150 steps straight (no serialize/restore)
+        let mut world_b = PhysicsWorld::new(config);
+        let ball_b = world_b.add_body(BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [3.0, 15.0, 0.0],
+            linear_velocity: [1.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        world_b.add_collider(ball_b, ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::rubber(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+        let floor_b = world_b.add_body(BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        world_b.add_collider(floor_b, ColliderDesc {
+            shape: ColliderShape::Box { half_extents: [50.0, 0.5, 0.0] },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::wood(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+        for _ in 0..150 {
+            world_b.step();
+        }
+
+        // Compare: positions and velocities must match exactly
+        let state_a = world_a_restored.get_body_state(ball_a).unwrap();
+        let state_b = world_b.get_body_state(ball_b).unwrap();
+
+        assert!(
+            (state_a.position[0] - state_b.position[0]).abs() < 1e-10,
+            "x position diverged: {} vs {}",
+            state_a.position[0],
+            state_b.position[0]
+        );
+        assert!(
+            (state_a.position[1] - state_b.position[1]).abs() < 1e-10,
+            "y position diverged: {} vs {}",
+            state_a.position[1],
+            state_b.position[1]
+        );
+        assert!(
+            (state_a.linear_velocity[0] - state_b.linear_velocity[0]).abs() < 1e-10,
+            "x velocity diverged"
+        );
+        assert!(
+            (state_a.linear_velocity[1] - state_b.linear_velocity[1]).abs() < 1e-10,
+            "y velocity diverged"
+        );
+    }
 }

@@ -4,7 +4,7 @@
 //! generation), and a sequential impulse constraint solver with friction and
 //! angular response. All geometry uses f64 precision.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use hisab::{DQuat, DVec3};
 
@@ -421,8 +421,8 @@ pub(crate) struct PhysicsState3d {
     pub bodies: Arena<RigidBody3d>,
     pub colliders: Arena<Collider3d>,
     pub joints: Arena<Joint3d>,
-    pub body_colliders: HashMap<BodyHandle, Vec<ColliderHandle>>,
-    prev_collision_pairs: HashSet<(ColliderHandle, ColliderHandle)>,
+    pub body_colliders: BTreeMap<BodyHandle, Vec<ColliderHandle>>,
+    prev_collision_pairs: BTreeSet<(ColliderHandle, ColliderHandle)>,
 }
 
 impl PhysicsState3d {
@@ -431,8 +431,8 @@ impl PhysicsState3d {
             bodies: Arena::new(),
             colliders: Arena::new(),
             joints: Arena::new(),
-            body_colliders: HashMap::new(),
-            prev_collision_pairs: HashSet::new(),
+            body_colliders: BTreeMap::new(),
+            prev_collision_pairs: BTreeSet::new(),
         }
     }
 
@@ -777,7 +777,7 @@ impl PhysicsState3d {
         }
 
         let candidates = grid.query_pairs();
-        let aabb_map: HashMap<ColliderHandle, Aabb3d> = collider_aabbs.into_iter().collect();
+        let aabb_map: BTreeMap<ColliderHandle, Aabb3d> = collider_aabbs.into_iter().collect();
 
         let mut pairs = Vec::with_capacity(candidates.len());
         for (ha, hb) in candidates {
@@ -1209,7 +1209,7 @@ impl PhysicsState3d {
 
     fn generate_events(&mut self, contacts: &[Contact3d]) -> Vec<CollisionEvent> {
         let mut events = Vec::new();
-        let current_pairs: HashSet<(ColliderHandle, ColliderHandle)> = contacts
+        let current_pairs: BTreeSet<(ColliderHandle, ColliderHandle)> = contacts
             .iter()
             .map(|c| {
                 if c.collider_a.0 < c.collider_b.0 {
