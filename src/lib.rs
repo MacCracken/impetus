@@ -25,6 +25,9 @@ pub mod serialize;
 pub mod units;
 pub mod world;
 
+#[cfg(feature = "2d")]
+mod backend_2d;
+
 mod error;
 pub use error::ImpetusError;
 

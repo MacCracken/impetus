@@ -23,7 +23,8 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 
 # Physics backend — native, built on ganit math
-ganit = { version = "0.1", optional = true }
+# TODO: switch to version dep before publish
+ganit = { path = "../ganit", optional = true }
 
 # Serialization (optional)
 bincode = { version = "2", optional = true }
