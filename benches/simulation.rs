@@ -28,14 +28,14 @@ fn bench_world(c: &mut Criterion) {
         for i in 0..10 {
             let body = world.add_body(BodyDesc {
                 body_type: BodyType::Dynamic,
-                position: [(i % 5) as f64, (i / 5) as f64 * 2.0],
+                position: [(i % 5) as f64, (i / 5) as f64 * 2.0, 0.0],
                 ..Default::default()
             });
             world.add_collider(
                 body,
                 ColliderDesc {
                     shape: ColliderShape::Ball { radius: 0.5 },
-                    offset: [0.0, 0.0],
+                    offset: [0.0, 0.0, 0.0],
                     material: PhysicsMaterial::default(),
                     is_sensor: false,
                     mass: None,
@@ -50,14 +50,14 @@ fn bench_world(c: &mut Criterion) {
         for i in 0..100 {
             let body = world.add_body(BodyDesc {
                 body_type: BodyType::Dynamic,
-                position: [(i % 10) as f64, (i / 10) as f64 * 2.0],
+                position: [(i % 10) as f64, (i / 10) as f64 * 2.0, 0.0],
                 ..Default::default()
             });
             world.add_collider(
                 body,
                 ColliderDesc {
                     shape: ColliderShape::Ball { radius: 0.5 },
-                    offset: [0.0, 0.0],
+                    offset: [0.0, 0.0, 0.0],
                     material: PhysicsMaterial::default(),
                     is_sensor: false,
                     mass: None,
@@ -72,14 +72,14 @@ fn bench_world(c: &mut Criterion) {
         for i in 0..1000 {
             let body = world.add_body(BodyDesc {
                 body_type: BodyType::Dynamic,
-                position: [(i % 32) as f64, (i / 32) as f64 * 2.0],
+                position: [(i % 32) as f64, (i / 32) as f64 * 2.0, 0.0],
                 ..Default::default()
             });
             world.add_collider(
                 body,
                 ColliderDesc {
                     shape: ColliderShape::Ball { radius: 0.5 },
-                    offset: [0.0, 0.0],
+                    offset: [0.0, 0.0, 0.0],
                     material: PhysicsMaterial::default(),
                     is_sensor: false,
                     mass: None,
@@ -119,14 +119,14 @@ fn bench_bodies(c: &mut Criterion) {
         b.iter(|| {
             let body = world.add_body(black_box(BodyDesc {
                 body_type: BodyType::Dynamic,
-                position: [1.0, 2.0],
+                position: [1.0, 2.0, 0.0],
                 ..Default::default()
             }));
             world.add_collider(
                 body,
                 black_box(ColliderDesc {
                     shape: ColliderShape::Ball { radius: 0.5 },
-                    offset: [0.0, 0.0],
+                    offset: [0.0, 0.0, 0.0],
                     material: PhysicsMaterial::default(),
                     is_sensor: false,
                     mass: None,
@@ -168,7 +168,7 @@ fn bench_forces(c: &mut Criterion) {
         let mut world = PhysicsWorld::new(WorldConfig::default());
         let body = world.add_body(BodyDesc::default());
         b.iter(|| {
-            world.apply_force(black_box(body), black_box(Force::new(10.0, -5.0)));
+            world.apply_force(black_box(body), black_box(Force::new(10.0, -5.0, 0.0)));
         })
     });
 
@@ -176,12 +176,12 @@ fn bench_forces(c: &mut Criterion) {
         let mut world = PhysicsWorld::new(WorldConfig::default());
         let body = world.add_body(BodyDesc::default());
         b.iter(|| {
-            world.apply_impulse(black_box(body), black_box(Impulse::new(0.0, 20.0)));
+            world.apply_impulse(black_box(body), black_box(Impulse::new(0.0, 20.0, 0.0)));
         })
     });
 
     group.bench_function("force_magnitude", |b| {
-        let f = Force::new(3.0, 4.0);
+        let f = Force::new(3.0, 4.0, 0.0);
         b.iter(|| black_box(&f).magnitude())
     });
 
@@ -234,7 +234,7 @@ fn bench_serde(c: &mut Criterion) {
     group.bench_function("serialize_body_desc", |b| {
         let desc = BodyDesc {
             body_type: BodyType::Dynamic,
-            position: [5.0, 10.0],
+            position: [5.0, 10.0, 0.0],
             rotation: 1.57,
             ..Default::default()
         };
@@ -254,7 +254,7 @@ fn bench_serde(c: &mut Criterion) {
     group.bench_function("roundtrip_collider_desc", |b| {
         let desc = ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
-            offset: [0.0, 0.0],
+            offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::rubber(),
             is_sensor: false,
             mass: Some(5.0),
@@ -283,8 +283,8 @@ fn bench_particles(c: &mut Criterion) {
                 for i in 0..100 {
                     world.spawn_particle(
                         Particle::new(
-                            [(i % 10) as f64, (i / 10) as f64 * 2.0 + 5.0],
-                            [0.0, 0.0],
+                            [(i % 10) as f64, (i / 10) as f64 * 2.0 + 5.0, 0.0],
+                            [0.0, 0.0, 0.0],
                             100.0,
                         )
                         .with_radius(0.05),
@@ -306,8 +306,8 @@ fn bench_particles(c: &mut Criterion) {
                 for i in 0..1000 {
                     world.spawn_particle(
                         Particle::new(
-                            [(i % 32) as f64, (i / 32) as f64 * 2.0 + 5.0],
-                            [0.0, 0.0],
+                            [(i % 32) as f64, (i / 32) as f64 * 2.0 + 5.0, 0.0],
+                            [0.0, 0.0, 0.0],
                             100.0,
                         )
                         .with_radius(0.05),
@@ -325,16 +325,16 @@ fn bench_particles(c: &mut Criterion) {
         let mut world = PhysicsWorld::new(WorldConfig::default());
         let floor = world.add_body(BodyDesc {
             body_type: BodyType::Static,
-            position: [0.0, 0.0],
+            position: [0.0, 0.0, 0.0],
             ..Default::default()
         });
         world.add_collider(
             floor,
             ColliderDesc {
                 shape: ColliderShape::Box {
-                    half_extents: [50.0, 0.5],
+                    half_extents: [50.0, 0.5, 0.0],
                 },
-                offset: [0.0, 0.0],
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
@@ -343,8 +343,8 @@ fn bench_particles(c: &mut Criterion) {
         for i in 0..100 {
             world.spawn_particle(
                 Particle::new(
-                    [(i % 10) as f64, (i / 10) as f64 + 1.0],
-                    [0.0, -2.0],
+                    [(i % 10) as f64, (i / 10) as f64 + 1.0, 0.0],
+                    [0.0, -2.0, 0.0],
                     10.0,
                 )
                 .with_radius(0.05)
@@ -357,14 +357,14 @@ fn bench_particles(c: &mut Criterion) {
     group.bench_function("spawn_particle", |b| {
         let mut world = PhysicsWorld::new(WorldConfig::default());
         b.iter(|| {
-            world.spawn_particle(black_box(Particle::new([0.0, 0.0], [1.0, 2.0], 3.0)));
+            world.spawn_particle(black_box(Particle::new([0.0, 0.0, 0.0], [1.0, 2.0, 0.0], 3.0)));
         })
     });
 
     group.bench_function("emitter_step", |b| {
         let mut world = PhysicsWorld::new(WorldConfig::default());
         world.add_emitter(
-            ParticleEmitter::new([0.0, 0.0], [0.0, 10.0], 100.0).with_lifetime(0.5),
+            ParticleEmitter::new([0.0, 0.0, 0.0], [0.0, 10.0, 0.0], 100.0).with_lifetime(0.5),
         );
         b.iter(|| world.step())
     });
@@ -390,14 +390,14 @@ fn bench_serialize(c: &mut Criterion) {
         for i in 0..100 {
             let body = world.add_body(BodyDesc {
                 body_type: BodyType::Dynamic,
-                position: [(i % 10) as f64, (i / 10) as f64],
+                position: [(i % 10) as f64, (i / 10) as f64, 0.0],
                 ..Default::default()
             });
             world.add_collider(
                 body,
                 ColliderDesc {
                     shape: ColliderShape::Ball { radius: 0.5 },
-                    offset: [0.0, 0.0],
+                    offset: [0.0, 0.0, 0.0],
                     material: PhysicsMaterial::default(),
                     is_sensor: false,
                     mass: None,
@@ -412,14 +412,14 @@ fn bench_serialize(c: &mut Criterion) {
         for i in 0..100 {
             let body = world.add_body(BodyDesc {
                 body_type: BodyType::Dynamic,
-                position: [(i % 10) as f64, (i / 10) as f64],
+                position: [(i % 10) as f64, (i / 10) as f64, 0.0],
                 ..Default::default()
             });
             world.add_collider(
                 body,
                 ColliderDesc {
                     shape: ColliderShape::Ball { radius: 0.5 },
-                    offset: [0.0, 0.0],
+                    offset: [0.0, 0.0, 0.0],
                     material: PhysicsMaterial::default(),
                     is_sensor: false,
                     mass: None,

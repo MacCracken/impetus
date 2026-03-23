@@ -18,16 +18,16 @@ fn full_world_lifecycle() {
     // Add a static floor
     let floor = world.add_body(BodyDesc {
         body_type: BodyType::Static,
-        position: [0.0, -1.0],
+        position: [0.0, -1.0, 0.0],
         ..Default::default()
     });
     world.add_collider(
         floor,
         ColliderDesc {
             shape: ColliderShape::Box {
-                half_extents: [50.0, 1.0],
+                half_extents: [50.0, 1.0, 0.0],
             },
-            offset: [0.0, 0.0],
+            offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::wood(),
             is_sensor: false,
             mass: None,
@@ -37,14 +37,14 @@ fn full_world_lifecycle() {
     // Add a dynamic ball
     let ball = world.add_body(BodyDesc {
         body_type: BodyType::Dynamic,
-        position: [0.0, 10.0],
+        position: [0.0, 10.0, 0.0],
         ..Default::default()
     });
     world.add_collider(
         ball,
         ColliderDesc {
             shape: ColliderShape::Ball { radius: 0.5 },
-            offset: [0.0, 0.0],
+            offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::rubber(),
             is_sensor: false,
             mass: None,
@@ -70,13 +70,13 @@ fn joint_connects_bodies() {
 
     let body_a = world.add_body(BodyDesc {
         body_type: BodyType::Static,
-        position: [0.0, 5.0],
+        position: [0.0, 5.0, 0.0],
         ..Default::default()
     });
 
     let body_b = world.add_body(BodyDesc {
         body_type: BodyType::Dynamic,
-        position: [0.0, 3.0],
+        position: [0.0, 3.0, 0.0],
         ..Default::default()
     });
 
@@ -107,7 +107,7 @@ fn forces_and_impulses() {
     world.apply_force(body, Force::gravity(10.0, 9.81));
 
     // Apply an impulse
-    world.apply_impulse(body, Impulse::new(5.0, 0.0));
+    world.apply_impulse(body, Impulse::new(5.0, 0.0, 0.0));
 
     // Step should not panic
     world.step();
@@ -146,7 +146,7 @@ fn unit_quantities_display() {
 fn config_serde_roundtrip() {
     let config = WorldConfig {
         timestep: 1.0 / 120.0,
-        gravity: [0.0, -10.0],
+        gravity: [0.0, -10.0, 0.0],
         velocity_iterations: 8,
         position_iterations: 3,
         deterministic: true,
@@ -197,7 +197,7 @@ fn sensor_collider_creation() {
         body,
         ColliderDesc {
             shape: ColliderShape::Ball { radius: 5.0 },
-            offset: [0.0, 0.0],
+            offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
             is_sensor: true,
             mass: None,

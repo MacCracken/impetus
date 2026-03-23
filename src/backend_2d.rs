@@ -45,9 +45,9 @@ impl RigidBody2d {
         Self {
             handle,
             body_type: desc.body_type,
-            position: desc.position,
+            position: [desc.position[0], desc.position[1]],
             rotation: desc.rotation,
-            linear_velocity: desc.linear_velocity,
+            linear_velocity: [desc.linear_velocity[0], desc.linear_velocity[1]],
             angular_velocity: desc.angular_velocity,
             linear_damping: desc.linear_damping,
             angular_damping: desc.angular_damping,
@@ -139,7 +139,7 @@ impl Collider2d {
             handle,
             body,
             shape: desc.shape.clone(),
-            offset: desc.offset,
+            offset: [desc.offset[0], desc.offset[1]],
             material: desc.material.clone(),
             is_sensor: desc.is_sensor,
             mass: desc.mass,
@@ -526,9 +526,9 @@ impl PhysicsState2d {
         Ok(BodyState {
             handle: rb.handle,
             body_type: rb.body_type,
-            position: rb.position,
+            position: [rb.position[0], rb.position[1], 0.0],
             rotation: rb.rotation,
-            linear_velocity: rb.linear_velocity,
+            linear_velocity: [rb.linear_velocity[0], rb.linear_velocity[1], 0.0],
             angular_velocity: rb.angular_velocity,
             is_sleeping: false,
         })
@@ -540,14 +540,15 @@ impl PhysicsState2d {
 
     pub fn step(
         &mut self,
-        gravity: [f64; 2],
+        gravity: [f64; 3],
         dt: f64,
         velocity_iterations: u32,
         position_iterations: u32,
     ) -> Vec<CollisionEvent> {
+        let gravity_2d = [gravity[0], gravity[1]];
         // 1. Integrate velocities
         for rb in self.bodies.values_mut() {
-            rb.integrate_velocities(gravity, dt);
+            rb.integrate_velocities(gravity_2d, dt);
         }
 
         // 2. Broadphase
@@ -1179,15 +1180,17 @@ impl PhysicsState2d {
 
     pub fn raycast(
         &self,
-        origin: [f64; 2],
-        direction: [f64; 2],
+        origin: [f64; 3],
+        direction: [f64; 3],
         max_dist: f64,
     ) -> Option<RayHit> {
-        let dir_len = (direction[0] * direction[0] + direction[1] * direction[1]).sqrt();
+        let origin_2d = [origin[0], origin[1]];
+        let direction_2d = [direction[0], direction[1]];
+        let dir_len = (direction_2d[0] * direction_2d[0] + direction_2d[1] * direction_2d[1]).sqrt();
         if dir_len < 1e-10 {
             return None;
         }
-        let dir = [direction[0] / dir_len, direction[1] / dir_len];
+        let dir = [direction_2d[0] / dir_len, direction_2d[1] / dir_len];
 
         let mut best: Option<(f64, ColliderHandle, [f64; 2], [f64; 2])> = None;
 
@@ -1199,9 +1202,9 @@ impl PhysicsState2d {
             let pos = world_pos(rb.position, rb.rotation, collider.offset);
 
             let hit = match &collider.shape {
-                ColliderShape::Ball { radius } => ray_circle(origin, dir, pos, *radius),
+                ColliderShape::Ball { radius } => ray_circle(origin_2d, dir, pos, *radius),
                 ColliderShape::Box { half_extents } => ray_aabb_2d(
-                    origin,
+                    origin_2d,
                     dir,
                     [pos[0] - half_extents[0], pos[1] - half_extents[1]],
                     [pos[0] + half_extents[0], pos[1] + half_extents[1]],
@@ -1209,7 +1212,7 @@ impl PhysicsState2d {
                 ColliderShape::Capsule {
                     half_height,
                     radius,
-                } => ray_capsule(origin, dir, pos, rb.rotation, *half_height, *radius),
+                } => ray_capsule(origin_2d, dir, pos, rb.rotation, *half_height, *radius),
                 _ => None,
             };
 
@@ -1218,15 +1221,15 @@ impl PhysicsState2d {
                 && t <= max_dist
                 && (best.is_none() || t < best.as_ref().unwrap().0)
             {
-                let point = [origin[0] + dir[0] * t, origin[1] + dir[1] * t];
+                let point = [origin_2d[0] + dir[0] * t, origin_2d[1] + dir[1] * t];
                 best = Some((t, collider.handle, point, normal));
             }
         }
 
         best.map(|(distance, collider, point, normal)| RayHit {
             collider,
-            point,
-            normal,
+            point: [point[0], point[1], 0.0],
+            normal: [normal[0], normal[1], 0.0],
             distance,
         })
     }
@@ -1263,17 +1266,17 @@ fn generate_contact(
         }
         // Ball vs Box
         (ColliderShape::Ball { radius }, ColliderShape::Box { half_extents }) => {
-            circle_aabb(pos_a, *radius, pos_b, *half_extents)
+            circle_aabb(pos_a, *radius, pos_b, [half_extents[0], half_extents[1]])
         }
         (ColliderShape::Box { half_extents }, ColliderShape::Ball { radius }) => {
-            circle_aabb(pos_b, *radius, pos_a, *half_extents)
+            circle_aabb(pos_b, *radius, pos_a, [half_extents[0], half_extents[1]])
                 .map(|(n, d, p)| ([-n[0], -n[1]], d, p))
         }
         // Box vs Box
         (
             ColliderShape::Box { half_extents: he_a },
             ColliderShape::Box { half_extents: he_b },
-        ) => aabb_aabb_contact(pos_a, *he_a, pos_b, *he_b),
+        ) => aabb_aabb_contact(pos_a, [he_a[0], he_a[1]], pos_b, [he_b[0], he_b[1]]),
         // Capsule vs Ball
         (
             ColliderShape::Capsule {
@@ -1299,7 +1302,7 @@ fn generate_contact(
                 radius: cr,
             },
             ColliderShape::Box { half_extents },
-        ) => capsule_aabb(pos_a, rot_a, *hh, *cr, pos_b, *half_extents),
+        ) => capsule_aabb(pos_a, rot_a, *hh, *cr, pos_b, [half_extents[0], half_extents[1]]),
         (
             ColliderShape::Box { half_extents },
             ColliderShape::Capsule {
@@ -1307,7 +1310,7 @@ fn generate_contact(
                 radius: cr,
             },
         ) => {
-            capsule_aabb(pos_b, rot_b, *hh, *cr, pos_a, *half_extents)
+            capsule_aabb(pos_b, rot_b, *hh, *cr, pos_a, [half_extents[0], half_extents[1]])
                 .map(|(n, d, p)| ([-n[0], -n[1]], d, p))
         }
         // Capsule vs Capsule
@@ -1875,7 +1878,7 @@ mod tests {
             BodyHandle(0),
             &ColliderDesc {
                 shape: ColliderShape::Ball { radius: 1.0 },
-                offset: [0.0, 0.0],
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
                 is_sensor: false,
                 mass: None,
@@ -1891,8 +1894,8 @@ mod tests {
             ColliderHandle(0),
             BodyHandle(0),
             &ColliderDesc {
-                shape: ColliderShape::Box { half_extents: [1.0, 1.0] },
-                offset: [0.0, 0.0],
+                shape: ColliderShape::Box { half_extents: [1.0, 1.0, 0.0] },
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
                 is_sensor: false,
                 mass: None,
@@ -1907,8 +1910,8 @@ mod tests {
             ColliderHandle(0),
             BodyHandle(0),
             &ColliderDesc {
-                shape: ColliderShape::Segment { a: [0.0, 0.0], b: [10.0, 0.0] },
-                offset: [0.0, 0.0],
+                shape: ColliderShape::Segment { a: [0.0, 0.0, 0.0], b: [10.0, 0.0, 0.0] },
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
@@ -1924,7 +1927,7 @@ mod tests {
             BodyHandle(0),
             &ColliderDesc {
                 shape: ColliderShape::Ball { radius: 1.0 },
-                offset: [0.0, 0.0],
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: Some(42.0),
@@ -1941,7 +1944,7 @@ mod tests {
 
         state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
-            offset: [0.0, 0.0],
+            offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
             is_sensor: false,
             mass: None,
@@ -1950,7 +1953,7 @@ mod tests {
 
         state.add_collider(ColliderHandle(1), bh, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
-            offset: [1.0, 0.0],
+            offset: [1.0, 0.0, 0.0],
             material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
             is_sensor: false,
             mass: None,
@@ -2067,7 +2070,7 @@ mod tests {
             BodyHandle(0),
             &ColliderDesc {
                 shape: ColliderShape::Ball { radius: 1.0 },
-                offset: [0.0, 0.0],
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
@@ -2086,8 +2089,8 @@ mod tests {
             ColliderHandle(0),
             BodyHandle(0),
             &ColliderDesc {
-                shape: ColliderShape::Box { half_extents: [2.0, 1.0] },
-                offset: [0.0, 0.0],
+                shape: ColliderShape::Box { half_extents: [2.0, 1.0, 0.0] },
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
@@ -2107,7 +2110,7 @@ mod tests {
             BodyHandle(0),
             &ColliderDesc {
                 shape: ColliderShape::Ball { radius: 0.5 },
-                offset: [3.0, 0.0],
+                offset: [3.0, 0.0, 0.0],
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
@@ -2128,12 +2131,12 @@ mod tests {
         let floor = BodyHandle(0);
         state.add_body(floor, &BodyDesc {
             body_type: BodyType::Static,
-            position: [0.0, 0.0],
+            position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
         state.add_collider(ColliderHandle(0), floor, &ColliderDesc {
-            shape: ColliderShape::Box { half_extents: [10.0, 0.5] },
-            offset: [0.0, 0.0],
+            shape: ColliderShape::Box { half_extents: [10.0, 0.5, 0.0] },
+            offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
             is_sensor: true, // Sensor!
             mass: None,
@@ -2143,19 +2146,19 @@ mod tests {
         let ball = BodyHandle(1);
         state.add_body(ball, &BodyDesc {
             body_type: BodyType::Dynamic,
-            position: [0.0, 0.0],
+            position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
         state.add_collider(ColliderHandle(1), ball, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 0.5 },
-            offset: [0.0, 0.0],
+            offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
             is_sensor: false,
             mass: None,
         });
 
         let vel_before = state.bodies[&ball].linear_velocity;
-        let events = state.step([0.0, 0.0], 1.0 / 60.0, 4, 1);
+        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1);
 
         // Should generate events
         assert!(!events.is_empty());
@@ -2173,13 +2176,13 @@ mod tests {
         let bh = BodyHandle(0);
         state.add_body(bh, &BodyDesc {
             body_type: BodyType::Kinematic,
-            position: [0.0, 0.0],
-            linear_velocity: [10.0, 0.0],
+            position: [0.0, 0.0, 0.0],
+            linear_velocity: [10.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
 
         let dt = 1.0 / 60.0;
-        state.step([0.0, -9.81], dt, 4, 1);
+        state.step([0.0, -9.81, 0.0], dt, 4, 1);
 
         let rb = &state.bodies[&bh];
         // Should have moved from velocity
@@ -2197,12 +2200,12 @@ mod tests {
         let a = BodyHandle(0);
         state.add_body(a, &BodyDesc {
             body_type: BodyType::Static,
-            position: [0.0, 0.0],
+            position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
         state.add_collider(ColliderHandle(0), a, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
-            offset: [0.0, 0.0],
+            offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
             is_sensor: false,
             mass: None,
@@ -2211,19 +2214,19 @@ mod tests {
         let b = BodyHandle(1);
         state.add_body(b, &BodyDesc {
             body_type: BodyType::Dynamic,
-            position: [0.5, 0.0],
+            position: [0.5, 0.0, 0.0],
             ..BodyDesc::default()
         });
         state.add_collider(ColliderHandle(1), b, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
-            offset: [0.0, 0.0],
+            offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
             is_sensor: false,
             mass: None,
         });
 
         // Step to generate collision pairs
-        state.step([0.0, 0.0], 1.0 / 60.0, 4, 1);
+        state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1);
         assert!(!state.prev_collision_pairs.is_empty());
 
         // Remove body b — should clean pairs

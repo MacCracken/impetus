@@ -11,13 +11,13 @@ pub struct ColliderHandle(pub u64);
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ColliderShape {
     /// Axis-aligned box.
-    Box { half_extents: [f64; 2] },
+    Box { half_extents: [f64; 3] },
     /// Circle (2D) / Sphere (3D).
     Ball { radius: f64 },
     /// Capsule defined by half-height and radius.
     Capsule { half_height: f64, radius: f64 },
     /// Convex polygon from vertices.
-    ConvexHull { points: Vec<[f64; 2]> },
+    ConvexHull { points: Vec<[f64; 3]> },
     /// Triangle mesh (3D only).
     TriMesh {
         vertices: Vec<[f64; 3]>,
@@ -26,10 +26,10 @@ pub enum ColliderShape {
     /// Heightfield (3D only).
     Heightfield {
         heights: Vec<f64>,
-        scale: [f64; 2],
+        scale: [f64; 3],
     },
     /// Line segment.
-    Segment { a: [f64; 2], b: [f64; 2] },
+    Segment { a: [f64; 3], b: [f64; 3] },
 }
 
 /// Descriptor for creating a collider.
@@ -37,7 +37,7 @@ pub enum ColliderShape {
 pub struct ColliderDesc {
     pub shape: ColliderShape,
     #[serde(default)]
-    pub offset: [f64; 2],
+    pub offset: [f64; 3],
     #[serde(default)]
     pub material: PhysicsMaterial,
     #[serde(default)]
@@ -54,7 +54,7 @@ mod tests {
     fn collider_shapes_serde() {
         let shapes = vec![
             ColliderShape::Box {
-                half_extents: [1.0, 1.0],
+                half_extents: [1.0, 1.0, 0.0],
             },
             ColliderShape::Ball { radius: 0.5 },
             ColliderShape::Capsule {
@@ -72,7 +72,7 @@ mod tests {
     #[test]
     fn convex_hull_serde() {
         let shape = ColliderShape::ConvexHull {
-            points: vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+            points: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 1.0, 0.0]],
         };
         let json = serde_json::to_string(&shape).unwrap();
         let back: ColliderShape = serde_json::from_str(&json).unwrap();
@@ -94,7 +94,7 @@ mod tests {
     fn heightfield_serde() {
         let shape = ColliderShape::Heightfield {
             heights: vec![0.0, 1.0, 0.5, 2.0],
-            scale: [1.0, 1.0],
+            scale: [1.0, 1.0, 0.0],
         };
         let json = serde_json::to_string(&shape).unwrap();
         let back: ColliderShape = serde_json::from_str(&json).unwrap();
@@ -104,8 +104,8 @@ mod tests {
     #[test]
     fn segment_serde() {
         let shape = ColliderShape::Segment {
-            a: [0.0, 0.0],
-            b: [5.0, 5.0],
+            a: [0.0, 0.0, 0.0],
+            b: [5.0, 5.0, 0.0],
         };
         let json = serde_json::to_string(&shape).unwrap();
         let back: ColliderShape = serde_json::from_str(&json).unwrap();
@@ -116,7 +116,7 @@ mod tests {
     fn sensor_collider() {
         let desc = ColliderDesc {
             shape: ColliderShape::Ball { radius: 5.0 },
-            offset: [0.0, 0.0],
+            offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
             is_sensor: true,
             mass: None,
@@ -128,9 +128,9 @@ mod tests {
     fn collider_desc_serde() {
         let desc = ColliderDesc {
             shape: ColliderShape::Box {
-                half_extents: [2.0, 3.0],
+                half_extents: [2.0, 3.0, 0.0],
             },
-            offset: [1.0, 1.0],
+            offset: [1.0, 1.0, 0.0],
             material: PhysicsMaterial::steel(),
             is_sensor: false,
             mass: Some(10.0),

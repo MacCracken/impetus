@@ -14,7 +14,7 @@ categories = ["simulation", "game-engines"]
 [features]
 default = ["2d"]
 2d = ["dep:hisab"]
-3d = []
+3d = ["dep:hisab"]
 serialize = ["dep:bincode"]
 full = ["2d", "3d", "serialize"]
 

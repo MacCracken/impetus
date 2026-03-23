@@ -14,8 +14,8 @@ pub struct ParticleHandle(pub u64);
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Particle {
     pub handle: ParticleHandle,
-    pub position: [f64; 2],
-    pub velocity: [f64; 2],
+    pub position: [f64; 3],
+    pub velocity: [f64; 3],
     /// Remaining lifetime in seconds. Particle is removed when this reaches 0.
     pub lifetime: f64,
     /// Particle radius for collision detection. 0 = no collision.
@@ -33,7 +33,7 @@ pub struct Particle {
 
 impl Particle {
     /// Create a new particle.
-    pub fn new(position: [f64; 2], velocity: [f64; 2], lifetime: f64) -> Self {
+    pub fn new(position: [f64; 3], velocity: [f64; 3], lifetime: f64) -> Self {
         Self {
             handle: ParticleHandle(0), // Set by the world on spawn
             position,
@@ -93,11 +93,11 @@ pub struct ParticleEmitter {
     /// Handle for this emitter.
     pub handle: EmitterHandle,
     /// Emitter position in world space.
-    pub position: [f64; 2],
+    pub position: [f64; 3],
     /// Base velocity for spawned particles.
-    pub velocity: [f64; 2],
+    pub velocity: [f64; 3],
     /// Random spread added to velocity (per axis).
-    pub velocity_spread: [f64; 2],
+    pub velocity_spread: [f64; 3],
     /// Particles spawned per second.
     pub rate: f64,
     /// Lifetime of spawned particles in seconds.
@@ -118,12 +118,12 @@ pub struct ParticleEmitter {
 
 impl ParticleEmitter {
     /// Create a new emitter.
-    pub fn new(position: [f64; 2], velocity: [f64; 2], rate: f64) -> Self {
+    pub fn new(position: [f64; 3], velocity: [f64; 3], rate: f64) -> Self {
         Self {
             handle: EmitterHandle(0), // Set by the world on add
             position,
             velocity,
-            velocity_spread: [0.0, 0.0],
+            velocity_spread: [0.0, 0.0, 0.0],
             rate,
             particle_lifetime: 2.0,
             particle_radius: 0.05,
@@ -136,7 +136,7 @@ impl ParticleEmitter {
     }
 
     /// Set velocity spread (randomization per axis).
-    pub fn with_spread(mut self, spread: [f64; 2]) -> Self {
+    pub fn with_spread(mut self, spread: [f64; 3]) -> Self {
         self.velocity_spread = spread;
         self
     }
@@ -172,22 +172,22 @@ mod tests {
 
     #[test]
     fn particle_new() {
-        let p = Particle::new([1.0, 2.0], [3.0, 4.0], 5.0);
-        assert_eq!(p.position, [1.0, 2.0]);
-        assert_eq!(p.velocity, [3.0, 4.0]);
+        let p = Particle::new([1.0, 2.0, 0.0], [3.0, 4.0, 0.0], 5.0);
+        assert_eq!(p.position, [1.0, 2.0, 0.0]);
+        assert_eq!(p.velocity, [3.0, 4.0, 0.0]);
         assert_eq!(p.lifetime, 5.0);
         assert!(p.is_alive());
     }
 
     #[test]
     fn particle_dead() {
-        let p = Particle::new([0.0, 0.0], [0.0, 0.0], 0.0);
+        let p = Particle::new([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0.0);
         assert!(!p.is_alive());
     }
 
     #[test]
     fn particle_builder() {
-        let p = Particle::new([0.0, 0.0], [1.0, 0.0], 3.0)
+        let p = Particle::new([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 3.0)
             .with_radius(0.1)
             .with_drag(0.5)
             .with_restitution(0.8)
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn particle_serde() {
-        let p = Particle::new([1.0, 2.0], [3.0, 4.0], 5.0);
+        let p = Particle::new([1.0, 2.0, 0.0], [3.0, 4.0, 0.0], 5.0);
         let json = serde_json::to_string(&p).unwrap();
         let back: Particle = serde_json::from_str(&json).unwrap();
         assert_eq!(p, back);
@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn emitter_new() {
-        let e = ParticleEmitter::new([0.0, 0.0], [0.0, 10.0], 100.0);
+        let e = ParticleEmitter::new([0.0, 0.0, 0.0], [0.0, 10.0, 0.0], 100.0);
         assert_eq!(e.rate, 100.0);
         assert!(e.active);
         assert_eq!(e.particle_lifetime, 2.0);
@@ -218,13 +218,13 @@ mod tests {
 
     #[test]
     fn emitter_builder() {
-        let e = ParticleEmitter::new([0.0, 0.0], [0.0, 5.0], 50.0)
-            .with_spread([1.0, 2.0])
+        let e = ParticleEmitter::new([0.0, 0.0, 0.0], [0.0, 5.0, 0.0], 50.0)
+            .with_spread([1.0, 2.0, 0.0])
             .with_lifetime(3.0)
             .with_radius(0.2)
             .with_gravity_scale(0.0)
             .with_damping(0.5);
-        assert_eq!(e.velocity_spread, [1.0, 2.0]);
+        assert_eq!(e.velocity_spread, [1.0, 2.0, 0.0]);
         assert_eq!(e.particle_lifetime, 3.0);
         assert_eq!(e.particle_radius, 0.2);
         assert_eq!(e.particle_gravity_scale, 0.0);
@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn emitter_serde() {
-        let e = ParticleEmitter::new([1.0, 2.0], [3.0, 4.0], 10.0);
+        let e = ParticleEmitter::new([1.0, 2.0, 0.0], [3.0, 4.0, 0.0], 10.0);
         let json = serde_json::to_string(&e).unwrap();
         let back: ParticleEmitter = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);

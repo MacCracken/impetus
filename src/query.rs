@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RayHit {
     pub collider: ColliderHandle,
-    pub point: [f64; 2],
-    pub normal: [f64; 2],
+    pub point: [f64; 3],
+    pub normal: [f64; 3],
     pub distance: f64,
 }
 
@@ -28,8 +28,8 @@ mod tests {
     fn ray_hit_serde() {
         let hit = RayHit {
             collider: ColliderHandle(5),
-            point: [1.0, 2.0],
-            normal: [0.0, 1.0],
+            point: [1.0, 2.0, 0.0],
+            normal: [0.0, 1.0, 0.0],
             distance: 3.5,
         };
         let json = serde_json::to_string(&hit).unwrap();

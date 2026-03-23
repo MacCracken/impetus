@@ -23,7 +23,7 @@ pub enum CollisionEvent {
 pub struct ContactData {
     pub collider_a: ColliderHandle,
     pub collider_b: ColliderHandle,
-    pub normal: [f64; 2],
+    pub normal: [f64; 3],
     pub depth: f64,
     pub points: Vec<ContactPoint>,
 }
@@ -31,8 +31,8 @@ pub struct ContactData {
 /// A single contact point.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContactPoint {
-    pub local_a: [f64; 2],
-    pub local_b: [f64; 2],
+    pub local_a: [f64; 3],
+    pub local_b: [f64; 3],
     pub impulse: f64,
 }
 
@@ -67,11 +67,11 @@ mod tests {
         let data = ContactData {
             collider_a: ColliderHandle(0),
             collider_b: ColliderHandle(1),
-            normal: [0.0, 1.0],
+            normal: [0.0, 1.0, 0.0],
             depth: 0.01,
             points: vec![ContactPoint {
-                local_a: [0.5, 0.0],
-                local_b: [0.5, 1.0],
+                local_a: [0.5, 0.0, 0.0],
+                local_b: [0.5, 1.0, 0.0],
                 impulse: 42.0,
             }],
         };
@@ -85,7 +85,7 @@ mod tests {
         let data = ContactData {
             collider_a: ColliderHandle(0),
             collider_b: ColliderHandle(1),
-            normal: [1.0, 0.0],
+            normal: [1.0, 0.0, 0.0],
             depth: 0.0,
             points: vec![],
         };
@@ -95,8 +95,8 @@ mod tests {
     #[test]
     fn contact_point_serde() {
         let pt = ContactPoint {
-            local_a: [1.0, 2.0],
-            local_b: [3.0, 4.0],
+            local_a: [1.0, 2.0, 0.0],
+            local_b: [3.0, 4.0, 0.0],
             impulse: 10.5,
         };
         let json = serde_json::to_string(&pt).unwrap();

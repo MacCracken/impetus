@@ -35,9 +35,9 @@ pub struct WorldSnapshot {
 pub struct BodySnapshot {
     pub handle: BodyHandle,
     pub desc: BodyDesc,
-    pub position: [f64; 2],
+    pub position: [f64; 3],
     pub rotation: f64,
-    pub linear_velocity: [f64; 2],
+    pub linear_velocity: [f64; 3],
     pub angular_velocity: f64,
 }
 
@@ -95,14 +95,14 @@ mod tests {
 
         let ball = world.add_body(BodyDesc {
             body_type: BodyType::Dynamic,
-            position: [5.0, 10.0],
+            position: [5.0, 10.0, 0.0],
             ..BodyDesc::default()
         });
         world.add_collider(
             ball,
             ColliderDesc {
                 shape: ColliderShape::Ball { radius: 1.0 },
-                offset: [0.0, 0.0],
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial::rubber(),
                 is_sensor: false,
                 mass: None,
@@ -111,16 +111,16 @@ mod tests {
 
         let floor = world.add_body(BodyDesc {
             body_type: BodyType::Static,
-            position: [0.0, 0.0],
+            position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
         world.add_collider(
             floor,
             ColliderDesc {
                 shape: ColliderShape::Box {
-                    half_extents: [50.0, 0.5],
+                    half_extents: [50.0, 0.5, 0.0],
                 },
-                offset: [0.0, 0.0],
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial::wood(),
                 is_sensor: false,
                 mass: None,
@@ -148,14 +148,14 @@ mod tests {
 
         let body = world.add_body(BodyDesc {
             body_type: BodyType::Dynamic,
-            position: [0.0, 10.0],
+            position: [0.0, 10.0, 0.0],
             ..BodyDesc::default()
         });
         world.add_collider(
             body,
             ColliderDesc {
                 shape: ColliderShape::Ball { radius: 0.5 },
-                offset: [0.0, 0.0],
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
@@ -186,21 +186,21 @@ mod tests {
     #[test]
     fn roundtrip_continues_simulation() {
         let mut world = PhysicsWorld::new(WorldConfig {
-            gravity: [0.0, 0.0],
+            gravity: [0.0, 0.0, 0.0],
             ..WorldConfig::default()
         });
 
         let body = world.add_body(BodyDesc {
             body_type: BodyType::Dynamic,
-            position: [0.0, 0.0],
-            linear_velocity: [1.0, 0.0],
+            position: [0.0, 0.0, 0.0],
+            linear_velocity: [1.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
         world.add_collider(
             body,
             ColliderDesc {
                 shape: ColliderShape::Ball { radius: 0.5 },
-                offset: [0.0, 0.0],
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,

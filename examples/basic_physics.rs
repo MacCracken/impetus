@@ -21,16 +21,16 @@ fn main() {
     // Add a static floor
     let floor = world.add_body(BodyDesc {
         body_type: BodyType::Static,
-        position: [0.0, -1.0],
+        position: [0.0, -1.0, 0.0],
         ..Default::default()
     });
     world.add_collider(
         floor,
         ColliderDesc {
             shape: ColliderShape::Box {
-                half_extents: [50.0, 1.0],
+                half_extents: [50.0, 1.0, 0.0],
             },
-            offset: [0.0, 0.0],
+            offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::wood(),
             is_sensor: false,
             mass: None,
@@ -40,14 +40,14 @@ fn main() {
     // Add a bouncy ball
     let ball = world.add_body(BodyDesc {
         body_type: BodyType::Dynamic,
-        position: [0.0, 10.0],
+        position: [0.0, 10.0, 0.0],
         ..Default::default()
     });
     world.add_collider(
         ball,
         ColliderDesc {
             shape: ColliderShape::Ball { radius: 0.5 },
-            offset: [0.0, 0.0],
+            offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::bouncy(),
             is_sensor: false,
             mass: None,
@@ -57,7 +57,7 @@ fn main() {
     println!("Bodies: {}", world.body_count());
 
     // Apply a lateral force
-    world.apply_force(ball, Force::new(5.0, 0.0));
+    world.apply_force(ball, Force::new(5.0, 0.0, 0.0));
 
     // Step for 1 second (60 steps at 1/60 timestep)
     for _ in 0..60 {

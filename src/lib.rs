@@ -25,8 +25,11 @@ pub mod serialize;
 pub mod units;
 pub mod world;
 
-#[cfg(feature = "2d")]
+#[cfg(all(feature = "2d", not(feature = "3d")))]
 mod backend_2d;
+
+#[cfg(feature = "3d")]
+mod backend_3d;
 
 mod error;
 pub use error::ImpetusError;

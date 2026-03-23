@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 pub struct WorldConfig {
     /// Fixed timestep in seconds (default: 1/60).
     pub timestep: f64,
-    /// Gravity (default: [0, -9.81] for 2D).
-    pub gravity: [f64; 2],
+    /// Gravity (default: [0, -9.81, 0]).
+    pub gravity: [f64; 3],
     /// Solver velocity iterations (default: 4).
     pub velocity_iterations: u32,
     /// Solver position iterations (default: 1).
@@ -23,7 +23,7 @@ impl Default for WorldConfig {
     fn default() -> Self {
         Self {
             timestep: 1.0 / 60.0,
-            gravity: [0.0, -9.81],
+            gravity: [0.0, -9.81, 0.0],
             velocity_iterations: 4,
             position_iterations: 1,
             deterministic: true,
@@ -40,7 +40,7 @@ mod tests {
     fn default_config() {
         let config = WorldConfig::default();
         assert_eq!(config.timestep, 1.0 / 60.0);
-        assert_eq!(config.gravity, [0.0, -9.81]);
+        assert_eq!(config.gravity, [0.0, -9.81, 0.0]);
         assert!(config.deterministic);
         assert_eq!(config.velocity_iterations, 4);
         assert_eq!(config.position_iterations, 1);
@@ -59,7 +59,7 @@ mod tests {
     fn custom_config_serde() {
         let config = WorldConfig {
             timestep: 1.0 / 120.0,
-            gravity: [0.0, -10.0],
+            gravity: [0.0, -10.0, 0.0],
             velocity_iterations: 8,
             position_iterations: 3,
             deterministic: false,
@@ -73,9 +73,9 @@ mod tests {
     #[test]
     fn zero_gravity_config() {
         let config = WorldConfig {
-            gravity: [0.0, 0.0],
+            gravity: [0.0, 0.0, 0.0],
             ..Default::default()
         };
-        assert_eq!(config.gravity, [0.0, 0.0]);
+        assert_eq!(config.gravity, [0.0, 0.0, 0.0]);
     }
 }

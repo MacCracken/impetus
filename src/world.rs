@@ -23,8 +23,11 @@ pub struct PhysicsWorld {
     particles: Vec<Particle>,
     emitters: Vec<ParticleEmitter>,
 
-    #[cfg(feature = "2d")]
-    backend: crate::backend_2d::PhysicsState2d,
+    #[cfg(all(feature = "2d", not(feature = "3d")))]
+    backend_2d: crate::backend_2d::PhysicsState2d,
+
+    #[cfg(feature = "3d")]
+    backend_3d: crate::backend_3d::PhysicsState3d,
 
     #[cfg(not(any(feature = "2d", feature = "3d")))]
     body_count: usize,
@@ -44,8 +47,11 @@ impl PhysicsWorld {
             particles: Vec::new(),
             emitters: Vec::new(),
 
-            #[cfg(feature = "2d")]
-            backend: crate::backend_2d::PhysicsState2d::new(),
+            #[cfg(all(feature = "2d", not(feature = "3d")))]
+            backend_2d: crate::backend_2d::PhysicsState2d::new(),
+
+            #[cfg(feature = "3d")]
+            backend_3d: crate::backend_3d::PhysicsState3d::new(),
 
             #[cfg(not(any(feature = "2d", feature = "3d")))]
             body_count: 0,
@@ -56,9 +62,19 @@ impl PhysicsWorld {
     pub fn step(&mut self) {
         self.config.step += 1;
 
-        #[cfg(feature = "2d")]
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
         {
-            self.collision_events = self.backend.step(
+            self.collision_events = self.backend_2d.step(
+                self.config.gravity,
+                self.config.timestep,
+                self.config.velocity_iterations,
+                self.config.position_iterations,
+            );
+        }
+
+        #[cfg(feature = "3d")]
+        {
+            self.collision_events = self.backend_3d.step(
                 self.config.gravity,
                 self.config.timestep,
                 self.config.velocity_iterations,
@@ -92,10 +108,12 @@ impl PhysicsWorld {
                 // Golden ratio based spread for both axes
                 let sx = (self.next_particle_id as f64 * 0.618033).fract() * 2.0 - 1.0;
                 let sy = (self.next_particle_id as f64 * 0.381966).fract() * 2.0 - 1.0;
+                let sz = (self.next_particle_id as f64 * 0.291796).fract() * 2.0 - 1.0;
                 let vx = emitter.velocity[0] + emitter.velocity_spread[0] * sx;
                 let vy = emitter.velocity[1] + emitter.velocity_spread[1] * sy;
+                let vz = emitter.velocity[2] + emitter.velocity_spread[2] * sz;
 
-                let mut p = Particle::new(emitter.position, [vx, vy], emitter.particle_lifetime)
+                let mut p = Particle::new(emitter.position, [vx, vy, vz], emitter.particle_lifetime)
                     .with_radius(emitter.particle_radius)
                     .with_restitution(emitter.particle_restitution)
                     .with_gravity_scale(emitter.particle_gravity_scale)
@@ -116,51 +134,61 @@ impl PhysicsWorld {
             // Gravity
             p.velocity[0] += gravity[0] * p.gravity_scale * dt;
             p.velocity[1] += gravity[1] * p.gravity_scale * dt;
+            p.velocity[2] += gravity[2] * p.gravity_scale * dt;
 
             // Quadratic drag (proportional to speed²)
             if p.drag > 0.0 {
-                let speed_sq = p.velocity[0] * p.velocity[0] + p.velocity[1] * p.velocity[1];
+                let speed_sq = p.velocity[0] * p.velocity[0]
+                    + p.velocity[1] * p.velocity[1]
+                    + p.velocity[2] * p.velocity[2];
                 if speed_sq > 1e-20 {
                     let speed = speed_sq.sqrt();
                     let drag_force = p.drag * speed_sq;
                     let factor = (drag_force * dt / speed).min(speed); // clamp to not reverse
                     p.velocity[0] -= (p.velocity[0] / speed) * factor;
                     p.velocity[1] -= (p.velocity[1] / speed) * factor;
+                    p.velocity[2] -= (p.velocity[2] / speed) * factor;
                 }
             }
 
             // Linear damping
-            p.velocity[0] *= 1.0 / (1.0 + dt * p.damping);
-            p.velocity[1] *= 1.0 / (1.0 + dt * p.damping);
+            let damping_factor = 1.0 / (1.0 + dt * p.damping);
+            p.velocity[0] *= damping_factor;
+            p.velocity[1] *= damping_factor;
+            p.velocity[2] *= damping_factor;
 
             // Integrate position
             p.position[0] += p.velocity[0] * dt;
             p.position[1] += p.velocity[1] * dt;
+            p.position[2] += p.velocity[2] * dt;
 
             // Decay lifetime
             p.lifetime -= dt;
         }
 
         // Collide particles with rigid body colliders
-        #[cfg(feature = "2d")]
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
+        self.collide_particles();
+
+        #[cfg(feature = "3d")]
         self.collide_particles();
 
         // Remove dead particles
         self.particles.retain(|p| p.is_alive());
     }
 
-    #[cfg(feature = "2d")]
+    #[cfg(all(feature = "2d", not(feature = "3d")))]
     fn collide_particles(&mut self) {
         for p in &mut self.particles {
             if !p.is_alive() || p.radius <= 0.0 {
                 continue;
             }
 
-            for collider in self.backend.colliders.values() {
+            for collider in self.backend_2d.colliders.values() {
                 if collider.is_sensor {
                     continue;
                 }
-                let rb = match self.backend.bodies.get(&collider.body) {
+                let rb = match self.backend_2d.bodies.get(&collider.body) {
                     Some(b) => b,
                     None => continue,
                 };
@@ -169,8 +197,8 @@ impl PhysicsWorld {
                 let cx = rb.position[0] + cos * collider.offset[0] - sin * collider.offset[1];
                 let cy = rb.position[1] + sin * collider.offset[0] + cos * collider.offset[1];
 
-                let contact = particle_vs_collider(
-                    p.position,
+                let contact = particle_vs_collider_2d(
+                    [p.position[0], p.position[1]],
                     p.radius,
                     &collider.shape,
                     [cx, cy],
@@ -193,6 +221,50 @@ impl PhysicsWorld {
         }
     }
 
+    #[cfg(feature = "3d")]
+    fn collide_particles(&mut self) {
+        for p in &mut self.particles {
+            if !p.is_alive() || p.radius <= 0.0 {
+                continue;
+            }
+
+            for collider in self.backend_3d.colliders.values() {
+                if collider.is_sensor {
+                    continue;
+                }
+                let rb = match self.backend_3d.bodies.get(&collider.body) {
+                    Some(b) => b,
+                    None => continue,
+                };
+
+                let contact = particle_vs_collider_3d(
+                    p.position,
+                    p.radius,
+                    &collider.shape,
+                    rb.position,
+                    collider.offset,
+                );
+
+                if let Some((normal, depth)) = contact {
+                    // Separate particle from collider
+                    p.position[0] += normal[0] * depth;
+                    p.position[1] += normal[1] * depth;
+                    p.position[2] += normal[2] * depth;
+
+                    // Reflect velocity
+                    let vel_dot_n = p.velocity[0] * normal[0]
+                        + p.velocity[1] * normal[1]
+                        + p.velocity[2] * normal[2];
+                    if vel_dot_n < 0.0 {
+                        p.velocity[0] -= (1.0 + p.restitution) * vel_dot_n * normal[0];
+                        p.velocity[1] -= (1.0 + p.restitution) * vel_dot_n * normal[1];
+                        p.velocity[2] -= (1.0 + p.restitution) * vel_dot_n * normal[2];
+                    }
+                }
+            }
+        }
+    }
+
     /// Current simulation step number.
     pub fn current_step(&self) -> u64 {
         self.config.step
@@ -208,8 +280,11 @@ impl PhysicsWorld {
         let handle = BodyHandle(self.next_body_id);
         self.next_body_id += 1;
 
-        #[cfg(feature = "2d")]
-        self.backend.add_body(handle, &desc);
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
+        self.backend_2d.add_body(handle, &desc);
+
+        #[cfg(feature = "3d")]
+        self.backend_3d.add_body(handle, &desc);
 
         #[cfg(not(any(feature = "2d", feature = "3d")))]
         {
@@ -225,8 +300,11 @@ impl PhysicsWorld {
         let handle = ColliderHandle(self.next_collider_id);
         self.next_collider_id += 1;
 
-        #[cfg(feature = "2d")]
-        self.backend.add_collider(handle, body, &desc);
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
+        self.backend_2d.add_collider(handle, body, &desc);
+
+        #[cfg(feature = "3d")]
+        self.backend_3d.add_collider(handle, body, &desc);
 
         #[cfg(not(any(feature = "2d", feature = "3d")))]
         {
@@ -241,8 +319,11 @@ impl PhysicsWorld {
         let handle = JointHandle(self.next_joint_id);
         self.next_joint_id += 1;
 
-        #[cfg(feature = "2d")]
-        self.backend.add_joint(handle, &desc);
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
+        self.backend_2d.add_joint(handle, &desc);
+
+        #[cfg(feature = "3d")]
+        self.backend_3d.add_joint(handle, &desc);
 
         #[cfg(not(any(feature = "2d", feature = "3d")))]
         {
@@ -254,8 +335,11 @@ impl PhysicsWorld {
 
     /// Apply a force to a body (applied over the next step).
     pub fn apply_force(&mut self, body: BodyHandle, force: Force) {
-        #[cfg(feature = "2d")]
-        self.backend.apply_force(body, &force);
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
+        self.backend_2d.apply_force(body, &force);
+
+        #[cfg(feature = "3d")]
+        self.backend_3d.apply_force(body, &force);
 
         #[cfg(not(any(feature = "2d", feature = "3d")))]
         {
@@ -265,8 +349,11 @@ impl PhysicsWorld {
 
     /// Apply an impulse to a body (instant velocity change).
     pub fn apply_impulse(&mut self, body: BodyHandle, impulse: Impulse) {
-        #[cfg(feature = "2d")]
-        self.backend.apply_impulse(body, &impulse);
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
+        self.backend_2d.apply_impulse(body, &impulse);
+
+        #[cfg(feature = "3d")]
+        self.backend_3d.apply_impulse(body, &impulse);
 
         #[cfg(not(any(feature = "2d", feature = "3d")))]
         {
@@ -276,8 +363,11 @@ impl PhysicsWorld {
 
     /// Apply torque to a body.
     pub fn apply_torque(&mut self, body: BodyHandle, torque: Torque) {
-        #[cfg(feature = "2d")]
-        self.backend.apply_torque(body, &torque);
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
+        self.backend_2d.apply_torque(body, &torque);
+
+        #[cfg(feature = "3d")]
+        self.backend_3d.apply_torque(body, &torque);
 
         #[cfg(not(any(feature = "2d", feature = "3d")))]
         {
@@ -287,9 +377,14 @@ impl PhysicsWorld {
 
     /// Remove a body and its attached colliders.
     pub fn remove_body(&mut self, handle: BodyHandle) -> crate::Result<()> {
-        #[cfg(feature = "2d")]
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
         {
-            self.backend.remove_body(handle);
+            self.backend_2d.remove_body(handle);
+        }
+
+        #[cfg(feature = "3d")]
+        {
+            self.backend_3d.remove_body(handle);
         }
 
         #[cfg(not(any(feature = "2d", feature = "3d")))]
@@ -304,13 +399,18 @@ impl PhysicsWorld {
     /// Cast a ray and return the first hit.
     pub fn raycast(
         &self,
-        origin: [f64; 2],
-        direction: [f64; 2],
+        origin: [f64; 3],
+        direction: [f64; 3],
         max_dist: f64,
     ) -> Option<RayHit> {
-        #[cfg(feature = "2d")]
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
         {
-            self.backend.raycast(origin, direction, max_dist)
+            self.backend_2d.raycast(origin, direction, max_dist)
+        }
+
+        #[cfg(feature = "3d")]
+        {
+            self.backend_3d.raycast(origin, direction, max_dist)
         }
 
         #[cfg(not(any(feature = "2d", feature = "3d")))]
@@ -327,9 +427,14 @@ impl PhysicsWorld {
 
     /// Number of bodies in the world.
     pub fn body_count(&self) -> usize {
-        #[cfg(feature = "2d")]
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
         {
-            self.backend.body_count()
+            self.backend_2d.body_count()
+        }
+
+        #[cfg(feature = "3d")]
+        {
+            self.backend_3d.body_count()
         }
 
         #[cfg(not(any(feature = "2d", feature = "3d")))]
@@ -345,9 +450,14 @@ impl PhysicsWorld {
 
     /// Read the current state of a body from the simulation.
     pub fn get_body_state(&self, handle: BodyHandle) -> crate::Result<BodyState> {
-        #[cfg(feature = "2d")]
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
         {
-            self.backend.get_body_state(handle)
+            self.backend_2d.get_body_state(handle)
+        }
+
+        #[cfg(feature = "3d")]
+        {
+            self.backend_3d.get_body_state(handle)
         }
 
         #[cfg(not(any(feature = "2d", feature = "3d")))]
@@ -408,30 +518,84 @@ impl PhysicsWorld {
         let mut colliders = Vec::new();
         let mut joints = Vec::new();
 
-        #[cfg(feature = "2d")]
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
         {
-            for rb in self.backend.bodies.values() {
+            for rb in self.backend_2d.bodies.values() {
+                let pos3 = [rb.position[0], rb.position[1], 0.0];
+                let vel3 = [rb.linear_velocity[0], rb.linear_velocity[1], 0.0];
                 bodies.push(BodySnapshot {
                     handle: rb.handle,
                     desc: BodyDesc {
                         body_type: rb.body_type,
-                        position: rb.position,
+                        position: pos3,
                         rotation: rb.rotation,
-                        linear_velocity: rb.linear_velocity,
+                        linear_velocity: vel3,
                         angular_velocity: rb.angular_velocity,
                         linear_damping: rb.linear_damping,
                         angular_damping: rb.angular_damping,
                         fixed_rotation: rb.fixed_rotation,
                         gravity_scale: Some(rb.gravity_scale),
                     },
-                    position: rb.position,
+                    position: pos3,
                     rotation: rb.rotation,
-                    linear_velocity: rb.linear_velocity,
+                    linear_velocity: vel3,
                     angular_velocity: rb.angular_velocity,
                 });
             }
 
-            for c in self.backend.colliders.values() {
+            for c in self.backend_2d.colliders.values() {
+                colliders.push(ColliderSnapshot {
+                    handle: c.handle,
+                    body: c.body,
+                    desc: ColliderDesc {
+                        shape: c.shape.clone(),
+                        offset: [c.offset[0], c.offset[1], 0.0],
+                        material: c.material.clone(),
+                        is_sensor: c.is_sensor,
+                        mass: c.mass,
+                    },
+                });
+            }
+
+            for (handle, j) in &self.backend_2d.joints {
+                joints.push(JointSnapshot {
+                    handle: *handle,
+                    desc: crate::joint::JointDesc {
+                        body_a: j.body_a,
+                        body_b: j.body_b,
+                        joint_type: j.joint_type.clone(),
+                        local_anchor_a: j.local_anchor_a,
+                        local_anchor_b: j.local_anchor_b,
+                    },
+                });
+            }
+        }
+
+        #[cfg(feature = "3d")]
+        {
+            for rb in self.backend_3d.bodies.values() {
+                let rotation = rb.rotation[2].atan2(rb.rotation[3]) * 2.0;
+                bodies.push(BodySnapshot {
+                    handle: rb.handle,
+                    desc: BodyDesc {
+                        body_type: rb.body_type,
+                        position: rb.position,
+                        rotation,
+                        linear_velocity: rb.linear_velocity,
+                        angular_velocity: rb.angular_velocity[2],
+                        linear_damping: rb.linear_damping,
+                        angular_damping: rb.angular_damping,
+                        fixed_rotation: rb.fixed_rotation,
+                        gravity_scale: Some(rb.gravity_scale),
+                    },
+                    position: rb.position,
+                    rotation,
+                    linear_velocity: rb.linear_velocity,
+                    angular_velocity: rb.angular_velocity[2],
+                });
+            }
+
+            for c in self.backend_3d.colliders.values() {
                 colliders.push(ColliderSnapshot {
                     handle: c.handle,
                     body: c.body,
@@ -445,15 +609,15 @@ impl PhysicsWorld {
                 });
             }
 
-            for (handle, j) in &self.backend.joints {
+            for (handle, j) in &self.backend_3d.joints {
                 joints.push(JointSnapshot {
                     handle: *handle,
                     desc: crate::joint::JointDesc {
                         body_a: j.body_a,
                         body_b: j.body_b,
                         joint_type: j.joint_type.clone(),
-                        local_anchor_a: j.local_anchor_a,
-                        local_anchor_b: j.local_anchor_b,
+                        local_anchor_a: [j.local_anchor_a[0], j.local_anchor_a[1]],
+                        local_anchor_b: [j.local_anchor_b[0], j.local_anchor_b[1]],
                     },
                 });
             }
@@ -487,26 +651,48 @@ impl PhysicsWorld {
         self.particles = snapshot.particles.clone();
         self.emitters = snapshot.emitters.clone();
 
-        #[cfg(feature = "2d")]
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
         {
-            self.backend = crate::backend_2d::PhysicsState2d::new();
+            self.backend_2d = crate::backend_2d::PhysicsState2d::new();
 
             for bs in &snapshot.bodies {
-                self.backend.add_body(bs.handle, &bs.desc);
-                if let Some(rb) = self.backend.bodies.get_mut(&bs.handle) {
-                    rb.position = bs.position;
+                self.backend_2d.add_body(bs.handle, &bs.desc);
+                if let Some(rb) = self.backend_2d.bodies.get_mut(&bs.handle) {
+                    rb.position = [bs.position[0], bs.position[1]];
                     rb.rotation = bs.rotation;
-                    rb.linear_velocity = bs.linear_velocity;
+                    rb.linear_velocity = [bs.linear_velocity[0], bs.linear_velocity[1]];
                     rb.angular_velocity = bs.angular_velocity;
                 }
             }
 
             for cs in &snapshot.colliders {
-                self.backend.add_collider(cs.handle, cs.body, &cs.desc);
+                self.backend_2d.add_collider(cs.handle, cs.body, &cs.desc);
             }
 
             for js in &snapshot.joints {
-                self.backend.add_joint(js.handle, &js.desc);
+                self.backend_2d.add_joint(js.handle, &js.desc);
+            }
+        }
+
+        #[cfg(feature = "3d")]
+        {
+            self.backend_3d = crate::backend_3d::PhysicsState3d::new();
+
+            for bs in &snapshot.bodies {
+                self.backend_3d.add_body(bs.handle, &bs.desc);
+                if let Some(rb) = self.backend_3d.bodies.get_mut(&bs.handle) {
+                    rb.position = bs.position;
+                    rb.linear_velocity = bs.linear_velocity;
+                    rb.angular_velocity[2] = bs.angular_velocity;
+                }
+            }
+
+            for cs in &snapshot.colliders {
+                self.backend_3d.add_collider(cs.handle, cs.body, &cs.desc);
+            }
+
+            for js in &snapshot.joints {
+                self.backend_3d.add_joint(js.handle, &js.desc);
             }
         }
 
@@ -521,8 +707,8 @@ impl PhysicsWorld {
 // Particle-vs-collider overlap (circle vs shape)
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "2d")]
-fn particle_vs_collider(
+#[cfg(all(feature = "2d", not(feature = "3d")))]
+fn particle_vs_collider_2d(
     pos: [f64; 2],
     radius: f64,
     shape: &crate::collider::ColliderShape,
@@ -597,6 +783,85 @@ fn particle_vs_collider(
     }
 }
 
+#[cfg(feature = "3d")]
+fn particle_vs_collider_3d(
+    pos: [f64; 3],
+    radius: f64,
+    shape: &crate::collider::ColliderShape,
+    body_pos: [f64; 3],
+    collider_offset: [f64; 3],
+) -> Option<([f64; 3], f64)> {
+    use crate::collider::ColliderShape;
+
+    let shape_pos = [
+        body_pos[0] + collider_offset[0],
+        body_pos[1] + collider_offset[1],
+        body_pos[2] + collider_offset[2],
+    ];
+
+    match shape {
+        ColliderShape::Ball {
+            radius: shape_radius,
+        } => {
+            let dx = pos[0] - shape_pos[0];
+            let dy = pos[1] - shape_pos[1];
+            let dz = pos[2] - shape_pos[2];
+            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+            let overlap = (radius + shape_radius) - dist;
+            if overlap > 0.0 && dist > 1e-10 {
+                Some(([dx / dist, dy / dist, dz / dist], overlap))
+            } else {
+                None
+            }
+        }
+        ColliderShape::Box { half_extents } => {
+            let dx = pos[0] - shape_pos[0];
+            let dy = pos[1] - shape_pos[1];
+            let dz = pos[2] - shape_pos[2];
+            let he_z = if half_extents.len() > 2 {
+                half_extents[2]
+            } else {
+                0.0
+            };
+            let cx = dx.clamp(-half_extents[0], half_extents[0]);
+            let cy = dy.clamp(-half_extents[1], half_extents[1]);
+            let cz = dz.clamp(-he_z, he_z);
+            let diff_x = dx - cx;
+            let diff_y = dy - cy;
+            let diff_z = dz - cz;
+            let dist = (diff_x * diff_x + diff_y * diff_y + diff_z * diff_z).sqrt();
+            if dist < radius && dist > 1e-10 {
+                Some((
+                    [diff_x / dist, diff_y / dist, diff_z / dist],
+                    radius - dist,
+                ))
+            } else {
+                None
+            }
+        }
+        ColliderShape::Capsule {
+            half_height,
+            radius: cap_radius,
+        } => {
+            // Capsule along Y axis
+            let dy_from_center = pos[1] - shape_pos[1];
+            let closest_y = dy_from_center.clamp(-half_height, *half_height);
+            let closest = [shape_pos[0], shape_pos[1] + closest_y, shape_pos[2]];
+            let dx = pos[0] - closest[0];
+            let dy = pos[1] - closest[1];
+            let dz = pos[2] - closest[2];
+            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+            let overlap = (radius + cap_radius) - dist;
+            if overlap > 0.0 && dist > 1e-10 {
+                Some(([dx / dist, dy / dist, dz / dist], overlap))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,7 +877,7 @@ mod tests {
 
         let body = world.add_body(BodyDesc {
             body_type: BodyType::Dynamic,
-            position: [0.0, 10.0],
+            position: [0.0, 10.0, 0.0],
             ..Default::default()
         });
 
@@ -620,7 +885,7 @@ mod tests {
             body,
             ColliderDesc {
                 shape: ColliderShape::Ball { radius: 0.5 },
-                offset: [0.0, 0.0],
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
@@ -649,8 +914,8 @@ mod tests {
     fn force_application() {
         let mut world = PhysicsWorld::new(WorldConfig::default());
         let body = world.add_body(BodyDesc::default());
-        world.apply_force(body, Force::new(10.0, 0.0));
-        world.apply_impulse(body, Impulse::new(0.0, 5.0));
+        world.apply_force(body, Force::new(10.0, 0.0, 0.0));
+        world.apply_impulse(body, Impulse::new(0.0, 5.0, 0.0));
         world.apply_torque(body, Torque::new(1.0));
         world.step();
     }
@@ -694,7 +959,7 @@ mod tests {
         };
         let world = PhysicsWorld::new(config);
         assert_eq!(world.timestep(), 1.0 / 120.0);
-        assert_eq!(world.config().gravity, [0.0, -9.81]);
+        assert_eq!(world.config().gravity, [0.0, -9.81, 0.0]);
     }
 
     #[test]
@@ -718,7 +983,7 @@ mod tests {
             a,
             ColliderDesc {
                 shape: ColliderShape::Ball { radius: 1.0 },
-                offset: [0.0, 0.0],
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
@@ -728,7 +993,7 @@ mod tests {
             b,
             ColliderDesc {
                 shape: ColliderShape::Ball { radius: 1.0 },
-                offset: [0.0, 0.0],
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
@@ -747,14 +1012,14 @@ mod tests {
         let mut world = PhysicsWorld::new(WorldConfig::default());
         let body = world.add_body(BodyDesc {
             body_type: BodyType::Dynamic,
-            position: [0.0, 10.0],
+            position: [0.0, 10.0, 0.0],
             ..Default::default()
         });
         world.add_collider(
             body,
             ColliderDesc {
                 shape: ColliderShape::Ball { radius: 0.5 },
-                offset: [0.0, 0.0],
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
@@ -776,7 +1041,7 @@ mod tests {
     #[test]
     fn impulse_changes_velocity() {
         let mut world = PhysicsWorld::new(WorldConfig {
-            gravity: [0.0, 0.0],
+            gravity: [0.0, 0.0, 0.0],
             ..Default::default()
         });
         let body = world.add_body(BodyDesc::default());
@@ -784,14 +1049,14 @@ mod tests {
             body,
             ColliderDesc {
                 shape: ColliderShape::Ball { radius: 0.5 },
-                offset: [0.0, 0.0],
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
             },
         );
 
-        world.apply_impulse(body, Impulse::new(10.0, 0.0));
+        world.apply_impulse(body, Impulse::new(10.0, 0.0, 0.0));
         world.step();
 
         let state = world.get_body_state(body).unwrap();
@@ -807,16 +1072,16 @@ mod tests {
         // Floor
         let floor = world.add_body(BodyDesc {
             body_type: BodyType::Static,
-            position: [0.0, 0.0],
+            position: [0.0, 0.0, 0.0],
             ..Default::default()
         });
         world.add_collider(
             floor,
             ColliderDesc {
                 shape: ColliderShape::Box {
-                    half_extents: [50.0, 0.5],
+                    half_extents: [50.0, 0.5, 0.0],
                 },
-                offset: [0.0, 0.0],
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
@@ -826,14 +1091,14 @@ mod tests {
         // Falling ball
         let ball = world.add_body(BodyDesc {
             body_type: BodyType::Dynamic,
-            position: [0.0, 2.0],
+            position: [0.0, 2.0, 0.0],
             ..Default::default()
         });
         world.add_collider(
             ball,
             ColliderDesc {
                 shape: ColliderShape::Ball { radius: 0.5 },
-                offset: [0.0, 0.0],
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
@@ -855,27 +1120,27 @@ mod tests {
     #[test]
     fn raycast_hits_body() {
         let mut world = PhysicsWorld::new(WorldConfig {
-            gravity: [0.0, 0.0],
+            gravity: [0.0, 0.0, 0.0],
             ..Default::default()
         });
 
         let body = world.add_body(BodyDesc {
             body_type: BodyType::Static,
-            position: [5.0, 0.0],
+            position: [5.0, 0.0, 0.0],
             ..Default::default()
         });
         world.add_collider(
             body,
             ColliderDesc {
                 shape: ColliderShape::Ball { radius: 1.0 },
-                offset: [0.0, 0.0],
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
             },
         );
 
-        let hit = world.raycast([0.0, 0.0], [1.0, 0.0], 100.0);
+        let hit = world.raycast([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 100.0);
         assert!(hit.is_some(), "ray should hit the ball");
         let hit = hit.unwrap();
         assert!((hit.distance - 4.0).abs() < 0.1, "should hit at distance ~4 (5 - radius 1)");
@@ -888,10 +1153,10 @@ mod tests {
     #[test]
     fn spawn_particle() {
         let mut world = PhysicsWorld::new(WorldConfig {
-            gravity: [0.0, 0.0],
+            gravity: [0.0, 0.0, 0.0],
             ..Default::default()
         });
-        let p = Particle::new([0.0, 0.0], [1.0, 0.0], 1.0);
+        let p = Particle::new([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 1.0);
         let handle = world.spawn_particle(p);
         assert_eq!(world.particle_count(), 1);
         assert_eq!(world.particles()[0].handle, handle);
@@ -900,7 +1165,7 @@ mod tests {
     #[test]
     fn particle_falls_with_gravity() {
         let mut world = PhysicsWorld::new(WorldConfig::default());
-        world.spawn_particle(Particle::new([0.0, 10.0], [0.0, 0.0], 5.0));
+        world.spawn_particle(Particle::new([0.0, 10.0, 0.0], [0.0, 0.0, 0.0], 5.0));
 
         for _ in 0..60 {
             world.step();
@@ -913,11 +1178,11 @@ mod tests {
     #[test]
     fn particle_expires() {
         let mut world = PhysicsWorld::new(WorldConfig {
-            gravity: [0.0, 0.0],
+            gravity: [0.0, 0.0, 0.0],
             ..Default::default()
         });
         // Lifetime of 0.5 seconds = 30 frames at 60fps
-        world.spawn_particle(Particle::new([0.0, 0.0], [0.0, 0.0], 0.5));
+        world.spawn_particle(Particle::new([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0.5));
         assert_eq!(world.particle_count(), 1);
 
         for _ in 0..60 {
@@ -930,11 +1195,11 @@ mod tests {
     #[test]
     fn emitter_spawns_particles() {
         let mut world = PhysicsWorld::new(WorldConfig {
-            gravity: [0.0, 0.0],
+            gravity: [0.0, 0.0, 0.0],
             ..Default::default()
         });
         // 60 particles per second
-        world.add_emitter(ParticleEmitter::new([0.0, 0.0], [0.0, 5.0], 60.0));
+        world.add_emitter(ParticleEmitter::new([0.0, 0.0, 0.0], [0.0, 5.0, 0.0], 60.0));
 
         // Step 1 second
         for _ in 0..60 {
@@ -953,16 +1218,16 @@ mod tests {
         // Static floor
         let floor = world.add_body(BodyDesc {
             body_type: BodyType::Static,
-            position: [0.0, 0.0],
+            position: [0.0, 0.0, 0.0],
             ..Default::default()
         });
         world.add_collider(
             floor,
             ColliderDesc {
                 shape: ColliderShape::Box {
-                    half_extents: [50.0, 0.5],
+                    half_extents: [50.0, 0.5, 0.0],
                 },
-                offset: [0.0, 0.0],
+                offset: [0.0, 0.0, 0.0],
                 material: PhysicsMaterial::default(),
                 is_sensor: false,
                 mass: None,
@@ -971,7 +1236,7 @@ mod tests {
 
         // Particle falling toward floor
         world.spawn_particle(
-            Particle::new([0.0, 2.0], [0.0, -5.0], 5.0)
+            Particle::new([0.0, 2.0, 0.0], [0.0, -5.0, 0.0], 5.0)
                 .with_radius(0.1)
                 .with_restitution(0.8),
         );
@@ -991,11 +1256,11 @@ mod tests {
     #[test]
     fn clear_particles() {
         let mut world = PhysicsWorld::new(WorldConfig {
-            gravity: [0.0, 0.0],
+            gravity: [0.0, 0.0, 0.0],
             ..Default::default()
         });
-        world.spawn_particle(Particle::new([0.0, 0.0], [0.0, 0.0], 10.0));
-        world.spawn_particle(Particle::new([1.0, 0.0], [0.0, 0.0], 10.0));
+        world.spawn_particle(Particle::new([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 10.0));
+        world.spawn_particle(Particle::new([1.0, 0.0, 0.0], [0.0, 0.0, 0.0], 10.0));
         assert_eq!(world.particle_count(), 2);
 
         world.clear_particles();

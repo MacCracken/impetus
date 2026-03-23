@@ -21,10 +21,10 @@ pub enum BodyType {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BodyDesc {
     pub body_type: BodyType,
-    pub position: [f64; 2],
+    pub position: [f64; 3],
     pub rotation: f64,
     #[serde(default)]
-    pub linear_velocity: [f64; 2],
+    pub linear_velocity: [f64; 3],
     #[serde(default)]
     pub angular_velocity: f64,
     #[serde(default)]
@@ -41,9 +41,9 @@ impl Default for BodyDesc {
     fn default() -> Self {
         Self {
             body_type: BodyType::Dynamic,
-            position: [0.0, 0.0],
+            position: [0.0, 0.0, 0.0],
             rotation: 0.0,
-            linear_velocity: [0.0, 0.0],
+            linear_velocity: [0.0, 0.0, 0.0],
             angular_velocity: 0.0,
             linear_damping: 0.0,
             angular_damping: 0.0,
@@ -58,9 +58,9 @@ impl Default for BodyDesc {
 pub struct BodyState {
     pub handle: BodyHandle,
     pub body_type: BodyType,
-    pub position: [f64; 2],
+    pub position: [f64; 3],
     pub rotation: f64,
-    pub linear_velocity: [f64; 2],
+    pub linear_velocity: [f64; 3],
     pub angular_velocity: f64,
     pub is_sleeping: bool,
 }
@@ -73,7 +73,7 @@ mod tests {
     fn default_body_desc() {
         let desc = BodyDesc::default();
         assert_eq!(desc.body_type, BodyType::Dynamic);
-        assert_eq!(desc.position, [0.0, 0.0]);
+        assert_eq!(desc.position, [0.0, 0.0, 0.0]);
         assert_eq!(desc.rotation, 0.0);
         assert_eq!(desc.linear_damping, 0.0);
         assert_eq!(desc.angular_damping, 0.0);
@@ -85,7 +85,7 @@ mod tests {
     fn body_desc_serde() {
         let desc = BodyDesc {
             body_type: BodyType::Static,
-            position: [5.0, 3.0],
+            position: [5.0, 3.0, 0.0],
             rotation: 1.57,
             ..Default::default()
         };
@@ -98,8 +98,8 @@ mod tests {
     fn body_desc_kinematic_serde() {
         let desc = BodyDesc {
             body_type: BodyType::Kinematic,
-            position: [1.0, 2.0],
-            linear_velocity: [3.0, 4.0],
+            position: [1.0, 2.0, 0.0],
+            linear_velocity: [3.0, 4.0, 0.0],
             angular_velocity: 0.5,
             fixed_rotation: true,
             gravity_scale: Some(0.5),
@@ -121,9 +121,9 @@ mod tests {
         let state = BodyState {
             handle: BodyHandle(42),
             body_type: BodyType::Dynamic,
-            position: [1.0, 2.0],
+            position: [1.0, 2.0, 0.0],
             rotation: 0.5,
-            linear_velocity: [3.0, 4.0],
+            linear_velocity: [3.0, 4.0, 0.0],
             angular_velocity: 1.0,
             is_sleeping: false,
         };
@@ -137,9 +137,9 @@ mod tests {
         let state = BodyState {
             handle: BodyHandle(0),
             body_type: BodyType::Static,
-            position: [0.0, 0.0],
+            position: [0.0, 0.0, 0.0],
             rotation: 0.0,
-            linear_velocity: [0.0, 0.0],
+            linear_velocity: [0.0, 0.0, 0.0],
             angular_velocity: 0.0,
             is_sleeping: true,
         };
