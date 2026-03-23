@@ -11,6 +11,7 @@ use crate::collider::{ColliderDesc, ColliderHandle, ColliderShape};
 use crate::event::CollisionEvent;
 use crate::force::{Force, Impulse, Torque};
 use crate::joint::{JointDesc, JointHandle, JointType};
+use crate::material::PhysicsMaterial;
 use crate::query::RayHit;
 use crate::ImpetusError;
 
@@ -41,10 +42,6 @@ pub(crate) struct RigidBody2d {
 
 impl RigidBody2d {
     fn from_desc(handle: BodyHandle, desc: &BodyDesc) -> Self {
-        let (mass, inv_mass, inertia, inv_inertia) = match desc.body_type {
-            BodyType::Dynamic => (0.0, 0.0, 0.0, 0.0), // Set when colliders attach
-            BodyType::Static | BodyType::Kinematic => (0.0, 0.0, 0.0, 0.0),
-        };
         Self {
             handle,
             body_type: desc.body_type,
@@ -58,10 +55,10 @@ impl RigidBody2d {
             gravity_scale: desc.gravity_scale.unwrap_or(1.0),
             force_accumulator: [0.0, 0.0],
             torque_accumulator: 0.0,
-            mass,
-            inv_mass,
-            inertia,
-            inv_inertia,
+            mass: 0.0,
+            inv_mass: 0.0,
+            inertia: 0.0,
+            inv_inertia: 0.0,
         }
     }
 
@@ -98,7 +95,12 @@ impl RigidBody2d {
     }
 
     fn integrate_positions(&mut self, dt: f64) {
-        if !self.is_dynamic() || self.inv_mass == 0.0 {
+        // Static bodies never move
+        if self.is_static() {
+            return;
+        }
+        // Dynamic bodies need mass; kinematic bodies move from user-set velocity
+        if self.is_dynamic() && self.inv_mass == 0.0 {
             return;
         }
 
@@ -276,8 +278,6 @@ impl Collider2d {
     }
 }
 
-use crate::material::PhysicsMaterial;
-
 // ---------------------------------------------------------------------------
 // Internal joint representation
 // ---------------------------------------------------------------------------
@@ -429,9 +429,12 @@ impl PhysicsState2d {
     pub fn remove_body(&mut self, handle: BodyHandle) {
         self.bodies.remove(&handle);
         if let Some(collider_handles) = self.body_colliders.remove(&handle) {
-            for ch in collider_handles {
-                self.colliders.remove(&ch);
+            for ch in &collider_handles {
+                self.colliders.remove(ch);
             }
+            // Clean stale collision pairs referencing removed colliders
+            self.prev_collision_pairs
+                .retain(|(a, b)| !collider_handles.contains(a) && !collider_handles.contains(b));
         }
         self.joints
             .retain(|_, j| j.body_a != handle && j.body_b != handle);
@@ -466,7 +469,7 @@ impl PhysicsState2d {
         gravity: [f64; 2],
         dt: f64,
         velocity_iterations: u32,
-        _position_iterations: u32,
+        position_iterations: u32,
     ) -> Vec<CollisionEvent> {
         // 1. Integrate velocities
         for rb in self.bodies.values_mut() {
@@ -479,23 +482,26 @@ impl PhysicsState2d {
         // 3. Narrowphase
         let contacts = self.narrowphase(&broad_pairs);
 
-        // 4. Solve contact constraints
+        // 4. Solve velocity constraints
         self.solve_contacts(&contacts, velocity_iterations);
 
         // 5. Solve joint constraints
         self.solve_joints(dt, velocity_iterations);
 
-        // 6. Integrate positions
+        // 6. Positional correction
+        self.solve_positions(&contacts, position_iterations);
+
+        // 7. Integrate positions
         for rb in self.bodies.values_mut() {
             rb.integrate_positions(dt);
         }
 
-        // 7. Clear forces
+        // 8. Clear forces
         for rb in self.bodies.values_mut() {
             rb.clear_forces();
         }
 
-        // 8. Generate collision events
+        // 9. Generate collision events
         self.generate_events(&contacts)
     }
 
@@ -597,8 +603,41 @@ impl PhysicsState2d {
     // -----------------------------------------------------------------------
 
     fn solve_contacts(&mut self, contacts: &[Contact], iterations: u32) {
+        // Pre-extract material properties to avoid repeated HashMap lookups
+        struct ContactMaterial {
+            restitution: f64,
+            friction: f64,
+            is_sensor: bool,
+        }
+        let materials: Vec<ContactMaterial> = contacts
+            .iter()
+            .map(|c| {
+                let (rest, fric, sensor) = match (
+                    self.colliders.get(&c.collider_a),
+                    self.colliders.get(&c.collider_b),
+                ) {
+                    (Some(a), Some(b)) => (
+                        a.material.restitution.min(b.material.restitution),
+                        (a.material.friction * b.material.friction).sqrt(),
+                        a.is_sensor || b.is_sensor,
+                    ),
+                    _ => (0.0, 0.0, false),
+                };
+                ContactMaterial {
+                    restitution: rest,
+                    friction: fric,
+                    is_sensor: sensor,
+                }
+            })
+            .collect();
+
         for _ in 0..iterations {
-            for contact in contacts {
+            for (ci, contact) in contacts.iter().enumerate() {
+                // Sensors generate events but no physical response
+                if materials[ci].is_sensor {
+                    continue;
+                }
+
                 let (inv_mass_a, inv_inertia_a, vel_a, angvel_a, pos_a) = {
                     let ba = match self.bodies.get(&contact.body_a) {
                         Some(b) => b,
@@ -620,8 +659,6 @@ impl PhysicsState2d {
 
                 let n = contact.normal;
                 let cp = contact.point;
-
-                // Radii from body centers to contact point
                 let ra = [cp[0] - pos_a[0], cp[1] - pos_a[1]];
                 let rb = [cp[0] - pos_b[0], cp[1] - pos_b[1]];
 
@@ -641,24 +678,15 @@ impl PhysicsState2d {
                     continue;
                 }
 
-                // Cross products for angular effective mass
+                // Angular effective mass
                 let ra_cross_n = ra[0] * n[1] - ra[1] * n[0];
                 let rb_cross_n = rb[0] * n[1] - rb[1] * n[0];
                 let inv_mass_sum = inv_mass_a + inv_mass_b
                     + ra_cross_n * ra_cross_n * inv_inertia_a
                     + rb_cross_n * rb_cross_n * inv_inertia_b;
 
-                // Restitution
-                let restitution = match (
-                    self.colliders.get(&contact.collider_a),
-                    self.colliders.get(&contact.collider_b),
-                ) {
-                    (Some(a), Some(b)) => a.material.restitution.min(b.material.restitution),
-                    _ => 0.0,
-                };
-
                 // Normal impulse
-                let j = -(1.0 + restitution) * vel_along_normal / inv_mass_sum;
+                let j = -(1.0 + materials[ci].restitution) * vel_along_normal / inv_mass_sum;
                 let impulse_n = [j * n[0], j * n[1]];
 
                 if let Some(ba) = self.bodies.get_mut(&contact.body_a)
@@ -676,15 +704,8 @@ impl PhysicsState2d {
                     bb.angular_velocity += rb_cross_n * j * bb.inv_inertia;
                 }
 
-                // Friction impulse (tangent direction)
-                let friction = match (
-                    self.colliders.get(&contact.collider_a),
-                    self.colliders.get(&contact.collider_b),
-                ) {
-                    (Some(a), Some(b)) => (a.material.friction * b.material.friction).sqrt(),
-                    _ => 0.0,
-                };
-
+                // Friction impulse
+                let friction = materials[ci].friction;
                 if friction > 0.0 {
                     let tangent = [-n[1], n[0]];
                     let vel_along_tangent = rel_vel[0] * tangent[0] + rel_vel[1] * tangent[1];
@@ -695,9 +716,8 @@ impl PhysicsState2d {
                         + ra_cross_t * ra_cross_t * inv_inertia_a
                         + rb_cross_t * rb_cross_t * inv_inertia_b;
 
-                    let jt = -vel_along_tangent / inv_mass_sum_t;
-                    // Coulomb friction clamp
-                    let jt = jt.clamp(-j.abs() * friction, j.abs() * friction);
+                    let jt = (-vel_along_tangent / inv_mass_sum_t)
+                        .clamp(-j.abs() * friction, j.abs() * friction);
                     let impulse_t = [jt * tangent[0], jt * tangent[1]];
 
                     if let Some(ba) = self.bodies.get_mut(&contact.body_a)
@@ -715,12 +735,42 @@ impl PhysicsState2d {
                         bb.angular_velocity += rb_cross_t * jt * bb.inv_inertia;
                     }
                 }
+            }
+        }
+    }
 
-                // Positional correction (Baumgarte stabilization)
-                let slop = 0.01;
-                let percent = 0.2;
-                let correction_mag =
-                    (contact.depth - slop).max(0.0) / (inv_mass_a + inv_mass_b) * percent;
+    // -----------------------------------------------------------------------
+    // Positional correction (Baumgarte stabilization)
+    // -----------------------------------------------------------------------
+
+    fn solve_positions(&mut self, contacts: &[Contact], iterations: u32) {
+        let slop = 0.01;
+        let percent = 0.2;
+
+        for _ in 0..iterations {
+            for contact in contacts {
+                // Skip sensors
+                let is_sensor = match (
+                    self.colliders.get(&contact.collider_a),
+                    self.colliders.get(&contact.collider_b),
+                ) {
+                    (Some(a), Some(b)) => a.is_sensor || b.is_sensor,
+                    _ => false,
+                };
+                if is_sensor {
+                    continue;
+                }
+
+                let inv_mass_a = self.bodies.get(&contact.body_a).map(|b| b.inv_mass).unwrap_or(0.0);
+                let inv_mass_b = self.bodies.get(&contact.body_b).map(|b| b.inv_mass).unwrap_or(0.0);
+                let inv_mass_sum = inv_mass_a + inv_mass_b;
+
+                if inv_mass_sum == 0.0 {
+                    continue;
+                }
+
+                let n = contact.normal;
+                let correction_mag = (contact.depth - slop).max(0.0) / inv_mass_sum * percent;
                 let correction = [correction_mag * n[0], correction_mag * n[1]];
 
                 if let Some(ba) = self.bodies.get_mut(&contact.body_a)
@@ -1543,5 +1593,178 @@ mod tests {
 
         assert!(mass_after_second > mass_after_first);
         assert!((mass_after_second - 2.0 * mass_after_first).abs() < EPS);
+    }
+
+    // -- World AABB tests --
+
+    #[test]
+    fn world_aabb_ball_no_rotation() {
+        let c = Collider2d::from_desc(
+            ColliderHandle(0),
+            BodyHandle(0),
+            &ColliderDesc {
+                shape: ColliderShape::Ball { radius: 1.0 },
+                offset: [0.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+            },
+        );
+        let aabb = c.world_aabb([5.0, 3.0], 0.0);
+        assert!((aabb.min[0] - 4.0).abs() < EPS);
+        assert!((aabb.max[0] - 6.0).abs() < EPS);
+        assert!((aabb.min[1] - 2.0).abs() < EPS);
+        assert!((aabb.max[1] - 4.0).abs() < EPS);
+    }
+
+    #[test]
+    fn world_aabb_box_with_rotation() {
+        let c = Collider2d::from_desc(
+            ColliderHandle(0),
+            BodyHandle(0),
+            &ColliderDesc {
+                shape: ColliderShape::Box { half_extents: [2.0, 1.0] },
+                offset: [0.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+            },
+        );
+        // 90 degree rotation swaps extents
+        let aabb = c.world_aabb([0.0, 0.0], std::f64::consts::FRAC_PI_2);
+        // After 90deg rotation, a 2x1 box becomes ~1x2 in AABB
+        assert!((aabb.max[0] - aabb.min[0] - 2.0).abs() < 0.01);
+        assert!((aabb.max[1] - aabb.min[1] - 4.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn world_aabb_with_offset() {
+        let c = Collider2d::from_desc(
+            ColliderHandle(0),
+            BodyHandle(0),
+            &ColliderDesc {
+                shape: ColliderShape::Ball { radius: 0.5 },
+                offset: [3.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+            },
+        );
+        let aabb = c.world_aabb([0.0, 0.0], 0.0);
+        assert!((aabb.min[0] - 2.5).abs() < EPS);
+        assert!((aabb.max[0] - 3.5).abs() < EPS);
+    }
+
+    // -- Sensor tests --
+
+    #[test]
+    fn sensor_generates_events_no_physics() {
+        let mut state = PhysicsState2d::new();
+
+        // Static floor
+        let floor = BodyHandle(0);
+        state.add_body(floor, &BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(0), floor, &ColliderDesc {
+            shape: ColliderShape::Box { half_extents: [10.0, 0.5] },
+            offset: [0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: true, // Sensor!
+            mass: None,
+        });
+
+        // Dynamic ball overlapping the sensor
+        let ball = BodyHandle(1);
+        state.add_body(ball, &BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(1), ball, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+        });
+
+        let vel_before = state.bodies[&ball].linear_velocity;
+        let events = state.step([0.0, 0.0], 1.0 / 60.0, 4, 1);
+
+        // Should generate events
+        assert!(!events.is_empty());
+        // But sensor should not affect velocity (no physical response)
+        let vel_after = state.bodies[&ball].linear_velocity;
+        assert!((vel_after[0] - vel_before[0]).abs() < EPS);
+        assert!((vel_after[1] - vel_before[1]).abs() < EPS);
+    }
+
+    // -- Kinematic body tests --
+
+    #[test]
+    fn kinematic_body_moves_from_velocity() {
+        let mut state = PhysicsState2d::new();
+        let bh = BodyHandle(0);
+        state.add_body(bh, &BodyDesc {
+            body_type: BodyType::Kinematic,
+            position: [0.0, 0.0],
+            linear_velocity: [10.0, 0.0],
+            ..BodyDesc::default()
+        });
+
+        let dt = 1.0 / 60.0;
+        state.step([0.0, -9.81], dt, 4, 1);
+
+        let rb = &state.bodies[&bh];
+        // Should have moved from velocity
+        assert!(rb.position[0] > 0.0);
+        // Should NOT have been affected by gravity
+        assert!((rb.linear_velocity[1]).abs() < EPS);
+    }
+
+    // -- Stale collision pair cleanup --
+
+    #[test]
+    fn remove_body_cleans_collision_pairs() {
+        let mut state = PhysicsState2d::new();
+
+        let a = BodyHandle(0);
+        state.add_body(a, &BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(0), a, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+        });
+
+        let b = BodyHandle(1);
+        state.add_body(b, &BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.5, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(1), b, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+        });
+
+        // Step to generate collision pairs
+        state.step([0.0, 0.0], 1.0 / 60.0, 4, 1);
+        assert!(!state.prev_collision_pairs.is_empty());
+
+        // Remove body b — should clean pairs
+        state.remove_body(b);
+        assert!(state.prev_collision_pairs.is_empty());
     }
 }
