@@ -1,118 +1,93 @@
 # Changelog
 
-## 0.22.3
+All notable changes to this project will be documented in this file.
 
-### Phase 1 — Scaffold
+The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-- Core types: `BodyDesc`, `BodyHandle`, `BodyType`, `BodyState`, `ColliderDesc`, `ColliderHandle`, `ColliderShape`
-- Physics world with deterministic stepping, body/collider/joint management
-- Material presets (ice, rubber, wood, steel, bouncy)
-- Force, impulse, and torque types with constructors and magnitude helpers
-- Collision events and contact data
-- Spatial query types (raycast, point query, overlap sphere/AABB)
-- Unit-aware quantities with PhysicsUnit enum (14 units, display formatting)
-- Error types with PartialEq for testability
-- Feature flags: `2d` (default), `3d`, `serialize`, `full`
-- Send + Sync compile-time assertions on all public types
-- `#[non_exhaustive]` on all public enums, `#[must_use]` on pure functions
+## [0.23.3] — 2026-03-23
 
-### Phase 2 — Native 2D Backend
+Initial public release.
 
-- Spatial hash broadphase with collision layer/mask filtering
-- Narrowphase: circle, AABB, OBB (rotation-aware SAT), capsule, ConvexHull, segment contacts
+### Added
+
+#### Physics Engine
+- 2D and 3D rigid body simulation backends (feature-gated: `2d`, `3d`)
 - Sequential impulse constraint solver with Coulomb friction and angular response
-- Configurable Baumgarte positional correction (position_slop, position_correction)
-- Sleep/deactivation system with velocity threshold and contact waking
-- Raycasting with hit point and normal (circle, AABB, capsule shapes)
-- Collision events: Started/Stopped/Ongoing with contact pair tracking
-- Kinematic body support, sensor colliders
-- Physics particles: gravity, drag, damping, lifetime, collider AABB pre-filtering
-- Particle emitters with golden-ratio spread
-- Mass/inertia accumulation across multiple colliders
-- CCD via max_velocity clamp
+- Warm starting with accumulated impulse clamping
+- Persistent multi-point contact manifolds (up to 2 per pair in 2D)
+- Simulation islands via union-find (atomic sleep/wake per island)
+- Static vs dynamic friction with configurable `static_friction` on materials
+- Sub-stepping (`sub_steps` on `WorldConfig`)
+- Restitution velocity threshold (prevents micro-bouncing)
+- Configurable Baumgarte positional correction (`position_slop`, `position_correction`)
+- CCD via `max_velocity` clamp on `WorldConfig`
 
-### Phase 3 — 3D Backend + Serialization
+#### Collision Detection
+- Spatial hash broadphase with collision layer/mask filtering
+- Narrowphase: circle, AABB, OBB (rotation-aware SAT), capsule, ConvexHull, segment
+- 3D narrowphase: sphere, OBB, capsule-sphere, capsule-box, capsule-capsule, segment-sphere, segment-box, convex hull-sphere
+- Raycasting with hit point/normal (circle, AABB, capsule)
+- `raycast_filtered()` with collision layer mask
+- Overlap queries: `overlap_sphere()`, `overlap_aabb()`
+- Collision events: `Started`, `Stopped`, `Ongoing`
+- Sensor colliders (events only, no physical response)
 
-- Native 3D backend with DVec3/DQuat (via hisab 0.22.4)
-- 3D spatial hash broadphase with collision layer filtering
-- 3D narrowphase: sphere-sphere, sphere-OBB, OBB-OBB, capsule-sphere, capsule-box, capsule-capsule, segment-sphere, segment-box, convex hull-sphere
-- 3D contact solver with friction, angular response, 3-axis inertia tensor
-- 3D joint solver: Fixed, Distance, Spring with damping
-- Sleep/deactivation system (mirrors 2D)
-- Proper capsule inertia (hemisphere + parallel axis theorem)
-- Quaternion rotation integration
-- Bincode serialization: WorldSnapshot with snapshot/restore
-- All public types use `[f64; 3]` for unified 2D/3D API
-
-### Phase 4 — Spring Animation
-
-- Standalone `Spring` module: damped harmonic oscillator (no world needed)
-- 1D, 2D, 3D spring types
-- Presets: critically_damped, over_damped, under_damped
-- Settle detection, snap, fling (add_velocity), retarget
-
-### Phase 5 — Kiran ECS Bridge
-
-- Physics bridge in kiran: RigidBody, Collider, PhysicsPosition, Velocity components
-- PhysicsEngine resource with entity-body handle mapping
-- `physics_step()` system function with position sync and collision event publishing
-
-### Phase 6 — Production Hardening
-
-- CI: 8-job matrix (check, security, deny, test×3OS, MSRV, coverage, doc, semver)
-- Supply-chain: cargo-vet config, cargo-deny strict mode
-- Documentation: architecture overview, development roadmap, testing guide
-- SECURITY.md, CONTRIBUTING.md
-- Fuzz testing targets (contact generation, serialization)
-- Named constants replacing magic numbers throughout
-
-### Phase 7 — Engineering Backlog
-
-- Arena storage replacing HashMap for O(1) body/collider/joint access
-- BTreeMap/BTreeSet for deterministic iteration order
+#### Bodies & Colliders
+- Body types: Static, Dynamic, Kinematic
 - `set_body_state()`, `set_body_type()` for runtime mutation
 - `remove_collider()`, `remove_joint()` by handle
-- `raycast_filtered()` with collision layer mask
-- `CollisionEvent::Ongoing` for persistent contacts
-- Configurable Baumgarte constants, NaN guards, u64 wrapping
-- Shared spatial hash module (deduplicated 2D/3D)
+- Mass/inertia accumulation across multiple colliders per body
+- Sleep/deactivation with velocity threshold and island-based atomic wake
+- Generational arena storage for O(1) access
 
-### Phase 8 — Joints & Simulation Quality
-
+#### Joints
 - 8 joint types: Fixed, Revolute, Prismatic, Spring, Distance, Wheel, Rope, Mouse
-- Joint motors (revolute/prismatic), damping, breaking
-- Rolling friction, static vs dynamic friction
-- Friction/restitution combine rules (Min, Average, Multiply, Max)
-- Restitution velocity threshold (no micro-bouncing)
+- Joint motors (revolute/prismatic) with `target_velocity` and `max_force`
+- Joint damping and breaking (`break_force` threshold)
+- Joint limits on Revolute and Prismatic
 
-### Phase 9 — Particles & Force Fields
+#### Materials
+- Presets: `ice()`, `rubber()`, `wood()`, `steel()`, `bouncy()`
+- Rolling friction
+- Static friction (`static_friction` field)
+- Friction/restitution combine rules: `Min`, `Average`, `Multiply`, `Max`
 
+#### Particles
 - Physics particles with gravity, drag, damping, lifetime, collider interaction
-- Particle emitters with rate-based spawning
-- Radial force fields (attraction/repulsion with falloff)
+- Particle emitters with rate-based spawning and golden-ratio spread
+- Radial force fields (attraction/repulsion with configurable falloff)
 - Directional force fields (wind zones with AABB regions)
 - Sub-emitters (spawn children on particle death)
 
-### Phase 10 — Essential Solver Quality
+#### Spring Animation
+- Standalone `Spring`, `Spring2d`, `Spring3d` types (no world needed)
+- Presets: `critically_damped()`, `over_damped()`, `under_damped()`
+- Settle detection, snap, fling, retarget
 
-- Warm starting with accumulated impulse clamping
-- Persistent contact manifolds with frame-to-frame matching
-- Multi-point contact manifolds (up to 2 per pair, incremental building with revalidation)
-- Simulation islands (union-find, atomic sleep/wake per island)
-- Static vs dynamic friction on PhysicsMaterial
-- Sub-stepping (configurable sub_steps on WorldConfig)
+#### Serialization
+- `WorldSnapshot` with `snapshot()`/`restore()` on `PhysicsWorld`
+- `serialize_world()`/`deserialize_world()` via bitcode
+- Step-exact determinism verified (serialize at step N, restore, continue)
 
-### Refactoring
+#### Units
+- `Quantity` type with 14 `PhysicsUnit` variants
+- Display formatting (N, m, kg, rad, Pa, etc.)
 
-- Backend modules split: `backend_2d/` and `backend_3d/` with 8 sub-modules each
-- Step-exact determinism verified (serialize/restore roundtrip test)
-- Cargo doc clean with `-D warnings`
+#### API Quality
+- `#[non_exhaustive]` on all public enums
+- `#[must_use]` on pure functions and accessors
+- `Send + Sync` compile-time assertions on all public types
+- BTreeMap/BTreeSet for deterministic iteration order
+- Zero `.unwrap()` in library code
 
-### Infrastructure
-
-- Native physics on hisab math — zero external physics deps
-- hisab 0.22.4 from crates.io (DVec3, DQuat re-exports)
-- Generational arena for O(1) body/collider/joint storage
-- Three-point benchmark tracking (baseline/previous/latest)
-- 35 benchmarks across 10 groups
-- 227 tests (2D), 190 tests (3D), all feature paths clean
+#### Infrastructure
+- Native physics on hisab math — zero external physics engine deps
+- hisab 0.22.4 (DVec3, DQuat via glam f64 re-exports)
+- CI: check, security audit, cargo-deny, test (Linux/macOS/Windows), MSRV 1.89, coverage, doc, semver
+- 35 benchmarks across 10 groups with three-point history tracking
+- 227 tests (2D path), 190 tests (3D path)
+- Fuzz testing targets (contact generation, serialization)
+- Supply-chain: cargo-vet config, cargo-deny strict mode
+- Documentation: architecture overview, roadmap, testing guide
+- SECURITY.md, CONTRIBUTING.md
+- Backend modules split into 8 sub-modules each for maintainability
