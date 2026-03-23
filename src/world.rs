@@ -49,8 +49,12 @@ impl PhysicsWorld {
 
         #[cfg(feature = "2d")]
         {
-            self.collision_events =
-                self.backend.step(self.config.gravity, self.config.timestep);
+            self.collision_events = self.backend.step(
+                self.config.gravity,
+                self.config.timestep,
+                self.config.velocity_iterations,
+                self.config.position_iterations,
+            );
         }
 
         #[cfg(not(any(feature = "2d", feature = "3d")))]
