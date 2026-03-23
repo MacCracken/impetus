@@ -428,7 +428,8 @@ impl PhysicsState2d {
         // Insert with a placeholder handle; we'll patch it once the arena assigns the slot.
         let ah = self.bodies.insert(RigidBody2d::from_desc(BodyHandle(0), desc));
         let handle = body_from(ah);
-        self.bodies.get_mut(ah).unwrap().handle = handle;
+        // SAFETY: we just inserted at `ah`, so this slot is guaranteed occupied.
+        self.bodies.get_mut(ah).expect("just-inserted body").handle = handle;
         self.body_colliders.insert(handle, Vec::new());
         handle
     }
@@ -459,7 +460,8 @@ impl PhysicsState2d {
 
         let ah = self.colliders.insert(collider);
         let handle = coll_from(ah);
-        self.colliders.get_mut(ah).unwrap().handle = handle;
+        // SAFETY: we just inserted at `ah`, so this slot is guaranteed occupied.
+        self.colliders.get_mut(ah).expect("just-inserted collider").handle = handle;
         self.body_colliders.entry(body).or_default().push(handle);
         handle
     }

@@ -30,6 +30,8 @@ pub struct PhysicsWorld {
 
     #[cfg(not(any(feature = "2d", feature = "3d")))]
     body_count: usize,
+    #[cfg(not(any(feature = "2d", feature = "3d")))]
+    next_stub_id: u64,
 }
 
 impl PhysicsWorld {
@@ -51,6 +53,8 @@ impl PhysicsWorld {
 
             #[cfg(not(any(feature = "2d", feature = "3d")))]
             body_count: 0,
+            #[cfg(not(any(feature = "2d", feature = "3d")))]
+            next_stub_id: 0,
         }
     }
 
@@ -329,7 +333,9 @@ impl PhysicsWorld {
         {
             let _ = desc;
             self.body_count += 1;
-            BodyHandle(0)
+            let id = self.next_stub_id;
+            self.next_stub_id = self.next_stub_id.wrapping_add(1);
+            BodyHandle(id)
         }
     }
 
@@ -348,7 +354,9 @@ impl PhysicsWorld {
         #[cfg(not(any(feature = "2d", feature = "3d")))]
         {
             let _ = (body, desc);
-            ColliderHandle(0)
+            let id = self.next_stub_id;
+            self.next_stub_id = self.next_stub_id.wrapping_add(1);
+            ColliderHandle(id)
         }
     }
 
@@ -367,7 +375,9 @@ impl PhysicsWorld {
         #[cfg(not(any(feature = "2d", feature = "3d")))]
         {
             let _ = desc;
-            JointHandle(0)
+            let id = self.next_stub_id;
+            self.next_stub_id = self.next_stub_id.wrapping_add(1);
+            JointHandle(id)
         }
     }
 
