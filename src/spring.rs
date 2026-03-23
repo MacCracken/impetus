@@ -161,12 +161,7 @@ pub struct Spring2d {
 
 impl Spring2d {
     /// Create a 2D spring.
-    pub fn new(
-        from: [f64; 2],
-        to: [f64; 2],
-        stiffness: f64,
-        damping: f64,
-    ) -> Self {
+    pub fn new(from: [f64; 2], to: [f64; 2], stiffness: f64, damping: f64) -> Self {
         Self {
             x: Spring::new(from[0], to[0], stiffness, damping),
             y: Spring::new(from[1], to[1], stiffness, damping),
@@ -228,12 +223,7 @@ pub struct Spring3d {
 
 impl Spring3d {
     /// Create a 3D spring.
-    pub fn new(
-        from: [f64; 3],
-        to: [f64; 3],
-        stiffness: f64,
-        damping: f64,
-    ) -> Self {
+    pub fn new(from: [f64; 3], to: [f64; 3], stiffness: f64, damping: f64) -> Self {
         Self {
             x: Spring::new(from[0], to[0], stiffness, damping),
             y: Spring::new(from[1], to[1], stiffness, damping),

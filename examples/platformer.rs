@@ -7,12 +7,12 @@
 //! - Reading body state each frame
 
 use impetus::{
+    PhysicsWorld,
     body::{BodyDesc, BodyType},
     collider::{ColliderDesc, ColliderShape},
     config::WorldConfig,
     force::Force,
     material::PhysicsMaterial,
-    PhysicsWorld,
 };
 
 fn main() {

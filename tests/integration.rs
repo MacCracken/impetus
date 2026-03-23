@@ -1,6 +1,7 @@
 //! Integration tests exercising cross-module usage.
 
 use impetus::{
+    PhysicsWorld,
     body::{BodyDesc, BodyType},
     collider::{ColliderDesc, ColliderShape},
     config::WorldConfig,
@@ -8,7 +9,6 @@ use impetus::{
     joint::{JointDesc, JointType},
     material::PhysicsMaterial,
     units::Quantity,
-    PhysicsWorld,
 };
 
 #[test]

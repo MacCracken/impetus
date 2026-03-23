@@ -60,7 +60,9 @@ pub use joint::{JointDesc, JointHandle, JointMotor, JointType};
 pub use material::{CombineRule, PhysicsMaterial};
 
 // Particles
-pub use particle::{EmitterHandle, ForceField, Particle, ParticleEmitter, ParticleHandle, SubEmitter};
+pub use particle::{
+    EmitterHandle, ForceField, Particle, ParticleEmitter, ParticleHandle, SubEmitter,
+};
 
 // Queries
 pub use query::{PointQuery, RayHit};

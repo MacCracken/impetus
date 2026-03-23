@@ -3,25 +3,21 @@
 use crate::collider::{ColliderHandle, ColliderShape};
 use crate::query::RayHit;
 
-use super::types::{Aabb2d, EPSILON};
-use super::narrowphase::{world_pos, capsule_endpoints, closest_point_on_segment};
+use super::body_ah;
+use super::narrowphase::{capsule_endpoints, closest_point_on_segment, world_pos};
 use super::state::PhysicsState2d;
-use super::{body_ah};
+use super::types::{Aabb2d, EPSILON};
 
 impl PhysicsState2d {
     // -----------------------------------------------------------------------
     // Raycast
     // -----------------------------------------------------------------------
 
-    pub fn raycast(
-        &self,
-        origin: [f64; 3],
-        direction: [f64; 3],
-        max_dist: f64,
-    ) -> Option<RayHit> {
+    pub fn raycast(&self, origin: [f64; 3], direction: [f64; 3], max_dist: f64) -> Option<RayHit> {
         let origin_2d = [origin[0], origin[1]];
         let direction_2d = [direction[0], direction[1]];
-        let dir_len = (direction_2d[0] * direction_2d[0] + direction_2d[1] * direction_2d[1]).sqrt();
+        let dir_len =
+            (direction_2d[0] * direction_2d[0] + direction_2d[1] * direction_2d[1]).sqrt();
         if dir_len < EPSILON {
             return None;
         }
@@ -81,7 +77,8 @@ impl PhysicsState2d {
     ) -> Option<RayHit> {
         let origin_2d = [origin[0], origin[1]];
         let direction_2d = [direction[0], direction[1]];
-        let dir_len = (direction_2d[0] * direction_2d[0] + direction_2d[1] * direction_2d[1]).sqrt();
+        let dir_len =
+            (direction_2d[0] * direction_2d[0] + direction_2d[1] * direction_2d[1]).sqrt();
         if dir_len < EPSILON {
             return None;
         }

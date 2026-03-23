@@ -129,16 +129,28 @@ fn ray_aabb_inside() {
 
 #[test]
 fn aabb_overlaps() {
-    let a = Aabb2d { min: [0.0, 0.0], max: [2.0, 2.0] };
-    let b = Aabb2d { min: [1.0, 1.0], max: [3.0, 3.0] };
+    let a = Aabb2d {
+        min: [0.0, 0.0],
+        max: [2.0, 2.0],
+    };
+    let b = Aabb2d {
+        min: [1.0, 1.0],
+        max: [3.0, 3.0],
+    };
     assert!(a.overlaps(&b));
     assert!(b.overlaps(&a));
 }
 
 #[test]
 fn aabb_no_overlap() {
-    let a = Aabb2d { min: [0.0, 0.0], max: [1.0, 1.0] };
-    let b = Aabb2d { min: [2.0, 2.0], max: [3.0, 3.0] };
+    let a = Aabb2d {
+        min: [0.0, 0.0],
+        max: [1.0, 1.0],
+    };
+    let b = Aabb2d {
+        min: [2.0, 2.0],
+        max: [3.0, 3.0],
+    };
     assert!(!a.overlaps(&b));
 }
 
@@ -152,7 +164,10 @@ fn ball_mass() {
         &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
-            material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
+            material: PhysicsMaterial {
+                density: 1.0,
+                ..PhysicsMaterial::default()
+            },
             is_sensor: false,
             mass: None,
             collision_layer: 0xFFFF_FFFF,
@@ -169,9 +184,14 @@ fn box_mass() {
         ColliderHandle(0),
         BodyHandle(0),
         &ColliderDesc {
-            shape: ColliderShape::Box { half_extents: [1.0, 1.0, 0.0] },
+            shape: ColliderShape::Box {
+                half_extents: [1.0, 1.0, 0.0],
+            },
             offset: [0.0, 0.0, 0.0],
-            material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
+            material: PhysicsMaterial {
+                density: 1.0,
+                ..PhysicsMaterial::default()
+            },
             is_sensor: false,
             mass: None,
             collision_layer: 0xFFFF_FFFF,
@@ -187,7 +207,10 @@ fn segment_mass_nonzero() {
         ColliderHandle(0),
         BodyHandle(0),
         &ColliderDesc {
-            shape: ColliderShape::Segment { a: [0.0, 0.0, 0.0], b: [10.0, 0.0, 0.0] },
+            shape: ColliderShape::Segment {
+                a: [0.0, 0.0, 0.0],
+                b: [10.0, 0.0, 0.0],
+            },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
             is_sensor: false,
@@ -222,26 +245,38 @@ fn multiple_colliders_accumulate_mass() {
     let mut state = PhysicsState2d::new();
     let bh = state.add_body(&BodyDesc::default());
 
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial {
+                density: 1.0,
+                ..PhysicsMaterial::default()
+            },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
     let mass_after_first = state.bodies.get(body_ah(bh)).unwrap().mass;
 
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [1.0, 0.0, 0.0],
-        material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [1.0, 0.0, 0.0],
+            material: PhysicsMaterial {
+                density: 1.0,
+                ..PhysicsMaterial::default()
+            },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
     let mass_after_second = state.bodies.get(body_ah(bh)).unwrap().mass;
 
     assert!(mass_after_second > mass_after_first);
@@ -254,10 +289,15 @@ fn multiple_colliders_accumulate_mass() {
 fn capsule_circle_overlap() {
     // Vertical capsule at origin, circle to the right
     let r = generate_contact(
-        &ColliderShape::Capsule { half_height: 1.0, radius: 0.5 },
-        [0.0, 0.0], 0.0,
+        &ColliderShape::Capsule {
+            half_height: 1.0,
+            radius: 0.5,
+        },
+        [0.0, 0.0],
+        0.0,
         &ColliderShape::Ball { radius: 0.5 },
-        [0.8, 0.0], 0.0,
+        [0.8, 0.0],
+        0.0,
     );
     assert!(r.is_some());
     let (n, d, _) = r.unwrap();
@@ -268,10 +308,15 @@ fn capsule_circle_overlap() {
 #[test]
 fn capsule_circle_miss() {
     let r = generate_contact(
-        &ColliderShape::Capsule { half_height: 1.0, radius: 0.5 },
-        [0.0, 0.0], 0.0,
+        &ColliderShape::Capsule {
+            half_height: 1.0,
+            radius: 0.5,
+        },
+        [0.0, 0.0],
+        0.0,
         &ColliderShape::Ball { radius: 0.5 },
-        [5.0, 0.0], 0.0,
+        [5.0, 0.0],
+        0.0,
     );
     assert!(r.is_none());
 }
@@ -280,10 +325,15 @@ fn capsule_circle_miss() {
 fn capsule_circle_endpoint() {
     // Circle near the top endpoint of a vertical capsule
     let r = generate_contact(
-        &ColliderShape::Capsule { half_height: 1.0, radius: 0.5 },
-        [0.0, 0.0], 0.0,
+        &ColliderShape::Capsule {
+            half_height: 1.0,
+            radius: 0.5,
+        },
+        [0.0, 0.0],
+        0.0,
         &ColliderShape::Ball { radius: 0.5 },
-        [0.0, 1.3], 0.0,
+        [0.0, 1.3],
+        0.0,
     );
     assert!(r.is_some());
     let (n, d, _) = r.unwrap();
@@ -294,10 +344,17 @@ fn capsule_circle_endpoint() {
 #[test]
 fn capsule_aabb_overlap() {
     let r = generate_contact(
-        &ColliderShape::Capsule { half_height: 1.0, radius: 0.5 },
-        [0.0, 0.0], 0.0,
-        &ColliderShape::Box { half_extents: [0.5, 0.5, 0.0] },
-        [0.8, 0.0], 0.0,
+        &ColliderShape::Capsule {
+            half_height: 1.0,
+            radius: 0.5,
+        },
+        [0.0, 0.0],
+        0.0,
+        &ColliderShape::Box {
+            half_extents: [0.5, 0.5, 0.0],
+        },
+        [0.8, 0.0],
+        0.0,
     );
     assert!(r.is_some());
     let (_, d, _) = r.unwrap();
@@ -307,10 +364,17 @@ fn capsule_aabb_overlap() {
 #[test]
 fn capsule_aabb_miss() {
     let r = generate_contact(
-        &ColliderShape::Capsule { half_height: 1.0, radius: 0.5 },
-        [0.0, 0.0], 0.0,
-        &ColliderShape::Box { half_extents: [0.5, 0.5, 0.0] },
-        [5.0, 0.0], 0.0,
+        &ColliderShape::Capsule {
+            half_height: 1.0,
+            radius: 0.5,
+        },
+        [0.0, 0.0],
+        0.0,
+        &ColliderShape::Box {
+            half_extents: [0.5, 0.5, 0.0],
+        },
+        [5.0, 0.0],
+        0.0,
     );
     assert!(r.is_none());
 }
@@ -319,10 +383,18 @@ fn capsule_aabb_miss() {
 fn capsule_capsule_overlap() {
     // Two vertical capsules side by side
     let r = generate_contact(
-        &ColliderShape::Capsule { half_height: 1.0, radius: 0.5 },
-        [0.0, 0.0], 0.0,
-        &ColliderShape::Capsule { half_height: 1.0, radius: 0.5 },
-        [0.8, 0.0], 0.0,
+        &ColliderShape::Capsule {
+            half_height: 1.0,
+            radius: 0.5,
+        },
+        [0.0, 0.0],
+        0.0,
+        &ColliderShape::Capsule {
+            half_height: 1.0,
+            radius: 0.5,
+        },
+        [0.8, 0.0],
+        0.0,
     );
     assert!(r.is_some());
     let (n, d, _) = r.unwrap();
@@ -333,10 +405,18 @@ fn capsule_capsule_overlap() {
 #[test]
 fn capsule_capsule_miss() {
     let r = generate_contact(
-        &ColliderShape::Capsule { half_height: 1.0, radius: 0.5 },
-        [0.0, 0.0], 0.0,
-        &ColliderShape::Capsule { half_height: 1.0, radius: 0.5 },
-        [5.0, 0.0], 0.0,
+        &ColliderShape::Capsule {
+            half_height: 1.0,
+            radius: 0.5,
+        },
+        [0.0, 0.0],
+        0.0,
+        &ColliderShape::Capsule {
+            half_height: 1.0,
+            radius: 0.5,
+        },
+        [5.0, 0.0],
+        0.0,
     );
     assert!(r.is_none());
 }
@@ -346,10 +426,18 @@ fn capsule_capsule_perpendicular() {
     // Vertical capsule at x=0, horizontal capsule at x=0.2
     // With radius 0.5 each, sum=1.0, so overlap when segment dist < 1.0
     let r = generate_contact(
-        &ColliderShape::Capsule { half_height: 1.0, radius: 0.5 },
-        [0.0, 0.0], 0.0,
-        &ColliderShape::Capsule { half_height: 1.0, radius: 0.5 },
-        [0.2, 0.0], std::f64::consts::FRAC_PI_2,
+        &ColliderShape::Capsule {
+            half_height: 1.0,
+            radius: 0.5,
+        },
+        [0.0, 0.0],
+        0.0,
+        &ColliderShape::Capsule {
+            half_height: 1.0,
+            radius: 0.5,
+        },
+        [0.2, 0.0],
+        std::f64::consts::FRAC_PI_2,
     );
     assert!(r.is_some(), "capsule-capsule should overlap");
     let (_, d, _) = r.unwrap();
@@ -367,15 +455,21 @@ fn ray_capsule_hit_shaft() {
         position: [5.0, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Capsule { half_height: 1.0, radius: 0.5 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Capsule {
+                half_height: 1.0,
+                radius: 0.5,
+            },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     let r = state.raycast([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 100.0);
     assert!(r.is_some());
@@ -392,15 +486,21 @@ fn ray_capsule_hit_endpoint() {
         position: [5.0, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Capsule { half_height: 2.0, radius: 0.5 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Capsule {
+                half_height: 2.0,
+                radius: 0.5,
+            },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     let r = state.raycast([0.0, 2.0, 0.0], [1.0, 0.0, 0.0], 100.0);
     assert!(r.is_some());
@@ -414,15 +514,21 @@ fn ray_capsule_miss() {
         position: [5.0, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Capsule { half_height: 1.0, radius: 0.5 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Capsule {
+                half_height: 1.0,
+                radius: 0.5,
+            },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     let r = state.raycast([0.0, 5.0, 0.0], [1.0, 0.0, 0.0], 100.0);
     assert!(r.is_none());
@@ -458,7 +564,9 @@ fn world_aabb_box_with_rotation() {
         ColliderHandle(0),
         BodyHandle(0),
         &ColliderDesc {
-            shape: ColliderShape::Box { half_extents: [2.0, 1.0, 0.0] },
+            shape: ColliderShape::Box {
+                half_extents: [2.0, 1.0, 0.0],
+            },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
             is_sensor: false,
@@ -506,15 +614,20 @@ fn sensor_generates_events_no_physics() {
         position: [0.0, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(floor, &ColliderDesc {
-        shape: ColliderShape::Box { half_extents: [10.0, 0.5, 0.0] },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: true, // Sensor!
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        floor,
+        &ColliderDesc {
+            shape: ColliderShape::Box {
+                half_extents: [10.0, 0.5, 0.0],
+            },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: true, // Sensor!
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     // Dynamic ball overlapping the sensor
     let ball = state.add_body(&BodyDesc {
@@ -522,15 +635,18 @@ fn sensor_generates_events_no_physics() {
         position: [0.0, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(ball, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 0.5 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        ball,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     let vel_before = state.bodies.get(body_ah(ball)).unwrap().linear_velocity;
     let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
@@ -576,30 +692,36 @@ fn remove_body_cleans_collision_pairs() {
         position: [0.0, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(a, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        a,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     let b = state.add_body(&BodyDesc {
         body_type: BodyType::Dynamic,
         position: [0.5, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(b, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        b,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     // Step to generate collision manifolds
     state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
@@ -692,15 +814,18 @@ fn body_falls_asleep_when_stationary() {
         position: [0.0, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     // Zero gravity, zero velocity — body should go to sleep after SLEEP_TIME_THRESHOLD
     let dt = 1.0 / 60.0;
@@ -709,7 +834,10 @@ fn body_falls_asleep_when_stationary() {
         state.step([0.0, 0.0, 0.0], dt, 4, 1, 0.01, 0.2, 100.0);
     }
 
-    assert!(state.bodies.get(body_ah(bh)).unwrap().is_sleeping, "body should be sleeping after sitting still");
+    assert!(
+        state.bodies.get(body_ah(bh)).unwrap().is_sleeping,
+        "body should be sleeping after sitting still"
+    );
 }
 
 #[test]
@@ -720,15 +848,18 @@ fn sleeping_body_skips_integration() {
         position: [0.0, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     // Manually put to sleep
     state.bodies.get_mut(body_ah(bh)).unwrap().is_sleeping = true;
@@ -739,8 +870,7 @@ fn sleeping_body_skips_integration() {
 
     let pos_after = state.bodies.get(body_ah(bh)).unwrap().position;
     assert!(
-        (pos_after[0] - pos_before[0]).abs() < EPS
-            && (pos_after[1] - pos_before[1]).abs() < EPS,
+        (pos_after[0] - pos_before[0]).abs() < EPS && (pos_after[1] - pos_before[1]).abs() < EPS,
         "sleeping body should not have moved"
     );
 }
@@ -749,15 +879,18 @@ fn sleeping_body_skips_integration() {
 fn force_wakes_sleeping_body() {
     let mut state = PhysicsState2d::new();
     let bh = state.add_body(&BodyDesc::default());
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     // Put to sleep
     state.bodies.get_mut(body_ah(bh)).unwrap().is_sleeping = true;
@@ -773,15 +906,18 @@ fn force_wakes_sleeping_body() {
 fn impulse_wakes_sleeping_body() {
     let mut state = PhysicsState2d::new();
     let bh = state.add_body(&BodyDesc::default());
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     state.bodies.get_mut(body_ah(bh)).unwrap().is_sleeping = true;
     state.apply_impulse(bh, &Impulse::new(10.0, 0.0, 0.0));
@@ -792,15 +928,18 @@ fn impulse_wakes_sleeping_body() {
 fn torque_wakes_sleeping_body() {
     let mut state = PhysicsState2d::new();
     let bh = state.add_body(&BodyDesc::default());
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     state.bodies.get_mut(body_ah(bh)).unwrap().is_sleeping = true;
     state.apply_torque(bh, &Torque::new(5.0));
@@ -815,15 +954,18 @@ fn moving_body_does_not_sleep() {
         linear_velocity: [5.0, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     // Step many times — body is moving so should not sleep
     for _ in 0..100 {
@@ -836,15 +978,18 @@ fn moving_body_does_not_sleep() {
 fn get_body_state_reports_sleeping() {
     let mut state = PhysicsState2d::new();
     let bh = state.add_body(&BodyDesc::default());
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     assert!(!state.get_body_state(bh).unwrap().is_sleeping);
 
@@ -862,15 +1007,18 @@ fn contact_wakes_sleeping_body() {
         position: [0.0, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(a, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        a,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
     state.bodies.get_mut(body_ah(a)).unwrap().is_sleeping = true;
 
     // A moving body heading toward it
@@ -880,15 +1028,18 @@ fn contact_wakes_sleeping_body() {
         linear_velocity: [-5.0, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(b, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        b,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     // Step until contact
     for _ in 0..60 {
@@ -896,7 +1047,10 @@ fn contact_wakes_sleeping_body() {
     }
 
     // The sleeping body should have been woken by the impact
-    assert!(!state.bodies.get(body_ah(a)).unwrap().is_sleeping, "sleeping body should wake on contact");
+    assert!(
+        !state.bodies.get(body_ah(a)).unwrap().is_sleeping,
+        "sleeping body should wake on contact"
+    );
 }
 
 // =======================================================================
@@ -912,33 +1066,42 @@ fn collision_layers_prevent_collision() {
         position: [0.0, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(a, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0x01,
-        collision_mask: 0x01,
-    });
+    state.add_collider(
+        a,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0x01,
+            collision_mask: 0x01,
+        },
+    );
 
     let b = state.add_body(&BodyDesc {
         body_type: BodyType::Dynamic,
         position: [0.5, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(b, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0x02,
-        collision_mask: 0x02,
-    });
+    state.add_collider(
+        b,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0x02,
+            collision_mask: 0x02,
+        },
+    );
 
     let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
-    assert!(events.is_empty(), "different collision layers should not generate events");
+    assert!(
+        events.is_empty(),
+        "different collision layers should not generate events"
+    );
 }
 
 #[test]
@@ -950,33 +1113,42 @@ fn collision_layers_allow_same_layer() {
         position: [0.0, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(a, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0x01,
-        collision_mask: 0x01,
-    });
+    state.add_collider(
+        a,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0x01,
+            collision_mask: 0x01,
+        },
+    );
 
     let b = state.add_body(&BodyDesc {
         body_type: BodyType::Dynamic,
         position: [0.5, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(b, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0x01,
-        collision_mask: 0x01,
-    });
+    state.add_collider(
+        b,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0x01,
+            collision_mask: 0x01,
+        },
+    );
 
     let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
-    assert!(!events.is_empty(), "same collision layer should generate events");
+    assert!(
+        !events.is_empty(),
+        "same collision layer should generate events"
+    );
 }
 
 #[test]
@@ -988,33 +1160,42 @@ fn collision_layers_asymmetric_mask() {
         position: [0.0, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(a, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0x01,
-        collision_mask: 0x03,
-    });
+    state.add_collider(
+        a,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0x01,
+            collision_mask: 0x03,
+        },
+    );
 
     let b = state.add_body(&BodyDesc {
         body_type: BodyType::Dynamic,
         position: [0.5, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(b, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0x02,
-        collision_mask: 0x02,
-    });
+    state.add_collider(
+        b,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0x02,
+            collision_mask: 0x02,
+        },
+    );
 
     let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
-    assert!(!events.is_empty(), "asymmetric mask should still allow collision when one side matches");
+    assert!(
+        !events.is_empty(),
+        "asymmetric mask should still allow collision when one side matches"
+    );
 }
 
 #[test]
@@ -1026,30 +1207,36 @@ fn collision_layers_default_collide_everything() {
         position: [0.0, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(a, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        a,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     let b = state.add_body(&BodyDesc {
         body_type: BodyType::Dynamic,
         position: [0.5, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(b, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        b,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
     assert!(!events.is_empty(), "default layers should collide");
@@ -1068,15 +1255,18 @@ fn overlap_sphere_finds_ball() {
         ..BodyDesc::default()
     });
     let ch = ColliderHandle(0);
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     let hits = state.overlap_sphere([5.0, 0.0, 0.0], 0.5);
     assert!(hits.contains(&ch), "should find overlapping ball");
@@ -1094,15 +1284,20 @@ fn overlap_sphere_finds_box() {
         ..BodyDesc::default()
     });
     let ch = ColliderHandle(0);
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Box { half_extents: [2.0, 2.0, 0.0] },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Box {
+                half_extents: [2.0, 2.0, 0.0],
+            },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     let hits = state.overlap_sphere([2.3, 0.0, 0.0], 0.5);
     assert!(hits.contains(&ch), "sphere near box edge should overlap");
@@ -1119,15 +1314,18 @@ fn overlap_sphere_misses_distant() {
         position: [0.0, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     let results = state.overlap_sphere([10.0, 10.0, 0.0], 0.5);
     assert!(results.is_empty());
@@ -1143,15 +1341,18 @@ fn overlap_aabb_finds_colliders() {
         ..BodyDesc::default()
     });
     let c1 = ColliderHandle(0);
-    state.add_collider(b1, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        b1,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     let b2 = state.add_body(&BodyDesc {
         body_type: BodyType::Static,
@@ -1159,15 +1360,18 @@ fn overlap_aabb_finds_colliders() {
         ..BodyDesc::default()
     });
     let c2 = ColliderHandle(1);
-    state.add_collider(b2, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        b2,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     let hits = state.overlap_aabb([-2.0, -2.0, 0.0], [2.0, 2.0, 0.0]);
     assert!(hits.contains(&c1), "should find collider at origin");
@@ -1186,15 +1390,18 @@ fn overlap_aabb_empty() {
         position: [0.0, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     let results = state.overlap_aabb([50.0, 50.0, 0.0], [60.0, 60.0, 0.0]);
     assert!(results.is_empty());
@@ -1209,21 +1416,33 @@ fn overlap_sphere_finds_capsule() {
         ..BodyDesc::default()
     });
     let ch = ColliderHandle(0);
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Capsule { half_height: 2.0, radius: 0.5 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Capsule {
+                half_height: 2.0,
+                radius: 0.5,
+            },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     let hits = state.overlap_sphere([0.0, 2.3, 0.0], 0.5);
-    assert!(hits.contains(&ch), "sphere near capsule endpoint should overlap");
+    assert!(
+        hits.contains(&ch),
+        "sphere near capsule endpoint should overlap"
+    );
 
     let misses = state.overlap_sphere([5.0, 0.0, 0.0], 0.5);
-    assert!(misses.is_empty(), "distant sphere should not overlap capsule");
+    assert!(
+        misses.is_empty(),
+        "distant sphere should not overlap capsule"
+    );
 }
 
 // =======================================================================
@@ -1239,41 +1458,71 @@ fn manifold_persistence() {
         position: [0.0, -1.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(floor, &ColliderDesc {
-        shape: ColliderShape::Box { half_extents: [10.0, 1.0, 0.0] },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial { friction: 0.5, restitution: 0.0, density: 1.0, ..PhysicsMaterial::default() },
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        floor,
+        &ColliderDesc {
+            shape: ColliderShape::Box {
+                half_extents: [10.0, 1.0, 0.0],
+            },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial {
+                friction: 0.5,
+                restitution: 0.0,
+                density: 1.0,
+                ..PhysicsMaterial::default()
+            },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     let box_body = state.add_body(&BodyDesc {
         body_type: BodyType::Dynamic,
         position: [0.0, 0.4, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(box_body, &ColliderDesc {
-        shape: ColliderShape::Box { half_extents: [0.5, 0.5, 0.0] },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial { friction: 0.5, restitution: 0.0, density: 1.0, ..PhysicsMaterial::default() },
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        box_body,
+        &ColliderDesc {
+            shape: ColliderShape::Box {
+                half_extents: [0.5, 0.5, 0.0],
+            },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial {
+                friction: 0.5,
+                restitution: 0.0,
+                density: 1.0,
+                ..PhysicsMaterial::default()
+            },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 8, 4, 0.01, 0.2, 100.0);
-    assert!(!state.manifolds.is_empty(), "manifold should exist after first step with contact");
+    assert!(
+        !state.manifolds.is_empty(),
+        "manifold should exist after first step with contact"
+    );
 
     state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 8, 4, 0.01, 0.2, 100.0);
-    assert!(!state.manifolds.is_empty(), "manifold should persist across frames");
+    assert!(
+        !state.manifolds.is_empty(),
+        "manifold should persist across frames"
+    );
 
-    let has_nonzero_impulse = state.manifolds.values().any(|m| {
-        m.points.iter().any(|p| p.normal_impulse.abs() > EPS)
-    });
-    assert!(has_nonzero_impulse, "manifold should have non-zero accumulated impulse after two frames");
+    let has_nonzero_impulse = state
+        .manifolds
+        .values()
+        .any(|m| m.points.iter().any(|p| p.normal_impulse.abs() > EPS));
+    assert!(
+        has_nonzero_impulse,
+        "manifold should have non-zero accumulated impulse after two frames"
+    );
 }
 
 #[test]
@@ -1285,15 +1534,25 @@ fn warm_start_stabilizes_stack() {
         position: [0.0, -0.5, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(floor, &ColliderDesc {
-        shape: ColliderShape::Box { half_extents: [20.0, 0.5, 0.0] },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial { friction: 0.8, restitution: 0.0, density: 1.0, ..PhysicsMaterial::default() },
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        floor,
+        &ColliderDesc {
+            shape: ColliderShape::Box {
+                half_extents: [20.0, 0.5, 0.0],
+            },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial {
+                friction: 0.8,
+                restitution: 0.0,
+                density: 1.0,
+                ..PhysicsMaterial::default()
+            },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     let box_size = 0.5;
     let mut top_handle = BodyHandle(0);
@@ -1304,15 +1563,25 @@ fn warm_start_stabilizes_stack() {
             position: [0.0, y, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(bh, &ColliderDesc {
-            shape: ColliderShape::Box { half_extents: [box_size, box_size, 0.0] },
-            offset: [0.0, 0.0, 0.0],
-            material: PhysicsMaterial { friction: 0.8, restitution: 0.0, density: 1.0, ..PhysicsMaterial::default() },
-            is_sensor: false,
-            mass: None,
-            collision_layer: 0xFFFF_FFFF,
-            collision_mask: 0xFFFF_FFFF,
-        });
+        state.add_collider(
+            bh,
+            &ColliderDesc {
+                shape: ColliderShape::Box {
+                    half_extents: [box_size, box_size, 0.0],
+                },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial {
+                    friction: 0.8,
+                    restitution: 0.0,
+                    density: 1.0,
+                    ..PhysicsMaterial::default()
+                },
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
+            },
+        );
         if i == 4 {
             top_handle = bh;
         }
@@ -1352,15 +1621,21 @@ fn wheel_joint_constrains_perpendicular() {
         position: [0.0, -1.0, 0.0],
         ..Default::default()
     });
-    state.add_collider(b, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 0.5 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        b,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial {
+                density: 1.0,
+                ..PhysicsMaterial::default()
+            },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
     state.add_joint(&JointDesc {
         body_a: a,
         body_b: b,
@@ -1381,7 +1656,11 @@ fn wheel_joint_constrains_perpendicular() {
     }
 
     let pos = state.bodies.get(body_ah(b)).unwrap().position;
-    assert!(pos[0].abs() < 0.1, "wheel should constrain x (x={})", pos[0]);
+    assert!(
+        pos[0].abs() < 0.1,
+        "wheel should constrain x (x={})",
+        pos[0]
+    );
 }
 
 // -- Rope joint tests --
@@ -1399,15 +1678,21 @@ fn rope_joint_allows_closer_than_max() {
         position: [1.0, 0.0, 0.0],
         ..Default::default()
     });
-    state.add_collider(b, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 0.5 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        b,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial {
+                density: 1.0,
+                ..PhysicsMaterial::default()
+            },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
     state.add_joint(&JointDesc {
         body_a: a,
         body_b: b,
@@ -1424,7 +1709,11 @@ fn rope_joint_allows_closer_than_max() {
         state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
     }
     let final_y = state.bodies.get(body_ah(b)).unwrap().position[1];
-    assert!(final_y < initial_y, "body should fall under gravity (y={})", final_y);
+    assert!(
+        final_y < initial_y,
+        "body should fall under gravity (y={})",
+        final_y
+    );
 }
 
 #[test]
@@ -1440,15 +1729,21 @@ fn rope_joint_prevents_exceeding_max_length() {
         position: [0.0, -1.0, 0.0],
         ..Default::default()
     });
-    state.add_collider(b, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 0.5 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        b,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial {
+                density: 1.0,
+                ..PhysicsMaterial::default()
+            },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
     state.add_joint(&JointDesc {
         body_a: a,
         body_b: b,
@@ -1482,15 +1777,21 @@ fn mouse_joint_drags_body_toward_target() {
         position: [0.0, 0.0, 0.0],
         ..Default::default()
     });
-    state.add_collider(a, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 0.5 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        a,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial {
+                density: 1.0,
+                ..PhysicsMaterial::default()
+            },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
     let b = state.add_body(&BodyDesc {
         body_type: BodyType::Static,
         ..Default::default()
@@ -1516,7 +1817,11 @@ fn mouse_joint_drags_body_toward_target() {
     }
 
     let pos = state.bodies.get(body_ah(a)).unwrap().position;
-    assert!(pos[0] > 2.0, "mouse joint should pull body toward x=5 (x={})", pos[0]);
+    assert!(
+        pos[0] > 2.0,
+        "mouse joint should pull body toward x=5 (x={})",
+        pos[0]
+    );
 }
 
 // -- Joint breaking tests --
@@ -1534,15 +1839,21 @@ fn joint_breaking_removes_joint() {
         position: [0.0, -3.0, 0.0],
         ..Default::default()
     });
-    state.add_collider(b, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 0.5 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        b,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial {
+                density: 1.0,
+                ..PhysicsMaterial::default()
+            },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
     let jh = state.add_joint(&JointDesc {
         body_a: a,
         body_b: b,
@@ -1560,7 +1871,10 @@ fn joint_breaking_removes_joint() {
         state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
     }
 
-    assert!(!state.joints.contains(joint_ah(jh)), "joint should be broken");
+    assert!(
+        !state.joints.contains(joint_ah(jh)),
+        "joint should be broken"
+    );
 }
 
 #[test]
@@ -1576,15 +1890,21 @@ fn joint_not_broken_when_force_below_threshold() {
         position: [0.0, 0.0, 0.0],
         ..Default::default()
     });
-    state.add_collider(b, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 0.5 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        b,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial {
+                density: 1.0,
+                ..PhysicsMaterial::default()
+            },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
     let jh = state.add_joint(&JointDesc {
         body_a: a,
         body_b: b,
@@ -1600,7 +1920,10 @@ fn joint_not_broken_when_force_below_threshold() {
         state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
     }
 
-    assert!(state.joints.contains(joint_ah(jh)), "strong joint should survive");
+    assert!(
+        state.joints.contains(joint_ah(jh)),
+        "strong joint should survive"
+    );
 }
 
 // -- Combine rule tests --
@@ -1628,15 +1951,25 @@ fn multi_point_manifold() {
         position: [0.0, -0.5, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(floor, &ColliderDesc {
-        shape: ColliderShape::Box { half_extents: [20.0, 0.5, 0.0] },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial { friction: 0.8, restitution: 0.0, density: 1.0, ..PhysicsMaterial::default() },
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        floor,
+        &ColliderDesc {
+            shape: ColliderShape::Box {
+                half_extents: [20.0, 0.5, 0.0],
+            },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial {
+                friction: 0.8,
+                restitution: 0.0,
+                density: 1.0,
+                ..PhysicsMaterial::default()
+            },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     // A wide box that sits on the floor — wider than a point contact
     let box_body = state.add_body(&BodyDesc {
@@ -1644,15 +1977,25 @@ fn multi_point_manifold() {
         position: [0.0, 1.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(box_body, &ColliderDesc {
-        shape: ColliderShape::Box { half_extents: [2.0, 0.5, 0.0] },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial { friction: 0.8, restitution: 0.0, density: 1.0, ..PhysicsMaterial::default() },
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        box_body,
+        &ColliderDesc {
+            shape: ColliderShape::Box {
+                half_extents: [2.0, 0.5, 0.0],
+            },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial {
+                friction: 0.8,
+                restitution: 0.0,
+                density: 1.0,
+                ..PhysicsMaterial::default()
+            },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     // Step several frames to let the box drop onto the floor
     let dt = 1.0 / 60.0;
@@ -1677,7 +2020,10 @@ fn multi_point_manifold() {
     );
     // Check that manifolds existed and had non-zero impulses at some point during sim
     assert!(!state.manifolds.is_empty(), "should have manifolds");
-    assert!(found_impulse, "manifold points should have accumulated impulses at some point");
+    assert!(
+        found_impulse,
+        "manifold points should have accumulated impulses at some point"
+    );
 }
 
 // =======================================================================
@@ -1691,7 +2037,12 @@ fn simulation_islands_sleep() {
     // and verify the first stays asleep.
     let mut state = PhysicsState2d::new();
 
-    let mat = PhysicsMaterial { friction: 0.5, restitution: 0.0, density: 1.0, ..PhysicsMaterial::default() };
+    let mat = PhysicsMaterial {
+        friction: 0.5,
+        restitution: 0.0,
+        density: 1.0,
+        ..PhysicsMaterial::default()
+    };
 
     // --- Cluster A: a body on a static floor at x = 0 ---
     let floor_a = state.add_body(&BodyDesc {
@@ -1699,29 +2050,37 @@ fn simulation_islands_sleep() {
         position: [0.0, -1.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(floor_a, &ColliderDesc {
-        shape: ColliderShape::Box { half_extents: [5.0, 0.5, 0.0] },
-        offset: [0.0, 0.0, 0.0],
-        material: mat.clone(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        floor_a,
+        &ColliderDesc {
+            shape: ColliderShape::Box {
+                half_extents: [5.0, 0.5, 0.0],
+            },
+            offset: [0.0, 0.0, 0.0],
+            material: mat.clone(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
     let body_a1 = state.add_body(&BodyDesc {
         body_type: BodyType::Dynamic,
         position: [0.0, -0.2, 0.0], // start close to resting position
         ..BodyDesc::default()
     });
-    state.add_collider(body_a1, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 0.3 },
-        offset: [0.0, 0.0, 0.0],
-        material: mat.clone(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        body_a1,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.3 },
+            offset: [0.0, 0.0, 0.0],
+            material: mat.clone(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     // --- Cluster B: a body far away at x = 100 ---
     let floor_b = state.add_body(&BodyDesc {
@@ -1729,29 +2088,37 @@ fn simulation_islands_sleep() {
         position: [100.0, -1.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(floor_b, &ColliderDesc {
-        shape: ColliderShape::Box { half_extents: [5.0, 0.5, 0.0] },
-        offset: [0.0, 0.0, 0.0],
-        material: mat.clone(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        floor_b,
+        &ColliderDesc {
+            shape: ColliderShape::Box {
+                half_extents: [5.0, 0.5, 0.0],
+            },
+            offset: [0.0, 0.0, 0.0],
+            material: mat.clone(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
     let body_b1 = state.add_body(&BodyDesc {
         body_type: BodyType::Dynamic,
         position: [100.0, -0.2, 0.0], // start close to resting position
         ..BodyDesc::default()
     });
-    state.add_collider(body_b1, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 0.3 },
-        offset: [0.0, 0.0, 0.0],
-        material: mat,
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        body_b1,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.3 },
+            offset: [0.0, 0.0, 0.0],
+            material: mat,
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     // Use zero gravity so bodies are immediately stationary (no gravity jitter).
     // The key thing we're testing is island-level atomic sleep/wake, not
@@ -1774,10 +2141,16 @@ fn simulation_islands_sleep() {
 
     // Cluster A should remain sleeping (they're on a separate island)
     let a1_still_sleeping = state.bodies.get(body_ah(body_a1)).unwrap().is_sleeping;
-    assert!(a1_still_sleeping, "cluster A should still be sleeping after cluster B was woken");
+    assert!(
+        a1_still_sleeping,
+        "cluster A should still be sleeping after cluster B was woken"
+    );
     // Cluster B should be awake
     let b1_now_awake = !state.bodies.get(body_ah(body_b1)).unwrap().is_sleeping;
-    assert!(b1_now_awake, "cluster B body should be awake after force applied");
+    assert!(
+        b1_now_awake,
+        "cluster B body should be awake after force applied"
+    );
 }
 
 // =======================================================================
@@ -1796,38 +2169,48 @@ fn static_friction_holds() {
         position: [0.0, -1.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(floor, &ColliderDesc {
-        shape: ColliderShape::Box { half_extents: [20.0, 1.0, 0.0] },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial {
-            friction: 0.5,
-            static_friction: Some(2.0), // very high static friction
-            ..PhysicsMaterial::default()
+    state.add_collider(
+        floor,
+        &ColliderDesc {
+            shape: ColliderShape::Box {
+                half_extents: [20.0, 1.0, 0.0],
+            },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial {
+                friction: 0.5,
+                static_friction: Some(2.0), // very high static friction
+                ..PhysicsMaterial::default()
+            },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
         },
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    );
 
     let box_body = state.add_body(&BodyDesc {
         body_type: BodyType::Dynamic,
         position: [0.0, 0.5, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(box_body, &ColliderDesc {
-        shape: ColliderShape::Box { half_extents: [0.5, 0.5, 0.0] },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial {
-            friction: 0.5,
-            static_friction: Some(2.0),
-            ..PhysicsMaterial::default()
+    state.add_collider(
+        box_body,
+        &ColliderDesc {
+            shape: ColliderShape::Box {
+                half_extents: [0.5, 0.5, 0.0],
+            },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial {
+                friction: 0.5,
+                static_friction: Some(2.0),
+                ..PhysicsMaterial::default()
+            },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
         },
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    );
 
     // Let the box settle on the floor
     let dt = 1.0 / 60.0;
@@ -1897,8 +2280,8 @@ fn static_friction_serde_default_none() {
 
 #[test]
 fn sub_stepping_stability() {
-    use crate::config::WorldConfig;
     use crate::PhysicsWorld;
+    use crate::config::WorldConfig;
 
     // Stack of 5 boxes with sub_steps=4 vs sub_steps=1.
     // Both should produce valid simulations (no NaN, no explosion).
@@ -1915,15 +2298,25 @@ fn sub_stepping_stability() {
             position: [0.0, -0.5, 0.0],
             ..Default::default()
         });
-        world.add_collider(floor, ColliderDesc {
-            shape: ColliderShape::Box { half_extents: [20.0, 0.5, 0.0] },
-            offset: [0.0, 0.0, 0.0],
-            material: PhysicsMaterial { friction: 0.8, restitution: 0.0, density: 1.0, ..PhysicsMaterial::default() },
-            is_sensor: false,
-            mass: None,
-            collision_layer: 0xFFFF_FFFF,
-            collision_mask: 0xFFFF_FFFF,
-        });
+        world.add_collider(
+            floor,
+            ColliderDesc {
+                shape: ColliderShape::Box {
+                    half_extents: [20.0, 0.5, 0.0],
+                },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial {
+                    friction: 0.8,
+                    restitution: 0.0,
+                    density: 1.0,
+                    ..PhysicsMaterial::default()
+                },
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
+            },
+        );
 
         let box_size = 0.5;
         let mut top_handle = None;
@@ -1934,15 +2327,25 @@ fn sub_stepping_stability() {
                 position: [0.0, y, 0.0],
                 ..Default::default()
             });
-            world.add_collider(bh, ColliderDesc {
-                shape: ColliderShape::Box { half_extents: [box_size, box_size, 0.0] },
-                offset: [0.0, 0.0, 0.0],
-                material: PhysicsMaterial { friction: 0.8, restitution: 0.0, density: 1.0, ..PhysicsMaterial::default() },
-                is_sensor: false,
-                mass: None,
-                collision_layer: 0xFFFF_FFFF,
-                collision_mask: 0xFFFF_FFFF,
-            });
+            world.add_collider(
+                bh,
+                ColliderDesc {
+                    shape: ColliderShape::Box {
+                        half_extents: [box_size, box_size, 0.0],
+                    },
+                    offset: [0.0, 0.0, 0.0],
+                    material: PhysicsMaterial {
+                        friction: 0.8,
+                        restitution: 0.0,
+                        density: 1.0,
+                        ..PhysicsMaterial::default()
+                    },
+                    is_sensor: false,
+                    mass: None,
+                    collision_layer: 0xFFFF_FFFF,
+                    collision_mask: 0xFFFF_FFFF,
+                },
+            );
             if i == 4 {
                 top_handle = Some(bh);
             }

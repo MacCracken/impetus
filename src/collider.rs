@@ -25,10 +25,7 @@ pub enum ColliderShape {
         indices: Vec<[u32; 3]>,
     },
     /// Heightfield (3D only).
-    Heightfield {
-        heights: Vec<f64>,
-        scale: [f64; 3],
-    },
+    Heightfield { heights: Vec<f64>, scale: [f64; 3] },
     /// Line segment.
     Segment { a: [f64; 3], b: [f64; 3] },
 }

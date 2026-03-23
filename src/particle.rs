@@ -15,8 +15,8 @@ pub enum ForceField {
     Radial {
         center: [f64; 3],
         strength: f64,
-        falloff: f64,  // 0 = constant, 1 = linear, 2 = inverse-square
-        radius: f64,   // max effect radius (0 = infinite)
+        falloff: f64, // 0 = constant, 1 = linear, 2 = inverse-square
+        radius: f64,  // max effect radius (0 = infinite)
     },
     /// Constant directional force within a region (wind zone).
     Directional {

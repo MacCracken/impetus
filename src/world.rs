@@ -1,5 +1,7 @@
 //! Physics world — the simulation container.
 
+#[cfg(not(any(feature = "2d", feature = "3d")))]
+use crate::ImpetusError;
 #[cfg(any(feature = "2d", feature = "3d"))]
 use crate::arena::ArenaHandle;
 use crate::body::{BodyDesc, BodyHandle, BodyState};
@@ -10,8 +12,6 @@ use crate::force::{Force, Impulse, Torque};
 use crate::joint::{JointDesc, JointHandle};
 use crate::particle::{EmitterHandle, ForceField, Particle, ParticleEmitter, ParticleHandle};
 use crate::query::RayHit;
-#[cfg(not(any(feature = "2d", feature = "3d")))]
-use crate::ImpetusError;
 
 /// The physics world — owns all bodies, colliders, joints, and the simulation pipeline.
 pub struct PhysicsWorld {
@@ -125,11 +125,12 @@ impl PhysicsWorld {
                 let vy = emitter.velocity[1] + emitter.velocity_spread[1] * sy;
                 let vz = emitter.velocity[2] + emitter.velocity_spread[2] * sz;
 
-                let mut p = Particle::new(emitter.position, [vx, vy, vz], emitter.particle_lifetime)
-                    .with_radius(emitter.particle_radius)
-                    .with_restitution(emitter.particle_restitution)
-                    .with_gravity_scale(emitter.particle_gravity_scale)
-                    .with_damping(emitter.particle_damping);
+                let mut p =
+                    Particle::new(emitter.position, [vx, vy, vz], emitter.particle_lifetime)
+                        .with_radius(emitter.particle_radius)
+                        .with_restitution(emitter.particle_restitution)
+                        .with_gravity_scale(emitter.particle_gravity_scale)
+                        .with_damping(emitter.particle_damping);
                 p.handle = ParticleHandle(self.next_particle_id);
                 self.next_particle_id = self.next_particle_id.wrapping_add(1);
                 new_particles.push(p);
@@ -151,14 +152,23 @@ impl PhysicsWorld {
             // Force fields
             for field in &self.force_fields {
                 match field {
-                    ForceField::Radial { center, strength, falloff, radius } => {
+                    ForceField::Radial {
+                        center,
+                        strength,
+                        falloff,
+                        radius,
+                    } => {
                         let dx = center[0] - p.position[0];
                         let dy = center[1] - p.position[1];
                         let dz = center[2] - p.position[2];
                         let dist_sq = dx * dx + dy * dy + dz * dz;
                         let dist = dist_sq.sqrt();
-                        if dist < 1e-10 { continue; }
-                        if *radius > 0.0 && dist > *radius { continue; }
+                        if dist < 1e-10 {
+                            continue;
+                        }
+                        if *radius > 0.0 && dist > *radius {
+                            continue;
+                        }
                         let force_mag = strength / dist.powf(*falloff);
                         let dir = [dx / dist, dy / dist, dz / dist];
                         p.velocity[0] += dir[0] * force_mag * dt;
@@ -166,9 +176,12 @@ impl PhysicsWorld {
                         p.velocity[2] += dir[2] * force_mag * dt;
                     }
                     ForceField::Directional { force, min, max } => {
-                        if p.position[0] >= min[0] && p.position[0] <= max[0]
-                            && p.position[1] >= min[1] && p.position[1] <= max[1]
-                            && p.position[2] >= min[2] && p.position[2] <= max[2]
+                        if p.position[0] >= min[0]
+                            && p.position[0] <= max[0]
+                            && p.position[1] >= min[1]
+                            && p.position[1] <= max[1]
+                            && p.position[2] >= min[2]
+                            && p.position[2] <= max[2]
                         {
                             p.velocity[0] += force[0] * dt;
                             p.velocity[1] += force[1] * dt;
@@ -225,10 +238,12 @@ impl PhysicsWorld {
                     let angle = (i as f64 / sub.count as f64) * std::f64::consts::TAU;
                     let vx = angle.cos() * sub.speed;
                     let vy = angle.sin() * sub.speed;
-                    sub_spawns.push(Particle::new(p.position, [vx, vy, 0.0], sub.lifetime)
-                        .with_radius(sub.radius)
-                        .with_gravity_scale(sub.gravity_scale)
-                        .with_restitution(sub.restitution));
+                    sub_spawns.push(
+                        Particle::new(p.position, [vx, vy, 0.0], sub.lifetime)
+                            .with_radius(sub.radius)
+                            .with_gravity_scale(sub.gravity_scale)
+                            .with_restitution(sub.restitution),
+                    );
                 }
             }
         }
@@ -296,13 +311,8 @@ impl PhysicsWorld {
                     continue;
                 }
 
-                let contact = particle_vs_collider_2d(
-                    [px, py],
-                    pr,
-                    &info.shape,
-                    info.pos,
-                    info.rotation,
-                );
+                let contact =
+                    particle_vs_collider_2d([px, py], pr, &info.shape, info.pos, info.rotation);
 
                 if let Some((normal, depth)) = contact {
                     // Separate particle from collider
@@ -545,12 +555,7 @@ impl PhysicsWorld {
     }
 
     /// Cast a ray and return the first hit.
-    pub fn raycast(
-        &self,
-        origin: [f64; 3],
-        direction: [f64; 3],
-        max_dist: f64,
-    ) -> Option<RayHit> {
+    pub fn raycast(&self, origin: [f64; 3], direction: [f64; 3], max_dist: f64) -> Option<RayHit> {
         #[cfg(all(feature = "2d", not(feature = "3d")))]
         {
             self.backend_2d.raycast(origin, direction, max_dist)
@@ -582,12 +587,14 @@ impl PhysicsWorld {
     ) -> Option<RayHit> {
         #[cfg(all(feature = "2d", not(feature = "3d")))]
         {
-            self.backend_2d.raycast_filtered(origin, direction, max_dist, layer_mask)
+            self.backend_2d
+                .raycast_filtered(origin, direction, max_dist, layer_mask)
         }
 
         #[cfg(feature = "3d")]
         {
-            self.backend_3d.raycast_filtered(origin, direction, max_dist, layer_mask)
+            self.backend_3d
+                .raycast_filtered(origin, direction, max_dist, layer_mask)
         }
 
         #[cfg(not(any(feature = "2d", feature = "3d")))]
@@ -708,7 +715,11 @@ impl PhysicsWorld {
     }
 
     /// Change the body type (Static, Dynamic, Kinematic).
-    pub fn set_body_type(&mut self, handle: BodyHandle, body_type: crate::body::BodyType) -> crate::Result<()> {
+    pub fn set_body_type(
+        &mut self,
+        handle: BodyHandle,
+        body_type: crate::body::BodyType,
+    ) -> crate::Result<()> {
         #[cfg(all(feature = "2d", not(feature = "3d")))]
         {
             self.backend_2d.set_body_type(handle, body_type)
@@ -953,7 +964,8 @@ impl PhysicsWorld {
             }
 
             for cs in &snapshot.colliders {
-                self.backend_2d.add_collider_at(cs.handle, cs.body, &cs.desc);
+                self.backend_2d
+                    .add_collider_at(cs.handle, cs.body, &cs.desc);
             }
 
             for js in &snapshot.joints {
@@ -975,7 +987,8 @@ impl PhysicsWorld {
             }
 
             for cs in &snapshot.colliders {
-                self.backend_3d.add_collider_at(cs.handle, cs.body, &cs.desc);
+                self.backend_3d
+                    .add_collider_at(cs.handle, cs.body, &cs.desc);
             }
 
             for js in &snapshot.joints {
@@ -1051,8 +1064,7 @@ fn particle_vs_collider_2d(
             let closest = if len_sq < 1e-20 {
                 ep_a
             } else {
-                let t =
-                    ((pos[0] - ep_a[0]) * ab[0] + (pos[1] - ep_a[1]) * ab[1]) / len_sq;
+                let t = ((pos[0] - ep_a[0]) * ab[0] + (pos[1] - ep_a[1]) * ab[1]) / len_sq;
                 let t = t.clamp(0.0, 1.0);
                 [ep_a[0] + ab[0] * t, ep_a[1] + ab[1] * t]
             };
@@ -1118,10 +1130,7 @@ fn particle_vs_collider_3d(
             let diff_z = dz - cz;
             let dist = (diff_x * diff_x + diff_y * diff_y + diff_z * diff_z).sqrt();
             if dist < radius && dist > 1e-10 {
-                Some((
-                    [diff_x / dist, diff_y / dist, diff_z / dist],
-                    radius - dist,
-                ))
+                Some(([diff_x / dist, diff_y / dist, diff_z / dist], radius - dist))
             } else {
                 None
             }
@@ -1317,14 +1326,23 @@ mod tests {
         });
         // Particle to the right
         let h = world.spawn_particle(
-            Particle::new([10.0, 0.0, 0.0], [0.0, 0.0, 0.0], 5.0)
-                .with_gravity_scale(0.0),
+            Particle::new([10.0, 0.0, 0.0], [0.0, 0.0, 0.0], 5.0).with_gravity_scale(0.0),
         );
-        let x_before = world.particles().iter().find(|p| p.handle == h).unwrap().position[0];
+        let x_before = world
+            .particles()
+            .iter()
+            .find(|p| p.handle == h)
+            .unwrap()
+            .position[0];
         for _ in 0..10 {
             world.step();
         }
-        let x_after = world.particles().iter().find(|p| p.handle == h).unwrap().position[0];
+        let x_after = world
+            .particles()
+            .iter()
+            .find(|p| p.handle == h)
+            .unwrap()
+            .position[0];
         assert!(x_after < x_before, "particle should move toward attractor");
     }
 
@@ -1342,15 +1360,27 @@ mod tests {
             radius: 0.0,
         });
         let h = world.spawn_particle(
-            Particle::new([5.0, 0.0, 0.0], [0.0, 0.0, 0.0], 5.0)
-                .with_gravity_scale(0.0),
+            Particle::new([5.0, 0.0, 0.0], [0.0, 0.0, 0.0], 5.0).with_gravity_scale(0.0),
         );
-        let x_before = world.particles().iter().find(|p| p.handle == h).unwrap().position[0];
+        let x_before = world
+            .particles()
+            .iter()
+            .find(|p| p.handle == h)
+            .unwrap()
+            .position[0];
         for _ in 0..10 {
             world.step();
         }
-        let x_after = world.particles().iter().find(|p| p.handle == h).unwrap().position[0];
-        assert!(x_after > x_before, "particle should be pushed away from repulsor");
+        let x_after = world
+            .particles()
+            .iter()
+            .find(|p| p.handle == h)
+            .unwrap()
+            .position[0];
+        assert!(
+            x_after > x_before,
+            "particle should be pushed away from repulsor"
+        );
     }
 
     #[test]
@@ -1366,14 +1396,16 @@ mod tests {
             max: [100.0, 100.0, 100.0],
         });
         let h = world.spawn_particle(
-            Particle::new([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 5.0)
-                .with_gravity_scale(0.0),
+            Particle::new([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 5.0).with_gravity_scale(0.0),
         );
         for _ in 0..10 {
             world.step();
         }
         let p = world.particles().iter().find(|p| p.handle == h).unwrap();
-        assert!(p.position[0] > 0.0, "particle should be pushed in +X by wind");
+        assert!(
+            p.position[0] > 0.0,
+            "particle should be pushed in +X by wind"
+        );
     }
 
     #[test]
@@ -1389,8 +1421,7 @@ mod tests {
             max: [200.0, 200.0, 200.0],
         });
         let h = world.spawn_particle(
-            Particle::new([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 5.0)
-                .with_gravity_scale(0.0),
+            Particle::new([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 5.0).with_gravity_scale(0.0),
         );
         for _ in 0..10 {
             world.step();
@@ -1598,7 +1629,10 @@ mod tests {
         let hit = world.raycast([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 100.0);
         assert!(hit.is_some(), "ray should hit the ball");
         let hit = hit.unwrap();
-        assert!((hit.distance - 4.0).abs() < 0.1, "should hit at distance ~4 (5 - radius 1)");
+        assert!(
+            (hit.distance - 4.0).abs() < 0.1,
+            "should hit at distance ~4 (5 - radius 1)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1627,7 +1661,10 @@ mod tests {
         }
 
         assert_eq!(world.particle_count(), 1);
-        assert!(world.particles()[0].position[1] < 10.0, "particle should fall");
+        assert!(
+            world.particles()[0].position[1] < 10.0,
+            "particle should fall"
+        );
     }
 
     #[test]
@@ -1662,7 +1699,10 @@ mod tests {
         }
 
         // Should have spawned ~60 particles, minus any that expired
-        assert!(world.particle_count() > 0, "emitter should have spawned particles");
+        assert!(
+            world.particle_count() > 0,
+            "emitter should have spawned particles"
+        );
     }
 
     #[cfg(feature = "2d")]

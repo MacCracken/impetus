@@ -1,11 +1,11 @@
 use super::*;
-use hisab::{DQuat, DVec3};
 use crate::body::{BodyDesc, BodyHandle, BodyType};
 use crate::collider::{ColliderDesc, ColliderHandle, ColliderShape};
 use crate::force::Impulse;
 use crate::joint::{JointDesc, JointType};
 use crate::material::PhysicsMaterial;
 use crate::spatial_hash::SpatialHashGrid;
+use hisab::{DQuat, DVec3};
 
 use super::narrowphase::*;
 use super::raycast::*;
@@ -41,14 +41,16 @@ fn sphere_obb_overlap() {
 
 #[test]
 fn sphere_obb_miss() {
-    assert!(sphere_obb(
-        DVec3::new(5.0, 0.0, 0.0),
-        0.5,
-        DVec3::ZERO,
-        DQuat::IDENTITY,
-        DVec3::new(1.0, 1.0, 1.0),
-    )
-    .is_none());
+    assert!(
+        sphere_obb(
+            DVec3::new(5.0, 0.0, 0.0),
+            0.5,
+            DVec3::ZERO,
+            DQuat::IDENTITY,
+            DVec3::new(1.0, 1.0, 1.0),
+        )
+        .is_none()
+    );
 }
 
 #[test]
@@ -83,13 +85,15 @@ fn aabb_3d_overlap() {
 
 #[test]
 fn aabb_3d_no_overlap() {
-    assert!(aabb_aabb_3d(
-        DVec3::ZERO,
-        DVec3::ONE,
-        DVec3::new(5.0, 0.0, 0.0),
-        DVec3::ONE,
-    )
-    .is_none());
+    assert!(
+        aabb_aabb_3d(
+            DVec3::ZERO,
+            DVec3::ONE,
+            DVec3::new(5.0, 0.0, 0.0),
+            DVec3::ONE,
+        )
+        .is_none()
+    );
 }
 
 #[test]
@@ -141,13 +145,11 @@ fn quaternion_z_rotation() {
 #[test]
 fn gravity_moves_body_3d() {
     let mut state = PhysicsState3d::new();
-    let bh = state.add_body(
-        &BodyDesc {
-            body_type: BodyType::Dynamic,
-            position: [0.0, 10.0, 0.0],
-            ..BodyDesc::default()
-        },
-    );
+    let bh = state.add_body(&BodyDesc {
+        body_type: BodyType::Dynamic,
+        position: [0.0, 10.0, 0.0],
+        ..BodyDesc::default()
+    });
     state.add_collider(
         bh,
         &ColliderDesc {
@@ -165,20 +167,21 @@ fn gravity_moves_body_3d() {
         state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
     }
 
-    assert!(state.bodies.get(body_ah(bh)).unwrap().position.y < 10.0, "body should fall");
+    assert!(
+        state.bodies.get(body_ah(bh)).unwrap().position.y < 10.0,
+        "body should fall"
+    );
 }
 
 #[test]
 fn sphere_collision_3d() {
     let mut state = PhysicsState3d::new();
 
-    let floor = state.add_body(
-        &BodyDesc {
-            body_type: BodyType::Static,
-            position: [0.0, 0.0, 0.0],
-            ..BodyDesc::default()
-        },
-    );
+    let floor = state.add_body(&BodyDesc {
+        body_type: BodyType::Static,
+        position: [0.0, 0.0, 0.0],
+        ..BodyDesc::default()
+    });
     state.add_collider(
         floor,
         &ColliderDesc {
@@ -194,13 +197,11 @@ fn sphere_collision_3d() {
         },
     );
 
-    let ball = state.add_body(
-        &BodyDesc {
-            body_type: BodyType::Dynamic,
-            position: [0.0, 2.0, 0.0],
-            ..BodyDesc::default()
-        },
-    );
+    let ball = state.add_body(&BodyDesc {
+        body_type: BodyType::Dynamic,
+        position: [0.0, 2.0, 0.0],
+        ..BodyDesc::default()
+    });
     state.add_collider(
         ball,
         &ColliderDesc {
@@ -228,13 +229,11 @@ fn sphere_collision_3d() {
 #[test]
 fn raycast_3d() {
     let mut state = PhysicsState3d::new();
-    let bh = state.add_body(
-        &BodyDesc {
-            body_type: BodyType::Static,
-            position: [5.0, 0.0, 0.0],
-            ..BodyDesc::default()
-        },
-    );
+    let bh = state.add_body(&BodyDesc {
+        body_type: BodyType::Static,
+        position: [5.0, 0.0, 0.0],
+        ..BodyDesc::default()
+    });
     state.add_collider(
         bh,
         &ColliderDesc {
@@ -272,7 +271,10 @@ fn sphere_mass_3d() {
         &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
-            material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
+            material: PhysicsMaterial {
+                density: 1.0,
+                ..PhysicsMaterial::default()
+            },
             is_sensor: false,
             mass: None,
             collision_layer: 0xFFFF_FFFF,
@@ -290,9 +292,14 @@ fn box_mass_3d() {
         ColliderHandle(0),
         BodyHandle(0),
         &ColliderDesc {
-            shape: ColliderShape::Box { half_extents: [1.0, 1.0, 1.0] },
+            shape: ColliderShape::Box {
+                half_extents: [1.0, 1.0, 1.0],
+            },
             offset: [0.0, 0.0, 0.0],
-            material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
+            material: PhysicsMaterial {
+                density: 1.0,
+                ..PhysicsMaterial::default()
+            },
             is_sensor: false,
             mass: None,
             collision_layer: 0xFFFF_FFFF,
@@ -307,53 +314,85 @@ fn multiple_colliders_accumulate_mass_3d() {
     let mut state = PhysicsState3d::new();
     let bh = state.add_body(&BodyDesc::default());
 
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial {
+                density: 1.0,
+                ..PhysicsMaterial::default()
+            },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
     let mass_first = state.bodies.get(body_ah(bh)).unwrap().mass;
 
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [2.0, 0.0, 0.0],
-        material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [2.0, 0.0, 0.0],
+            material: PhysicsMaterial {
+                density: 1.0,
+                ..PhysicsMaterial::default()
+            },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
     assert!((state.bodies.get(body_ah(bh)).unwrap().mass - 2.0 * mass_first).abs() < EPS);
 }
 
 #[test]
 fn capsule_sphere_3d_overlap() {
-    let r = capsule_sphere_3d(DVec3::ZERO, DQuat::IDENTITY, 1.0, 0.5, DVec3::new(0.8, 0.0, 0.0), 0.5);
+    let r = capsule_sphere_3d(
+        DVec3::ZERO,
+        DQuat::IDENTITY,
+        1.0,
+        0.5,
+        DVec3::new(0.8, 0.0, 0.0),
+        0.5,
+    );
     assert!(r.is_some());
 }
 
 #[test]
 fn capsule_sphere_3d_miss() {
-    assert!(capsule_sphere_3d(DVec3::ZERO, DQuat::IDENTITY, 1.0, 0.5, DVec3::new(5.0, 0.0, 0.0), 0.5).is_none());
+    assert!(
+        capsule_sphere_3d(
+            DVec3::ZERO,
+            DQuat::IDENTITY,
+            1.0,
+            0.5,
+            DVec3::new(5.0, 0.0, 0.0),
+            0.5
+        )
+        .is_none()
+    );
 }
 
 #[test]
 fn impulse_changes_velocity_3d() {
     let mut state = PhysicsState3d::new();
     let bh = state.add_body(&BodyDesc::default());
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 0.5 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     state.apply_impulse(bh, &Impulse::new(10.0, 0.0, 0.0));
     assert!(state.bodies.get(body_ah(bh)).unwrap().linear_velocity.x > 0.0);
@@ -368,30 +407,36 @@ fn remove_cleans_collision_pairs_3d() {
         position: [0.0, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(a, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        a,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     let b = state.add_body(&BodyDesc {
         body_type: BodyType::Dynamic,
         position: [0.5, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(b, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 1.0 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        b,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
     assert!(!state.prev_collision_pairs.is_empty());
@@ -414,15 +459,18 @@ fn fixed_joint_3d() {
         position: [0.0, 3.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(b, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 0.5 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        b,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
     state.add_joint(&JointDesc {
         body_a: a,
         body_b: b,
@@ -466,15 +514,18 @@ fn spatial_hash_3d_no_false_pair() {
 fn set_body_state_teleports() {
     let mut state = PhysicsState3d::new();
     let bh = state.add_body(&BodyDesc::default());
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 0.5 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     let new_state = crate::body::BodyState {
         handle: bh,
@@ -497,15 +548,18 @@ fn set_body_state_teleports() {
 #[test]
 fn set_body_state_not_found() {
     let mut state = PhysicsState3d::new();
-    let result = state.set_body_state(BodyHandle(999), &crate::body::BodyState {
-        handle: BodyHandle(999),
-        body_type: BodyType::Dynamic,
-        position: [0.0, 0.0, 0.0],
-        rotation: 0.0,
-        linear_velocity: [0.0, 0.0, 0.0],
-        angular_velocity: 0.0,
-        is_sleeping: false,
-    });
+    let result = state.set_body_state(
+        BodyHandle(999),
+        &crate::body::BodyState {
+            handle: BodyHandle(999),
+            body_type: BodyType::Dynamic,
+            position: [0.0, 0.0, 0.0],
+            rotation: 0.0,
+            linear_velocity: [0.0, 0.0, 0.0],
+            angular_velocity: 0.0,
+            is_sleeping: false,
+        },
+    );
     assert!(result.is_err());
 }
 
@@ -517,15 +571,18 @@ fn set_body_type_dynamic_to_static() {
         linear_velocity: [5.0, 0.0, 0.0],
         ..BodyDesc::default()
     });
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 0.5 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     state.set_body_type(bh, BodyType::Static).unwrap();
     let rb = &state.bodies.get(body_ah(bh)).unwrap();
@@ -541,15 +598,18 @@ fn set_body_type_static_to_dynamic() {
         body_type: BodyType::Dynamic,
         ..BodyDesc::default()
     });
-    state.add_collider(bh, &ColliderDesc {
-        shape: ColliderShape::Ball { radius: 0.5 },
-        offset: [0.0, 0.0, 0.0],
-        material: PhysicsMaterial::default(),
-        is_sensor: false,
-        mass: None,
-        collision_layer: 0xFFFF_FFFF,
-        collision_mask: 0xFFFF_FFFF,
-    });
+    state.add_collider(
+        bh,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
 
     let mass_before = state.bodies.get(body_ah(bh)).unwrap().mass;
     assert!(mass_before > 0.0);
@@ -570,8 +630,12 @@ fn set_body_type_static_to_dynamic() {
 fn obb_obb_aligned_overlap() {
     // Two axis-aligned boxes overlapping
     let r = obb_obb_3d(
-        DVec3::ZERO, DQuat::IDENTITY, DVec3::ONE,
-        DVec3::new(1.5, 0.0, 0.0), DQuat::IDENTITY, DVec3::ONE,
+        DVec3::ZERO,
+        DQuat::IDENTITY,
+        DVec3::ONE,
+        DVec3::new(1.5, 0.0, 0.0),
+        DQuat::IDENTITY,
+        DVec3::ONE,
     );
     assert!(r.is_some());
     let (n, d, _) = r.unwrap();
@@ -581,10 +645,17 @@ fn obb_obb_aligned_overlap() {
 
 #[test]
 fn obb_obb_no_overlap() {
-    assert!(obb_obb_3d(
-        DVec3::ZERO, DQuat::IDENTITY, DVec3::ONE,
-        DVec3::new(5.0, 0.0, 0.0), DQuat::IDENTITY, DVec3::ONE,
-    ).is_none());
+    assert!(
+        obb_obb_3d(
+            DVec3::ZERO,
+            DQuat::IDENTITY,
+            DVec3::ONE,
+            DVec3::new(5.0, 0.0, 0.0),
+            DQuat::IDENTITY,
+            DVec3::ONE,
+        )
+        .is_none()
+    );
 }
 
 #[test]
@@ -592,8 +663,12 @@ fn obb_obb_rotated_overlap() {
     // One box rotated 45° around Z
     let rot = DQuat::from_rotation_z(std::f64::consts::FRAC_PI_4);
     let r = obb_obb_3d(
-        DVec3::ZERO, DQuat::IDENTITY, DVec3::ONE,
-        DVec3::new(1.5, 0.0, 0.0), rot, DVec3::ONE,
+        DVec3::ZERO,
+        DQuat::IDENTITY,
+        DVec3::ONE,
+        DVec3::new(1.5, 0.0, 0.0),
+        rot,
+        DVec3::ONE,
     );
     assert!(r.is_some());
 }
@@ -602,10 +677,17 @@ fn obb_obb_rotated_overlap() {
 fn obb_obb_rotated_separated() {
     // One box rotated, far enough apart to not overlap
     let rot = DQuat::from_rotation_z(std::f64::consts::FRAC_PI_4);
-    assert!(obb_obb_3d(
-        DVec3::ZERO, DQuat::IDENTITY, DVec3::new(0.5, 0.5, 0.5),
-        DVec3::new(3.0, 0.0, 0.0), rot, DVec3::new(0.5, 0.5, 0.5),
-    ).is_none());
+    assert!(
+        obb_obb_3d(
+            DVec3::ZERO,
+            DQuat::IDENTITY,
+            DVec3::new(0.5, 0.5, 0.5),
+            DVec3::new(3.0, 0.0, 0.0),
+            rot,
+            DVec3::new(0.5, 0.5, 0.5),
+        )
+        .is_none()
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -615,18 +697,33 @@ fn obb_obb_rotated_separated() {
 #[test]
 fn capsule_capsule_overlap() {
     let r = capsule_capsule_3d(
-        DVec3::ZERO, DQuat::IDENTITY, 1.0, 0.5,
-        DVec3::new(0.8, 0.0, 0.0), DQuat::IDENTITY, 1.0, 0.5,
+        DVec3::ZERO,
+        DQuat::IDENTITY,
+        1.0,
+        0.5,
+        DVec3::new(0.8, 0.0, 0.0),
+        DQuat::IDENTITY,
+        1.0,
+        0.5,
     );
     assert!(r.is_some());
 }
 
 #[test]
 fn capsule_capsule_miss() {
-    assert!(capsule_capsule_3d(
-        DVec3::ZERO, DQuat::IDENTITY, 1.0, 0.5,
-        DVec3::new(5.0, 0.0, 0.0), DQuat::IDENTITY, 1.0, 0.5,
-    ).is_none());
+    assert!(
+        capsule_capsule_3d(
+            DVec3::ZERO,
+            DQuat::IDENTITY,
+            1.0,
+            0.5,
+            DVec3::new(5.0, 0.0, 0.0),
+            DQuat::IDENTITY,
+            1.0,
+            0.5,
+        )
+        .is_none()
+    );
 }
 
 #[test]
@@ -634,8 +731,14 @@ fn capsule_capsule_crossed() {
     // Two capsules crossing at right angles
     let rot_x = DQuat::from_rotation_x(std::f64::consts::FRAC_PI_2);
     let r = capsule_capsule_3d(
-        DVec3::ZERO, DQuat::IDENTITY, 2.0, 0.3,
-        DVec3::new(0.0, 0.0, 0.0), rot_x, 2.0, 0.3,
+        DVec3::ZERO,
+        DQuat::IDENTITY,
+        2.0,
+        0.3,
+        DVec3::new(0.0, 0.0, 0.0),
+        rot_x,
+        2.0,
+        0.3,
     );
     assert!(r.is_some());
 }
@@ -647,18 +750,31 @@ fn capsule_capsule_crossed() {
 #[test]
 fn capsule_box_overlap() {
     let r = capsule_box_3d(
-        DVec3::new(0.0, 0.0, 0.0), DQuat::IDENTITY, 1.0, 0.5,
-        DVec3::new(1.0, 0.0, 0.0), DQuat::IDENTITY, DVec3::ONE,
+        DVec3::new(0.0, 0.0, 0.0),
+        DQuat::IDENTITY,
+        1.0,
+        0.5,
+        DVec3::new(1.0, 0.0, 0.0),
+        DQuat::IDENTITY,
+        DVec3::ONE,
     );
     assert!(r.is_some());
 }
 
 #[test]
 fn capsule_box_miss() {
-    assert!(capsule_box_3d(
-        DVec3::new(0.0, 0.0, 0.0), DQuat::IDENTITY, 1.0, 0.5,
-        DVec3::new(5.0, 0.0, 0.0), DQuat::IDENTITY, DVec3::ONE,
-    ).is_none());
+    assert!(
+        capsule_box_3d(
+            DVec3::new(0.0, 0.0, 0.0),
+            DQuat::IDENTITY,
+            1.0,
+            0.5,
+            DVec3::new(5.0, 0.0, 0.0),
+            DQuat::IDENTITY,
+            DVec3::ONE,
+        )
+        .is_none()
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -668,40 +784,60 @@ fn capsule_box_miss() {
 #[test]
 fn segment_sphere_overlap() {
     let r = segment_sphere_3d(
-        DVec3::ZERO, DQuat::IDENTITY,
-        DVec3::new(-2.0, 0.0, 0.0), DVec3::new(2.0, 0.0, 0.0),
-        DVec3::new(0.0, 0.3, 0.0), 0.5,
+        DVec3::ZERO,
+        DQuat::IDENTITY,
+        DVec3::new(-2.0, 0.0, 0.0),
+        DVec3::new(2.0, 0.0, 0.0),
+        DVec3::new(0.0, 0.3, 0.0),
+        0.5,
     );
     assert!(r.is_some());
 }
 
 #[test]
 fn segment_sphere_miss() {
-    assert!(segment_sphere_3d(
-        DVec3::ZERO, DQuat::IDENTITY,
-        DVec3::new(-2.0, 0.0, 0.0), DVec3::new(2.0, 0.0, 0.0),
-        DVec3::new(0.0, 5.0, 0.0), 0.5,
-    ).is_none());
+    assert!(
+        segment_sphere_3d(
+            DVec3::ZERO,
+            DQuat::IDENTITY,
+            DVec3::new(-2.0, 0.0, 0.0),
+            DVec3::new(2.0, 0.0, 0.0),
+            DVec3::new(0.0, 5.0, 0.0),
+            0.5,
+        )
+        .is_none()
+    );
 }
 
 #[test]
 fn segment_box_overlap() {
     // Segment passing through the center of a box
     let r = segment_box_3d(
-        DVec3::ZERO, DQuat::IDENTITY,
-        DVec3::new(-0.5, 0.0, 0.0), DVec3::new(0.5, 0.0, 0.0),
-        DVec3::ZERO, DQuat::IDENTITY, DVec3::ONE,
+        DVec3::ZERO,
+        DQuat::IDENTITY,
+        DVec3::new(-0.5, 0.0, 0.0),
+        DVec3::new(0.5, 0.0, 0.0),
+        DVec3::ZERO,
+        DQuat::IDENTITY,
+        DVec3::ONE,
     );
     assert!(r.is_some());
 }
 
 #[test]
 fn segment_box_miss() {
-    assert!(segment_box_3d(
-        DVec3::ZERO, DQuat::IDENTITY,
-        DVec3::new(-0.5, 0.0, 0.0), DVec3::new(0.5, 0.0, 0.0),
-        DVec3::new(5.0, 5.0, 5.0), DQuat::IDENTITY, DVec3::ONE,
-    ).is_none());
+    assert!(
+        segment_box_3d(
+            DVec3::ZERO,
+            DQuat::IDENTITY,
+            DVec3::new(-0.5, 0.0, 0.0),
+            DVec3::new(0.5, 0.0, 0.0),
+            DVec3::new(5.0, 5.0, 5.0),
+            DQuat::IDENTITY,
+            DVec3::ONE,
+        )
+        .is_none()
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -711,31 +847,30 @@ fn segment_box_miss() {
 #[test]
 fn convex_hull_sphere_overlap() {
     // Triangle hull near sphere
-    let points = vec![
-        [-1.0, -1.0, 0.0],
-        [1.0, -1.0, 0.0],
-        [0.0, 1.0, 0.0],
-    ];
+    let points = vec![[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]];
     let r = convex_hull_sphere_3d(
         &points,
-        DVec3::ZERO, DQuat::IDENTITY,
-        DVec3::new(0.0, 1.2, 0.0), 0.5,
+        DVec3::ZERO,
+        DQuat::IDENTITY,
+        DVec3::new(0.0, 1.2, 0.0),
+        0.5,
     );
     assert!(r.is_some());
 }
 
 #[test]
 fn convex_hull_sphere_miss() {
-    let points = vec![
-        [-1.0, -1.0, 0.0],
-        [1.0, -1.0, 0.0],
-        [0.0, 1.0, 0.0],
-    ];
-    assert!(convex_hull_sphere_3d(
-        &points,
-        DVec3::ZERO, DQuat::IDENTITY,
-        DVec3::new(0.0, 5.0, 0.0), 0.5,
-    ).is_none());
+    let points = vec![[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]];
+    assert!(
+        convex_hull_sphere_3d(
+            &points,
+            DVec3::ZERO,
+            DQuat::IDENTITY,
+            DVec3::new(0.0, 5.0, 0.0),
+            0.5,
+        )
+        .is_none()
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -745,8 +880,10 @@ fn convex_hull_sphere_miss() {
 #[test]
 fn closest_points_parallel_segments() {
     let (p1, p2) = closest_points_segments_3d(
-        DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0),
-        DVec3::new(0.0, 1.0, 0.0), DVec3::new(1.0, 1.0, 0.0),
+        DVec3::new(0.0, 0.0, 0.0),
+        DVec3::new(1.0, 0.0, 0.0),
+        DVec3::new(0.0, 1.0, 0.0),
+        DVec3::new(1.0, 1.0, 0.0),
     );
     // Closest points should be on the same x coordinate
     assert!((p1.y).abs() < EPS);
@@ -756,8 +893,10 @@ fn closest_points_parallel_segments() {
 #[test]
 fn closest_points_crossing_segments() {
     let (p1, p2) = closest_points_segments_3d(
-        DVec3::new(-1.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0),
-        DVec3::new(0.0, -1.0, 1.0), DVec3::new(0.0, 1.0, 1.0),
+        DVec3::new(-1.0, 0.0, 0.0),
+        DVec3::new(1.0, 0.0, 0.0),
+        DVec3::new(0.0, -1.0, 1.0),
+        DVec3::new(0.0, 1.0, 1.0),
     );
     // p1 should be at origin (0,0,0) and p2 at (0,0,1)
     assert!((p1 - DVec3::new(0.0, 0.0, 0.0)).length() < EPS);

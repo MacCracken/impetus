@@ -6,9 +6,9 @@ use crate::arena::ArenaHandle;
 use crate::body::BodyHandle;
 use crate::joint::JointType;
 
-use super::types::{Joint3d, EPSILON, EPSILON_SQ};
-use super::state::PhysicsState3d;
 use super::body_ah;
+use super::state::PhysicsState3d;
+use super::types::{EPSILON, EPSILON_SQ, Joint3d};
 
 impl PhysicsState3d {
     // -----------------------------------------------------------------------
@@ -16,9 +16,8 @@ impl PhysicsState3d {
     // -----------------------------------------------------------------------
 
     pub(super) fn solve_joints(&mut self, dt: f64, iterations: u32) {
-        let joints: Vec<(ArenaHandle, Joint3d)> = self.joints.iter()
-            .map(|(ah, j)| (ah, j.clone()))
-            .collect();
+        let joints: Vec<(ArenaHandle, Joint3d)> =
+            self.joints.iter().map(|(ah, j)| (ah, j.clone())).collect();
 
         let mut constraint_forces: Vec<f64> = vec![0.0; joints.len()];
 
@@ -26,25 +25,25 @@ impl PhysicsState3d {
             for (ji, (_ah, joint)) in joints.iter().enumerate() {
                 let force = match &joint.joint_type {
                     JointType::Fixed => self.solve_fixed_joint_3d(joint),
-                    JointType::Distance { length } => {
-                        self.solve_distance_joint_3d(joint, *length)
-                    }
+                    JointType::Distance { length } => self.solve_distance_joint_3d(joint, *length),
                     JointType::Spring {
                         rest_length,
                         stiffness,
                         damping,
-                    } => {
-                        self.solve_spring_joint_3d(joint, *rest_length, *stiffness, *damping, dt)
-                    }
-                    JointType::Wheel { axis, stiffness, damping } => {
-                        self.solve_wheel_joint_3d(joint, *axis, *stiffness, *damping, dt)
-                    }
-                    JointType::Rope { max_length } => {
-                        self.solve_rope_joint_3d(joint, *max_length)
-                    }
-                    JointType::Mouse { target, stiffness, damping, max_force } => {
-                        self.solve_mouse_joint_3d(joint, *target, *stiffness, *damping, *max_force, dt)
-                    }
+                    } => self.solve_spring_joint_3d(joint, *rest_length, *stiffness, *damping, dt),
+                    JointType::Wheel {
+                        axis,
+                        stiffness,
+                        damping,
+                    } => self.solve_wheel_joint_3d(joint, *axis, *stiffness, *damping, dt),
+                    JointType::Rope { max_length } => self.solve_rope_joint_3d(joint, *max_length),
+                    JointType::Mouse {
+                        target,
+                        stiffness,
+                        damping,
+                        max_force,
+                    } => self
+                        .solve_mouse_joint_3d(joint, *target, *stiffness, *damping, *max_force, dt),
                     _ => 0.0, // Revolute/Prismatic: 3D versions need axis definitions, skip for now
                 };
                 constraint_forces[ji] = constraint_forces[ji].max(force);
@@ -77,12 +76,22 @@ impl PhysicsState3d {
         let anchor_b = self.world_anchor_3d(joint.body_b, joint.local_anchor_b);
 
         let (vel_a, angvel_a, pos_a, inv_mass_a) = match self.bodies.get(body_ah(joint.body_a)) {
-            Some(b) if b.is_dynamic() => (b.linear_velocity, b.angular_velocity, b.position, b.inv_mass),
+            Some(b) if b.is_dynamic() => (
+                b.linear_velocity,
+                b.angular_velocity,
+                b.position,
+                b.inv_mass,
+            ),
             Some(b) => (b.linear_velocity, b.angular_velocity, b.position, 0.0),
             None => return,
         };
         let (vel_b, angvel_b, pos_b, inv_mass_b) = match self.bodies.get(body_ah(joint.body_b)) {
-            Some(b) if b.is_dynamic() => (b.linear_velocity, b.angular_velocity, b.position, b.inv_mass),
+            Some(b) if b.is_dynamic() => (
+                b.linear_velocity,
+                b.angular_velocity,
+                b.position,
+                b.inv_mass,
+            ),
             Some(b) => (b.linear_velocity, b.angular_velocity, b.position, 0.0),
             None => return,
         };
@@ -258,8 +267,16 @@ impl PhysicsState3d {
         let along = diff.dot(ax);
         let spring_force = stiffness * along;
 
-        let vel_a = self.bodies.get(body_ah(joint.body_a)).map(|b| b.linear_velocity).unwrap_or(DVec3::ZERO);
-        let vel_b = self.bodies.get(body_ah(joint.body_b)).map(|b| b.linear_velocity).unwrap_or(DVec3::ZERO);
+        let vel_a = self
+            .bodies
+            .get(body_ah(joint.body_a))
+            .map(|b| b.linear_velocity)
+            .unwrap_or(DVec3::ZERO);
+        let vel_b = self
+            .bodies
+            .get(body_ah(joint.body_b))
+            .map(|b| b.linear_velocity)
+            .unwrap_or(DVec3::ZERO);
         let rel_vel_along = (vel_b - vel_a).dot(ax);
         let damping_force = damping * rel_vel_along;
 
@@ -330,7 +347,11 @@ impl PhysicsState3d {
         }
 
         let spring_force = diff * stiffness;
-        let vel_a = self.bodies.get(body_ah(joint.body_a)).map(|b| b.linear_velocity).unwrap_or(DVec3::ZERO);
+        let vel_a = self
+            .bodies
+            .get(body_ah(joint.body_a))
+            .map(|b| b.linear_velocity)
+            .unwrap_or(DVec3::ZERO);
         let damping_force = vel_a * (-damping);
         let mut total = (spring_force + damping_force) * dt;
 

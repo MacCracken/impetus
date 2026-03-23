@@ -6,13 +6,13 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::ImpetusError;
+use crate::PhysicsWorld;
 use crate::body::{BodyDesc, BodyHandle};
 use crate::collider::{ColliderDesc, ColliderHandle};
 use crate::config::WorldConfig;
 use crate::joint::{JointDesc, JointHandle};
 use crate::particle::{Particle, ParticleEmitter};
-use crate::ImpetusError;
-use crate::PhysicsWorld;
 
 /// A serializable snapshot of the entire physics world.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -262,29 +262,37 @@ mod tests {
             linear_velocity: [1.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        world_a.add_collider(ball_a, ColliderDesc {
-            shape: ColliderShape::Ball { radius: 0.5 },
-            offset: [0.0, 0.0, 0.0],
-            material: PhysicsMaterial::rubber(),
-            is_sensor: false,
-            mass: None,
-            collision_layer: 0xFFFF_FFFF,
-            collision_mask: 0xFFFF_FFFF,
-        });
+        world_a.add_collider(
+            ball_a,
+            ColliderDesc {
+                shape: ColliderShape::Ball { radius: 0.5 },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial::rubber(),
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
+            },
+        );
         let floor_a = world_a.add_body(BodyDesc {
             body_type: BodyType::Static,
             position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        world_a.add_collider(floor_a, ColliderDesc {
-            shape: ColliderShape::Box { half_extents: [50.0, 0.5, 0.0] },
-            offset: [0.0, 0.0, 0.0],
-            material: PhysicsMaterial::wood(),
-            is_sensor: false,
-            mass: None,
-            collision_layer: 0xFFFF_FFFF,
-            collision_mask: 0xFFFF_FFFF,
-        });
+        world_a.add_collider(
+            floor_a,
+            ColliderDesc {
+                shape: ColliderShape::Box {
+                    half_extents: [50.0, 0.5, 0.0],
+                },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial::wood(),
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
+            },
+        );
         for _ in 0..50 {
             world_a.step();
         }
@@ -303,29 +311,37 @@ mod tests {
             linear_velocity: [1.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        world_b.add_collider(ball_b, ColliderDesc {
-            shape: ColliderShape::Ball { radius: 0.5 },
-            offset: [0.0, 0.0, 0.0],
-            material: PhysicsMaterial::rubber(),
-            is_sensor: false,
-            mass: None,
-            collision_layer: 0xFFFF_FFFF,
-            collision_mask: 0xFFFF_FFFF,
-        });
+        world_b.add_collider(
+            ball_b,
+            ColliderDesc {
+                shape: ColliderShape::Ball { radius: 0.5 },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial::rubber(),
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
+            },
+        );
         let floor_b = world_b.add_body(BodyDesc {
             body_type: BodyType::Static,
             position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        world_b.add_collider(floor_b, ColliderDesc {
-            shape: ColliderShape::Box { half_extents: [50.0, 0.5, 0.0] },
-            offset: [0.0, 0.0, 0.0],
-            material: PhysicsMaterial::wood(),
-            is_sensor: false,
-            mass: None,
-            collision_layer: 0xFFFF_FFFF,
-            collision_mask: 0xFFFF_FFFF,
-        });
+        world_b.add_collider(
+            floor_b,
+            ColliderDesc {
+                shape: ColliderShape::Box {
+                    half_extents: [50.0, 0.5, 0.0],
+                },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial::wood(),
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
+            },
+        );
         for _ in 0..150 {
             world_b.step();
         }

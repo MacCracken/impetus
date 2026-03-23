@@ -125,8 +125,8 @@ impl RigidBody3d {
         if !self.fixed_rotation {
             let w = self.angular_velocity;
             let half_dt = dt * 0.5;
-            let dq = DQuat::from_xyzw(w.x * half_dt, w.y * half_dt, w.z * half_dt, 0.0)
-                * self.rotation;
+            let dq =
+                DQuat::from_xyzw(w.x * half_dt, w.y * half_dt, w.z * half_dt, 0.0) * self.rotation;
             self.rotation = DQuat::from_xyzw(
                 self.rotation.x + dq.x,
                 self.rotation.y + dq.y,
@@ -227,7 +227,11 @@ impl Collider3d {
                     min = min.min(wv);
                     max = max.max(wv);
                 }
-                if min.x > max.x { Aabb3d { min: wp, max: wp } } else { Aabb3d { min, max } }
+                if min.x > max.x {
+                    Aabb3d { min: wp, max: wp }
+                } else {
+                    Aabb3d { min, max }
+                }
             }
             ColliderShape::ConvexHull { points } => {
                 let mut min = DVec3::splat(f64::INFINITY);
@@ -237,12 +241,19 @@ impl Collider3d {
                     min = min.min(wv);
                     max = max.max(wv);
                 }
-                if min.x > max.x { Aabb3d { min: wp, max: wp } } else { Aabb3d { min, max } }
+                if min.x > max.x {
+                    Aabb3d { min: wp, max: wp }
+                } else {
+                    Aabb3d { min, max }
+                }
             }
             ColliderShape::Segment { a, b } => {
                 let wa = wp + body_rot * DVec3::from_array(*a);
                 let wb = wp + body_rot * DVec3::from_array(*b);
-                Aabb3d { min: wa.min(wb), max: wa.max(wb) }
+                Aabb3d {
+                    min: wa.min(wb),
+                    max: wa.max(wb),
+                }
             }
             ColliderShape::Heightfield { heights, scale } => {
                 let w = scale[0] * (heights.len().max(1) - 1) as f64;

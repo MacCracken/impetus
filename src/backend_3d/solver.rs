@@ -8,9 +8,9 @@ use crate::collider::ColliderHandle;
 use crate::event::CollisionEvent;
 use crate::spatial_hash::SpatialHashGrid;
 
-use super::types::*;
-use super::state::PhysicsState3d;
 use super::narrowphase::*;
+use super::state::PhysicsState3d;
+use super::types::*;
 use super::{body_ah, coll_ah};
 
 impl PhysicsState3d {
@@ -160,8 +160,11 @@ impl PhysicsState3d {
             if ca.body == cb.body {
                 continue;
             }
-            if let (Some(ba), Some(bb)) = (self.bodies.get(body_ah(ca.body)), self.bodies.get(body_ah(cb.body)))
-                && ba.is_static() && bb.is_static()
+            if let (Some(ba), Some(bb)) = (
+                self.bodies.get(body_ah(ca.body)),
+                self.bodies.get(body_ah(cb.body)),
+            ) && ba.is_static()
+                && bb.is_static()
             {
                 continue;
             }
@@ -294,14 +297,26 @@ impl PhysicsState3d {
                         Some(b) => b,
                         None => continue,
                     };
-                    (ba.inv_mass, ba.inv_inertia, ba.linear_velocity, ba.angular_velocity, ba.position)
+                    (
+                        ba.inv_mass,
+                        ba.inv_inertia,
+                        ba.linear_velocity,
+                        ba.angular_velocity,
+                        ba.position,
+                    )
                 };
                 let (inv_mass_b, inv_inertia_b, vel_b, angvel_b, pos_b) = {
                     let bb = match self.bodies.get(body_ah(contact.body_b)) {
                         Some(b) => b,
                         None => continue,
                     };
-                    (bb.inv_mass, bb.inv_inertia, bb.linear_velocity, bb.angular_velocity, bb.position)
+                    (
+                        bb.inv_mass,
+                        bb.inv_inertia,
+                        bb.linear_velocity,
+                        bb.angular_velocity,
+                        bb.position,
+                    )
                 };
 
                 if inv_mass_a == 0.0 && inv_mass_b == 0.0 {
@@ -410,8 +425,13 @@ impl PhysicsState3d {
         }
     }
 
-    fn solve_positions(&mut self, contacts: &[Contact3d], iterations: u32, slop: f64, percent: f64) {
-
+    fn solve_positions(
+        &mut self,
+        contacts: &[Contact3d],
+        iterations: u32,
+        slop: f64,
+        percent: f64,
+    ) {
         for _ in 0..iterations {
             for contact in contacts {
                 let is_sensor = match (
@@ -425,8 +445,16 @@ impl PhysicsState3d {
                     continue;
                 }
 
-                let inv_mass_a = self.bodies.get(body_ah(contact.body_a)).map(|b| b.inv_mass).unwrap_or(0.0);
-                let inv_mass_b = self.bodies.get(body_ah(contact.body_b)).map(|b| b.inv_mass).unwrap_or(0.0);
+                let inv_mass_a = self
+                    .bodies
+                    .get(body_ah(contact.body_a))
+                    .map(|b| b.inv_mass)
+                    .unwrap_or(0.0);
+                let inv_mass_b = self
+                    .bodies
+                    .get(body_ah(contact.body_b))
+                    .map(|b| b.inv_mass)
+                    .unwrap_or(0.0);
                 let inv_mass_sum = inv_mass_a + inv_mass_b;
                 if inv_mass_sum == 0.0 {
                     continue;

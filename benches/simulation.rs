@@ -1,5 +1,6 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use impetus::{
+    PhysicsWorld,
     body::{BodyDesc, BodyState, BodyType},
     collider::{ColliderDesc, ColliderShape},
     config::WorldConfig,
@@ -9,7 +10,6 @@ use impetus::{
     particle::{Particle, ParticleEmitter},
     spring::{Spring, Spring2d},
     units::{PhysicsUnit, Quantity},
-    PhysicsWorld,
 };
 
 // ---------------------------------------------------------------------------
@@ -211,13 +211,9 @@ fn bench_forces(c: &mut Criterion) {
 fn bench_materials(c: &mut Criterion) {
     let mut group = c.benchmark_group("materials");
 
-    group.bench_function("preset_steel", |b| {
-        b.iter(PhysicsMaterial::steel)
-    });
+    group.bench_function("preset_steel", |b| b.iter(PhysicsMaterial::steel));
 
-    group.bench_function("preset_rubber", |b| {
-        b.iter(PhysicsMaterial::rubber)
-    });
+    group.bench_function("preset_rubber", |b| b.iter(PhysicsMaterial::rubber));
 
     group.bench_function("quantity_display", |b| {
         let q = Quantity::newtons(9.81);
@@ -373,7 +369,11 @@ fn bench_particles(c: &mut Criterion) {
     group.bench_function("spawn_particle", |b| {
         let mut world = PhysicsWorld::new(WorldConfig::default());
         b.iter(|| {
-            world.spawn_particle(black_box(Particle::new([0.0, 0.0, 0.0], [1.0, 2.0, 0.0], 3.0)));
+            world.spawn_particle(black_box(Particle::new(
+                [0.0, 0.0, 0.0],
+                [1.0, 2.0, 0.0],
+                3.0,
+            )));
         })
     });
 
@@ -478,17 +478,26 @@ fn bench_queries(c: &mut Criterion) {
                 position: [(i % 10) as f64 * 3.0, (i / 10) as f64 * 3.0, 0.0],
                 ..Default::default()
             });
-            world.add_collider(body, ColliderDesc {
-                shape: ColliderShape::Ball { radius: 1.0 },
-                offset: [0.0, 0.0, 0.0],
-                material: PhysicsMaterial::default(),
-                is_sensor: false,
-                mass: None,
-                collision_layer: 0xFFFF_FFFF,
-                collision_mask: 0xFFFF_FFFF,
-            });
+            world.add_collider(
+                body,
+                ColliderDesc {
+                    shape: ColliderShape::Ball { radius: 1.0 },
+                    offset: [0.0, 0.0, 0.0],
+                    material: PhysicsMaterial::default(),
+                    is_sensor: false,
+                    mass: None,
+                    collision_layer: 0xFFFF_FFFF,
+                    collision_mask: 0xFFFF_FFFF,
+                },
+            );
         }
-        b.iter(|| world.raycast(black_box([0.0, 0.0, 0.0]), black_box([1.0, 0.0, 0.0]), 100.0))
+        b.iter(|| {
+            world.raycast(
+                black_box([0.0, 0.0, 0.0]),
+                black_box([1.0, 0.0, 0.0]),
+                100.0,
+            )
+        })
     });
 
     // Overlap sphere
@@ -503,15 +512,18 @@ fn bench_queries(c: &mut Criterion) {
                 position: [(i % 10) as f64 * 3.0, (i / 10) as f64 * 3.0, 0.0],
                 ..Default::default()
             });
-            world.add_collider(body, ColliderDesc {
-                shape: ColliderShape::Ball { radius: 1.0 },
-                offset: [0.0, 0.0, 0.0],
-                material: PhysicsMaterial::default(),
-                is_sensor: false,
-                mass: None,
-                collision_layer: 0xFFFF_FFFF,
-                collision_mask: 0xFFFF_FFFF,
-            });
+            world.add_collider(
+                body,
+                ColliderDesc {
+                    shape: ColliderShape::Ball { radius: 1.0 },
+                    offset: [0.0, 0.0, 0.0],
+                    material: PhysicsMaterial::default(),
+                    is_sensor: false,
+                    mass: None,
+                    collision_layer: 0xFFFF_FFFF,
+                    collision_mask: 0xFFFF_FFFF,
+                },
+            );
         }
         b.iter(|| world.overlap_sphere(black_box([15.0, 15.0, 0.0]), black_box(5.0)))
     });
@@ -529,30 +541,36 @@ fn bench_mutation(c: &mut Criterion) {
     group.bench_function("get_body_state", |b| {
         let mut world = PhysicsWorld::new(WorldConfig::default());
         let body = world.add_body(BodyDesc::default());
-        world.add_collider(body, ColliderDesc {
-            shape: ColliderShape::Ball { radius: 0.5 },
-            offset: [0.0, 0.0, 0.0],
-            material: PhysicsMaterial::default(),
-            is_sensor: false,
-            mass: None,
-            collision_layer: 0xFFFF_FFFF,
-            collision_mask: 0xFFFF_FFFF,
-        });
+        world.add_collider(
+            body,
+            ColliderDesc {
+                shape: ColliderShape::Ball { radius: 0.5 },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
+            },
+        );
         b.iter(|| world.get_body_state(black_box(body)).unwrap())
     });
 
     group.bench_function("set_body_state", |b| {
         let mut world = PhysicsWorld::new(WorldConfig::default());
         let body = world.add_body(BodyDesc::default());
-        world.add_collider(body, ColliderDesc {
-            shape: ColliderShape::Ball { radius: 0.5 },
-            offset: [0.0, 0.0, 0.0],
-            material: PhysicsMaterial::default(),
-            is_sensor: false,
-            mass: None,
-            collision_layer: 0xFFFF_FFFF,
-            collision_mask: 0xFFFF_FFFF,
-        });
+        world.add_collider(
+            body,
+            ColliderDesc {
+                shape: ColliderShape::Ball { radius: 0.5 },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
+            },
+        );
         let state = BodyState {
             handle: body,
             body_type: BodyType::Dynamic,
@@ -562,24 +580,35 @@ fn bench_mutation(c: &mut Criterion) {
             angular_velocity: 0.1,
             is_sleeping: false,
         };
-        b.iter(|| world.set_body_state(black_box(body), black_box(&state)).unwrap())
+        b.iter(|| {
+            world
+                .set_body_state(black_box(body), black_box(&state))
+                .unwrap()
+        })
     });
 
     group.bench_function("set_body_type", |b| {
         let mut world = PhysicsWorld::new(WorldConfig::default());
         let body = world.add_body(BodyDesc::default());
-        world.add_collider(body, ColliderDesc {
-            shape: ColliderShape::Ball { radius: 0.5 },
-            offset: [0.0, 0.0, 0.0],
-            material: PhysicsMaterial::default(),
-            is_sensor: false,
-            mass: None,
-            collision_layer: 0xFFFF_FFFF,
-            collision_mask: 0xFFFF_FFFF,
-        });
+        world.add_collider(
+            body,
+            ColliderDesc {
+                shape: ColliderShape::Ball { radius: 0.5 },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
+            },
+        );
         let mut toggle = true;
         b.iter(|| {
-            let t = if toggle { BodyType::Static } else { BodyType::Dynamic };
+            let t = if toggle {
+                BodyType::Static
+            } else {
+                BodyType::Dynamic
+            };
             toggle = !toggle;
             world.set_body_type(black_box(body), black_box(t)).unwrap()
         })

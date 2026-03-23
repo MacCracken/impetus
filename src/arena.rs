@@ -24,8 +24,14 @@ impl ArenaHandle {
 
 /// Entry in the arena — either occupied or free (pointing to next free slot).
 enum Entry<T> {
-    Occupied { value: T, generation: u32 },
-    Free { next_free: Option<u32>, generation: u32 },
+    Occupied {
+        value: T,
+        generation: u32,
+    },
+    Free {
+        next_free: Option<u32>,
+        generation: u32,
+    },
 }
 
 /// A generational arena for O(1) operations.
@@ -53,7 +59,10 @@ impl<T> Arena<T> {
             // Reuse a free slot
             let idx = free_idx as usize;
             let generation = match &self.entries[idx] {
-                Entry::Free { next_free, generation } => {
+                Entry::Free {
+                    next_free,
+                    generation,
+                } => {
                     self.free_head = *next_free;
                     *generation
                 }
@@ -64,7 +73,10 @@ impl<T> Arena<T> {
         } else {
             // Append new slot
             let idx = self.entries.len() as u32;
-            self.entries.push(Entry::Occupied { value, generation: 0 });
+            self.entries.push(Entry::Occupied {
+                value,
+                generation: 0,
+            });
             ArenaHandle::new(idx, 0)
         }
     }
@@ -185,7 +197,10 @@ impl<T> Arena<T> {
             Entry::Occupied { .. } => return false,
         }
 
-        self.entries[idx] = Entry::Occupied { value, generation: target_gen };
+        self.entries[idx] = Entry::Occupied {
+            value,
+            generation: target_gen,
+        };
         self.len += 1;
         true
     }

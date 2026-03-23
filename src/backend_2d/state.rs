@@ -2,12 +2,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::ImpetusError;
 use crate::arena::Arena;
 use crate::body::{BodyDesc, BodyHandle, BodyState, BodyType};
 use crate::collider::{ColliderDesc, ColliderHandle};
 use crate::force::{Force, Impulse, Torque};
 use crate::joint::{JointDesc, JointHandle};
-use crate::ImpetusError;
 
 use super::types::*;
 use super::{body_ah, body_from, coll_ah, coll_from, joint_ah, joint_from};
@@ -44,7 +44,9 @@ impl PhysicsState2d {
 
     pub fn add_body(&mut self, desc: &BodyDesc) -> BodyHandle {
         // Insert with a placeholder handle; we'll patch it once the arena assigns the slot.
-        let ah = self.bodies.insert(RigidBody2d::from_desc(BodyHandle(0), desc));
+        let ah = self
+            .bodies
+            .insert(RigidBody2d::from_desc(BodyHandle(0), desc));
         let handle = body_from(ah);
         // SAFETY: we just inserted at `ah`, so this slot is guaranteed occupied.
         self.bodies.get_mut(ah).expect("just-inserted body").handle = handle;
@@ -52,11 +54,7 @@ impl PhysicsState2d {
         handle
     }
 
-    pub fn add_collider(
-        &mut self,
-        body: BodyHandle,
-        desc: &ColliderDesc,
-    ) -> ColliderHandle {
+    pub fn add_collider(&mut self, body: BodyHandle, desc: &ColliderDesc) -> ColliderHandle {
         // Insert with placeholder handle, patch after arena assigns slot.
         let collider = Collider2d::from_desc(ColliderHandle(0), body, desc);
 
@@ -79,7 +77,10 @@ impl PhysicsState2d {
         let ah = self.colliders.insert(collider);
         let handle = coll_from(ah);
         // SAFETY: we just inserted at `ah`, so this slot is guaranteed occupied.
-        self.colliders.get_mut(ah).expect("just-inserted collider").handle = handle;
+        self.colliders
+            .get_mut(ah)
+            .expect("just-inserted collider")
+            .handle = handle;
         self.body_colliders.entry(body).or_default().push(handle);
         handle
     }
@@ -122,8 +123,7 @@ impl PhysicsState2d {
             rb.linear_velocity[0] += impulse.vector[0] * rb.inv_mass;
             rb.linear_velocity[1] += impulse.vector[1] * rb.inv_mass;
             if let Some(point) = impulse.point {
-                let angular_impulse =
-                    point[0] * impulse.vector[1] - point[1] * impulse.vector[0];
+                let angular_impulse = point[0] * impulse.vector[1] - point[1] * impulse.vector[0];
                 rb.angular_velocity += angular_impulse * rb.inv_inertia;
             }
         }
@@ -154,7 +154,9 @@ impl PhysicsState2d {
 
     /// Remove a single collider and recompute the parent body's mass properties.
     pub fn remove_collider(&mut self, handle: ColliderHandle) -> Result<(), ImpetusError> {
-        let collider = self.colliders.remove(coll_ah(handle))
+        let collider = self
+            .colliders
+            .remove(coll_ah(handle))
             .ok_or_else(|| ImpetusError::ColliderNotFound(format!("{:?}", handle)))?;
         let body = collider.body;
 
@@ -186,7 +188,11 @@ impl PhysicsState2d {
             rb.inertia = inertia;
             if mass > 0.0 {
                 rb.inv_mass = 1.0 / mass;
-                rb.inv_inertia = if rb.fixed_rotation { 0.0 } else { 1.0 / inertia };
+                rb.inv_inertia = if rb.fixed_rotation {
+                    0.0
+                } else {
+                    1.0 / inertia
+                };
             } else {
                 rb.inv_mass = 0.0;
                 rb.inv_inertia = 0.0;
@@ -198,7 +204,8 @@ impl PhysicsState2d {
 
     /// Remove a joint by handle.
     pub fn remove_joint(&mut self, handle: JointHandle) -> Result<(), ImpetusError> {
-        self.joints.remove(joint_ah(handle))
+        self.joints
+            .remove(joint_ah(handle))
             .ok_or_else(|| ImpetusError::JointNotFound(format!("{:?}", handle)))?;
         Ok(())
     }
@@ -214,7 +221,12 @@ impl PhysicsState2d {
 
     /// Insert a collider at a specific handle (for snapshot restore).
     #[cfg(feature = "serialize")]
-    pub fn add_collider_at(&mut self, handle: ColliderHandle, body: BodyHandle, desc: &ColliderDesc) {
+    pub fn add_collider_at(
+        &mut self,
+        handle: ColliderHandle,
+        body: BodyHandle,
+        desc: &ColliderDesc,
+    ) {
         let collider = Collider2d::from_desc(handle, body, desc);
         if let Some(rb) = self.bodies.get_mut(body_ah(body))
             && rb.is_dynamic()
@@ -224,7 +236,11 @@ impl PhysicsState2d {
             rb.mass += c_mass;
             rb.inertia += c_inertia;
             rb.inv_mass = 1.0 / rb.mass;
-            rb.inv_inertia = if rb.fixed_rotation { 0.0 } else { 1.0 / rb.inertia };
+            rb.inv_inertia = if rb.fixed_rotation {
+                0.0
+            } else {
+                1.0 / rb.inertia
+            };
         }
         self.colliders.insert_at(coll_ah(handle), collider);
         self.body_colliders.entry(body).or_default().push(handle);
@@ -233,16 +249,19 @@ impl PhysicsState2d {
     /// Insert a joint at a specific handle (for snapshot restore).
     #[cfg(feature = "serialize")]
     pub fn add_joint_at(&mut self, handle: JointHandle, desc: &JointDesc) {
-        self.joints.insert_at(joint_ah(handle), Joint2d {
-            body_a: desc.body_a,
-            body_b: desc.body_b,
-            joint_type: desc.joint_type.clone(),
-            local_anchor_a: desc.local_anchor_a,
-            local_anchor_b: desc.local_anchor_b,
-            motor: desc.motor.clone(),
-            damping: desc.damping,
-            break_force: desc.break_force,
-        });
+        self.joints.insert_at(
+            joint_ah(handle),
+            Joint2d {
+                body_a: desc.body_a,
+                body_b: desc.body_b,
+                joint_type: desc.joint_type.clone(),
+                local_anchor_a: desc.local_anchor_a,
+                local_anchor_b: desc.local_anchor_b,
+                motor: desc.motor.clone(),
+                damping: desc.damping,
+                break_force: desc.break_force,
+            },
+        );
     }
 
     pub fn body_count(&self) -> usize {
@@ -265,8 +284,14 @@ impl PhysicsState2d {
         })
     }
 
-    pub fn set_body_state(&mut self, handle: BodyHandle, state: &BodyState) -> Result<(), ImpetusError> {
-        let rb = self.bodies.get_mut(body_ah(handle))
+    pub fn set_body_state(
+        &mut self,
+        handle: BodyHandle,
+        state: &BodyState,
+    ) -> Result<(), ImpetusError> {
+        let rb = self
+            .bodies
+            .get_mut(body_ah(handle))
             .ok_or_else(|| ImpetusError::BodyNotFound(format!("{:?}", handle)))?;
         rb.position = [state.position[0], state.position[1]];
         rb.rotation = state.rotation;
@@ -277,8 +302,14 @@ impl PhysicsState2d {
         Ok(())
     }
 
-    pub fn set_body_type(&mut self, handle: BodyHandle, body_type: BodyType) -> Result<(), ImpetusError> {
-        let rb = self.bodies.get_mut(body_ah(handle))
+    pub fn set_body_type(
+        &mut self,
+        handle: BodyHandle,
+        body_type: BodyType,
+    ) -> Result<(), ImpetusError> {
+        let rb = self
+            .bodies
+            .get_mut(body_ah(handle))
             .ok_or_else(|| ImpetusError::BodyNotFound(format!("{:?}", handle)))?;
         rb.body_type = body_type;
         // Reset mass properties if switching to/from static
@@ -293,7 +324,11 @@ impl PhysicsState2d {
                 // Recompute from colliders if mass is zero
                 if rb.mass > 0.0 {
                     rb.inv_mass = 1.0 / rb.mass;
-                    rb.inv_inertia = if rb.fixed_rotation { 0.0 } else { 1.0 / rb.inertia };
+                    rb.inv_inertia = if rb.fixed_rotation {
+                        0.0
+                    } else {
+                        1.0 / rb.inertia
+                    };
                 }
             }
         }

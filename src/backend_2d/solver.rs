@@ -6,9 +6,9 @@ use crate::collider::ColliderHandle;
 use crate::event::CollisionEvent;
 use crate::spatial_hash::SpatialHashGrid;
 
-use super::types::*;
-use super::state::PhysicsState2d;
 use super::narrowphase::*;
+use super::state::PhysicsState2d;
+use super::types::*;
 use super::{body_ah, coll_ah};
 
 impl PhysicsState2d {
@@ -144,8 +144,7 @@ impl PhysicsState2d {
         let candidates = grid.query_pairs();
 
         // Build AABB lookup for overlap verification
-        let aabb_map: BTreeMap<ColliderHandle, Aabb2d> =
-            collider_aabbs.into_iter().collect();
+        let aabb_map: BTreeMap<ColliderHandle, Aabb2d> = collider_aabbs.into_iter().collect();
 
         // Filter candidates
         let mut pairs = Vec::with_capacity(candidates.len());
@@ -163,8 +162,11 @@ impl PhysicsState2d {
                 continue;
             }
             // Skip static-static
-            if let (Some(ba), Some(bb)) = (self.bodies.get(body_ah(ca.body)), self.bodies.get(body_ah(cb.body)))
-                && ba.is_static() && bb.is_static()
+            if let (Some(ba), Some(bb)) = (
+                self.bodies.get(body_ah(ca.body)),
+                self.bodies.get(body_ah(cb.body)),
+            ) && ba.is_static()
+                && bb.is_static()
             {
                 continue;
             }
@@ -192,10 +194,7 @@ impl PhysicsState2d {
     // Narrowphase
     // -----------------------------------------------------------------------
 
-    fn narrowphase(
-        &self,
-        broad_pairs: &[(ColliderHandle, ColliderHandle)],
-    ) -> Vec<Contact> {
+    fn narrowphase(&self, broad_pairs: &[(ColliderHandle, ColliderHandle)]) -> Vec<Contact> {
         let mut contacts = Vec::new();
 
         for (ha, hb) in broad_pairs {
@@ -251,10 +250,14 @@ impl PhysicsState2d {
 
             // Transform contact point to body-local coordinates
             let (local_a, local_b) = {
-                let pos_a = self.bodies.get(body_ah(contact.body_a))
+                let pos_a = self
+                    .bodies
+                    .get(body_ah(contact.body_a))
                     .map(|b| (b.position, b.rotation))
                     .unwrap_or(([0.0, 0.0], 0.0));
-                let pos_b = self.bodies.get(body_ah(contact.body_b))
+                let pos_b = self
+                    .bodies
+                    .get(body_ah(contact.body_b))
                     .map(|b| (b.position, b.rotation))
                     .unwrap_or(([0.0, 0.0], 0.0));
                 (
@@ -270,11 +273,27 @@ impl PhysicsState2d {
                 } else {
                     [-contact.normal[0], -contact.normal[1]]
                 };
-                manifold.body_a = if key.0 == contact.collider_a { contact.body_a } else { contact.body_b };
-                manifold.body_b = if key.0 == contact.collider_a { contact.body_b } else { contact.body_a };
+                manifold.body_a = if key.0 == contact.collider_a {
+                    contact.body_a
+                } else {
+                    contact.body_b
+                };
+                manifold.body_b = if key.0 == contact.collider_a {
+                    contact.body_b
+                } else {
+                    contact.body_a
+                };
 
-                let new_local_a = if key.0 == contact.collider_a { local_a } else { local_b };
-                let new_local_b = if key.0 == contact.collider_a { local_b } else { local_a };
+                let new_local_a = if key.0 == contact.collider_a {
+                    local_a
+                } else {
+                    local_b
+                };
+                let new_local_b = if key.0 == contact.collider_a {
+                    local_b
+                } else {
+                    local_a
+                };
 
                 // Try to match the new contact point to an existing manifold point
                 let mut best_idx: Option<usize> = None;
@@ -307,7 +326,10 @@ impl PhysicsState2d {
                     } else {
                         // Already at max points — replace the one with the smallest
                         // accumulated normal impulse
-                        let min_idx = manifold.points.iter().enumerate()
+                        let min_idx = manifold
+                            .points
+                            .iter()
+                            .enumerate()
                             .min_by(|(_, a), (_, b)| {
                                 a.normal_impulse.partial_cmp(&b.normal_impulse).unwrap()
                             })
@@ -325,25 +347,43 @@ impl PhysicsState2d {
             } else {
                 // New manifold
                 let (ca, cb, ba, bb, normal, la, lb) = if key.0 == contact.collider_a {
-                    (contact.collider_a, contact.collider_b, contact.body_a, contact.body_b, contact.normal, local_a, local_b)
+                    (
+                        contact.collider_a,
+                        contact.collider_b,
+                        contact.body_a,
+                        contact.body_b,
+                        contact.normal,
+                        local_a,
+                        local_b,
+                    )
                 } else {
-                    (contact.collider_b, contact.collider_a, contact.body_b, contact.body_a,
-                     [-contact.normal[0], -contact.normal[1]], local_b, local_a)
+                    (
+                        contact.collider_b,
+                        contact.collider_a,
+                        contact.body_b,
+                        contact.body_a,
+                        [-contact.normal[0], -contact.normal[1]],
+                        local_b,
+                        local_a,
+                    )
                 };
-                self.manifolds.insert(key, ContactManifold {
-                    collider_a: ca,
-                    collider_b: cb,
-                    body_a: ba,
-                    body_b: bb,
-                    normal,
-                    points: vec![ManifoldPoint {
-                        local_a: la,
-                        local_b: lb,
-                        normal_impulse: 0.0,
-                        tangent_impulse: 0.0,
-                        depth: contact.depth,
-                    }],
-                });
+                self.manifolds.insert(
+                    key,
+                    ContactManifold {
+                        collider_a: ca,
+                        collider_b: cb,
+                        body_a: ba,
+                        body_b: bb,
+                        normal,
+                        points: vec![ManifoldPoint {
+                            local_a: la,
+                            local_b: lb,
+                            normal_impulse: 0.0,
+                            tangent_impulse: 0.0,
+                            depth: contact.depth,
+                        }],
+                    },
+                );
             }
         }
 
@@ -353,18 +393,21 @@ impl PhysicsState2d {
             if !current_keys.contains(&(manifold.collider_a, manifold.collider_b)) {
                 continue;
             }
-            let (pos_a, rot_a) = self.bodies.get(body_ah(manifold.body_a))
+            let (pos_a, rot_a) = self
+                .bodies
+                .get(body_ah(manifold.body_a))
                 .map(|b| (b.position, b.rotation))
                 .unwrap_or(([0.0, 0.0], 0.0));
-            let (pos_b, rot_b) = self.bodies.get(body_ah(manifold.body_b))
+            let (pos_b, rot_b) = self
+                .bodies
+                .get(body_ah(manifold.body_b))
                 .map(|b| (b.position, b.rotation))
                 .unwrap_or(([0.0, 0.0], 0.0));
             let n = manifold.normal;
             manifold.points.retain(|pt| {
                 let world_a = local_to_world(pt.local_a, pos_a, rot_a);
                 let world_b = local_to_world(pt.local_b, pos_b, rot_b);
-                let sep = (world_b[0] - world_a[0]) * n[0]
-                        + (world_b[1] - world_a[1]) * n[1];
+                let sep = (world_b[0] - world_a[0]) * n[0] + (world_b[1] - world_a[1]) * n[1];
                 sep < MANIFOLD_REVALIDATION_TOLERANCE
             });
         }
@@ -392,58 +435,73 @@ impl PhysicsState2d {
             jt: f64,
         }
 
-        let warm_data: Vec<WarmData> = self.manifolds.values().flat_map(|manifold| {
-            let pos_a = self.bodies.get(body_ah(manifold.body_a))
-                .map(|b| b.position)
-                .unwrap_or([0.0, 0.0]);
-            let pos_b = self.bodies.get(body_ah(manifold.body_b))
-                .map(|b| b.position)
-                .unwrap_or([0.0, 0.0]);
+        let warm_data: Vec<WarmData> = self
+            .manifolds
+            .values()
+            .flat_map(|manifold| {
+                let pos_a = self
+                    .bodies
+                    .get(body_ah(manifold.body_a))
+                    .map(|b| b.position)
+                    .unwrap_or([0.0, 0.0]);
+                let pos_b = self
+                    .bodies
+                    .get(body_ah(manifold.body_b))
+                    .map(|b| b.position)
+                    .unwrap_or([0.0, 0.0]);
 
-            // Check if this is a sensor contact
-            let is_sensor = match (
-                self.colliders.get(coll_ah(manifold.collider_a)),
-                self.colliders.get(coll_ah(manifold.collider_b)),
-            ) {
-                (Some(a), Some(b)) => a.is_sensor || b.is_sensor,
-                _ => false,
-            };
-            if is_sensor {
-                return Vec::new();
-            }
-
-            let n = manifold.normal;
-            let tangent = [-n[1], n[0]];
-
-            manifold.points.iter().filter_map(|mp| {
-                let j_n = mp.normal_impulse * WARM_START_FACTOR;
-                let jt = mp.tangent_impulse * WARM_START_FACTOR;
-                if j_n.abs() < EPSILON && jt.abs() < EPSILON {
-                    return None;
+                // Check if this is a sensor contact
+                let is_sensor = match (
+                    self.colliders.get(coll_ah(manifold.collider_a)),
+                    self.colliders.get(coll_ah(manifold.collider_b)),
+                ) {
+                    (Some(a), Some(b)) => a.is_sensor || b.is_sensor,
+                    _ => false,
+                };
+                if is_sensor {
+                    return Vec::new();
                 }
 
-                // Reconstruct world-space contact point from body A's local coords
-                let rot_a = self.bodies.get(body_ah(manifold.body_a))
-                    .map(|b| b.rotation).unwrap_or(0.0);
-                let cp = local_to_world(mp.local_a, pos_a, rot_a);
+                let n = manifold.normal;
+                let tangent = [-n[1], n[0]];
 
-                let ra = [cp[0] - pos_a[0], cp[1] - pos_a[1]];
-                let rb = [cp[0] - pos_b[0], cp[1] - pos_b[1]];
+                manifold
+                    .points
+                    .iter()
+                    .filter_map(|mp| {
+                        let j_n = mp.normal_impulse * WARM_START_FACTOR;
+                        let jt = mp.tangent_impulse * WARM_START_FACTOR;
+                        if j_n.abs() < EPSILON && jt.abs() < EPSILON {
+                            return None;
+                        }
 
-                Some(WarmData {
-                    body_a: manifold.body_a,
-                    body_b: manifold.body_b,
-                    impulse_n: [j_n * n[0], j_n * n[1]],
-                    impulse_t: [jt * tangent[0], jt * tangent[1]],
-                    ra_cross_n: ra[0] * n[1] - ra[1] * n[0],
-                    rb_cross_n: rb[0] * n[1] - rb[1] * n[0],
-                    ra_cross_t: ra[0] * tangent[1] - ra[1] * tangent[0],
-                    rb_cross_t: rb[0] * tangent[1] - rb[1] * tangent[0],
-                    j_n,
-                    jt,
-                })
-            }).collect::<Vec<_>>()
-        }).collect();
+                        // Reconstruct world-space contact point from body A's local coords
+                        let rot_a = self
+                            .bodies
+                            .get(body_ah(manifold.body_a))
+                            .map(|b| b.rotation)
+                            .unwrap_or(0.0);
+                        let cp = local_to_world(mp.local_a, pos_a, rot_a);
+
+                        let ra = [cp[0] - pos_a[0], cp[1] - pos_a[1]];
+                        let rb = [cp[0] - pos_b[0], cp[1] - pos_b[1]];
+
+                        Some(WarmData {
+                            body_a: manifold.body_a,
+                            body_b: manifold.body_b,
+                            impulse_n: [j_n * n[0], j_n * n[1]],
+                            impulse_t: [jt * tangent[0], jt * tangent[1]],
+                            ra_cross_n: ra[0] * n[1] - ra[1] * n[0],
+                            rb_cross_n: rb[0] * n[1] - rb[1] * n[0],
+                            ra_cross_t: ra[0] * tangent[1] - ra[1] * tangent[0],
+                            rb_cross_t: rb[0] * tangent[1] - rb[1] * tangent[0],
+                            j_n,
+                            jt,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
 
         for wd in &warm_data {
             let total_impulse = [
@@ -455,14 +513,16 @@ impl PhysicsState2d {
             {
                 ba.linear_velocity[0] -= total_impulse[0] * ba.inv_mass;
                 ba.linear_velocity[1] -= total_impulse[1] * ba.inv_mass;
-                ba.angular_velocity -= (wd.ra_cross_n * wd.j_n + wd.ra_cross_t * wd.jt) * ba.inv_inertia;
+                ba.angular_velocity -=
+                    (wd.ra_cross_n * wd.j_n + wd.ra_cross_t * wd.jt) * ba.inv_inertia;
             }
             if let Some(bb) = self.bodies.get_mut(body_ah(wd.body_b))
                 && bb.is_dynamic()
             {
                 bb.linear_velocity[0] += total_impulse[0] * bb.inv_mass;
                 bb.linear_velocity[1] += total_impulse[1] * bb.inv_mass;
-                bb.angular_velocity += (wd.rb_cross_n * wd.j_n + wd.rb_cross_t * wd.jt) * bb.inv_inertia;
+                bb.angular_velocity +=
+                    (wd.rb_cross_n * wd.j_n + wd.rb_cross_t * wd.jt) * bb.inv_inertia;
             }
         }
     }
@@ -494,44 +554,47 @@ impl PhysicsState2d {
         }
 
         let keys: Vec<ManifoldKey> = self.manifolds.keys().copied().collect();
-        let materials: Vec<ManifoldMaterial> = keys.iter().map(|key| {
-            let manifold = &self.manifolds[key];
-            let (rest, fric, sfric, roll_fric, sensor) = match (
-                self.colliders.get(coll_ah(manifold.collider_a)),
-                self.colliders.get(coll_ah(manifold.collider_b)),
-            ) {
-                (Some(a), Some(b)) => (
-                    combine_property(
-                        a.material.restitution,
-                        b.material.restitution,
-                        a.material.restitution_combine,
-                        b.material.restitution_combine,
+        let materials: Vec<ManifoldMaterial> = keys
+            .iter()
+            .map(|key| {
+                let manifold = &self.manifolds[key];
+                let (rest, fric, sfric, roll_fric, sensor) = match (
+                    self.colliders.get(coll_ah(manifold.collider_a)),
+                    self.colliders.get(coll_ah(manifold.collider_b)),
+                ) {
+                    (Some(a), Some(b)) => (
+                        combine_property(
+                            a.material.restitution,
+                            b.material.restitution,
+                            a.material.restitution_combine,
+                            b.material.restitution_combine,
+                        ),
+                        combine_property(
+                            a.material.friction,
+                            b.material.friction,
+                            a.material.friction_combine,
+                            b.material.friction_combine,
+                        ),
+                        combine_property(
+                            a.material.effective_static_friction(),
+                            b.material.effective_static_friction(),
+                            a.material.friction_combine,
+                            b.material.friction_combine,
+                        ),
+                        (a.material.rolling_friction + b.material.rolling_friction) * 0.5,
+                        a.is_sensor || b.is_sensor,
                     ),
-                    combine_property(
-                        a.material.friction,
-                        b.material.friction,
-                        a.material.friction_combine,
-                        b.material.friction_combine,
-                    ),
-                    combine_property(
-                        a.material.effective_static_friction(),
-                        b.material.effective_static_friction(),
-                        a.material.friction_combine,
-                        b.material.friction_combine,
-                    ),
-                    (a.material.rolling_friction + b.material.rolling_friction) * 0.5,
-                    a.is_sensor || b.is_sensor,
-                ),
-                _ => (0.0, 0.0, 0.0, 0.0, false),
-            };
-            ManifoldMaterial {
-                restitution: rest,
-                friction: fric,
-                static_friction: sfric,
-                rolling_friction: roll_fric,
-                is_sensor: sensor,
-            }
-        }).collect();
+                    _ => (0.0, 0.0, 0.0, 0.0, false),
+                };
+                ManifoldMaterial {
+                    restitution: rest,
+                    friction: fric,
+                    static_friction: sfric,
+                    rolling_friction: roll_fric,
+                    is_sensor: sensor,
+                }
+            })
+            .collect();
 
         for _ in 0..iterations {
             for (ki, key) in keys.iter().enumerate() {
@@ -594,21 +657,19 @@ impl PhysicsState2d {
                     };
 
                     // Relative velocity at contact point (including angular)
-                    let vel_a_at_cp = [
-                        vel_a[0] - angvel_a * ra[1],
-                        vel_a[1] + angvel_a * ra[0],
+                    let vel_a_at_cp = [vel_a[0] - angvel_a * ra[1], vel_a[1] + angvel_a * ra[0]];
+                    let vel_b_at_cp = [vel_b[0] - angvel_b * rb[1], vel_b[1] + angvel_b * rb[0]];
+                    let rel_vel = [
+                        vel_b_at_cp[0] - vel_a_at_cp[0],
+                        vel_b_at_cp[1] - vel_a_at_cp[1],
                     ];
-                    let vel_b_at_cp = [
-                        vel_b[0] - angvel_b * rb[1],
-                        vel_b[1] + angvel_b * rb[0],
-                    ];
-                    let rel_vel = [vel_b_at_cp[0] - vel_a_at_cp[0], vel_b_at_cp[1] - vel_a_at_cp[1]];
                     let vel_along_normal = rel_vel[0] * n[0] + rel_vel[1] * n[1];
 
                     // Angular effective mass
                     let ra_cross_n = ra[0] * n[1] - ra[1] * n[0];
                     let rb_cross_n = rb[0] * n[1] - rb[1] * n[0];
-                    let inv_mass_sum = inv_mass_a + inv_mass_b
+                    let inv_mass_sum = inv_mass_a
+                        + inv_mass_b
                         + ra_cross_n * ra_cross_n * inv_inertia_a
                         + rb_cross_n * rb_cross_n * inv_inertia_b;
 
@@ -662,22 +723,22 @@ impl PhysicsState2d {
                             (bb.linear_velocity, bb.angular_velocity)
                         };
 
-                        let vel_a_at_cp = [
-                            vel_a[0] - angvel_a * ra[1],
-                            vel_a[1] + angvel_a * ra[0],
+                        let vel_a_at_cp =
+                            [vel_a[0] - angvel_a * ra[1], vel_a[1] + angvel_a * ra[0]];
+                        let vel_b_at_cp =
+                            [vel_b[0] - angvel_b * rb[1], vel_b[1] + angvel_b * rb[0]];
+                        let rel_vel = [
+                            vel_b_at_cp[0] - vel_a_at_cp[0],
+                            vel_b_at_cp[1] - vel_a_at_cp[1],
                         ];
-                        let vel_b_at_cp = [
-                            vel_b[0] - angvel_b * rb[1],
-                            vel_b[1] + angvel_b * rb[0],
-                        ];
-                        let rel_vel = [vel_b_at_cp[0] - vel_a_at_cp[0], vel_b_at_cp[1] - vel_a_at_cp[1]];
 
                         let tangent = [-n[1], n[0]];
                         let vel_along_tangent = rel_vel[0] * tangent[0] + rel_vel[1] * tangent[1];
 
                         let ra_cross_t = ra[0] * tangent[1] - ra[1] * tangent[0];
                         let rb_cross_t = rb[0] * tangent[1] - rb[1] * tangent[0];
-                        let inv_mass_sum_t = inv_mass_a + inv_mass_b
+                        let inv_mass_sum_t = inv_mass_a
+                            + inv_mass_b
                             + ra_cross_t * ra_cross_t * inv_inertia_a
                             + rb_cross_t * rb_cross_t * inv_inertia_b;
 
@@ -694,7 +755,8 @@ impl PhysicsState2d {
                         let max_friction = j_accumulated.abs() * mu;
                         let jt_accumulated = (jt_old + jt_new).clamp(-max_friction, max_friction);
                         let jt_applied = jt_accumulated - jt_old;
-                        self.manifolds.get_mut(key).unwrap().points[pi].tangent_impulse = jt_accumulated;
+                        self.manifolds.get_mut(key).unwrap().points[pi].tangent_impulse =
+                            jt_accumulated;
 
                         let impulse_t = [jt_applied * tangent[0], jt_applied * tangent[1]];
 
@@ -764,22 +826,26 @@ impl PhysicsState2d {
             is_sensor: bool,
         }
 
-        let corrections: Vec<PosCorrection> = self.manifolds.values().flat_map(|manifold| {
-            let is_sensor = match (
-                self.colliders.get(coll_ah(manifold.collider_a)),
-                self.colliders.get(coll_ah(manifold.collider_b)),
-            ) {
-                (Some(a), Some(b)) => a.is_sensor || b.is_sensor,
-                _ => false,
-            };
-            manifold.points.iter().map(move |mp| PosCorrection {
-                body_a: manifold.body_a,
-                body_b: manifold.body_b,
-                normal: manifold.normal,
-                depth: mp.depth,
-                is_sensor,
+        let corrections: Vec<PosCorrection> = self
+            .manifolds
+            .values()
+            .flat_map(|manifold| {
+                let is_sensor = match (
+                    self.colliders.get(coll_ah(manifold.collider_a)),
+                    self.colliders.get(coll_ah(manifold.collider_b)),
+                ) {
+                    (Some(a), Some(b)) => a.is_sensor || b.is_sensor,
+                    _ => false,
+                };
+                manifold.points.iter().map(move |mp| PosCorrection {
+                    body_a: manifold.body_a,
+                    body_b: manifold.body_b,
+                    normal: manifold.normal,
+                    depth: mp.depth,
+                    is_sensor,
+                })
             })
-        }).collect();
+            .collect();
 
         for _ in 0..iterations {
             for corr in &corrections {
@@ -787,8 +853,16 @@ impl PhysicsState2d {
                     continue;
                 }
 
-                let inv_mass_a = self.bodies.get(body_ah(corr.body_a)).map(|b| b.inv_mass).unwrap_or(0.0);
-                let inv_mass_b = self.bodies.get(body_ah(corr.body_b)).map(|b| b.inv_mass).unwrap_or(0.0);
+                let inv_mass_a = self
+                    .bodies
+                    .get(body_ah(corr.body_a))
+                    .map(|b| b.inv_mass)
+                    .unwrap_or(0.0);
+                let inv_mass_b = self
+                    .bodies
+                    .get(body_ah(corr.body_b))
+                    .map(|b| b.inv_mass)
+                    .unwrap_or(0.0);
                 let inv_mass_sum = inv_mass_a + inv_mass_b;
 
                 if inv_mass_sum == 0.0 {
@@ -920,11 +994,9 @@ impl PhysicsState2d {
                 has_dynamic = true;
                 let lin_speed = (rb.linear_velocity[0] * rb.linear_velocity[0]
                     + rb.linear_velocity[1] * rb.linear_velocity[1])
-                .sqrt();
+                    .sqrt();
                 let ang_speed = rb.angular_velocity.abs();
-                if lin_speed >= SLEEP_VELOCITY_THRESHOLD
-                    || ang_speed >= SLEEP_VELOCITY_THRESHOLD
-                {
+                if lin_speed >= SLEEP_VELOCITY_THRESHOLD || ang_speed >= SLEEP_VELOCITY_THRESHOLD {
                     all_slow = false;
                     break;
                 }

@@ -120,8 +120,7 @@ impl RigidBody2d {
         self.angular_velocity *= 1.0 / (1.0 + dt * self.angular_damping);
 
         // CCD: clamp velocity magnitude to prevent tunneling
-        let speed_sq =
-            self.linear_velocity[0].powi(2) + self.linear_velocity[1].powi(2);
+        let speed_sq = self.linear_velocity[0].powi(2) + self.linear_velocity[1].powi(2);
         if speed_sq > max_velocity * max_velocity {
             let scale = max_velocity / speed_sq.sqrt();
             self.linear_velocity[0] *= scale;

@@ -1,13 +1,13 @@
 //! Basic usage of the impetus physics engine.
 
 use impetus::{
+    PhysicsWorld,
     body::{BodyDesc, BodyType},
     collider::{ColliderDesc, ColliderShape},
     config::WorldConfig,
     force::Force,
     material::PhysicsMaterial,
     units::Quantity,
-    PhysicsWorld,
 };
 
 fn main() {

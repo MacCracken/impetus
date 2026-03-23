@@ -5,21 +5,16 @@ use hisab::DVec3;
 use crate::collider::{ColliderHandle, ColliderShape};
 use crate::query::RayHit;
 
-use super::types::EPSILON;
-use super::state::PhysicsState3d;
 use super::body_ah;
+use super::state::PhysicsState3d;
+use super::types::EPSILON;
 
 impl PhysicsState3d {
     // -----------------------------------------------------------------------
     // Raycast
     // -----------------------------------------------------------------------
 
-    pub fn raycast(
-        &self,
-        origin: [f64; 3],
-        direction: [f64; 3],
-        max_dist: f64,
-    ) -> Option<RayHit> {
+    pub fn raycast(&self, origin: [f64; 3], direction: [f64; 3], max_dist: f64) -> Option<RayHit> {
         let origin = DVec3::from_array(origin);
         let dir = DVec3::from_array(direction).normalize_or(DVec3::Y);
 

@@ -1,8 +1,8 @@
 //! Narrowphase contact generation functions for 2D shapes.
 
-use crate::collider::ColliderShape;
 use super::types::EPSILON;
 use super::types::EPSILON_SQ;
+use crate::collider::ColliderShape;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -35,7 +35,10 @@ pub(super) fn local_to_world(local_pt: [f64; 2], body_pos: [f64; 2], body_rot: f
 }
 
 /// Create an ordered manifold key from a collider pair (smaller handle first).
-pub(super) fn ordered_manifold_key(a: crate::collider::ColliderHandle, b: crate::collider::ColliderHandle) -> super::types::ManifoldKey {
+pub(super) fn ordered_manifold_key(
+    a: crate::collider::ColliderHandle,
+    b: crate::collider::ColliderHandle,
+) -> super::types::ManifoldKey {
     if a.0 <= b.0 { (a, b) } else { (b, a) }
 }
 
@@ -65,14 +68,18 @@ pub(super) fn generate_contact(
                 .map(|(n, d, p)| ([-n[0], -n[1]], d, p))
         }
         // Box vs Box — use OBB-OBB SAT when either box is rotated, fast AABB path otherwise
-        (
-            ColliderShape::Box { half_extents: he_a },
-            ColliderShape::Box { half_extents: he_b },
-        ) => {
+        (ColliderShape::Box { half_extents: he_a }, ColliderShape::Box { half_extents: he_b }) => {
             if rot_a.abs() < EPSILON && rot_b.abs() < EPSILON {
                 aabb_aabb_contact(pos_a, [he_a[0], he_a[1]], pos_b, [he_b[0], he_b[1]])
             } else {
-                obb_obb_contact(pos_a, rot_a, [he_a[0], he_a[1]], pos_b, rot_b, [he_b[0], he_b[1]])
+                obb_obb_contact(
+                    pos_a,
+                    rot_a,
+                    [he_a[0], he_a[1]],
+                    pos_b,
+                    rot_b,
+                    [he_b[0], he_b[1]],
+                )
             }
         }
         // Capsule vs Ball
@@ -89,10 +96,8 @@ pub(super) fn generate_contact(
                 half_height: hh,
                 radius: cr,
             },
-        ) => {
-            capsule_circle(pos_b, rot_b, *hh, *cr, pos_a, *br)
-                .map(|(n, d, p)| ([-n[0], -n[1]], d, p))
-        }
+        ) => capsule_circle(pos_b, rot_b, *hh, *cr, pos_a, *br)
+            .map(|(n, d, p)| ([-n[0], -n[1]], d, p)),
         // Capsule vs Box
         (
             ColliderShape::Capsule {
@@ -100,17 +105,29 @@ pub(super) fn generate_contact(
                 radius: cr,
             },
             ColliderShape::Box { half_extents },
-        ) => capsule_aabb(pos_a, rot_a, *hh, *cr, pos_b, [half_extents[0], half_extents[1]]),
+        ) => capsule_aabb(
+            pos_a,
+            rot_a,
+            *hh,
+            *cr,
+            pos_b,
+            [half_extents[0], half_extents[1]],
+        ),
         (
             ColliderShape::Box { half_extents },
             ColliderShape::Capsule {
                 half_height: hh,
                 radius: cr,
             },
-        ) => {
-            capsule_aabb(pos_b, rot_b, *hh, *cr, pos_a, [half_extents[0], half_extents[1]])
-                .map(|(n, d, p)| ([-n[0], -n[1]], d, p))
-        }
+        ) => capsule_aabb(
+            pos_b,
+            rot_b,
+            *hh,
+            *cr,
+            pos_a,
+            [half_extents[0], half_extents[1]],
+        )
+        .map(|(n, d, p)| ([-n[0], -n[1]], d, p)),
         // Capsule vs Capsule
         (
             ColliderShape::Capsule {
@@ -153,13 +170,25 @@ pub(super) fn generate_contact(
                 .map(|(n, d, p)| ([-n[0], -n[1]], d, p))
         }
         // Segment vs Box
-        (ColliderShape::Segment { a, b }, ColliderShape::Box { half_extents }) => {
-            segment_box(pos_a, rot_a, *a, *b, pos_b, rot_b, [half_extents[0], half_extents[1]])
-        }
-        (ColliderShape::Box { half_extents }, ColliderShape::Segment { a, b }) => {
-            segment_box(pos_b, rot_b, *a, *b, pos_a, rot_a, [half_extents[0], half_extents[1]])
-                .map(|(n, d, p)| ([-n[0], -n[1]], d, p))
-        }
+        (ColliderShape::Segment { a, b }, ColliderShape::Box { half_extents }) => segment_box(
+            pos_a,
+            rot_a,
+            *a,
+            *b,
+            pos_b,
+            rot_b,
+            [half_extents[0], half_extents[1]],
+        ),
+        (ColliderShape::Box { half_extents }, ColliderShape::Segment { a, b }) => segment_box(
+            pos_b,
+            rot_b,
+            *a,
+            *b,
+            pos_a,
+            rot_a,
+            [half_extents[0], half_extents[1]],
+        )
+        .map(|(n, d, p)| ([-n[0], -n[1]], d, p)),
         _ => None,
     }
 }
@@ -416,10 +445,7 @@ pub(super) fn capsule_endpoints(pos: [f64; 2], rot: f64, half_height: f64) -> ([
     // Capsule axis is along local Y
     let dx = -sin * half_height;
     let dy = cos * half_height;
-    (
-        [pos[0] - dx, pos[1] - dy],
-        [pos[0] + dx, pos[1] + dy],
-    )
+    ([pos[0] - dx, pos[1] - dy], [pos[0] + dx, pos[1] + dy])
 }
 
 /// Closest point on segment (a, b) to point p. Returns (closest_point, t_parameter).

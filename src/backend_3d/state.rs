@@ -4,12 +4,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hisab::{DQuat, DVec3};
 
+use crate::ImpetusError;
 use crate::arena::Arena;
 use crate::body::{BodyDesc, BodyHandle, BodyState, BodyType};
 use crate::collider::{ColliderDesc, ColliderHandle};
 use crate::force::{Force, Impulse, Torque};
 use crate::joint::{JointDesc, JointHandle};
-use crate::ImpetusError;
 
 use super::types::*;
 use super::{body_ah, body_from, coll_ah, coll_from, joint_ah, joint_from};
@@ -38,7 +38,9 @@ impl PhysicsState3d {
     }
 
     pub fn add_body(&mut self, desc: &BodyDesc) -> BodyHandle {
-        let ah = self.bodies.insert(RigidBody3d::from_desc(BodyHandle(0), desc));
+        let ah = self
+            .bodies
+            .insert(RigidBody3d::from_desc(BodyHandle(0), desc));
         let handle = body_from(ah);
         self.bodies.get_mut(ah).expect("just-inserted body").handle = handle;
         self.body_colliders.insert(handle, Vec::new());
@@ -59,17 +61,16 @@ impl PhysicsState3d {
             rb.inv_inertia = if rb.fixed_rotation {
                 DVec3::ZERO
             } else {
-                DVec3::new(
-                    1.0 / rb.inertia.x,
-                    1.0 / rb.inertia.y,
-                    1.0 / rb.inertia.z,
-                )
+                DVec3::new(1.0 / rb.inertia.x, 1.0 / rb.inertia.y, 1.0 / rb.inertia.z)
             };
         }
 
         let ah = self.colliders.insert(collider);
         let handle = coll_from(ah);
-        self.colliders.get_mut(ah).expect("just-inserted collider").handle = handle;
+        self.colliders
+            .get_mut(ah)
+            .expect("just-inserted collider")
+            .handle = handle;
         self.body_colliders.entry(body).or_default().push(handle);
         handle
     }
@@ -144,7 +145,9 @@ impl PhysicsState3d {
 
     /// Remove a single collider and recompute the parent body's mass properties.
     pub fn remove_collider(&mut self, handle: ColliderHandle) -> Result<(), ImpetusError> {
-        let collider = self.colliders.remove(coll_ah(handle))
+        let collider = self
+            .colliders
+            .remove(coll_ah(handle))
             .ok_or_else(|| ImpetusError::ColliderNotFound(format!("{:?}", handle)))?;
         let body = collider.body;
 
@@ -192,7 +195,8 @@ impl PhysicsState3d {
 
     /// Remove a joint by handle.
     pub fn remove_joint(&mut self, handle: JointHandle) -> Result<(), ImpetusError> {
-        self.joints.remove(joint_ah(handle))
+        self.joints
+            .remove(joint_ah(handle))
             .ok_or_else(|| ImpetusError::JointNotFound(format!("{:?}", handle)))?;
         Ok(())
     }
@@ -208,7 +212,12 @@ impl PhysicsState3d {
 
     /// Insert a collider at a specific handle (for snapshot restore).
     #[cfg(feature = "serialize")]
-    pub fn add_collider_at(&mut self, handle: ColliderHandle, body: BodyHandle, desc: &ColliderDesc) {
+    pub fn add_collider_at(
+        &mut self,
+        handle: ColliderHandle,
+        body: BodyHandle,
+        desc: &ColliderDesc,
+    ) {
         let collider = Collider3d::from_desc(handle, body, desc);
         if let Some(rb) = self.bodies.get_mut(body_ah(body))
             && rb.is_dynamic()
@@ -231,16 +240,19 @@ impl PhysicsState3d {
     /// Insert a joint at a specific handle (for snapshot restore).
     #[cfg(feature = "serialize")]
     pub fn add_joint_at(&mut self, handle: JointHandle, desc: &JointDesc) {
-        self.joints.insert_at(joint_ah(handle), Joint3d {
-            body_a: desc.body_a,
-            body_b: desc.body_b,
-            joint_type: desc.joint_type.clone(),
-            local_anchor_a: DVec3::new(desc.local_anchor_a[0], desc.local_anchor_a[1], 0.0),
-            local_anchor_b: DVec3::new(desc.local_anchor_b[0], desc.local_anchor_b[1], 0.0),
-            motor: desc.motor.clone(),
-            damping: desc.damping,
-            break_force: desc.break_force,
-        });
+        self.joints.insert_at(
+            joint_ah(handle),
+            Joint3d {
+                body_a: desc.body_a,
+                body_b: desc.body_b,
+                joint_type: desc.joint_type.clone(),
+                local_anchor_a: DVec3::new(desc.local_anchor_a[0], desc.local_anchor_a[1], 0.0),
+                local_anchor_b: DVec3::new(desc.local_anchor_b[0], desc.local_anchor_b[1], 0.0),
+                motor: desc.motor.clone(),
+                damping: desc.damping,
+                break_force: desc.break_force,
+            },
+        );
     }
 
     pub fn body_count(&self) -> usize {
@@ -263,8 +275,14 @@ impl PhysicsState3d {
         })
     }
 
-    pub fn set_body_state(&mut self, handle: BodyHandle, state: &BodyState) -> Result<(), ImpetusError> {
-        let rb = self.bodies.get_mut(body_ah(handle))
+    pub fn set_body_state(
+        &mut self,
+        handle: BodyHandle,
+        state: &BodyState,
+    ) -> Result<(), ImpetusError> {
+        let rb = self
+            .bodies
+            .get_mut(body_ah(handle))
             .ok_or_else(|| ImpetusError::BodyNotFound(format!("{:?}", handle)))?;
         rb.position = DVec3::from_array(state.position);
         rb.rotation = DQuat::from_rotation_z(state.rotation);
@@ -275,8 +293,14 @@ impl PhysicsState3d {
         Ok(())
     }
 
-    pub fn set_body_type(&mut self, handle: BodyHandle, body_type: BodyType) -> Result<(), ImpetusError> {
-        let rb = self.bodies.get_mut(body_ah(handle))
+    pub fn set_body_type(
+        &mut self,
+        handle: BodyHandle,
+        body_type: BodyType,
+    ) -> Result<(), ImpetusError> {
+        let rb = self
+            .bodies
+            .get_mut(body_ah(handle))
             .ok_or_else(|| ImpetusError::BodyNotFound(format!("{:?}", handle)))?;
         rb.body_type = body_type;
         match body_type {
@@ -292,11 +316,7 @@ impl PhysicsState3d {
                     rb.inv_inertia = if rb.fixed_rotation {
                         DVec3::ZERO
                     } else {
-                        DVec3::new(
-                            1.0 / rb.inertia.x,
-                            1.0 / rb.inertia.y,
-                            1.0 / rb.inertia.z,
-                        )
+                        DVec3::new(1.0 / rb.inertia.x, 1.0 / rb.inertia.y, 1.0 / rb.inertia.z)
                     };
                 }
             }

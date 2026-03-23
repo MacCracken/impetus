@@ -4,9 +4,9 @@ use crate::arena::ArenaHandle;
 use crate::body::BodyHandle;
 use crate::joint::{JointMotor, JointType};
 
-use super::types::{Joint2d, EPSILON, EPSILON_SQ};
+use super::body_ah;
 use super::state::PhysicsState2d;
-use super::{body_ah};
+use super::types::{EPSILON, EPSILON_SQ, Joint2d};
 
 impl PhysicsState2d {
     // -----------------------------------------------------------------------
@@ -15,9 +15,8 @@ impl PhysicsState2d {
 
     pub(super) fn solve_joints(&mut self, dt: f64, iterations: u32) {
         // Collect (ArenaHandle, Joint2d) pairs so we can track handles for breaking.
-        let joints: Vec<(ArenaHandle, Joint2d)> = self.joints.iter()
-            .map(|(ah, j)| (ah, j.clone()))
-            .collect();
+        let joints: Vec<(ArenaHandle, Joint2d)> =
+            self.joints.iter().map(|(ah, j)| (ah, j.clone())).collect();
 
         // Track constraint forces for joint breaking.
         // We accumulate the maximum constraint force per joint across iterations.
@@ -27,16 +26,12 @@ impl PhysicsState2d {
             for (ji, (_ah, joint)) in joints.iter().enumerate() {
                 let force = match &joint.joint_type {
                     JointType::Fixed => self.solve_fixed_joint(joint),
-                    JointType::Distance { length } => {
-                        self.solve_distance_joint(joint, *length)
-                    }
+                    JointType::Distance { length } => self.solve_distance_joint(joint, *length),
                     JointType::Spring {
                         rest_length,
                         stiffness,
                         damping,
-                    } => {
-                        self.solve_spring_joint(joint, *rest_length, *stiffness, *damping, dt)
-                    }
+                    } => self.solve_spring_joint(joint, *rest_length, *stiffness, *damping, dt),
                     JointType::Revolute { limits, .. } => {
                         let f = self.solve_revolute_joint(joint, limits.as_ref());
                         if let Some(motor) = &joint.motor {
@@ -51,13 +46,18 @@ impl PhysicsState2d {
                         }
                         f
                     }
-                    JointType::Wheel { axis, stiffness, damping } => {
-                        self.solve_wheel_joint(joint, *axis, *stiffness, *damping, dt)
-                    }
-                    JointType::Rope { max_length } => {
-                        self.solve_rope_joint(joint, *max_length)
-                    }
-                    JointType::Mouse { target, stiffness, damping, max_force } => {
+                    JointType::Wheel {
+                        axis,
+                        stiffness,
+                        damping,
+                    } => self.solve_wheel_joint(joint, *axis, *stiffness, *damping, dt),
+                    JointType::Rope { max_length } => self.solve_rope_joint(joint, *max_length),
+                    JointType::Mouse {
+                        target,
+                        stiffness,
+                        damping,
+                        max_force,
+                    } => {
                         self.solve_mouse_joint(joint, *target, *stiffness, *damping, *max_force, dt)
                     }
                 };
@@ -89,12 +89,22 @@ impl PhysicsState2d {
         let anchor_b = self.world_anchor(joint.body_b, joint.local_anchor_b);
 
         let (vel_a, angvel_a, pos_a, inv_mass_a) = match self.bodies.get(body_ah(joint.body_a)) {
-            Some(b) if b.is_dynamic() => (b.linear_velocity, b.angular_velocity, b.position, b.inv_mass),
+            Some(b) if b.is_dynamic() => (
+                b.linear_velocity,
+                b.angular_velocity,
+                b.position,
+                b.inv_mass,
+            ),
             Some(b) => (b.linear_velocity, b.angular_velocity, b.position, 0.0),
             None => return,
         };
         let (vel_b, angvel_b, pos_b, inv_mass_b) = match self.bodies.get(body_ah(joint.body_b)) {
-            Some(b) if b.is_dynamic() => (b.linear_velocity, b.angular_velocity, b.position, b.inv_mass),
+            Some(b) if b.is_dynamic() => (
+                b.linear_velocity,
+                b.angular_velocity,
+                b.position,
+                b.inv_mass,
+            ),
             Some(b) => (b.linear_velocity, b.angular_velocity, b.position, 0.0),
             None => return,
         };

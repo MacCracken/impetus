@@ -2,15 +2,18 @@
 
 use hisab::{DQuat, DVec3};
 
-use crate::collider::ColliderShape;
 use super::types::{EPSILON, EPSILON_SQ};
+use crate::collider::ColliderShape;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 pub(super) fn is_identity_quat(q: DQuat) -> bool {
-    (q.x.abs() < EPSILON) && (q.y.abs() < EPSILON) && (q.z.abs() < EPSILON) && ((q.w.abs() - 1.0).abs() < EPSILON)
+    (q.x.abs() < EPSILON)
+        && (q.y.abs() < EPSILON)
+        && (q.z.abs() < EPSILON)
+        && ((q.w.abs() - 1.0).abs() < EPSILON)
 }
 
 pub(super) fn closest_point_on_segment_3d(a: DVec3, b: DVec3, p: DVec3) -> DVec3 {
@@ -48,25 +51,45 @@ pub(super) fn closest_points_segments_3d(a: DVec3, b: DVec3, c: DVec3, d: DVec3)
     if denom.abs() < EPSILON_SQ {
         // Nearly parallel
         sc = 0.0;
-        tc = if ss.abs() < EPSILON_SQ { 0.0 } else { (sw / ss).clamp(0.0, 1.0) };
+        tc = if ss.abs() < EPSILON_SQ {
+            0.0
+        } else {
+            (sw / ss).clamp(0.0, 1.0)
+        };
     } else {
         let sn = (rs * sw - ss * rw) / denom;
         let tn = (rr * sw - rs * rw) / denom;
 
         if sn < 0.0 {
-            let t = if ss.abs() < EPSILON_SQ { 0.0 } else { (sw / ss).clamp(0.0, 1.0) };
+            let t = if ss.abs() < EPSILON_SQ {
+                0.0
+            } else {
+                (sw / ss).clamp(0.0, 1.0)
+            };
             sc = 0.0;
             tc = t;
         } else if sn > 1.0 {
-            let t = if ss.abs() < EPSILON_SQ { 0.0 } else { ((sw + rs) / ss).clamp(0.0, 1.0) };
+            let t = if ss.abs() < EPSILON_SQ {
+                0.0
+            } else {
+                ((sw + rs) / ss).clamp(0.0, 1.0)
+            };
             sc = 1.0;
             tc = t;
         } else if tn < 0.0 {
             tc = 0.0;
-            sc = if rr.abs() < EPSILON_SQ { 0.0 } else { (-rw / rr).clamp(0.0, 1.0) };
+            sc = if rr.abs() < EPSILON_SQ {
+                0.0
+            } else {
+                (-rw / rr).clamp(0.0, 1.0)
+            };
         } else if tn > 1.0 {
             tc = 1.0;
-            sc = if rr.abs() < EPSILON_SQ { 0.0 } else { ((rs - rw) / rr).clamp(0.0, 1.0) };
+            sc = if rr.abs() < EPSILON_SQ {
+                0.0
+            } else {
+                ((rs - rw) / rr).clamp(0.0, 1.0)
+            };
         } else {
             sc = sn;
             tc = tn;
@@ -94,18 +117,23 @@ pub(super) fn generate_contact_3d(
             sphere_sphere(pos_a, *ra, pos_b, *rb)
         }
         // Ball vs Box
-        (ColliderShape::Ball { radius }, ColliderShape::Box { half_extents }) => {
-            sphere_obb(pos_a, *radius, pos_b, rot_b, DVec3::from_array(*half_extents))
-        }
-        (ColliderShape::Box { half_extents }, ColliderShape::Ball { radius }) => {
-            sphere_obb(pos_b, *radius, pos_a, rot_a, DVec3::from_array(*half_extents))
-                .map(|(n, d, p)| (-n, d, p))
-        }
+        (ColliderShape::Ball { radius }, ColliderShape::Box { half_extents }) => sphere_obb(
+            pos_a,
+            *radius,
+            pos_b,
+            rot_b,
+            DVec3::from_array(*half_extents),
+        ),
+        (ColliderShape::Box { half_extents }, ColliderShape::Ball { radius }) => sphere_obb(
+            pos_b,
+            *radius,
+            pos_a,
+            rot_a,
+            DVec3::from_array(*half_extents),
+        )
+        .map(|(n, d, p)| (-n, d, p)),
         // Box vs Box — OBB when rotated, AABB fast path otherwise
-        (
-            ColliderShape::Box { half_extents: he_a },
-            ColliderShape::Box { half_extents: he_b },
-        ) => {
+        (ColliderShape::Box { half_extents: he_a }, ColliderShape::Box { half_extents: he_b }) => {
             let hea = DVec3::from_array(*he_a);
             let heb = DVec3::from_array(*he_b);
             if is_identity_quat(rot_a) && is_identity_quat(rot_b) {
@@ -128,10 +156,8 @@ pub(super) fn generate_contact_3d(
                 half_height,
                 radius: cr,
             },
-        ) => {
-            capsule_sphere_3d(pos_b, rot_b, *half_height, *cr, pos_a, *br)
-                .map(|(n, d, p)| (-n, d, p))
-        }
+        ) => capsule_sphere_3d(pos_b, rot_b, *half_height, *cr, pos_a, *br)
+            .map(|(n, d, p)| (-n, d, p)),
         // Capsule vs Capsule
         (
             ColliderShape::Capsule {
@@ -150,40 +176,75 @@ pub(super) fn generate_contact_3d(
                 radius: cr,
             },
             ColliderShape::Box { half_extents },
-        ) => capsule_box_3d(pos_a, rot_a, *half_height, *cr, pos_b, rot_b, DVec3::from_array(*half_extents)),
+        ) => capsule_box_3d(
+            pos_a,
+            rot_a,
+            *half_height,
+            *cr,
+            pos_b,
+            rot_b,
+            DVec3::from_array(*half_extents),
+        ),
         (
             ColliderShape::Box { half_extents },
             ColliderShape::Capsule {
                 half_height,
                 radius: cr,
             },
-        ) => {
-            capsule_box_3d(pos_b, rot_b, *half_height, *cr, pos_a, rot_a, DVec3::from_array(*half_extents))
-                .map(|(n, d, p)| (-n, d, p))
-        }
+        ) => capsule_box_3d(
+            pos_b,
+            rot_b,
+            *half_height,
+            *cr,
+            pos_a,
+            rot_a,
+            DVec3::from_array(*half_extents),
+        )
+        .map(|(n, d, p)| (-n, d, p)),
         // Segment vs Ball
-        (ColliderShape::Segment { a, b }, ColliderShape::Ball { radius }) => {
-            segment_sphere_3d(pos_a, rot_a, DVec3::from_array(*a), DVec3::from_array(*b), pos_b, *radius)
-        }
-        (ColliderShape::Ball { radius }, ColliderShape::Segment { a, b }) => {
-            segment_sphere_3d(pos_b, rot_b, DVec3::from_array(*a), DVec3::from_array(*b), pos_a, *radius)
-                .map(|(n, d, p)| (-n, d, p))
-        }
+        (ColliderShape::Segment { a, b }, ColliderShape::Ball { radius }) => segment_sphere_3d(
+            pos_a,
+            rot_a,
+            DVec3::from_array(*a),
+            DVec3::from_array(*b),
+            pos_b,
+            *radius,
+        ),
+        (ColliderShape::Ball { radius }, ColliderShape::Segment { a, b }) => segment_sphere_3d(
+            pos_b,
+            rot_b,
+            DVec3::from_array(*a),
+            DVec3::from_array(*b),
+            pos_a,
+            *radius,
+        )
+        .map(|(n, d, p)| (-n, d, p)),
         // Segment vs Box
-        (ColliderShape::Segment { a, b }, ColliderShape::Box { half_extents }) => {
-            segment_box_3d(pos_a, rot_a, DVec3::from_array(*a), DVec3::from_array(*b), pos_b, rot_b, DVec3::from_array(*half_extents))
-        }
-        (ColliderShape::Box { half_extents }, ColliderShape::Segment { a, b }) => {
-            segment_box_3d(pos_b, rot_b, DVec3::from_array(*a), DVec3::from_array(*b), pos_a, rot_a, DVec3::from_array(*half_extents))
-                .map(|(n, d, p)| (-n, d, p))
-        }
+        (ColliderShape::Segment { a, b }, ColliderShape::Box { half_extents }) => segment_box_3d(
+            pos_a,
+            rot_a,
+            DVec3::from_array(*a),
+            DVec3::from_array(*b),
+            pos_b,
+            rot_b,
+            DVec3::from_array(*half_extents),
+        ),
+        (ColliderShape::Box { half_extents }, ColliderShape::Segment { a, b }) => segment_box_3d(
+            pos_b,
+            rot_b,
+            DVec3::from_array(*a),
+            DVec3::from_array(*b),
+            pos_a,
+            rot_a,
+            DVec3::from_array(*half_extents),
+        )
+        .map(|(n, d, p)| (-n, d, p)),
         // ConvexHull vs Ball
         (ColliderShape::ConvexHull { points }, ColliderShape::Ball { radius }) => {
             convex_hull_sphere_3d(points, pos_a, rot_a, pos_b, *radius)
         }
         (ColliderShape::Ball { radius }, ColliderShape::ConvexHull { points }) => {
-            convex_hull_sphere_3d(points, pos_b, rot_b, pos_a, *radius)
-                .map(|(n, d, p)| (-n, d, p))
+            convex_hull_sphere_3d(points, pos_b, rot_b, pos_a, *radius).map(|(n, d, p)| (-n, d, p))
         }
         _ => None,
     }
@@ -254,7 +315,11 @@ pub(super) fn sphere_obb(
             2
         };
         let mut n = DVec3::ZERO;
-        n[min_axis] = if local_sphere[min_axis] >= 0.0 { 1.0 } else { -1.0 };
+        n[min_axis] = if local_sphere[min_axis] >= 0.0 {
+            1.0
+        } else {
+            -1.0
+        };
         (n, face_dists[min_axis] + radius)
     } else {
         (diff / dist, radius - dist)
@@ -396,7 +461,9 @@ pub(super) fn obb_obb_3d(
 
     // Test 6 face normals (3 per box)
     // Test all 6 face normals (3 per box)
-    let all_axes = [axes_a[0], axes_a[1], axes_a[2], axes_b[0], axes_b[1], axes_b[2]];
+    let all_axes = [
+        axes_a[0], axes_a[1], axes_a[2], axes_b[0], axes_b[1], axes_b[2],
+    ];
 
     for axis in &all_axes {
         // Project half-extents of both boxes onto this axis
@@ -425,17 +492,23 @@ pub(super) fn obb_obb_3d(
     }
 
     // Contact point: midpoint of the overlap region projected onto the separating axis
-    let point = pos_a + best_axis * (he_a.x * axes_a[0].dot(best_axis).abs()
-        + he_a.y * axes_a[1].dot(best_axis).abs()
-        + he_a.z * axes_a[2].dot(best_axis).abs());
+    let point = pos_a
+        + best_axis
+            * (he_a.x * axes_a[0].dot(best_axis).abs()
+                + he_a.y * axes_a[1].dot(best_axis).abs()
+                + he_a.z * axes_a[2].dot(best_axis).abs());
 
     // Better contact point: average of the face centers along the normal
-    let face_a = pos_a + best_axis * (he_a.x * axes_a[0].dot(best_axis)
-        + he_a.y * axes_a[1].dot(best_axis)
-        + he_a.z * axes_a[2].dot(best_axis));
-    let face_b = pos_b - best_axis * (he_b.x * axes_b[0].dot(best_axis)
-        + he_b.y * axes_b[1].dot(best_axis)
-        + he_b.z * axes_b[2].dot(best_axis));
+    let face_a = pos_a
+        + best_axis
+            * (he_a.x * axes_a[0].dot(best_axis)
+                + he_a.y * axes_a[1].dot(best_axis)
+                + he_a.z * axes_a[2].dot(best_axis));
+    let face_b = pos_b
+        - best_axis
+            * (he_b.x * axes_b[0].dot(best_axis)
+                + he_b.y * axes_b[1].dot(best_axis)
+                + he_b.z * axes_b[2].dot(best_axis));
     let contact_point = (face_a + face_b) * 0.5;
 
     let _ = point;
@@ -555,7 +628,11 @@ pub(super) fn segment_box_3d(
         if depth > best_depth {
             best_depth = depth;
             let mut n = DVec3::ZERO;
-            n[min_axis] = if seg_at_center[min_axis] >= 0.0 { 1.0 } else { -1.0 };
+            n[min_axis] = if seg_at_center[min_axis] >= 0.0 {
+                1.0
+            } else {
+                -1.0
+            };
             best_normal = n;
             best_point = clamped;
         }

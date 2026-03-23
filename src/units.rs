@@ -125,13 +125,22 @@ mod tests {
             (Quantity::kilograms(1.0), "1 kg"),
             (Quantity::seconds(2.5), "2.5 s"),
             (Quantity::meters_per_second(10.0), "10 m/s"),
-            (Quantity::new(9.81, PhysicsUnit::MetersPerSecondSquared), "9.81 m/s\u{b2}"),
+            (
+                Quantity::new(9.81, PhysicsUnit::MetersPerSecondSquared),
+                "9.81 m/s\u{b2}",
+            ),
             (Quantity::new(5.0, PhysicsUnit::NewtonMeters), "5 N\u{b7}m"),
             (Quantity::joules(100.0), "100 J"),
             (Quantity::radians(2.5), "2.5 rad"),
             (Quantity::new(1.0, PhysicsUnit::RadiansPerSecond), "1 rad/s"),
-            (Quantity::new(1000.0, PhysicsUnit::KgPerCubicMeter), "1000 kg/m\u{b3}"),
-            (Quantity::new(500.0, PhysicsUnit::KgPerSquareMeter), "500 kg/m\u{b2}"),
+            (
+                Quantity::new(1000.0, PhysicsUnit::KgPerCubicMeter),
+                "1000 kg/m\u{b3}",
+            ),
+            (
+                Quantity::new(500.0, PhysicsUnit::KgPerSquareMeter),
+                "500 kg/m\u{b2}",
+            ),
             (Quantity::pascals(101325.0), "101325 Pa"),
         ];
         for (q, expected) in cases {
