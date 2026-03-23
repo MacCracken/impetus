@@ -1,0 +1,24 @@
+[package]
+name = "impetus-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+impetus = { path = "..", features = ["2d"] }
+arbitrary = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "fuzz_contacts"
+path = "fuzz_targets/fuzz_contacts.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_serialize"
+path = "fuzz_targets/fuzz_serialize.rs"
+doc = false

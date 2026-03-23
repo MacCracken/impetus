@@ -51,7 +51,7 @@ pub use event::{CollisionEvent, ContactData, ContactPoint};
 pub use force::{Force, Impulse, Torque};
 
 // Joints
-pub use joint::{JointDesc, JointHandle, JointType};
+pub use joint::{JointDesc, JointHandle, JointMotor, JointType};
 
 // Material
 pub use material::PhysicsMaterial;

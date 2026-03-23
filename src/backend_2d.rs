@@ -10,7 +10,7 @@ use crate::body::{BodyDesc, BodyHandle, BodyState, BodyType};
 use crate::collider::{ColliderDesc, ColliderHandle, ColliderShape};
 use crate::event::CollisionEvent;
 use crate::force::{Force, Impulse, Torque};
-use crate::joint::{JointDesc, JointHandle, JointType};
+use crate::joint::{JointDesc, JointHandle, JointMotor, JointType};
 use crate::material::PhysicsMaterial;
 use crate::query::RayHit;
 use crate::ImpetusError;
@@ -169,7 +169,7 @@ impl Collider2d {
     }
 
     /// Compute AABB in world space given body position and rotation.
-    fn world_aabb(&self, body_pos: [f64; 2], body_rot: f64) -> Aabb2d {
+    pub(crate) fn world_aabb(&self, body_pos: [f64; 2], body_rot: f64) -> Aabb2d {
         let (sin, cos) = body_rot.sin_cos();
         let wx = body_pos[0] + cos * self.offset[0] - sin * self.offset[1];
         let wy = body_pos[1] + sin * self.offset[0] + cos * self.offset[1];
@@ -323,6 +323,7 @@ pub(crate) struct Joint2d {
     pub joint_type: JointType,
     pub local_anchor_a: [f64; 2],
     pub local_anchor_b: [f64; 2],
+    pub motor: Option<JointMotor>,
 }
 
 // ---------------------------------------------------------------------------
@@ -499,6 +500,7 @@ impl PhysicsState2d {
                 joint_type: desc.joint_type.clone(),
                 local_anchor_a: desc.local_anchor_a,
                 local_anchor_b: desc.local_anchor_b,
+                motor: desc.motor.clone(),
             },
         );
     }
@@ -602,33 +604,41 @@ impl PhysicsState2d {
 
         // 4. Wake sleeping bodies on contact with non-sleeping moving bodies
         for contact in &contacts {
-            let a_sleeping = self.bodies.get(&contact.body_a).map_or(false, |b| b.is_sleeping);
-            let b_sleeping = self.bodies.get(&contact.body_b).map_or(false, |b| b.is_sleeping);
-            let a_moving = self.bodies.get(&contact.body_a).map_or(false, |b| {
+            let a_sleeping = self
+                .bodies
+                .get(&contact.body_a)
+                .is_some_and(|b| b.is_sleeping);
+            let b_sleeping = self
+                .bodies
+                .get(&contact.body_b)
+                .is_some_and(|b| b.is_sleeping);
+            let a_moving = self.bodies.get(&contact.body_a).is_some_and(|b| {
                 !b.is_sleeping
                     && b.is_dynamic()
                     && (b.linear_velocity[0].abs() > SLEEP_VELOCITY_THRESHOLD
                         || b.linear_velocity[1].abs() > SLEEP_VELOCITY_THRESHOLD
                         || b.angular_velocity.abs() > SLEEP_VELOCITY_THRESHOLD)
             });
-            let b_moving = self.bodies.get(&contact.body_b).map_or(false, |b| {
+            let b_moving = self.bodies.get(&contact.body_b).is_some_and(|b| {
                 !b.is_sleeping
                     && b.is_dynamic()
                     && (b.linear_velocity[0].abs() > SLEEP_VELOCITY_THRESHOLD
                         || b.linear_velocity[1].abs() > SLEEP_VELOCITY_THRESHOLD
                         || b.angular_velocity.abs() > SLEEP_VELOCITY_THRESHOLD)
             });
-            if a_sleeping && b_moving {
-                if let Some(ba) = self.bodies.get_mut(&contact.body_a) {
-                    ba.is_sleeping = false;
-                    ba.sleep_timer = 0.0;
-                }
+            if a_sleeping
+                && b_moving
+                && let Some(ba) = self.bodies.get_mut(&contact.body_a)
+            {
+                ba.is_sleeping = false;
+                ba.sleep_timer = 0.0;
             }
-            if b_sleeping && a_moving {
-                if let Some(bb) = self.bodies.get_mut(&contact.body_b) {
-                    bb.is_sleeping = false;
-                    bb.sleep_timer = 0.0;
-                }
+            if b_sleeping
+                && a_moving
+                && let Some(bb) = self.bodies.get_mut(&contact.body_b)
+            {
+                bb.is_sleeping = false;
+                bb.sleep_timer = 0.0;
             }
         }
 
@@ -1008,12 +1018,130 @@ impl PhysicsState2d {
                     }
                     JointType::Revolute { limits, .. } => {
                         self.solve_revolute_joint(joint, limits.as_ref());
+                        if let Some(motor) = &joint.motor {
+                            self.solve_revolute_motor(joint, motor, dt);
+                        }
                     }
                     JointType::Prismatic { axis, limits } => {
                         self.solve_prismatic_joint(joint, *axis, limits.as_ref());
+                        if let Some(motor) = &joint.motor {
+                            self.solve_prismatic_motor(joint, *axis, motor, dt);
+                        }
                     }
                 }
             }
+        }
+    }
+
+    /// Apply a revolute motor: drives relative angular velocity toward `target_velocity`,
+    /// clamped by `max_force` (torque).
+    fn solve_revolute_motor(&mut self, joint: &Joint2d, motor: &JointMotor, dt: f64) {
+        let angvel_a = self
+            .bodies
+            .get(&joint.body_a)
+            .map(|b| b.angular_velocity)
+            .unwrap_or(0.0);
+        let angvel_b = self
+            .bodies
+            .get(&joint.body_b)
+            .map(|b| b.angular_velocity)
+            .unwrap_or(0.0);
+        let inv_inertia_a = self
+            .bodies
+            .get(&joint.body_a)
+            .filter(|b| b.is_dynamic())
+            .map(|b| b.inv_inertia)
+            .unwrap_or(0.0);
+        let inv_inertia_b = self
+            .bodies
+            .get(&joint.body_b)
+            .filter(|b| b.is_dynamic())
+            .map(|b| b.inv_inertia)
+            .unwrap_or(0.0);
+
+        let inv_inertia_sum = inv_inertia_a + inv_inertia_b;
+        if inv_inertia_sum == 0.0 {
+            return;
+        }
+
+        let rel_angvel = angvel_b - angvel_a;
+        let error = motor.target_velocity - rel_angvel;
+        // Impulse = error / inv_inertia_sum, clamped by max_force * dt
+        let max_impulse = motor.max_force * dt;
+        let impulse = (error / inv_inertia_sum).clamp(-max_impulse, max_impulse);
+
+        if let Some(ba) = self.bodies.get_mut(&joint.body_a)
+            && ba.is_dynamic()
+        {
+            ba.angular_velocity -= impulse * ba.inv_inertia;
+        }
+        if let Some(bb) = self.bodies.get_mut(&joint.body_b)
+            && bb.is_dynamic()
+        {
+            bb.angular_velocity += impulse * bb.inv_inertia;
+        }
+    }
+
+    /// Apply a prismatic motor: drives relative linear velocity along `axis` toward
+    /// `target_velocity`, clamped by `max_force`.
+    fn solve_prismatic_motor(
+        &mut self,
+        joint: &Joint2d,
+        axis: [f64; 2],
+        motor: &JointMotor,
+        dt: f64,
+    ) {
+        let axis_len = (axis[0] * axis[0] + axis[1] * axis[1]).sqrt();
+        if axis_len < 1e-10 {
+            return;
+        }
+        let ax = [axis[0] / axis_len, axis[1] / axis_len];
+
+        let vel_a = self
+            .bodies
+            .get(&joint.body_a)
+            .map(|b| b.linear_velocity)
+            .unwrap_or([0.0, 0.0]);
+        let vel_b = self
+            .bodies
+            .get(&joint.body_b)
+            .map(|b| b.linear_velocity)
+            .unwrap_or([0.0, 0.0]);
+        let inv_mass_a = self
+            .bodies
+            .get(&joint.body_a)
+            .filter(|b| b.is_dynamic())
+            .map(|b| b.inv_mass)
+            .unwrap_or(0.0);
+        let inv_mass_b = self
+            .bodies
+            .get(&joint.body_b)
+            .filter(|b| b.is_dynamic())
+            .map(|b| b.inv_mass)
+            .unwrap_or(0.0);
+
+        let inv_mass_sum = inv_mass_a + inv_mass_b;
+        if inv_mass_sum == 0.0 {
+            return;
+        }
+
+        let rel_vel = [vel_b[0] - vel_a[0], vel_b[1] - vel_a[1]];
+        let rel_speed_along_axis = rel_vel[0] * ax[0] + rel_vel[1] * ax[1];
+        let error = motor.target_velocity - rel_speed_along_axis;
+        let max_impulse = motor.max_force * dt;
+        let impulse = (error / inv_mass_sum).clamp(-max_impulse, max_impulse);
+
+        if let Some(ba) = self.bodies.get_mut(&joint.body_a)
+            && ba.is_dynamic()
+        {
+            ba.linear_velocity[0] -= impulse * ax[0] * ba.inv_mass;
+            ba.linear_velocity[1] -= impulse * ax[1] * ba.inv_mass;
+        }
+        if let Some(bb) = self.bodies.get_mut(&joint.body_b)
+            && bb.is_dynamic()
+        {
+            bb.linear_velocity[0] += impulse * ax[0] * bb.inv_mass;
+            bb.linear_velocity[1] += impulse * ax[1] * bb.inv_mass;
         }
     }
 
@@ -1471,11 +1599,17 @@ fn generate_contact(
             circle_aabb(pos_b, *radius, pos_a, [half_extents[0], half_extents[1]])
                 .map(|(n, d, p)| ([-n[0], -n[1]], d, p))
         }
-        // Box vs Box
+        // Box vs Box — use OBB-OBB SAT when either box is rotated, fast AABB path otherwise
         (
             ColliderShape::Box { half_extents: he_a },
             ColliderShape::Box { half_extents: he_b },
-        ) => aabb_aabb_contact(pos_a, [he_a[0], he_a[1]], pos_b, [he_b[0], he_b[1]]),
+        ) => {
+            if rot_a.abs() < 1e-10 && rot_b.abs() < 1e-10 {
+                aabb_aabb_contact(pos_a, [he_a[0], he_a[1]], pos_b, [he_b[0], he_b[1]])
+            } else {
+                obb_obb_contact(pos_a, rot_a, [he_a[0], he_a[1]], pos_b, rot_b, [he_b[0], he_b[1]])
+            }
+        }
         // Capsule vs Ball
         (
             ColliderShape::Capsule {
@@ -1620,6 +1754,89 @@ fn aabb_aabb_contact(
         pos_a[1] + normal[1] * he_a[1],
     ];
     Some((normal, depth, point))
+}
+
+// ---------------------------------------------------------------------------
+// OBB-OBB contact (Separating Axis Theorem for 2D oriented bounding boxes)
+// ---------------------------------------------------------------------------
+
+/// OBB-OBB contact using 2D SAT with 4 separating axes (2 edge normals per box).
+/// Returns (normal_from_a_to_b, penetration_depth, contact_point).
+#[allow(clippy::too_many_arguments)]
+fn obb_obb_contact(
+    pos_a: [f64; 2],
+    rot_a: f64,
+    he_a: [f64; 2],
+    pos_b: [f64; 2],
+    rot_b: f64,
+    he_b: [f64; 2],
+) -> Option<([f64; 2], f64, [f64; 2])> {
+    let (sin_a, cos_a) = rot_a.sin_cos();
+    let (sin_b, cos_b) = rot_b.sin_cos();
+
+    // Local axes for each box
+    let axes_a = [[cos_a, sin_a], [-sin_a, cos_a]];
+    let axes_b = [[cos_b, sin_b], [-sin_b, cos_b]];
+
+    // Centre-to-centre vector
+    let d = [pos_b[0] - pos_a[0], pos_b[1] - pos_a[1]];
+
+    let mut min_overlap = f64::INFINITY;
+    let mut best_axis = [0.0f64; 2];
+
+    // Test all 4 axes (2 per box)
+    let all_axes = [axes_a[0], axes_a[1], axes_b[0], axes_b[1]];
+
+    for axis in &all_axes {
+        // Project half-extents of A onto axis
+        let proj_a = he_a[0] * (axes_a[0][0] * axis[0] + axes_a[0][1] * axis[1]).abs()
+            + he_a[1] * (axes_a[1][0] * axis[0] + axes_a[1][1] * axis[1]).abs();
+        // Project half-extents of B onto axis
+        let proj_b = he_b[0] * (axes_b[0][0] * axis[0] + axes_b[0][1] * axis[1]).abs()
+            + he_b[1] * (axes_b[1][0] * axis[0] + axes_b[1][1] * axis[1]).abs();
+        // Distance between centres along this axis
+        let dist = d[0] * axis[0] + d[1] * axis[1];
+
+        let overlap = proj_a + proj_b - dist.abs();
+        if overlap <= 0.0 {
+            return None; // Separating axis found
+        }
+
+        if overlap < min_overlap {
+            min_overlap = overlap;
+            // Normal should point from A to B
+            if dist >= 0.0 {
+                best_axis = *axis;
+            } else {
+                best_axis = [-axis[0], -axis[1]];
+            }
+        }
+    }
+
+    // Contact point: midpoint of support points on each box's surface toward the other.
+    let cp_a = obb_support_point(pos_a, he_a, &axes_a, best_axis);
+    let cp_b = obb_support_point(pos_b, he_b, &axes_b, [-best_axis[0], -best_axis[1]]);
+    let point = [(cp_a[0] + cp_b[0]) * 0.5, (cp_a[1] + cp_b[1]) * 0.5];
+
+    Some((best_axis, min_overlap, point))
+}
+
+/// Compute the support point of an OBB in a given direction.
+/// Returns the corner of the box that is furthest in `dir`.
+fn obb_support_point(
+    center: [f64; 2],
+    half_extents: [f64; 2],
+    axes: &[[f64; 2]; 2],
+    dir: [f64; 2],
+) -> [f64; 2] {
+    let mut point = center;
+    for i in 0..2 {
+        let dot = axes[i][0] * dir[0] + axes[i][1] * dir[1];
+        let sign = if dot >= 0.0 { 1.0 } else { -1.0 };
+        point[0] += sign * half_extents[i] * axes[i][0];
+        point[1] += sign * half_extents[i] * axes[i][1];
+    }
+    point
 }
 
 // ---------------------------------------------------------------------------

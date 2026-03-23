@@ -179,30 +179,64 @@ impl PhysicsWorld {
 
     #[cfg(all(feature = "2d", not(feature = "3d")))]
     fn collide_particles(&mut self) {
+        // Pre-compute collider world positions and AABBs to avoid redundant
+        // sin_cos calculations and enable AABB pre-filtering.
+        struct ColliderInfo {
+            shape: crate::collider::ColliderShape,
+            pos: [f64; 2],
+            rotation: f64,
+            aabb_min: [f64; 2],
+            aabb_max: [f64; 2],
+        }
+        let infos: Vec<ColliderInfo> = self
+            .backend_2d
+            .colliders
+            .values()
+            .filter_map(|collider| {
+                if collider.is_sensor {
+                    return None;
+                }
+                let rb = self.backend_2d.bodies.get(&collider.body)?;
+                let (sin, cos) = rb.rotation.sin_cos();
+                let cx = rb.position[0] + cos * collider.offset[0] - sin * collider.offset[1];
+                let cy = rb.position[1] + sin * collider.offset[0] + cos * collider.offset[1];
+                let aabb = collider.world_aabb(rb.position, rb.rotation);
+                Some(ColliderInfo {
+                    shape: collider.shape.clone(),
+                    pos: [cx, cy],
+                    rotation: rb.rotation,
+                    aabb_min: aabb.min,
+                    aabb_max: aabb.max,
+                })
+            })
+            .collect();
+
         for p in &mut self.particles {
             if !p.is_alive() || p.radius <= 0.0 {
                 continue;
             }
 
-            for collider in self.backend_2d.colliders.values() {
-                if collider.is_sensor {
+            let px = p.position[0];
+            let py = p.position[1];
+            let pr = p.radius;
+
+            for info in &infos {
+                // AABB pre-check: skip colliders whose AABB doesn't overlap the
+                // particle's bounding box.
+                if px + pr < info.aabb_min[0]
+                    || px - pr > info.aabb_max[0]
+                    || py + pr < info.aabb_min[1]
+                    || py - pr > info.aabb_max[1]
+                {
                     continue;
                 }
-                let rb = match self.backend_2d.bodies.get(&collider.body) {
-                    Some(b) => b,
-                    None => continue,
-                };
-
-                let (sin, cos) = rb.rotation.sin_cos();
-                let cx = rb.position[0] + cos * collider.offset[0] - sin * collider.offset[1];
-                let cy = rb.position[1] + sin * collider.offset[0] + cos * collider.offset[1];
 
                 let contact = particle_vs_collider_2d(
-                    [p.position[0], p.position[1]],
-                    p.radius,
-                    &collider.shape,
-                    [cx, cy],
-                    rb.rotation,
+                    [px, py],
+                    pr,
+                    &info.shape,
+                    info.pos,
+                    info.rotation,
                 );
 
                 if let Some((normal, depth)) = contact {
@@ -617,6 +651,7 @@ impl PhysicsWorld {
                         joint_type: j.joint_type.clone(),
                         local_anchor_a: j.local_anchor_a,
                         local_anchor_b: j.local_anchor_b,
+                        motor: j.motor.clone(),
                     },
                 });
             }
@@ -676,6 +711,7 @@ impl PhysicsWorld {
                         joint_type: j.joint_type.clone(),
                         local_anchor_a: [j.local_anchor_a[0], j.local_anchor_a[1]],
                         local_anchor_b: [j.local_anchor_b[0], j.local_anchor_b[1]],
+                        motor: j.motor.clone(),
                     },
                 });
             }
@@ -1000,6 +1036,7 @@ mod tests {
             joint_type: JointType::Fixed,
             local_anchor_a: [0.0, 0.0],
             local_anchor_b: [0.0, 0.0],
+            motor: None,
         });
         world.step();
     }

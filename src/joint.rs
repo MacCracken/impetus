@@ -33,6 +33,18 @@ pub enum JointType {
     Distance { length: f64 },
 }
 
+/// Motor parameters for revolute and prismatic joints.
+///
+/// A motor drives the joint toward a target velocity, applying up to
+/// `max_force` (torque for revolute, force for prismatic) each step.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JointMotor {
+    /// Target velocity (rad/s for revolute, m/s for prismatic).
+    pub target_velocity: f64,
+    /// Maximum force/torque the motor can apply per step.
+    pub max_force: f64,
+}
+
 /// Descriptor for creating a joint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JointDesc {
@@ -41,6 +53,9 @@ pub struct JointDesc {
     pub joint_type: JointType,
     pub local_anchor_a: [f64; 2],
     pub local_anchor_b: [f64; 2],
+    /// Optional motor (only used for Revolute and Prismatic joints).
+    #[serde(default)]
+    pub motor: Option<JointMotor>,
 }
 
 #[cfg(test)]
@@ -55,6 +70,7 @@ mod tests {
             joint_type: JointType::Fixed,
             local_anchor_a: [0.0, 0.0],
             local_anchor_b: [1.0, 0.0],
+            motor: None,
         };
         let json = serde_json::to_string(&desc).unwrap();
         let back: JointDesc = serde_json::from_str(&json).unwrap();
@@ -73,6 +89,7 @@ mod tests {
             },
             local_anchor_a: [0.0, 0.0],
             local_anchor_b: [0.0, 0.0],
+            motor: None,
         };
         let json = serde_json::to_string(&desc).unwrap();
         let back: JointDesc = serde_json::from_str(&json).unwrap();

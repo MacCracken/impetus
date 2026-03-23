@@ -94,6 +94,7 @@ fn joint_connects_bodies() {
         },
         local_anchor_a: [0.0, 0.0],
         local_anchor_b: [0.0, 0.0],
+        motor: None,
     });
 
     // Stepping should not panic with joints

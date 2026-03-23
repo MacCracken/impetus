@@ -12,10 +12,19 @@ use crate::body::{BodyDesc, BodyHandle, BodyState, BodyType};
 use crate::collider::{ColliderDesc, ColliderHandle, ColliderShape};
 use crate::event::CollisionEvent;
 use crate::force::{Force, Impulse, Torque};
-use crate::joint::{JointDesc, JointHandle, JointType};
+use crate::joint::{JointDesc, JointHandle, JointMotor, JointType};
 use crate::material::PhysicsMaterial;
 use crate::query::RayHit;
 use crate::ImpetusError;
+
+// ---------------------------------------------------------------------------
+// Sleep / deactivation thresholds
+// ---------------------------------------------------------------------------
+
+/// Bodies with both linear and angular speed below this are candidates for sleep.
+const SLEEP_VELOCITY_THRESHOLD_3D: f64 = 0.01;
+/// How many seconds of low motion before a body is put to sleep.
+const SLEEP_TIME_THRESHOLD_3D: f64 = 0.5;
 
 // ---------------------------------------------------------------------------
 // Internal body representation
@@ -39,6 +48,9 @@ pub(crate) struct RigidBody3d {
     pub inv_mass: f64,
     pub inertia: DVec3, // diagonal inertia tensor
     pub inv_inertia: DVec3,
+    // Sleep state
+    pub is_sleeping: bool,
+    pub sleep_timer: f64,
 }
 
 impl RigidBody3d {
@@ -60,6 +72,8 @@ impl RigidBody3d {
             inv_mass: 0.0,
             inertia: DVec3::ZERO,
             inv_inertia: DVec3::ZERO,
+            is_sleeping: false,
+            sleep_timer: 0.0,
         }
     }
 
@@ -73,6 +87,9 @@ impl RigidBody3d {
 
     fn integrate_velocities(&mut self, gravity: DVec3, dt: f64) {
         if !self.is_dynamic() || self.inv_mass == 0.0 {
+            return;
+        }
+        if self.is_sleeping {
             return;
         }
 
@@ -300,6 +317,7 @@ pub(crate) struct Joint3d {
     pub joint_type: JointType,
     pub local_anchor_a: DVec3,
     pub local_anchor_b: DVec3,
+    pub motor: Option<JointMotor>,
 }
 
 // ---------------------------------------------------------------------------
@@ -473,12 +491,16 @@ impl PhysicsState3d {
                 joint_type: desc.joint_type.clone(),
                 local_anchor_a: DVec3::new(desc.local_anchor_a[0], desc.local_anchor_a[1], 0.0),
                 local_anchor_b: DVec3::new(desc.local_anchor_b[0], desc.local_anchor_b[1], 0.0),
+                motor: desc.motor.clone(),
             },
         );
     }
 
     pub fn apply_force(&mut self, body: BodyHandle, force: &Force) {
         if let Some(rb) = self.bodies.get_mut(&body) {
+            // Wake the body
+            rb.is_sleeping = false;
+            rb.sleep_timer = 0.0;
             let fv = DVec3::from_array(force.vector);
             rb.force_accumulator += fv;
             if let Some(point) = force.point {
@@ -493,6 +515,9 @@ impl PhysicsState3d {
             && rb.is_dynamic()
             && rb.inv_mass > 0.0
         {
+            // Wake the body
+            rb.is_sleeping = false;
+            rb.sleep_timer = 0.0;
             let iv = DVec3::from_array(impulse.vector);
             rb.linear_velocity += iv * rb.inv_mass;
             if let Some(point) = impulse.point {
@@ -505,6 +530,9 @@ impl PhysicsState3d {
 
     pub fn apply_torque(&mut self, body: BodyHandle, torque: &Torque) {
         if let Some(rb) = self.bodies.get_mut(&body) {
+            // Wake the body
+            rb.is_sleeping = false;
+            rb.sleep_timer = 0.0;
             rb.torque_accumulator.z += torque.value;
         }
     }
@@ -538,7 +566,7 @@ impl PhysicsState3d {
             rotation: rb.rotation.z.atan2(rb.rotation.w) * 2.0, // extract z-rotation
             linear_velocity: rb.linear_velocity.to_array(),
             angular_velocity: rb.angular_velocity.z,
-            is_sleeping: false,
+            is_sleeping: rb.is_sleeping,
         })
     }
 
@@ -554,23 +582,91 @@ impl PhysicsState3d {
         position_iterations: u32,
     ) -> Vec<CollisionEvent> {
         let g = DVec3::from_array(gravity);
+        // 1. Integrate velocities
         for rb in self.bodies.values_mut() {
             rb.integrate_velocities(g, dt);
         }
 
+        // 2-3. Broadphase + narrowphase
         let broad_pairs = self.broadphase();
         let contacts = self.narrowphase(&broad_pairs);
+
+        // 4. Wake sleeping bodies on contact with non-sleeping moving bodies
+        for contact in &contacts {
+            let a_sleeping = self
+                .bodies
+                .get(&contact.body_a)
+                .is_some_and(|b| b.is_sleeping);
+            let b_sleeping = self
+                .bodies
+                .get(&contact.body_b)
+                .is_some_and(|b| b.is_sleeping);
+            let a_moving = self.bodies.get(&contact.body_a).is_some_and(|b| {
+                !b.is_sleeping
+                    && b.is_dynamic()
+                    && (b.linear_velocity.length() > SLEEP_VELOCITY_THRESHOLD_3D
+                        || b.angular_velocity.length() > SLEEP_VELOCITY_THRESHOLD_3D)
+            });
+            let b_moving = self.bodies.get(&contact.body_b).is_some_and(|b| {
+                !b.is_sleeping
+                    && b.is_dynamic()
+                    && (b.linear_velocity.length() > SLEEP_VELOCITY_THRESHOLD_3D
+                        || b.angular_velocity.length() > SLEEP_VELOCITY_THRESHOLD_3D)
+            });
+            if a_sleeping
+                && b_moving
+                && let Some(ba) = self.bodies.get_mut(&contact.body_a)
+            {
+                ba.is_sleeping = false;
+                ba.sleep_timer = 0.0;
+            }
+            if b_sleeping
+                && a_moving
+                && let Some(bb) = self.bodies.get_mut(&contact.body_b)
+            {
+                bb.is_sleeping = false;
+                bb.sleep_timer = 0.0;
+            }
+        }
+
+        // 5. Solve velocity constraints
         self.solve_contacts(&contacts, velocity_iterations);
+
+        // 6. Solve joint constraints
         self.solve_joints(dt, velocity_iterations);
+
+        // 7. Positional correction
         self.solve_positions(&contacts, position_iterations);
 
+        // 8. Integrate positions
         for rb in self.bodies.values_mut() {
             rb.integrate_positions(dt);
         }
+
+        // 9. Sleep check: put nearly-stationary dynamic bodies to sleep
+        for rb in self.bodies.values_mut() {
+            if !rb.is_dynamic() || rb.inv_mass == 0.0 {
+                continue;
+            }
+            let lin_speed = rb.linear_velocity.length();
+            let ang_speed = rb.angular_velocity.length();
+            if lin_speed < SLEEP_VELOCITY_THRESHOLD_3D && ang_speed < SLEEP_VELOCITY_THRESHOLD_3D {
+                rb.sleep_timer += dt;
+                if rb.sleep_timer >= SLEEP_TIME_THRESHOLD_3D {
+                    rb.is_sleeping = true;
+                }
+            } else {
+                rb.sleep_timer = 0.0;
+                rb.is_sleeping = false;
+            }
+        }
+
+        // 10. Clear forces
         for rb in self.bodies.values_mut() {
             rb.clear_forces();
         }
 
+        // 11. Generate collision events
         self.generate_events(&contacts)
     }
 
@@ -1733,6 +1829,7 @@ mod tests {
             joint_type: JointType::Fixed,
             local_anchor_a: [0.0, 0.0],
             local_anchor_b: [0.0, 0.0],
+            motor: None,
         });
 
         for _ in 0..10 {
