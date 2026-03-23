@@ -726,6 +726,12 @@ impl PhysicsState3d {
             if ca.is_sensor && cb.is_sensor {
                 continue;
             }
+            // Collision layer filtering
+            if (ca.collision_layer & cb.collision_mask) == 0
+                && (cb.collision_layer & ca.collision_mask) == 0
+            {
+                continue;
+            }
             if let (Some(aabb_a), Some(aabb_b)) = (aabb_map.get(&ha), aabb_map.get(&hb))
                 && aabb_a.overlaps(aabb_b)
             {
@@ -972,6 +978,8 @@ impl PhysicsState3d {
                 if joint.damping > 0.0 && !matches!(joint.joint_type, JointType::Spring { .. }) {
                     self.apply_joint_damping_3d(joint, dt);
                 }
+                // Motors: applied for Revolute/Prismatic when 3D axis support is added
+                let _ = &joint.motor;
             }
         }
     }
