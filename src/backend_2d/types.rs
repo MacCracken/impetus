@@ -22,6 +22,10 @@ pub(super) const MIN_MASS: f64 = 1e-6;
 pub(super) const MIN_INERTIA: f64 = 1e-10;
 /// Distance threshold for matching manifold points across frames (body-local coords).
 pub(super) const MANIFOLD_MATCH_THRESHOLD: f64 = 0.02;
+/// Maximum number of contact points per manifold in 2D.
+pub(super) const MAX_MANIFOLD_POINTS: usize = 2;
+/// Separation tolerance for re-validating old manifold points.
+pub(super) const MANIFOLD_REVALIDATION_TOLERANCE: f64 = 0.02;
 /// Warm starting scale factor — slightly less than 1.0 for stability.
 pub(super) const WARM_START_FACTOR: f64 = 0.95;
 
@@ -51,6 +55,8 @@ pub(crate) struct RigidBody2d {
     // Sleep state
     pub is_sleeping: bool,
     pub sleep_timer: f64,
+    // Island id assigned during island building (used for island-based sleep).
+    pub island_id: u32,
 }
 
 impl RigidBody2d {
@@ -74,6 +80,7 @@ impl RigidBody2d {
             inv_inertia: 0.0,
             is_sleeping: false,
             sleep_timer: 0.0,
+            island_id: 0,
         }
     }
 
@@ -399,8 +406,67 @@ pub(super) struct ContactManifold {
     pub body_a: BodyHandle,
     pub body_b: BodyHandle,
     pub normal: [f64; 2],
-    pub points: Vec<ManifoldPoint>, // Up to 1 point (single-point manifolds for now)
+    pub points: Vec<ManifoldPoint>, // Up to MAX_MANIFOLD_POINTS (2 in 2D)
 }
 
 /// Key for looking up manifolds between collider pairs.
 pub(super) type ManifoldKey = (ColliderHandle, ColliderHandle);
+
+// ---------------------------------------------------------------------------
+// Simulation island manager (union-find)
+// ---------------------------------------------------------------------------
+
+/// Union-find structure for simulation islands.
+pub(crate) struct IslandManager {
+    parent: Vec<u32>,
+    rank: Vec<u32>,
+}
+
+impl IslandManager {
+    /// Create a new island manager with given capacity.
+    pub fn new(capacity: usize) -> Self {
+        let mut parent = Vec::with_capacity(capacity);
+        let mut rank = Vec::with_capacity(capacity);
+        for i in 0..capacity {
+            parent.push(i as u32);
+            rank.push(0);
+        }
+        Self { parent, rank }
+    }
+
+    /// Reset for a new frame with `count` elements.
+    pub fn reset(&mut self, count: usize) {
+        self.parent.clear();
+        self.rank.clear();
+        for i in 0..count {
+            self.parent.push(i as u32);
+            self.rank.push(0);
+        }
+    }
+
+    /// Path-compressed find.
+    pub fn find(&mut self, mut x: u32) -> u32 {
+        while self.parent[x as usize] != x {
+            self.parent[x as usize] = self.parent[self.parent[x as usize] as usize];
+            x = self.parent[x as usize];
+        }
+        x
+    }
+
+    /// Union by rank.
+    pub fn union(&mut self, a: u32, b: u32) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra == rb {
+            return;
+        }
+        if self.rank[ra as usize] < self.rank[rb as usize] {
+            self.parent[ra as usize] = rb;
+        } else if self.rank[ra as usize] > self.rank[rb as usize] {
+            self.parent[rb as usize] = ra;
+        } else {
+            self.parent[rb as usize] = ra;
+            self.rank[ra as usize] += 1;
+        }
+    }
+}

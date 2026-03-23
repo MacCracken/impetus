@@ -13,19 +13,13 @@
 | 7 | Engineering backlog — all items resolved |
 | 8 | Arena storage, BTreeMap determinism, API completeness |
 | 9 | Warm starting, persistent manifolds, joints, simulation quality, particles, refactoring |
+| 10 | Essential solver quality — multi-point manifolds, simulation islands, static/dynamic friction, sub-stepping |
 
 ## Current Status
 
-Feature-complete for 0.22.3. 217+ tests (2D), 190+ tests (3D), 34 benchmarks. Backends refactored into sub-modules. Kiran builds clean.
+All essential and important items complete. 227 tests (2D), 190 tests (3D), 35 benchmarks. Backends refactored into sub-modules. Kiran builds clean.
 
 ## Road to v1.0
-
-### Essential — Solver Quality
-
-- [ ] **Multi-point contact manifolds** — 2 points per pair (2D), 4 per pair (3D). Sutherland-Hodgman clipping.
-- [ ] **Simulation islands** — union-find grouping of connected bodies. Atomic sleep/wake, solver partitioning.
-- [ ] **Static vs dynamic friction** — two coefficients per material.
-- [ ] **Sub-stepping** — multiple solver sub-steps per frame (Box2D v3 "Soft Step" approach).
 
 ### Important — Simulation Quality
 

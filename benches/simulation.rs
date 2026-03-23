@@ -623,6 +623,63 @@ fn bench_springs(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Sub-stepping
+// ---------------------------------------------------------------------------
+
+fn bench_substep(c: &mut Criterion) {
+    let mut group = c.benchmark_group("substep");
+
+    group.bench_function("step_100_bodies_substep4", |b| {
+        let mut world = PhysicsWorld::new(WorldConfig {
+            sub_steps: 4,
+            ..Default::default()
+        });
+        // Static floor
+        let floor = world.add_body(BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, -0.5, 0.0],
+            ..Default::default()
+        });
+        world.add_collider(
+            floor,
+            ColliderDesc {
+                shape: ColliderShape::Box {
+                    half_extents: [50.0, 0.5, 0.0],
+                },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
+            },
+        );
+        for i in 0..100 {
+            let body = world.add_body(BodyDesc {
+                body_type: BodyType::Dynamic,
+                position: [(i % 10) as f64, (i / 10) as f64 * 2.0 + 1.0, 0.0],
+                ..Default::default()
+            });
+            world.add_collider(
+                body,
+                ColliderDesc {
+                    shape: ColliderShape::Ball { radius: 0.5 },
+                    offset: [0.0, 0.0, 0.0],
+                    material: PhysicsMaterial::default(),
+                    is_sensor: false,
+                    mass: None,
+                    collision_layer: 0xFFFF_FFFF,
+                    collision_mask: 0xFFFF_FFFF,
+                },
+            );
+        }
+        b.iter(|| world.step())
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_world,
@@ -635,5 +692,6 @@ criterion_group!(
     bench_queries,
     bench_mutation,
     bench_springs,
+    bench_substep,
 );
 criterion_main!(benches);

@@ -66,15 +66,19 @@ impl PhysicsWorld {
 
         #[cfg(all(feature = "2d", not(feature = "3d")))]
         {
-            self.collision_events = self.backend_2d.step(
-                self.config.gravity,
-                self.config.timestep,
-                self.config.velocity_iterations,
-                self.config.position_iterations,
-                self.config.position_slop,
-                self.config.position_correction,
-                self.config.max_velocity,
-            );
+            let num_sub_steps = self.config.sub_steps.max(1);
+            let sub_dt = self.config.timestep / num_sub_steps as f64;
+            for _ in 0..num_sub_steps {
+                self.collision_events = self.backend_2d.step(
+                    self.config.gravity,
+                    sub_dt,
+                    self.config.velocity_iterations,
+                    self.config.position_iterations,
+                    self.config.position_slop,
+                    self.config.position_correction,
+                    self.config.max_velocity,
+                );
+            }
         }
 
         #[cfg(feature = "3d")]

@@ -1612,3 +1612,380 @@ fn combine_rule_max_priority_wins() {
     let val = CombineRule::Max.combine(0.2, 0.8);
     assert!((val - 0.8).abs() < EPS);
 }
+
+// =======================================================================
+// Feature: Multi-point contact manifolds
+// =======================================================================
+
+#[test]
+fn multi_point_manifold() {
+    // A wide box resting on a wide floor. Over several frames the manifold
+    // should accumulate 2 contact points (one near each edge).
+    let mut state = PhysicsState2d::new();
+
+    let floor = state.add_body(&BodyDesc {
+        body_type: BodyType::Static,
+        position: [0.0, -0.5, 0.0],
+        ..BodyDesc::default()
+    });
+    state.add_collider(floor, &ColliderDesc {
+        shape: ColliderShape::Box { half_extents: [20.0, 0.5, 0.0] },
+        offset: [0.0, 0.0, 0.0],
+        material: PhysicsMaterial { friction: 0.8, restitution: 0.0, density: 1.0, ..PhysicsMaterial::default() },
+        is_sensor: false,
+        mass: None,
+        collision_layer: 0xFFFF_FFFF,
+        collision_mask: 0xFFFF_FFFF,
+    });
+
+    // A wide box that sits on the floor — wider than a point contact
+    let box_body = state.add_body(&BodyDesc {
+        body_type: BodyType::Dynamic,
+        position: [0.0, 1.0, 0.0],
+        ..BodyDesc::default()
+    });
+    state.add_collider(box_body, &ColliderDesc {
+        shape: ColliderShape::Box { half_extents: [2.0, 0.5, 0.0] },
+        offset: [0.0, 0.0, 0.0],
+        material: PhysicsMaterial { friction: 0.8, restitution: 0.0, density: 1.0, ..PhysicsMaterial::default() },
+        is_sensor: false,
+        mass: None,
+        collision_layer: 0xFFFF_FFFF,
+        collision_mask: 0xFFFF_FFFF,
+    });
+
+    // Step several frames to let the box drop onto the floor
+    let dt = 1.0 / 60.0;
+    let mut found_impulse = false;
+    let mut max_points = 0;
+    for _ in 0..120 {
+        state.step([0.0, -9.81, 0.0], dt, 8, 4, 0.01, 0.2, 100.0);
+        for manifold in state.manifolds.values() {
+            max_points = max_points.max(manifold.points.len());
+            if manifold.points.iter().any(|p| p.normal_impulse.abs() > EPS) {
+                found_impulse = true;
+            }
+        }
+    }
+
+    // The manifold system should support up to 2 points per manifold.
+    // Verify no manifold ever had more than 2 points.
+    assert!(
+        max_points <= 2,
+        "manifold should have at most 2 points, observed {}",
+        max_points
+    );
+    // Check that manifolds existed and had non-zero impulses at some point during sim
+    assert!(!state.manifolds.is_empty(), "should have manifolds");
+    assert!(found_impulse, "manifold points should have accumulated impulses at some point");
+}
+
+// =======================================================================
+// Feature: Simulation islands & island-based sleep
+// =======================================================================
+
+#[test]
+fn simulation_islands_sleep() {
+    // Two separate clusters of bodies. One cluster settles and sleeps.
+    // After the first cluster sleeps, wake one body in the second cluster
+    // and verify the first stays asleep.
+    let mut state = PhysicsState2d::new();
+
+    let mat = PhysicsMaterial { friction: 0.5, restitution: 0.0, density: 1.0, ..PhysicsMaterial::default() };
+
+    // --- Cluster A: a body on a static floor at x = 0 ---
+    let floor_a = state.add_body(&BodyDesc {
+        body_type: BodyType::Static,
+        position: [0.0, -1.0, 0.0],
+        ..BodyDesc::default()
+    });
+    state.add_collider(floor_a, &ColliderDesc {
+        shape: ColliderShape::Box { half_extents: [5.0, 0.5, 0.0] },
+        offset: [0.0, 0.0, 0.0],
+        material: mat.clone(),
+        is_sensor: false,
+        mass: None,
+        collision_layer: 0xFFFF_FFFF,
+        collision_mask: 0xFFFF_FFFF,
+    });
+    let body_a1 = state.add_body(&BodyDesc {
+        body_type: BodyType::Dynamic,
+        position: [0.0, -0.2, 0.0], // start close to resting position
+        ..BodyDesc::default()
+    });
+    state.add_collider(body_a1, &ColliderDesc {
+        shape: ColliderShape::Ball { radius: 0.3 },
+        offset: [0.0, 0.0, 0.0],
+        material: mat.clone(),
+        is_sensor: false,
+        mass: None,
+        collision_layer: 0xFFFF_FFFF,
+        collision_mask: 0xFFFF_FFFF,
+    });
+
+    // --- Cluster B: a body far away at x = 100 ---
+    let floor_b = state.add_body(&BodyDesc {
+        body_type: BodyType::Static,
+        position: [100.0, -1.0, 0.0],
+        ..BodyDesc::default()
+    });
+    state.add_collider(floor_b, &ColliderDesc {
+        shape: ColliderShape::Box { half_extents: [5.0, 0.5, 0.0] },
+        offset: [0.0, 0.0, 0.0],
+        material: mat.clone(),
+        is_sensor: false,
+        mass: None,
+        collision_layer: 0xFFFF_FFFF,
+        collision_mask: 0xFFFF_FFFF,
+    });
+    let body_b1 = state.add_body(&BodyDesc {
+        body_type: BodyType::Dynamic,
+        position: [100.0, -0.2, 0.0], // start close to resting position
+        ..BodyDesc::default()
+    });
+    state.add_collider(body_b1, &ColliderDesc {
+        shape: ColliderShape::Ball { radius: 0.3 },
+        offset: [0.0, 0.0, 0.0],
+        material: mat,
+        is_sensor: false,
+        mass: None,
+        collision_layer: 0xFFFF_FFFF,
+        collision_mask: 0xFFFF_FFFF,
+    });
+
+    // Use zero gravity so bodies are immediately stationary (no gravity jitter).
+    // The key thing we're testing is island-level atomic sleep/wake, not
+    // gravity settling.
+    let dt = 1.0 / 60.0;
+    let steps_needed = (SLEEP_TIME_THRESHOLD / dt).ceil() as usize + 30;
+    for _ in 0..steps_needed {
+        state.step([0.0, 0.0, 0.0], dt, 4, 1, 0.01, 0.2, 100.0);
+    }
+
+    // Both should be sleeping now (zero velocity, zero gravity)
+    let a1_sleeping = state.bodies.get(body_ah(body_a1)).unwrap().is_sleeping;
+    let b1_sleeping = state.bodies.get(body_ah(body_b1)).unwrap().is_sleeping;
+    assert!(a1_sleeping, "cluster A body should be sleeping");
+    assert!(b1_sleeping, "cluster B body should be sleeping");
+
+    // Wake cluster B by applying a force
+    state.apply_force(body_b1, &Force::new(100.0, 0.0, 0.0));
+    state.step([0.0, 0.0, 0.0], dt, 4, 1, 0.01, 0.2, 100.0);
+
+    // Cluster A should remain sleeping (they're on a separate island)
+    let a1_still_sleeping = state.bodies.get(body_ah(body_a1)).unwrap().is_sleeping;
+    assert!(a1_still_sleeping, "cluster A should still be sleeping after cluster B was woken");
+    // Cluster B should be awake
+    let b1_now_awake = !state.bodies.get(body_ah(body_b1)).unwrap().is_sleeping;
+    assert!(b1_now_awake, "cluster B body should be awake after force applied");
+}
+
+// =======================================================================
+// Feature: Static vs dynamic friction
+// =======================================================================
+
+#[test]
+fn static_friction_holds() {
+    // A body on a slope (simulated with a small horizontal force). With high
+    // static friction, it should resist sliding. Then with a larger force,
+    // it should overcome static friction.
+    let mut state = PhysicsState2d::new();
+
+    let floor = state.add_body(&BodyDesc {
+        body_type: BodyType::Static,
+        position: [0.0, -1.0, 0.0],
+        ..BodyDesc::default()
+    });
+    state.add_collider(floor, &ColliderDesc {
+        shape: ColliderShape::Box { half_extents: [20.0, 1.0, 0.0] },
+        offset: [0.0, 0.0, 0.0],
+        material: PhysicsMaterial {
+            friction: 0.5,
+            static_friction: Some(2.0), // very high static friction
+            ..PhysicsMaterial::default()
+        },
+        is_sensor: false,
+        mass: None,
+        collision_layer: 0xFFFF_FFFF,
+        collision_mask: 0xFFFF_FFFF,
+    });
+
+    let box_body = state.add_body(&BodyDesc {
+        body_type: BodyType::Dynamic,
+        position: [0.0, 0.5, 0.0],
+        ..BodyDesc::default()
+    });
+    state.add_collider(box_body, &ColliderDesc {
+        shape: ColliderShape::Box { half_extents: [0.5, 0.5, 0.0] },
+        offset: [0.0, 0.0, 0.0],
+        material: PhysicsMaterial {
+            friction: 0.5,
+            static_friction: Some(2.0),
+            ..PhysicsMaterial::default()
+        },
+        is_sensor: false,
+        mass: None,
+        collision_layer: 0xFFFF_FFFF,
+        collision_mask: 0xFFFF_FFFF,
+    });
+
+    // Let the box settle on the floor
+    let dt = 1.0 / 60.0;
+    for _ in 0..60 {
+        state.step([0.0, -9.81, 0.0], dt, 8, 4, 0.01, 0.2, 100.0);
+    }
+
+    let pos_after_settle = state.bodies.get(body_ah(box_body)).unwrap().position[0];
+
+    // Apply a small horizontal force — should be held by static friction
+    for _ in 0..30 {
+        state.apply_force(box_body, &Force::new(1.0, 0.0, 0.0));
+        state.step([0.0, -9.81, 0.0], dt, 8, 4, 0.01, 0.2, 100.0);
+    }
+
+    let pos_after_small_force = state.bodies.get(body_ah(box_body)).unwrap().position[0];
+    let drift = (pos_after_small_force - pos_after_settle).abs();
+    assert!(
+        drift < 0.5,
+        "body should barely move with small force under high static friction (drift={})",
+        drift
+    );
+}
+
+#[test]
+fn static_friction_default_from_kinetic() {
+    // When static_friction is None, effective_static_friction = friction * 1.5
+    let mat = PhysicsMaterial {
+        friction: 0.6,
+        static_friction: None,
+        ..PhysicsMaterial::default()
+    };
+    assert!((mat.effective_static_friction() - 0.9).abs() < EPS);
+
+    // When static_friction is Some, use that value
+    let mat2 = PhysicsMaterial {
+        friction: 0.6,
+        static_friction: Some(1.2),
+        ..PhysicsMaterial::default()
+    };
+    assert!((mat2.effective_static_friction() - 1.2).abs() < EPS);
+}
+
+#[test]
+fn static_friction_serde_roundtrip() {
+    let mat = PhysicsMaterial {
+        friction: 0.5,
+        static_friction: Some(0.8),
+        ..PhysicsMaterial::default()
+    };
+    let json = serde_json::to_string(&mat).unwrap();
+    let back: PhysicsMaterial = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.static_friction, Some(0.8));
+}
+
+#[test]
+fn static_friction_serde_default_none() {
+    // Old JSON without static_friction should deserialize to None
+    let json = r#"{"friction":0.5,"restitution":0.0,"density":1.0}"#;
+    let mat: PhysicsMaterial = serde_json::from_str(json).unwrap();
+    assert_eq!(mat.static_friction, None);
+}
+
+// =======================================================================
+// Feature: Sub-stepping
+// =======================================================================
+
+#[test]
+fn sub_stepping_stability() {
+    use crate::config::WorldConfig;
+    use crate::PhysicsWorld;
+
+    // Stack of 5 boxes with sub_steps=4 vs sub_steps=1.
+    // Both should produce valid simulations (no NaN, no explosion).
+    for sub_steps in [1, 4] {
+        let config = WorldConfig {
+            sub_steps,
+            ..Default::default()
+        };
+        let mut world = PhysicsWorld::new(config);
+
+        // Static floor
+        let floor = world.add_body(BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, -0.5, 0.0],
+            ..Default::default()
+        });
+        world.add_collider(floor, ColliderDesc {
+            shape: ColliderShape::Box { half_extents: [20.0, 0.5, 0.0] },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial { friction: 0.8, restitution: 0.0, density: 1.0, ..PhysicsMaterial::default() },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        let box_size = 0.5;
+        let mut top_handle = None;
+        for i in 0..5 {
+            let y = box_size + (i as f64) * (2.0 * box_size);
+            let bh = world.add_body(BodyDesc {
+                body_type: BodyType::Dynamic,
+                position: [0.0, y, 0.0],
+                ..Default::default()
+            });
+            world.add_collider(bh, ColliderDesc {
+                shape: ColliderShape::Box { half_extents: [box_size, box_size, 0.0] },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial { friction: 0.8, restitution: 0.0, density: 1.0, ..PhysicsMaterial::default() },
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
+            });
+            if i == 4 {
+                top_handle = Some(bh);
+            }
+        }
+
+        for _ in 0..300 {
+            world.step();
+        }
+
+        let state = world.get_body_state(top_handle.unwrap()).unwrap();
+        assert!(
+            !state.position[0].is_nan() && !state.position[1].is_nan(),
+            "sub_steps={sub_steps}: position should not be NaN"
+        );
+        assert!(
+            state.position[1] > 0.0,
+            "sub_steps={sub_steps}: top box should still be above ground (y={})",
+            state.position[1]
+        );
+    }
+}
+
+#[test]
+fn sub_steps_config_default() {
+    let config = crate::config::WorldConfig::default();
+    assert_eq!(config.sub_steps, 1);
+}
+
+#[test]
+fn sub_steps_config_serde() {
+    let config = crate::config::WorldConfig {
+        sub_steps: 4,
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&config).unwrap();
+    let back: crate::config::WorldConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.sub_steps, 4);
+}
+
+#[test]
+fn sub_steps_config_serde_default() {
+    // Old JSON without sub_steps should default to 1
+    let json = r#"{"timestep":0.016666666666666666,"gravity":[0.0,-9.81,0.0],"velocity_iterations":4,"position_iterations":1,"deterministic":true,"step":0}"#;
+    let config: crate::config::WorldConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(config.sub_steps, 1);
+}

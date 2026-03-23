@@ -99,25 +99,8 @@ impl PhysicsState2d {
             rb.integrate_positions(dt);
         }
 
-        // 11. Sleep check: put nearly-stationary dynamic bodies to sleep
-        for rb in self.bodies.values_mut() {
-            if !rb.is_dynamic() || rb.inv_mass == 0.0 {
-                continue;
-            }
-            let lin_speed = (rb.linear_velocity[0] * rb.linear_velocity[0]
-                + rb.linear_velocity[1] * rb.linear_velocity[1])
-            .sqrt();
-            let ang_speed = rb.angular_velocity.abs();
-            if lin_speed < SLEEP_VELOCITY_THRESHOLD && ang_speed < SLEEP_VELOCITY_THRESHOLD {
-                rb.sleep_timer += dt;
-                if rb.sleep_timer >= SLEEP_TIME_THRESHOLD {
-                    rb.is_sleeping = true;
-                }
-            } else {
-                rb.sleep_timer = 0.0;
-                rb.is_sleeping = false;
-            }
-        }
+        // 11. Build simulation islands and sleep check
+        self.build_islands_and_sleep(dt);
 
         // 12. Clear forces
         for rb in self.bodies.values_mut() {
@@ -312,15 +295,32 @@ impl PhysicsState2d {
                     manifold.points[idx].local_b = new_local_b;
                     manifold.points[idx].depth = contact.depth;
                 } else {
-                    // New point — zero impulses
-                    manifold.points.clear(); // single-point manifold: replace
-                    manifold.points.push(ManifoldPoint {
-                        local_a: new_local_a,
-                        local_b: new_local_b,
-                        normal_impulse: 0.0,
-                        tangent_impulse: 0.0,
-                        depth: contact.depth,
-                    });
+                    // New unmatched point — add it to the manifold (incremental building)
+                    if manifold.points.len() < MAX_MANIFOLD_POINTS {
+                        manifold.points.push(ManifoldPoint {
+                            local_a: new_local_a,
+                            local_b: new_local_b,
+                            normal_impulse: 0.0,
+                            tangent_impulse: 0.0,
+                            depth: contact.depth,
+                        });
+                    } else {
+                        // Already at max points — replace the one with the smallest
+                        // accumulated normal impulse
+                        let min_idx = manifold.points.iter().enumerate()
+                            .min_by(|(_, a), (_, b)| {
+                                a.normal_impulse.partial_cmp(&b.normal_impulse).unwrap()
+                            })
+                            .map(|(i, _)| i)
+                            .unwrap();
+                        manifold.points[min_idx] = ManifoldPoint {
+                            local_a: new_local_a,
+                            local_b: new_local_b,
+                            normal_impulse: 0.0,
+                            tangent_impulse: 0.0,
+                            depth: contact.depth,
+                        };
+                    }
                 }
             } else {
                 // New manifold
@@ -345,6 +345,28 @@ impl PhysicsState2d {
                     }],
                 });
             }
+        }
+
+        // Re-validate old manifold points by re-projecting from body-local to world space.
+        // Points that have separated beyond the tolerance are removed.
+        for manifold in self.manifolds.values_mut() {
+            if !current_keys.contains(&(manifold.collider_a, manifold.collider_b)) {
+                continue;
+            }
+            let (pos_a, rot_a) = self.bodies.get(body_ah(manifold.body_a))
+                .map(|b| (b.position, b.rotation))
+                .unwrap_or(([0.0, 0.0], 0.0));
+            let (pos_b, rot_b) = self.bodies.get(body_ah(manifold.body_b))
+                .map(|b| (b.position, b.rotation))
+                .unwrap_or(([0.0, 0.0], 0.0));
+            let n = manifold.normal;
+            manifold.points.retain(|pt| {
+                let world_a = local_to_world(pt.local_a, pos_a, rot_a);
+                let world_b = local_to_world(pt.local_b, pos_b, rot_b);
+                let sep = (world_b[0] - world_a[0]) * n[0]
+                        + (world_b[1] - world_a[1]) * n[1];
+                sep < MANIFOLD_REVALIDATION_TOLERANCE
+            });
         }
 
         // Remove manifolds for pairs no longer in contact
@@ -460,6 +482,7 @@ impl PhysicsState2d {
         struct ManifoldMaterial {
             restitution: f64,
             friction: f64,
+            static_friction: f64,
             rolling_friction: f64,
             is_sensor: bool,
         }
@@ -473,7 +496,7 @@ impl PhysicsState2d {
         let keys: Vec<ManifoldKey> = self.manifolds.keys().copied().collect();
         let materials: Vec<ManifoldMaterial> = keys.iter().map(|key| {
             let manifold = &self.manifolds[key];
-            let (rest, fric, roll_fric, sensor) = match (
+            let (rest, fric, sfric, roll_fric, sensor) = match (
                 self.colliders.get(coll_ah(manifold.collider_a)),
                 self.colliders.get(coll_ah(manifold.collider_b)),
             ) {
@@ -490,14 +513,21 @@ impl PhysicsState2d {
                         a.material.friction_combine,
                         b.material.friction_combine,
                     ),
+                    combine_property(
+                        a.material.effective_static_friction(),
+                        b.material.effective_static_friction(),
+                        a.material.friction_combine,
+                        b.material.friction_combine,
+                    ),
                     (a.material.rolling_friction + b.material.rolling_friction) * 0.5,
                     a.is_sensor || b.is_sensor,
                 ),
-                _ => (0.0, 0.0, 0.0, false),
+                _ => (0.0, 0.0, 0.0, 0.0, false),
             };
             ManifoldMaterial {
                 restitution: rest,
                 friction: fric,
+                static_friction: sfric,
                 rolling_friction: roll_fric,
                 is_sensor: sensor,
             }
@@ -612,9 +642,10 @@ impl PhysicsState2d {
                         bb.angular_velocity += rb_cross_n * j_applied * bb.inv_inertia;
                     }
 
-                    // Friction impulse with accumulation
-                    let friction = materials[ki].friction;
-                    if friction > 0.0 {
+                    // Friction impulse with accumulation (static vs kinetic)
+                    let kinetic_friction = materials[ki].friction;
+                    let static_friction = materials[ki].static_friction;
+                    if kinetic_friction > 0.0 || static_friction > 0.0 {
                         // Re-read velocities after normal impulse application
                         let (vel_a, angvel_a) = {
                             let ba = match self.bodies.get(body_ah(body_a_handle)) {
@@ -652,7 +683,15 @@ impl PhysicsState2d {
 
                         let jt_new = -vel_along_tangent / inv_mass_sum_t;
                         let jt_old = self.manifolds[key].points[pi].tangent_impulse;
-                        let max_friction = j_accumulated.abs() * friction;
+
+                        // Use static friction when tangential velocity is very low,
+                        // kinetic friction otherwise.
+                        let mu = if vel_along_tangent.abs() < 0.01 {
+                            static_friction
+                        } else {
+                            kinetic_friction
+                        };
+                        let max_friction = j_accumulated.abs() * mu;
                         let jt_accumulated = (jt_old + jt_new).clamp(-max_friction, max_friction);
                         let jt_applied = jt_accumulated - jt_old;
                         self.manifolds.get_mut(key).unwrap().points[pi].tangent_impulse = jt_accumulated;
@@ -810,5 +849,115 @@ impl PhysicsState2d {
 
         self.prev_manifold_keys = current_keys;
         events
+    }
+
+    // -----------------------------------------------------------------------
+    // Simulation islands — union-find based grouping and island-level sleep
+    // -----------------------------------------------------------------------
+
+    fn build_islands_and_sleep(&mut self, dt: f64) {
+        use std::collections::BTreeMap as Map;
+
+        // Collect all body handles and assign indices
+        let body_handles: Vec<crate::body::BodyHandle> =
+            self.bodies.iter().map(|(_, b)| b.handle).collect();
+        let body_count = body_handles.len();
+        if body_count == 0 {
+            return;
+        }
+
+        // Build handle -> index map
+        let mut handle_to_idx: Map<crate::body::BodyHandle, u32> = Map::new();
+        for (i, &h) in body_handles.iter().enumerate() {
+            handle_to_idx.insert(h, i as u32);
+        }
+
+        // Reset island manager
+        self.island_manager.reset(body_count);
+
+        // Union bodies connected by contacts
+        for manifold in self.manifolds.values() {
+            if let (Some(&ia), Some(&ib)) = (
+                handle_to_idx.get(&manifold.body_a),
+                handle_to_idx.get(&manifold.body_b),
+            ) {
+                self.island_manager.union(ia, ib);
+            }
+        }
+
+        // Union bodies connected by joints
+        for (_, joint) in self.joints.iter() {
+            if let (Some(&ia), Some(&ib)) = (
+                handle_to_idx.get(&joint.body_a),
+                handle_to_idx.get(&joint.body_b),
+            ) {
+                self.island_manager.union(ia, ib);
+            }
+        }
+
+        // Assign island IDs and collect per-island info
+        // island_root -> list of body indices in that island
+        let mut islands: Map<u32, Vec<u32>> = Map::new();
+        for i in 0..body_count {
+            let root = self.island_manager.find(i as u32);
+            islands.entry(root).or_default().push(i as u32);
+        }
+
+        // For each island, check if ALL dynamic bodies are below velocity threshold
+        for members in islands.values() {
+            let mut all_slow = true;
+            let mut has_dynamic = false;
+
+            for &idx in members {
+                let handle = body_handles[idx as usize];
+                let rb = match self.bodies.get(body_ah(handle)) {
+                    Some(b) => b,
+                    None => continue,
+                };
+                if !rb.is_dynamic() || rb.inv_mass == 0.0 {
+                    continue;
+                }
+                has_dynamic = true;
+                let lin_speed = (rb.linear_velocity[0] * rb.linear_velocity[0]
+                    + rb.linear_velocity[1] * rb.linear_velocity[1])
+                .sqrt();
+                let ang_speed = rb.angular_velocity.abs();
+                if lin_speed >= SLEEP_VELOCITY_THRESHOLD
+                    || ang_speed >= SLEEP_VELOCITY_THRESHOLD
+                {
+                    all_slow = false;
+                    break;
+                }
+            }
+
+            if !has_dynamic {
+                continue;
+            }
+
+            // Update sleep timers for the whole island atomically
+            for &idx in members {
+                let handle = body_handles[idx as usize];
+                let rb = match self.bodies.get_mut(body_ah(handle)) {
+                    Some(b) => b,
+                    None => continue,
+                };
+                if !rb.is_dynamic() || rb.inv_mass == 0.0 {
+                    continue;
+                }
+                // Assign island_id for external inspection
+                rb.island_id = self.island_manager.find(idx);
+
+                if all_slow {
+                    rb.sleep_timer += dt;
+                    if rb.sleep_timer >= SLEEP_TIME_THRESHOLD {
+                        rb.is_sleeping = true;
+                    }
+                } else {
+                    // Any body in the island is fast — wake the whole island
+                    rb.sleep_timer = 0.0;
+                    rb.is_sleeping = false;
+                }
+            }
+        }
     }
 }

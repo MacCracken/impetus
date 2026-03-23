@@ -43,6 +43,11 @@ pub struct PhysicsMaterial {
     pub restitution: f64,
     /// Density in kg/m² (2D) or kg/m³ (3D). 0.0 = use shape default.
     pub density: f64,
+    /// Coefficient of static friction. If `None`, defaults to `friction * 1.5`.
+    /// Static friction is higher than kinetic friction and determines the
+    /// threshold force needed to start sliding.
+    #[serde(default)]
+    pub static_friction: Option<f64>,
     /// Coefficient of rolling friction (0.0 = no rolling resistance).
     #[serde(default)]
     pub rolling_friction: f64,
@@ -67,10 +72,19 @@ impl Default for PhysicsMaterial {
             friction: 0.5,
             restitution: 0.0,
             density: 1.0,
+            static_friction: None,
             rolling_friction: 0.0,
             friction_combine: CombineRule::Average,
             restitution_combine: CombineRule::Min,
         }
+    }
+}
+
+impl PhysicsMaterial {
+    /// Returns the effective static friction coefficient.
+    /// If `static_friction` is `None`, returns `friction * 1.5`.
+    pub fn effective_static_friction(&self) -> f64 {
+        self.static_friction.unwrap_or(self.friction * 1.5)
     }
 }
 

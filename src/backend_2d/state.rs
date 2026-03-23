@@ -25,6 +25,8 @@ pub(crate) struct PhysicsState2d {
     pub(super) manifolds: BTreeMap<ManifoldKey, ContactManifold>,
     /// Previous frame's manifold keys for collision event generation.
     pub(super) prev_manifold_keys: BTreeSet<ManifoldKey>,
+    /// Union-find structure for simulation islands.
+    pub(super) island_manager: IslandManager,
 }
 
 impl PhysicsState2d {
@@ -36,6 +38,7 @@ impl PhysicsState2d {
             body_colliders: BTreeMap::new(),
             manifolds: BTreeMap::new(),
             prev_manifold_keys: BTreeSet::new(),
+            island_manager: IslandManager::new(0),
         }
     }
 

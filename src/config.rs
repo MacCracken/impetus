@@ -26,6 +26,10 @@ pub struct WorldConfig {
     /// Maximum velocity magnitude for CCD — clamps velocity to prevent tunneling (default: 100.0).
     #[serde(default = "default_max_velocity")]
     pub max_velocity: f64,
+    /// Number of sub-steps per timestep for improved stability (default: 1).
+    /// Higher values improve stacking stability at a cost of performance.
+    #[serde(default = "default_sub_steps")]
+    pub sub_steps: u32,
 }
 
 fn default_slop() -> f64 {
@@ -40,6 +44,10 @@ fn default_max_velocity() -> f64 {
     100.0
 }
 
+fn default_sub_steps() -> u32 {
+    1
+}
+
 impl Default for WorldConfig {
     fn default() -> Self {
         Self {
@@ -52,6 +60,7 @@ impl Default for WorldConfig {
             position_slop: default_slop(),
             position_correction: default_correction(),
             max_velocity: default_max_velocity(),
+            sub_steps: default_sub_steps(),
         }
     }
 }
@@ -91,6 +100,7 @@ mod tests {
             position_slop: 0.02,
             position_correction: 0.3,
             max_velocity: 100.0,
+            sub_steps: 1,
         };
         let json = serde_json::to_string(&config).unwrap();
         let back: WorldConfig = serde_json::from_str(&json).unwrap();
