@@ -32,6 +32,7 @@ impl Force {
     }
 
     /// Magnitude of the force.
+    #[must_use]
     pub fn magnitude(&self) -> f64 {
         (self.vector[0].powi(2) + self.vector[1].powi(2) + self.vector[2].powi(2)).sqrt()
     }
@@ -62,6 +63,7 @@ impl Impulse {
     }
 
     /// Magnitude of the impulse.
+    #[must_use]
     pub fn magnitude(&self) -> f64 {
         (self.vector[0].powi(2) + self.vector[1].powi(2) + self.vector[2].powi(2)).sqrt()
     }

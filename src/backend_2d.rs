@@ -213,10 +213,22 @@ impl Collider2d {
                     max: [wx + w, wy + h_max * scale[1]],
                 }
             }
-            ColliderShape::TriMesh { .. } => Aabb2d {
-                min: [wx, wy],
-                max: [wx, wy],
-            },
+            ColliderShape::TriMesh { vertices, .. } => {
+                let mut min_p = [f64::INFINITY, f64::INFINITY];
+                let mut max_p = [f64::NEG_INFINITY, f64::NEG_INFINITY];
+                for v in vertices {
+                    let px = cos * v[0] - sin * v[1] + wx;
+                    let py = sin * v[0] + cos * v[1] + wy;
+                    min_p[0] = min_p[0].min(px);
+                    min_p[1] = min_p[1].min(py);
+                    max_p[0] = max_p[0].max(px);
+                    max_p[1] = max_p[1].max(py);
+                }
+                Aabb2d {
+                    min: min_p,
+                    max: max_p,
+                }
+            }
         }
     }
 

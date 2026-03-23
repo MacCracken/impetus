@@ -266,11 +266,13 @@ impl PhysicsWorld {
     }
 
     /// Current simulation step number.
+    #[must_use]
     pub fn current_step(&self) -> u64 {
         self.config.step
     }
 
     /// Timestep duration.
+    #[must_use]
     pub fn timestep(&self) -> f64 {
         self.config.timestep
     }
@@ -421,11 +423,13 @@ impl PhysicsWorld {
     }
 
     /// Get collision events from the last step.
+    #[must_use]
     pub fn collision_events(&self) -> &[CollisionEvent] {
         &self.collision_events
     }
 
     /// Number of bodies in the world.
+    #[must_use]
     pub fn body_count(&self) -> usize {
         #[cfg(all(feature = "2d", not(feature = "3d")))]
         {
@@ -444,6 +448,7 @@ impl PhysicsWorld {
     }
 
     /// Get the world configuration.
+    #[must_use]
     pub fn config(&self) -> &WorldConfig {
         &self.config
     }
@@ -490,11 +495,13 @@ impl PhysicsWorld {
     }
 
     /// Get all live particles (read-only).
+    #[must_use]
     pub fn particles(&self) -> &[Particle] {
         &self.particles
     }
 
     /// Number of live particles.
+    #[must_use]
     pub fn particle_count(&self) -> usize {
         self.particles.len()
     }
@@ -574,6 +581,11 @@ impl PhysicsWorld {
         #[cfg(feature = "3d")]
         {
             for rb in self.backend_3d.bodies.values() {
+                // Extract Z-rotation angle from quaternion. This is correct for
+                // pure Z-axis rotations (created via DQuat::from_rotation_z).
+                // For arbitrary 3D rotations, a full Euler decomposition would
+                // be needed, but BodyDesc.rotation is a single f64 representing
+                // only Z-rotation.
                 let rotation = rb.rotation.z.atan2(rb.rotation.w) * 2.0;
                 bodies.push(BodySnapshot {
                     handle: rb.handle,

@@ -9,6 +9,7 @@ pub struct ColliderHandle(pub u64);
 
 /// Collider shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ColliderShape {
     /// Axis-aligned box.
     Box { half_extents: [f64; 3] },

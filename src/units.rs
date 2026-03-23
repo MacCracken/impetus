@@ -14,6 +14,7 @@ pub struct Quantity {
 
 /// Physics-relevant units (subset of abaco-core UnitCategory).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum PhysicsUnit {
     Meters,
     Kilograms,
@@ -65,6 +66,7 @@ impl Quantity {
     }
 
     /// Convert degrees to radians.
+    #[must_use]
     pub fn to_radians(&self) -> f64 {
         match self.unit {
             PhysicsUnit::Degrees => self.value * std::f64::consts::PI / 180.0,

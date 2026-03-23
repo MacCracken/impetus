@@ -74,16 +74,19 @@ impl Spring {
     }
 
     /// Current position.
+    #[must_use]
     pub fn position(&self) -> f64 {
         self.position
     }
 
     /// Current velocity.
+    #[must_use]
     pub fn velocity(&self) -> f64 {
         self.velocity
     }
 
     /// Target position.
+    #[must_use]
     pub fn target(&self) -> f64 {
         self.target
     }
@@ -109,6 +112,7 @@ impl Spring {
     }
 
     /// Whether the spring has settled (position ≈ target and velocity ≈ 0).
+    #[must_use]
     pub fn is_settled(&self) -> bool {
         (self.position - self.target).abs() < self.settle_threshold
             && self.velocity.abs() < self.settle_threshold
@@ -126,11 +130,13 @@ impl Spring {
     }
 
     /// Stiffness value.
+    #[must_use]
     pub fn stiffness(&self) -> f64 {
         self.stiffness
     }
 
     /// Damping value.
+    #[must_use]
     pub fn damping(&self) -> f64 {
         self.damping
     }
@@ -182,6 +188,7 @@ impl Spring2d {
     }
 
     /// Current position as [x, y].
+    #[must_use]
     pub fn position(&self) -> [f64; 2] {
         [self.x.position(), self.y.position()]
     }
@@ -193,6 +200,7 @@ impl Spring2d {
     }
 
     /// Whether both axes have settled.
+    #[must_use]
     pub fn is_settled(&self) -> bool {
         self.x.is_settled() && self.y.is_settled()
     }
@@ -250,6 +258,7 @@ impl Spring3d {
     }
 
     /// Current position.
+    #[must_use]
     pub fn position(&self) -> [f64; 3] {
         [self.x.position(), self.y.position(), self.z.position()]
     }
@@ -262,6 +271,7 @@ impl Spring3d {
     }
 
     /// Whether all axes have settled.
+    #[must_use]
     pub fn is_settled(&self) -> bool {
         self.x.is_settled() && self.y.is_settled() && self.z.is_settled()
     }

@@ -1,0 +1,8 @@
+# cargo-vet audits
+# https://mozilla.github.io/cargo-vet/recording-audits.html
+
+[criteria.safe-to-deploy]
+description = "Audited for production deployment"
+
+[criteria.safe-to-run]
+description = "Audited for safe execution"

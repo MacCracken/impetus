@@ -15,9 +15,11 @@ is owned in-house.
 Impetus is a pure physics library — no ECS, no rendering, no scene loading.
 It sits at the foundation layer, consumed by:
 
-- **Kiran** — game engine (ECS integration via kiran-core, physics queries, collision callbacks)
+- **Kiran** — game engine (ECS integration via kiran-physics bridge)
 - **Aethersafha** — desktop compositor (window spring animations, snapping physics)
 - **Simulation workloads** — headless agent training environments via daimon
+
+See [docs/architecture/overview.md](docs/architecture/overview.md) for the full module map and simulation pipeline.
 
 ## Features
 
@@ -97,23 +99,11 @@ let [x, y] = pos.position();
 | `serialize` | no | bincode world snapshots |
 | `full` | no | all features |
 
-## Roadmap
+## Documentation
 
-| Phase | Status | Description |
-|-------|--------|-------------|
-| 1 | done | Scaffold — types, CI/CD, benchmarks, tests |
-| 2 | done | Native 2D backend — spatial hash, narrowphase, solver, particles |
-| 3 | done | 3D backend (DVec3/DQuat), bincode serialization, `[f64;3]` API |
-| 4 | done | Standalone spring API for Aethersafha |
-| 5 | next | Kiran ECS bridge |
-
-## Reference Code
-
-| Crate | Relevance |
-|-------|-----------|
-| [hisab](https://github.com/MacCracken/hisab) | Math foundation (DVec3, DQuat, geometry, transforms) |
-| [kiran](https://github.com/MacCracken/kiran) | Game engine (ECS consumer) |
-| [aethersafha](https://github.com/MacCracken/agnosticos) | Desktop compositor (spring animation consumer) |
+- [Architecture overview](docs/architecture/overview.md)
+- [Development roadmap](docs/development/roadmap.md)
+- [Testing guide](docs/guides/testing.md)
 
 ## License
 

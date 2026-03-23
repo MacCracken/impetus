@@ -1,7 +1,10 @@
-.PHONY: check fmt clippy test audit deny bench coverage build doc clean
+.PHONY: check fmt clippy test audit deny vet semver bench coverage build doc clean all
 
 # Run all CI checks locally
 check: fmt clippy test audit
+
+# Full check including supply-chain
+all: check deny vet semver doc
 
 # Format check
 fmt:
@@ -22,6 +25,14 @@ audit:
 # Supply-chain checks (cargo-deny)
 deny:
 	cargo deny check
+
+# Supply-chain verification (cargo-vet)
+vet:
+	cargo vet --locked
+
+# SemVer compatibility check
+semver:
+	cargo semver-checks check-release
 
 # Run benchmarks with history
 bench:

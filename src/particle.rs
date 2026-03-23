@@ -78,6 +78,7 @@ impl Particle {
     }
 
     /// Whether this particle is still alive.
+    #[must_use]
     pub fn is_alive(&self) -> bool {
         self.lifetime > 0.0
     }

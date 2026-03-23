@@ -1,0 +1,7 @@
+# cargo-vet configuration
+# https://mozilla.github.io/cargo-vet/
+
+[cargo-vet]
+version = "0.10"
+
+[imports]

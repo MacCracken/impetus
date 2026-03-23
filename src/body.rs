@@ -8,6 +8,7 @@ pub struct BodyHandle(pub u64);
 
 /// Body type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum BodyType {
     /// Immovable, infinite mass.
     Static,

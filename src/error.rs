@@ -3,6 +3,7 @@
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
+#[non_exhaustive]
 pub enum ImpetusError {
     #[error("body not found: {0}")]
     BodyNotFound(String),

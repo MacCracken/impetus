@@ -9,6 +9,7 @@ pub struct JointHandle(pub u64);
 
 /// Joint type.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum JointType {
     /// Fixed joint — bodies maintain relative position/rotation.
     Fixed,

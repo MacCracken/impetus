@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 /// A collision event from the physics step.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum CollisionEvent {
     /// Two colliders started touching.
     Started {
