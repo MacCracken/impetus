@@ -13,7 +13,7 @@ categories = ["simulation", "game-engines"]
 
 [features]
 default = ["2d"]
-2d = ["dep:ganit"]
+2d = ["dep:hisab"]
 3d = []
 serialize = ["dep:bincode"]
 full = ["2d", "3d", "serialize"]
@@ -22,12 +22,12 @@ full = ["2d", "3d", "serialize"]
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 
-# Physics backend — native, built on ganit math
+# Physics backend — native, built on hisab math
 # TODO: switch to version dep before publish
-ganit = { path = "../ganit", optional = true }
+hisab = { path = "../hisab", optional = true }
 
 # Serialization (optional)
-bincode = { version = "2", optional = true }
+bincode = { version = "2", features = ["serde"], optional = true }
 
 [dev-dependencies]
 serde_json = "1"

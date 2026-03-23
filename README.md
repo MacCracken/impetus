@@ -5,7 +5,7 @@ objects keep moving after being thrown) is a physics engine for the AGNOS
 ecosystem. It provides 2D/3D rigid-body simulation with deterministic stepping,
 serializable state, and unit-aware quantities.
 
-Built on [ganit](https://github.com/MacCracken/ganit) — the AGNOS math
+Built on [hisab](https://github.com/MacCracken/hisab) — the AGNOS math
 library — for geometry, transforms, and numerical methods. No external physics
 engine dependencies; the entire simulation stack is owned in-house.
 
@@ -20,7 +20,7 @@ It sits at the foundation layer, consumed by:
 
 ## Features
 
-- **2D and 3D** — feature-gated backends built on ganit geometry
+- **2D and 3D** — feature-gated backends built on hisab geometry
 - **Native f64** — full double precision, no lossy f32 conversions
 - **Deterministic** — fixed timestep, reproducible simulation for replay and network sync
 - **Serializable** — bincode world snapshots for save/load and network state transfer
@@ -29,7 +29,7 @@ It sits at the foundation layer, consumed by:
 - **Joint system** — fixed, revolute, prismatic, spring, distance constraints
 - **Spatial queries** — raycast, point queries
 - **Collision events** — started/stopped events with detailed contact data
-- **Zero external physics deps** — broadphase, narrowphase, solver all built on ganit
+- **Zero external physics deps** — broadphase, narrowphase, solver all built on hisab
 
 ## Quick Start
 
@@ -76,7 +76,7 @@ world.step();
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `2d` | yes | 2D physics backend (ganit geometry) |
+| `2d` | yes | 2D physics backend (hisab geometry) |
 | `3d` | no | 3D physics backend |
 | `serialize` | no | bincode world snapshots |
 | `full` | no | all features |
@@ -97,26 +97,26 @@ println!("{:.4} rad", angle.to_radians()); // "0.7854 rad"
 | Phase | Status | Description |
 |-------|--------|-------------|
 | 1 | done | Scaffold — types, world stubs, CI/CD, benchmarks, tests |
-| 2 | next | Native 2D physics backend — ganit-based broadphase, narrowphase, solver |
+| 2 | next | Native 2D physics backend — hisab-based broadphase, narrowphase, solver |
 | 3 | | 3D backend, bincode serialization |
 | 4 | | Kiran ECS bridge, Aethersafha spring physics API |
 
 ### Phase 2 scope
 
-Native 2D physics backend in `backend_2d` module, built on ganit:
-- **Broadphase** — spatial hash or sweep-and-prune using ganit AABB
+Native 2D physics backend in `backend_2d` module, built on hisab:
+- **Broadphase** — spatial hash or sweep-and-prune using hisab AABB
 - **Narrowphase** — shape-vs-shape contact generation (circle, box, capsule, segment)
 - **Constraint solver** — sequential impulse solver for contacts and joints
 - **Island manager** — connected-body grouping for sleep/wake optimization
 - Bodies fall under gravity, collide, respond to forces/impulses/torques
 - All 5 joint types functional (Fixed, Revolute, Prismatic, Spring, Distance)
-- Raycasting via ganit's ray-intersection tests
+- Raycasting via hisab's ray-intersection tests
 - Collision events generated from actual contacts
 - `get_body_state()` for reading simulation results
 
 ### Phase 3 scope
 
-- 3D backend extending the same architecture with ganit's 3D primitives
+- 3D backend extending the same architecture with hisab's 3D primitives
 - bincode world serialization for save/load and network sync
 
 ### Phase 4 scope
@@ -129,7 +129,7 @@ Native 2D physics backend in `backend_2d` module, built on ganit:
 
 | Crate | Relevance |
 |-------|-----------|
-| [ganit](https://github.com/MacCracken/ganit) | Math foundation (geometry, transforms, numerical methods) |
+| [hisab](https://github.com/MacCracken/hisab) | Math foundation (geometry, transforms, numerical methods) |
 | [kiran](https://github.com/MacCracken/kiran) | Game engine (ECS consumer) |
 | [abaco](https://github.com/MacCracken/abaco) | Unit categories (Length, Mass, Force, etc.) |
 | [aethersafha](https://github.com/MacCracken/agnosticos) | Desktop compositor (spring animation consumer) |

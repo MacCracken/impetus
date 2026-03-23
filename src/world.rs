@@ -225,6 +225,115 @@ impl PhysicsWorld {
             Err(ImpetusError::BodyNotFound(format!("{:?}", handle)))
         }
     }
+
+    /// Capture a snapshot of the current world state for serialization.
+    #[cfg(feature = "serialize")]
+    pub fn snapshot(&self) -> crate::serialize::WorldSnapshot {
+        use crate::serialize::*;
+
+        let mut bodies = Vec::new();
+        let mut colliders = Vec::new();
+        let mut joints = Vec::new();
+
+        #[cfg(feature = "2d")]
+        {
+            for rb in self.backend.bodies.values() {
+                bodies.push(BodySnapshot {
+                    handle: rb.handle,
+                    desc: BodyDesc {
+                        body_type: rb.body_type,
+                        position: rb.position,
+                        rotation: rb.rotation,
+                        linear_velocity: rb.linear_velocity,
+                        angular_velocity: rb.angular_velocity,
+                        linear_damping: rb.linear_damping,
+                        angular_damping: rb.angular_damping,
+                        fixed_rotation: rb.fixed_rotation,
+                        gravity_scale: Some(rb.gravity_scale),
+                    },
+                    position: rb.position,
+                    rotation: rb.rotation,
+                    linear_velocity: rb.linear_velocity,
+                    angular_velocity: rb.angular_velocity,
+                });
+            }
+
+            for c in self.backend.colliders.values() {
+                colliders.push(ColliderSnapshot {
+                    handle: c.handle,
+                    body: c.body,
+                    desc: ColliderDesc {
+                        shape: c.shape.clone(),
+                        offset: c.offset,
+                        material: c.material.clone(),
+                        is_sensor: c.is_sensor,
+                        mass: c.mass,
+                    },
+                });
+            }
+
+            for (handle, j) in &self.backend.joints {
+                joints.push(JointSnapshot {
+                    handle: *handle,
+                    desc: crate::joint::JointDesc {
+                        body_a: j.body_a,
+                        body_b: j.body_b,
+                        joint_type: j.joint_type.clone(),
+                        local_anchor_a: j.local_anchor_a,
+                        local_anchor_b: j.local_anchor_b,
+                    },
+                });
+            }
+        }
+
+        WorldSnapshot {
+            config: self.config.clone(),
+            next_body_id: self.next_body_id,
+            next_collider_id: self.next_collider_id,
+            next_joint_id: self.next_joint_id,
+            bodies,
+            colliders,
+            joints,
+        }
+    }
+
+    /// Restore world state from a snapshot. Replaces all current state.
+    #[cfg(feature = "serialize")]
+    pub fn restore(&mut self, snapshot: &crate::serialize::WorldSnapshot) {
+        self.config = snapshot.config.clone();
+        self.next_body_id = snapshot.next_body_id;
+        self.next_collider_id = snapshot.next_collider_id;
+        self.next_joint_id = snapshot.next_joint_id;
+        self.collision_events.clear();
+
+        #[cfg(feature = "2d")]
+        {
+            self.backend = crate::backend_2d::PhysicsState2d::new();
+
+            for bs in &snapshot.bodies {
+                self.backend.add_body(bs.handle, &bs.desc);
+                if let Some(rb) = self.backend.bodies.get_mut(&bs.handle) {
+                    rb.position = bs.position;
+                    rb.rotation = bs.rotation;
+                    rb.linear_velocity = bs.linear_velocity;
+                    rb.angular_velocity = bs.angular_velocity;
+                }
+            }
+
+            for cs in &snapshot.colliders {
+                self.backend.add_collider(cs.handle, cs.body, &cs.desc);
+            }
+
+            for js in &snapshot.joints {
+                self.backend.add_joint(js.handle, &js.desc);
+            }
+        }
+
+        #[cfg(not(any(feature = "2d", feature = "3d")))]
+        {
+            self.body_count = snapshot.bodies.len();
+        }
+    }
 }
 
 #[cfg(test)]

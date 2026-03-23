@@ -233,16 +233,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
-name = "ganit"
-version = "0.1.0"
-dependencies = [
- "glam",
- "serde",
- "thiserror",
- "tracing",
-]
-
-[[package]]
 name = "getrandom"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -303,6 +293,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
+name = "hisab"
+version = "0.22.3"
+dependencies = [
+ "glam",
+ "serde",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "id-arena"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -314,7 +314,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "criterion",
- "ganit",
+ "hisab",
  "serde",
  "serde_json",
  "tempfile",
