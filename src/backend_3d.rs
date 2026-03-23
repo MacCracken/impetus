@@ -6,6 +6,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use hisab::{DQuat, DVec3};
+
 use crate::body::{BodyDesc, BodyHandle, BodyState, BodyType};
 use crate::collider::{ColliderDesc, ColliderHandle, ColliderShape};
 use crate::event::CollisionEvent;
@@ -16,82 +18,6 @@ use crate::query::RayHit;
 use crate::ImpetusError;
 
 // ---------------------------------------------------------------------------
-// 3D vector math helpers
-// ---------------------------------------------------------------------------
-
-fn v3_add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-}
-
-fn v3_sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-
-fn v3_scale(v: [f64; 3], s: f64) -> [f64; 3] {
-    [v[0] * s, v[1] * s, v[2] * s]
-}
-
-fn v3_dot(a: [f64; 3], b: [f64; 3]) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-fn v3_cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-fn v3_len(v: [f64; 3]) -> f64 {
-    v3_dot(v, v).sqrt()
-}
-
-fn v3_normalize(v: [f64; 3]) -> [f64; 3] {
-    let l = v3_len(v);
-    if l < 1e-10 {
-        [0.0, 1.0, 0.0]
-    } else {
-        v3_scale(v, 1.0 / l)
-    }
-}
-
-// Quaternion: [x, y, z, w]
-fn q_identity() -> [f64; 4] {
-    [0.0, 0.0, 0.0, 1.0]
-}
-
-fn q_from_z_rotation(angle: f64) -> [f64; 4] {
-    let (s, c) = (angle * 0.5).sin_cos();
-    [0.0, 0.0, s, c]
-}
-
-fn q_rotate_vec(q: [f64; 4], v: [f64; 3]) -> [f64; 3] {
-    let qv = [q[0], q[1], q[2]];
-    let w = q[3];
-    let t = v3_scale(v3_cross(qv, v), 2.0);
-    v3_add(v3_add(v, v3_scale(t, w)), v3_cross(qv, t))
-}
-
-fn q_multiply(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
-    [
-        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
-        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
-        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
-        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
-    ]
-}
-
-fn q_normalize(q: [f64; 4]) -> [f64; 4] {
-    let l = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
-    if l < 1e-10 {
-        q_identity()
-    } else {
-        [q[0] / l, q[1] / l, q[2] / l, q[3] / l]
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Internal body representation
 // ---------------------------------------------------------------------------
 
@@ -99,20 +25,20 @@ fn q_normalize(q: [f64; 4]) -> [f64; 4] {
 pub(crate) struct RigidBody3d {
     pub handle: BodyHandle,
     pub body_type: BodyType,
-    pub position: [f64; 3],
-    pub rotation: [f64; 4], // quaternion [x, y, z, w]
-    pub linear_velocity: [f64; 3],
-    pub angular_velocity: [f64; 3],
+    pub position: DVec3,
+    pub rotation: DQuat,
+    pub linear_velocity: DVec3,
+    pub angular_velocity: DVec3,
     pub linear_damping: f64,
     pub angular_damping: f64,
     pub fixed_rotation: bool,
     pub gravity_scale: f64,
-    pub force_accumulator: [f64; 3],
-    pub torque_accumulator: [f64; 3],
+    pub force_accumulator: DVec3,
+    pub torque_accumulator: DVec3,
     pub mass: f64,
     pub inv_mass: f64,
-    pub inertia: [f64; 3], // diagonal inertia tensor
-    pub inv_inertia: [f64; 3],
+    pub inertia: DVec3, // diagonal inertia tensor
+    pub inv_inertia: DVec3,
 }
 
 impl RigidBody3d {
@@ -120,20 +46,20 @@ impl RigidBody3d {
         Self {
             handle,
             body_type: desc.body_type,
-            position: desc.position,
-            rotation: q_from_z_rotation(desc.rotation),
-            linear_velocity: desc.linear_velocity,
-            angular_velocity: [0.0, 0.0, desc.angular_velocity],
+            position: DVec3::from_array(desc.position),
+            rotation: DQuat::from_rotation_z(desc.rotation),
+            linear_velocity: DVec3::from_array(desc.linear_velocity),
+            angular_velocity: DVec3::new(0.0, 0.0, desc.angular_velocity),
             linear_damping: desc.linear_damping,
             angular_damping: desc.angular_damping,
             fixed_rotation: desc.fixed_rotation,
             gravity_scale: desc.gravity_scale.unwrap_or(1.0),
-            force_accumulator: [0.0, 0.0, 0.0],
-            torque_accumulator: [0.0, 0.0, 0.0],
+            force_accumulator: DVec3::ZERO,
+            torque_accumulator: DVec3::ZERO,
             mass: 0.0,
             inv_mass: 0.0,
-            inertia: [0.0, 0.0, 0.0],
-            inv_inertia: [0.0, 0.0, 0.0],
+            inertia: DVec3::ZERO,
+            inv_inertia: DVec3::ZERO,
         }
     }
 
@@ -145,33 +71,23 @@ impl RigidBody3d {
         self.body_type == BodyType::Static
     }
 
-    fn integrate_velocities(&mut self, gravity: [f64; 3], dt: f64) {
+    fn integrate_velocities(&mut self, gravity: DVec3, dt: f64) {
         if !self.is_dynamic() || self.inv_mass == 0.0 {
             return;
         }
 
-        self.linear_velocity = v3_add(
-            self.linear_velocity,
-            v3_scale(gravity, self.gravity_scale * dt),
-        );
-        self.linear_velocity = v3_add(
-            self.linear_velocity,
-            v3_scale(self.force_accumulator, self.inv_mass * dt),
-        );
+        self.linear_velocity += gravity * (self.gravity_scale * dt);
+        self.linear_velocity += self.force_accumulator * (self.inv_mass * dt);
 
         if !self.fixed_rotation {
-            let torque_effect = [
-                self.torque_accumulator[0] * self.inv_inertia[0] * dt,
-                self.torque_accumulator[1] * self.inv_inertia[1] * dt,
-                self.torque_accumulator[2] * self.inv_inertia[2] * dt,
-            ];
-            self.angular_velocity = v3_add(self.angular_velocity, torque_effect);
+            let torque_effect = self.torque_accumulator * self.inv_inertia * dt;
+            self.angular_velocity += torque_effect;
         }
 
         let damp = 1.0 / (1.0 + dt * self.linear_damping);
-        self.linear_velocity = v3_scale(self.linear_velocity, damp);
+        self.linear_velocity *= damp;
         let adamp = 1.0 / (1.0 + dt * self.angular_damping);
-        self.angular_velocity = v3_scale(self.angular_velocity, adamp);
+        self.angular_velocity *= adamp;
     }
 
     fn integrate_positions(&mut self, dt: f64) {
@@ -182,24 +98,26 @@ impl RigidBody3d {
             return;
         }
 
-        self.position = v3_add(self.position, v3_scale(self.linear_velocity, dt));
+        self.position += self.linear_velocity * dt;
 
         if !self.fixed_rotation {
             let w = self.angular_velocity;
             let half_dt = dt * 0.5;
-            let dq = q_multiply([w[0] * half_dt, w[1] * half_dt, w[2] * half_dt, 0.0], self.rotation);
-            self.rotation = q_normalize([
-                self.rotation[0] + dq[0],
-                self.rotation[1] + dq[1],
-                self.rotation[2] + dq[2],
-                self.rotation[3] + dq[3],
-            ]);
+            let dq = DQuat::from_xyzw(w.x * half_dt, w.y * half_dt, w.z * half_dt, 0.0)
+                * self.rotation;
+            self.rotation = DQuat::from_xyzw(
+                self.rotation.x + dq.x,
+                self.rotation.y + dq.y,
+                self.rotation.z + dq.z,
+                self.rotation.w + dq.w,
+            )
+            .normalize();
         }
     }
 
     fn clear_forces(&mut self) {
-        self.force_accumulator = [0.0, 0.0, 0.0];
-        self.torque_accumulator = [0.0, 0.0, 0.0];
+        self.force_accumulator = DVec3::ZERO;
+        self.torque_accumulator = DVec3::ZERO;
     }
 }
 
@@ -212,7 +130,7 @@ pub(crate) struct Collider3d {
     pub handle: ColliderHandle,
     pub body: BodyHandle,
     pub shape: ColliderShape,
-    pub offset: [f64; 3],
+    pub offset: DVec3,
     pub material: PhysicsMaterial,
     pub is_sensor: bool,
     pub mass: Option<f64>,
@@ -224,42 +142,43 @@ impl Collider3d {
             handle,
             body,
             shape: desc.shape.clone(),
-            offset: desc.offset,
+            offset: DVec3::from_array(desc.offset),
             material: desc.material.clone(),
             is_sensor: desc.is_sensor,
             mass: desc.mass,
         }
     }
 
-    fn world_aabb(&self, body_pos: [f64; 3], body_rot: [f64; 4]) -> Aabb3d {
-        let wp = v3_add(body_pos, q_rotate_vec(body_rot, self.offset));
+    fn world_aabb(&self, body_pos: DVec3, body_rot: DQuat) -> Aabb3d {
+        let wp = body_pos + body_rot * self.offset;
 
         match &self.shape {
-            ColliderShape::Ball { radius } => Aabb3d {
-                min: v3_sub(wp, [*radius, *radius, *radius]),
-                max: v3_add(wp, [*radius, *radius, *radius]),
-            },
+            ColliderShape::Ball { radius } => {
+                let r = DVec3::splat(*radius);
+                Aabb3d {
+                    min: wp - r,
+                    max: wp + r,
+                }
+            }
             ColliderShape::Box { half_extents } => {
                 // Conservative AABB for rotated box
                 let he = *half_extents;
                 let corners = [
-                    [-he[0], -he[1], -he[2]],
-                    [he[0], -he[1], -he[2]],
-                    [-he[0], he[1], -he[2]],
-                    [he[0], he[1], -he[2]],
-                    [-he[0], -he[1], he[2]],
-                    [he[0], -he[1], he[2]],
-                    [-he[0], he[1], he[2]],
-                    [he[0], he[1], he[2]],
+                    DVec3::new(-he[0], -he[1], -he[2]),
+                    DVec3::new(he[0], -he[1], -he[2]),
+                    DVec3::new(-he[0], he[1], -he[2]),
+                    DVec3::new(he[0], he[1], -he[2]),
+                    DVec3::new(-he[0], -he[1], he[2]),
+                    DVec3::new(he[0], -he[1], he[2]),
+                    DVec3::new(-he[0], he[1], he[2]),
+                    DVec3::new(he[0], he[1], he[2]),
                 ];
-                let mut min = [f64::INFINITY; 3];
-                let mut max = [f64::NEG_INFINITY; 3];
+                let mut min = DVec3::splat(f64::INFINITY);
+                let mut max = DVec3::splat(f64::NEG_INFINITY);
                 for c in &corners {
-                    let wc = v3_add(wp, q_rotate_vec(body_rot, *c));
-                    for i in 0..3 {
-                        min[i] = min[i].min(wc[i]);
-                        max[i] = max[i].max(wc[i]);
-                    }
+                    let wc = wp + body_rot * *c;
+                    min = min.min(wc);
+                    max = max.max(wc);
                 }
                 Aabb3d { min, max }
             }
@@ -267,19 +186,14 @@ impl Collider3d {
                 half_height,
                 radius,
             } => {
-                let axis = q_rotate_vec(body_rot, [0.0, *half_height, 0.0]);
-                let mut min = [f64::INFINITY; 3];
-                let mut max = [f64::NEG_INFINITY; 3];
-                for i in 0..3 {
-                    min[i] = wp[i] - axis[i].abs() - radius;
-                    max[i] = wp[i] + axis[i].abs() + radius;
+                let axis = body_rot * DVec3::new(0.0, *half_height, 0.0);
+                let r = DVec3::splat(*radius);
+                Aabb3d {
+                    min: wp - axis.abs() - r,
+                    max: wp + axis.abs() + r,
                 }
-                Aabb3d { min, max }
             }
-            _ => Aabb3d {
-                min: wp,
-                max: wp,
-            },
+            _ => Aabb3d { min: wp, max: wp },
         }
     }
 
@@ -304,21 +218,21 @@ impl Collider3d {
         (vol * self.material.density).max(1e-6)
     }
 
-    fn compute_inertia(&self, mass: f64) -> [f64; 3] {
+    fn compute_inertia(&self, mass: f64) -> DVec3 {
         let i = match &self.shape {
             ColliderShape::Ball { radius } => {
                 let i = 0.4 * mass * radius * radius;
-                [i, i, i]
+                DVec3::splat(i)
             }
             ColliderShape::Box { half_extents } => {
                 let w = 2.0 * half_extents[0];
                 let h = 2.0 * half_extents[1];
                 let d = 2.0 * half_extents[2];
-                [
+                DVec3::new(
                     mass * (h * h + d * d) / 12.0,
                     mass * (w * w + d * d) / 12.0,
                     mass * (w * w + h * h) / 12.0,
-                ]
+                )
             }
             ColliderShape::Capsule {
                 half_height,
@@ -330,11 +244,11 @@ impl Collider3d {
                 let ix = mass * (3.0 * r2 + h * h) / 12.0;
                 let iy = ix;
                 let iz = mass * r2 / 2.0;
-                [ix, iy, iz]
+                DVec3::new(ix, iy, iz)
             }
-            _ => [mass, mass, mass],
+            _ => DVec3::splat(mass),
         };
-        [i[0].max(1e-10), i[1].max(1e-10), i[2].max(1e-10)]
+        i.max(DVec3::splat(1e-10))
     }
 }
 
@@ -347,8 +261,8 @@ pub(crate) struct Joint3d {
     pub body_a: BodyHandle,
     pub body_b: BodyHandle,
     pub joint_type: JointType,
-    pub local_anchor_a: [f64; 3],
-    pub local_anchor_b: [f64; 3],
+    pub local_anchor_a: DVec3,
+    pub local_anchor_b: DVec3,
 }
 
 // ---------------------------------------------------------------------------
@@ -357,18 +271,18 @@ pub(crate) struct Joint3d {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Aabb3d {
-    pub min: [f64; 3],
-    pub max: [f64; 3],
+    pub min: DVec3,
+    pub max: DVec3,
 }
 
 impl Aabb3d {
     fn overlaps(&self, other: &Aabb3d) -> bool {
-        self.min[0] <= other.max[0]
-            && self.max[0] >= other.min[0]
-            && self.min[1] <= other.max[1]
-            && self.max[1] >= other.min[1]
-            && self.min[2] <= other.max[2]
-            && self.max[2] >= other.min[2]
+        self.min.x <= other.max.x
+            && self.max.x >= other.min.x
+            && self.min.y <= other.max.y
+            && self.max.y >= other.min.y
+            && self.min.z <= other.max.z
+            && self.max.z >= other.min.z
     }
 }
 
@@ -396,10 +310,8 @@ impl SpatialHash3d {
         let total: f64 = aabbs
             .iter()
             .map(|(_, aabb)| {
-                let w = aabb.max[0] - aabb.min[0];
-                let h = aabb.max[1] - aabb.min[1];
-                let d = aabb.max[2] - aabb.min[2];
-                w.max(h).max(d)
+                let size = aabb.max - aabb.min;
+                size.x.max(size.y).max(size.z)
             })
             .sum();
         (total / aabbs.len() as f64 * 2.0).max(0.1)
@@ -414,8 +326,8 @@ impl SpatialHash3d {
     }
 
     fn insert(&mut self, handle: ColliderHandle, aabb: &Aabb3d) {
-        let (min_cx, min_cy, min_cz) = self.cell(aabb.min[0], aabb.min[1], aabb.min[2]);
-        let (max_cx, max_cy, max_cz) = self.cell(aabb.max[0], aabb.max[1], aabb.max[2]);
+        let (min_cx, min_cy, min_cz) = self.cell(aabb.min.x, aabb.min.y, aabb.min.z);
+        let (max_cx, max_cy, max_cz) = self.cell(aabb.max.x, aabb.max.y, aabb.max.z);
 
         for cx in min_cx..=max_cx {
             for cy in min_cy..=max_cy {
@@ -455,9 +367,9 @@ pub(crate) struct Contact3d {
     pub collider_b: ColliderHandle,
     pub body_a: BodyHandle,
     pub body_b: BodyHandle,
-    pub normal: [f64; 3],
+    pub normal: DVec3,
     pub depth: f64,
-    pub point: [f64; 3],
+    pub point: DVec3,
 }
 
 // ---------------------------------------------------------------------------
@@ -498,13 +410,17 @@ impl PhysicsState3d {
             let c_mass = collider.compute_mass();
             let c_inertia = collider.compute_inertia(c_mass);
             rb.mass += c_mass;
-            for (ri, ci) in rb.inertia.iter_mut().zip(c_inertia.iter()) {
-                *ri += ci;
-            }
+            rb.inertia += c_inertia;
             rb.inv_mass = 1.0 / rb.mass;
-            for (inv, ine) in rb.inv_inertia.iter_mut().zip(rb.inertia.iter()) {
-                *inv = if rb.fixed_rotation { 0.0 } else { 1.0 / ine };
-            }
+            rb.inv_inertia = if rb.fixed_rotation {
+                DVec3::ZERO
+            } else {
+                DVec3::new(
+                    1.0 / rb.inertia.x,
+                    1.0 / rb.inertia.y,
+                    1.0 / rb.inertia.z,
+                )
+            };
         }
 
         self.body_colliders.entry(body).or_default().push(handle);
@@ -518,18 +434,19 @@ impl PhysicsState3d {
                 body_a: desc.body_a,
                 body_b: desc.body_b,
                 joint_type: desc.joint_type.clone(),
-                local_anchor_a: [desc.local_anchor_a[0], desc.local_anchor_a[1], 0.0],
-                local_anchor_b: [desc.local_anchor_b[0], desc.local_anchor_b[1], 0.0],
+                local_anchor_a: DVec3::new(desc.local_anchor_a[0], desc.local_anchor_a[1], 0.0),
+                local_anchor_b: DVec3::new(desc.local_anchor_b[0], desc.local_anchor_b[1], 0.0),
             },
         );
     }
 
     pub fn apply_force(&mut self, body: BodyHandle, force: &Force) {
         if let Some(rb) = self.bodies.get_mut(&body) {
-            rb.force_accumulator = v3_add(rb.force_accumulator, force.vector);
+            let fv = DVec3::from_array(force.vector);
+            rb.force_accumulator += fv;
             if let Some(point) = force.point {
-                rb.torque_accumulator =
-                    v3_add(rb.torque_accumulator, v3_cross(point, force.vector));
+                let p = DVec3::from_array(point);
+                rb.torque_accumulator += p.cross(fv);
             }
         }
     }
@@ -539,27 +456,19 @@ impl PhysicsState3d {
             && rb.is_dynamic()
             && rb.inv_mass > 0.0
         {
-            rb.linear_velocity = v3_add(
-                rb.linear_velocity,
-                v3_scale(impulse.vector, rb.inv_mass),
-            );
+            let iv = DVec3::from_array(impulse.vector);
+            rb.linear_velocity += iv * rb.inv_mass;
             if let Some(point) = impulse.point {
-                let ang = v3_cross(point, impulse.vector);
-                rb.angular_velocity = v3_add(
-                    rb.angular_velocity,
-                    [
-                        ang[0] * rb.inv_inertia[0],
-                        ang[1] * rb.inv_inertia[1],
-                        ang[2] * rb.inv_inertia[2],
-                    ],
-                );
+                let p = DVec3::from_array(point);
+                let ang = p.cross(iv);
+                rb.angular_velocity += ang * rb.inv_inertia;
             }
         }
     }
 
     pub fn apply_torque(&mut self, body: BodyHandle, torque: &Torque) {
         if let Some(rb) = self.bodies.get_mut(&body) {
-            rb.torque_accumulator[2] += torque.value;
+            rb.torque_accumulator.z += torque.value;
         }
     }
 
@@ -588,10 +497,10 @@ impl PhysicsState3d {
         Ok(BodyState {
             handle: rb.handle,
             body_type: rb.body_type,
-            position: rb.position,
-            rotation: rb.rotation[2].atan2(rb.rotation[3]) * 2.0, // extract z-rotation
-            linear_velocity: rb.linear_velocity,
-            angular_velocity: rb.angular_velocity[2],
+            position: rb.position.to_array(),
+            rotation: rb.rotation.z.atan2(rb.rotation.w) * 2.0, // extract z-rotation
+            linear_velocity: rb.linear_velocity.to_array(),
+            angular_velocity: rb.angular_velocity.z,
             is_sleeping: false,
         })
     }
@@ -607,8 +516,9 @@ impl PhysicsState3d {
         velocity_iterations: u32,
         position_iterations: u32,
     ) -> Vec<CollisionEvent> {
+        let g = DVec3::from_array(gravity);
         for rb in self.bodies.values_mut() {
-            rb.integrate_velocities(gravity, dt);
+            rb.integrate_velocities(g, dt);
         }
 
         let broad_pairs = self.broadphase();
@@ -705,8 +615,8 @@ impl PhysicsState3d {
                 None => continue,
             };
 
-            let pos_a = v3_add(ba.position, q_rotate_vec(ba.rotation, ca.offset));
-            let pos_b = v3_add(bb.position, q_rotate_vec(bb.rotation, cb.offset));
+            let pos_a = ba.position + ba.rotation * ca.offset;
+            let pos_b = bb.position + bb.rotation * cb.offset;
 
             if let Some((normal, depth, point)) =
                 generate_contact_3d(&ca.shape, pos_a, &cb.shape, pos_b)
@@ -784,110 +694,66 @@ impl PhysicsState3d {
 
                 let n = contact.normal;
                 let cp = contact.point;
-                let ra = v3_sub(cp, pos_a);
-                let rb = v3_sub(cp, pos_b);
+                let ra = cp - pos_a;
+                let rb = cp - pos_b;
 
-                let vel_a_at_cp = v3_add(vel_a, v3_cross(angvel_a, ra));
-                let vel_b_at_cp = v3_add(vel_b, v3_cross(angvel_b, rb));
-                let rel_vel = v3_sub(vel_b_at_cp, vel_a_at_cp);
-                let vel_along_normal = v3_dot(rel_vel, n);
+                let vel_a_at_cp = vel_a + angvel_a.cross(ra);
+                let vel_b_at_cp = vel_b + angvel_b.cross(rb);
+                let rel_vel = vel_b_at_cp - vel_a_at_cp;
+                let vel_along_normal = rel_vel.dot(n);
 
                 if vel_along_normal > 0.0 {
                     continue;
                 }
 
-                let ra_cross_n = v3_cross(ra, n);
-                let rb_cross_n = v3_cross(rb, n);
-                let ang_eff_a = v3_dot(
-                    ra_cross_n,
-                    [
-                        ra_cross_n[0] * inv_inertia_a[0],
-                        ra_cross_n[1] * inv_inertia_a[1],
-                        ra_cross_n[2] * inv_inertia_a[2],
-                    ],
-                );
-                let ang_eff_b = v3_dot(
-                    rb_cross_n,
-                    [
-                        rb_cross_n[0] * inv_inertia_b[0],
-                        rb_cross_n[1] * inv_inertia_b[1],
-                        rb_cross_n[2] * inv_inertia_b[2],
-                    ],
-                );
+                let ra_cross_n = ra.cross(n);
+                let rb_cross_n = rb.cross(n);
+                let ang_eff_a = ra_cross_n.dot(ra_cross_n * inv_inertia_a);
+                let ang_eff_b = rb_cross_n.dot(rb_cross_n * inv_inertia_b);
                 let inv_mass_sum = inv_mass_a + inv_mass_b + ang_eff_a + ang_eff_b;
 
                 let j = -(1.0 + materials[ci].restitution) * vel_along_normal / inv_mass_sum;
-                let impulse_n = v3_scale(n, j);
+                let impulse_n = n * j;
 
                 if let Some(ba) = self.bodies.get_mut(&contact.body_a)
                     && ba.is_dynamic()
                 {
-                    ba.linear_velocity = v3_sub(ba.linear_velocity, v3_scale(impulse_n, ba.inv_mass));
-                    let ang_imp = v3_cross(ra, impulse_n);
-                    ba.angular_velocity = v3_sub(
-                        ba.angular_velocity,
-                        [
-                            ang_imp[0] * ba.inv_inertia[0],
-                            ang_imp[1] * ba.inv_inertia[1],
-                            ang_imp[2] * ba.inv_inertia[2],
-                        ],
-                    );
+                    ba.linear_velocity -= impulse_n * ba.inv_mass;
+                    let ang_imp = ra.cross(impulse_n);
+                    ba.angular_velocity -= ang_imp * ba.inv_inertia;
                 }
                 if let Some(bb) = self.bodies.get_mut(&contact.body_b)
                     && bb.is_dynamic()
                 {
-                    bb.linear_velocity = v3_add(bb.linear_velocity, v3_scale(impulse_n, bb.inv_mass));
-                    let ang_imp = v3_cross(rb, impulse_n);
-                    bb.angular_velocity = v3_add(
-                        bb.angular_velocity,
-                        [
-                            ang_imp[0] * bb.inv_inertia[0],
-                            ang_imp[1] * bb.inv_inertia[1],
-                            ang_imp[2] * bb.inv_inertia[2],
-                        ],
-                    );
+                    bb.linear_velocity += impulse_n * bb.inv_mass;
+                    let ang_imp = rb.cross(impulse_n);
+                    bb.angular_velocity += ang_imp * bb.inv_inertia;
                 }
 
                 // Friction
                 let friction = materials[ci].friction;
                 if friction > 0.0 {
-                    let tangent_vel = v3_sub(rel_vel, v3_scale(n, vel_along_normal));
-                    let tangent_speed = v3_len(tangent_vel);
+                    let tangent_vel = rel_vel - n * vel_along_normal;
+                    let tangent_speed = tangent_vel.length();
                     if tangent_speed > 1e-10 {
-                        let tangent = v3_scale(tangent_vel, 1.0 / tangent_speed);
+                        let tangent = tangent_vel / tangent_speed;
                         let jt = (-tangent_speed / inv_mass_sum)
                             .clamp(-j.abs() * friction, j.abs() * friction);
-                        let impulse_t = v3_scale(tangent, jt);
+                        let impulse_t = tangent * jt;
 
                         if let Some(ba) = self.bodies.get_mut(&contact.body_a)
                             && ba.is_dynamic()
                         {
-                            ba.linear_velocity =
-                                v3_sub(ba.linear_velocity, v3_scale(impulse_t, ba.inv_mass));
-                            let ang_t = v3_cross(ra, impulse_t);
-                            ba.angular_velocity = v3_sub(
-                                ba.angular_velocity,
-                                [
-                                    ang_t[0] * ba.inv_inertia[0],
-                                    ang_t[1] * ba.inv_inertia[1],
-                                    ang_t[2] * ba.inv_inertia[2],
-                                ],
-                            );
+                            ba.linear_velocity -= impulse_t * ba.inv_mass;
+                            let ang_t = ra.cross(impulse_t);
+                            ba.angular_velocity -= ang_t * ba.inv_inertia;
                         }
                         if let Some(bb) = self.bodies.get_mut(&contact.body_b)
                             && bb.is_dynamic()
                         {
-                            bb.linear_velocity =
-                                v3_add(bb.linear_velocity, v3_scale(impulse_t, bb.inv_mass));
-                            let ang_t = v3_cross(rb, impulse_t);
-                            bb.angular_velocity = v3_add(
-                                bb.angular_velocity,
-                                [
-                                    ang_t[0] * bb.inv_inertia[0],
-                                    ang_t[1] * bb.inv_inertia[1],
-                                    ang_t[2] * bb.inv_inertia[2],
-                                ],
-                            );
+                            bb.linear_velocity += impulse_t * bb.inv_mass;
+                            let ang_t = rb.cross(impulse_t);
+                            bb.angular_velocity += ang_t * bb.inv_inertia;
                         }
                     }
                 }
@@ -920,17 +786,17 @@ impl PhysicsState3d {
                 }
 
                 let correction_mag = (contact.depth - slop).max(0.0) / inv_mass_sum * percent;
-                let correction = v3_scale(contact.normal, correction_mag);
+                let correction = contact.normal * correction_mag;
 
                 if let Some(ba) = self.bodies.get_mut(&contact.body_a)
                     && ba.is_dynamic()
                 {
-                    ba.position = v3_sub(ba.position, v3_scale(correction, ba.inv_mass));
+                    ba.position -= correction * ba.inv_mass;
                 }
                 if let Some(bb) = self.bodies.get_mut(&contact.body_b)
                     && bb.is_dynamic()
                 {
-                    bb.position = v3_add(bb.position, v3_scale(correction, bb.inv_mass));
+                    bb.position += correction * bb.inv_mass;
                 }
             }
         }
@@ -963,53 +829,53 @@ impl PhysicsState3d {
         }
     }
 
-    fn world_anchor_3d(&self, body: BodyHandle, local: [f64; 3]) -> [f64; 3] {
+    fn world_anchor_3d(&self, body: BodyHandle, local: DVec3) -> DVec3 {
         let rb = match self.bodies.get(&body) {
             Some(b) => b,
             None => return local,
         };
-        v3_add(rb.position, q_rotate_vec(rb.rotation, local))
+        rb.position + rb.rotation * local
     }
 
     fn solve_fixed_joint_3d(&mut self, joint: &Joint3d) {
         let anchor_a = self.world_anchor_3d(joint.body_a, joint.local_anchor_a);
         let anchor_b = self.world_anchor_3d(joint.body_b, joint.local_anchor_b);
-        let diff = v3_sub(anchor_b, anchor_a);
+        let diff = anchor_b - anchor_a;
 
         if let Some(ba) = self.bodies.get_mut(&joint.body_a)
             && ba.is_dynamic()
         {
-            ba.position = v3_add(ba.position, v3_scale(diff, 0.5));
+            ba.position += diff * 0.5;
         }
         if let Some(bb) = self.bodies.get_mut(&joint.body_b)
             && bb.is_dynamic()
         {
-            bb.position = v3_sub(bb.position, v3_scale(diff, 0.5));
+            bb.position -= diff * 0.5;
         }
     }
 
     fn solve_distance_joint_3d(&mut self, joint: &Joint3d, length: f64) {
         let anchor_a = self.world_anchor_3d(joint.body_a, joint.local_anchor_a);
         let anchor_b = self.world_anchor_3d(joint.body_b, joint.local_anchor_b);
-        let diff = v3_sub(anchor_b, anchor_a);
-        let dist = v3_len(diff);
+        let diff = anchor_b - anchor_a;
+        let dist = diff.length();
 
         if dist < 1e-10 {
             return;
         }
 
-        let n = v3_scale(diff, 1.0 / dist);
+        let n = diff / dist;
         let correction = (dist - length) * 0.5;
 
         if let Some(ba) = self.bodies.get_mut(&joint.body_a)
             && ba.is_dynamic()
         {
-            ba.position = v3_add(ba.position, v3_scale(n, correction));
+            ba.position += n * correction;
         }
         if let Some(bb) = self.bodies.get_mut(&joint.body_b)
             && bb.is_dynamic()
         {
-            bb.position = v3_sub(bb.position, v3_scale(n, correction));
+            bb.position -= n * correction;
         }
     }
 
@@ -1023,41 +889,41 @@ impl PhysicsState3d {
     ) {
         let anchor_a = self.world_anchor_3d(joint.body_a, joint.local_anchor_a);
         let anchor_b = self.world_anchor_3d(joint.body_b, joint.local_anchor_b);
-        let diff = v3_sub(anchor_b, anchor_a);
-        let dist = v3_len(diff);
+        let diff = anchor_b - anchor_a;
+        let dist = diff.length();
 
         if dist < 1e-10 {
             return;
         }
 
-        let n = v3_scale(diff, 1.0 / dist);
+        let n = diff / dist;
         let spring_force = stiffness * (dist - rest_length);
 
         let vel_a = self
             .bodies
             .get(&joint.body_a)
             .map(|b| b.linear_velocity)
-            .unwrap_or([0.0, 0.0, 0.0]);
+            .unwrap_or(DVec3::ZERO);
         let vel_b = self
             .bodies
             .get(&joint.body_b)
             .map(|b| b.linear_velocity)
-            .unwrap_or([0.0, 0.0, 0.0]);
-        let rel_vel = v3_sub(vel_b, vel_a);
-        let damping_force = damping * v3_dot(rel_vel, n);
+            .unwrap_or(DVec3::ZERO);
+        let rel_vel = vel_b - vel_a;
+        let damping_force = damping * rel_vel.dot(n);
 
         let total_force = spring_force + damping_force;
-        let force = v3_scale(n, total_force * dt);
+        let force = n * (total_force * dt);
 
         if let Some(ba) = self.bodies.get_mut(&joint.body_a)
             && ba.is_dynamic()
         {
-            ba.linear_velocity = v3_add(ba.linear_velocity, v3_scale(force, ba.inv_mass));
+            ba.linear_velocity += force * ba.inv_mass;
         }
         if let Some(bb) = self.bodies.get_mut(&joint.body_b)
             && bb.is_dynamic()
         {
-            bb.linear_velocity = v3_sub(bb.linear_velocity, v3_scale(force, bb.inv_mass));
+            bb.linear_velocity -= force * bb.inv_mass;
         }
     }
 
@@ -1108,25 +974,24 @@ impl PhysicsState3d {
         direction: [f64; 3],
         max_dist: f64,
     ) -> Option<RayHit> {
-        let dir = v3_normalize(direction);
+        let origin = DVec3::from_array(origin);
+        let dir = DVec3::from_array(direction).normalize_or(DVec3::Y);
 
-        let mut best: Option<(f64, ColliderHandle, [f64; 3], [f64; 3])> = None;
+        let mut best: Option<(f64, ColliderHandle, DVec3, DVec3)> = None;
 
         for collider in self.colliders.values() {
             let rb = match self.bodies.get(&collider.body) {
                 Some(b) => b,
                 None => continue,
             };
-            let pos = v3_add(rb.position, q_rotate_vec(rb.rotation, collider.offset));
+            let pos = rb.position + rb.rotation * collider.offset;
 
             let hit = match &collider.shape {
                 ColliderShape::Ball { radius } => ray_sphere(origin, dir, pos, *radius),
-                ColliderShape::Box { half_extents } => ray_aabb_3d(
-                    origin,
-                    dir,
-                    v3_sub(pos, *half_extents),
-                    v3_add(pos, *half_extents),
-                ),
+                ColliderShape::Box { half_extents } => {
+                    let he = DVec3::from_array(*half_extents);
+                    ray_aabb_3d(origin, dir, pos - he, pos + he)
+                }
                 _ => None,
             };
 
@@ -1135,15 +1000,15 @@ impl PhysicsState3d {
                 && t <= max_dist
                 && (best.is_none() || t < best.as_ref().unwrap().0)
             {
-                let point = v3_add(origin, v3_scale(dir, t));
+                let point = origin + dir * t;
                 best = Some((t, collider.handle, point, normal));
             }
         }
 
         best.map(|(distance, collider, point, normal)| RayHit {
             collider,
-            point,
-            normal,
+            point: point.to_array(),
+            normal: normal.to_array(),
             distance,
         })
     }
@@ -1155,25 +1020,25 @@ impl PhysicsState3d {
 
 fn generate_contact_3d(
     shape_a: &ColliderShape,
-    pos_a: [f64; 3],
+    pos_a: DVec3,
     shape_b: &ColliderShape,
-    pos_b: [f64; 3],
-) -> Option<([f64; 3], f64, [f64; 3])> {
+    pos_b: DVec3,
+) -> Option<(DVec3, f64, DVec3)> {
     match (shape_a, shape_b) {
         (ColliderShape::Ball { radius: ra }, ColliderShape::Ball { radius: rb }) => {
             sphere_sphere(pos_a, *ra, pos_b, *rb)
         }
         (ColliderShape::Ball { radius }, ColliderShape::Box { half_extents }) => {
-            sphere_aabb(pos_a, *radius, pos_b, *half_extents)
+            sphere_aabb(pos_a, *radius, pos_b, DVec3::from_array(*half_extents))
         }
         (ColliderShape::Box { half_extents }, ColliderShape::Ball { radius }) => {
-            sphere_aabb(pos_b, *radius, pos_a, *half_extents)
-                .map(|(n, d, p)| (v3_scale(n, -1.0), d, p))
+            sphere_aabb(pos_b, *radius, pos_a, DVec3::from_array(*half_extents))
+                .map(|(n, d, p)| (-n, d, p))
         }
         (
             ColliderShape::Box { half_extents: he_a },
             ColliderShape::Box { half_extents: he_b },
-        ) => aabb_aabb_3d(pos_a, *he_a, pos_b, *he_b),
+        ) => aabb_aabb_3d(pos_a, DVec3::from_array(*he_a), pos_b, DVec3::from_array(*he_b)),
         // Capsule vs Sphere
         (
             ColliderShape::Capsule {
@@ -1190,20 +1055,20 @@ fn generate_contact_3d(
             },
         ) => {
             capsule_sphere_3d(pos_b, *half_height, *cr, pos_a, *br)
-                .map(|(n, d, p)| (v3_scale(n, -1.0), d, p))
+                .map(|(n, d, p)| (-n, d, p))
         }
         _ => None,
     }
 }
 
 fn sphere_sphere(
-    pos_a: [f64; 3],
+    pos_a: DVec3,
     ra: f64,
-    pos_b: [f64; 3],
+    pos_b: DVec3,
     rb: f64,
-) -> Option<([f64; 3], f64, [f64; 3])> {
-    let d = v3_sub(pos_b, pos_a);
-    let dist_sq = v3_dot(d, d);
+) -> Option<(DVec3, f64, DVec3)> {
+    let d = pos_b - pos_a;
+    let dist_sq = d.dot(d);
     let sum_r = ra + rb;
 
     if dist_sq >= sum_r * sum_r {
@@ -1212,29 +1077,25 @@ fn sphere_sphere(
 
     let dist = dist_sq.sqrt();
     let (normal, depth) = if dist < 1e-10 {
-        ([0.0, 1.0, 0.0], sum_r)
+        (DVec3::Y, sum_r)
     } else {
-        (v3_scale(d, 1.0 / dist), sum_r - dist)
+        (d / dist, sum_r - dist)
     };
 
-    let point = v3_add(pos_a, v3_scale(normal, ra));
+    let point = pos_a + normal * ra;
     Some((normal, depth, point))
 }
 
 fn sphere_aabb(
-    sphere_pos: [f64; 3],
+    sphere_pos: DVec3,
     radius: f64,
-    box_pos: [f64; 3],
-    half_extents: [f64; 3],
-) -> Option<([f64; 3], f64, [f64; 3])> {
-    let d = v3_sub(sphere_pos, box_pos);
-    let closest = [
-        d[0].clamp(-half_extents[0], half_extents[0]),
-        d[1].clamp(-half_extents[1], half_extents[1]),
-        d[2].clamp(-half_extents[2], half_extents[2]),
-    ];
-    let diff = v3_sub(d, closest);
-    let dist_sq = v3_dot(diff, diff);
+    box_pos: DVec3,
+    half_extents: DVec3,
+) -> Option<(DVec3, f64, DVec3)> {
+    let d = sphere_pos - box_pos;
+    let closest = d.clamp(-half_extents, half_extents);
+    let diff = d - closest;
+    let dist_sq = diff.dot(diff);
 
     if dist_sq >= radius * radius {
         return None;
@@ -1242,55 +1103,55 @@ fn sphere_aabb(
 
     let dist = dist_sq.sqrt();
     let (normal, depth) = if dist < 1e-10 {
-        let face_dists = [
-            half_extents[0] - d[0].abs(),
-            half_extents[1] - d[1].abs(),
-            half_extents[2] - d[2].abs(),
-        ];
-        let min_axis = if face_dists[0] <= face_dists[1] && face_dists[0] <= face_dists[2] {
+        let face_dists = DVec3::new(
+            half_extents.x - d.x.abs(),
+            half_extents.y - d.y.abs(),
+            half_extents.z - d.z.abs(),
+        );
+        let min_axis = if face_dists.x <= face_dists.y && face_dists.x <= face_dists.z {
             0
-        } else if face_dists[1] <= face_dists[2] {
+        } else if face_dists.y <= face_dists.z {
             1
         } else {
             2
         };
-        let mut n = [0.0, 0.0, 0.0];
+        let mut n = DVec3::ZERO;
         n[min_axis] = if d[min_axis] >= 0.0 { 1.0 } else { -1.0 };
         (n, face_dists[min_axis] + radius)
     } else {
-        (v3_scale(diff, 1.0 / dist), radius - dist)
+        (diff / dist, radius - dist)
     };
 
-    let point = v3_add(box_pos, closest);
+    let point = box_pos + closest;
     Some((normal, depth, point))
 }
 
 fn aabb_aabb_3d(
-    pos_a: [f64; 3],
-    he_a: [f64; 3],
-    pos_b: [f64; 3],
-    he_b: [f64; 3],
-) -> Option<([f64; 3], f64, [f64; 3])> {
-    let d = v3_sub(pos_b, pos_a);
-    let overlap = [
-        he_a[0] + he_b[0] - d[0].abs(),
-        he_a[1] + he_b[1] - d[1].abs(),
-        he_a[2] + he_b[2] - d[2].abs(),
-    ];
+    pos_a: DVec3,
+    he_a: DVec3,
+    pos_b: DVec3,
+    he_b: DVec3,
+) -> Option<(DVec3, f64, DVec3)> {
+    let d = pos_b - pos_a;
+    let overlap = DVec3::new(
+        he_a.x + he_b.x - d.x.abs(),
+        he_a.y + he_b.y - d.y.abs(),
+        he_a.z + he_b.z - d.z.abs(),
+    );
 
-    if overlap[0] <= 0.0 || overlap[1] <= 0.0 || overlap[2] <= 0.0 {
+    if overlap.x <= 0.0 || overlap.y <= 0.0 || overlap.z <= 0.0 {
         return None;
     }
 
-    let min_axis = if overlap[0] <= overlap[1] && overlap[0] <= overlap[2] {
+    let min_axis = if overlap.x <= overlap.y && overlap.x <= overlap.z {
         0
-    } else if overlap[1] <= overlap[2] {
+    } else if overlap.y <= overlap.z {
         1
     } else {
         2
     };
 
-    let mut normal = [0.0, 0.0, 0.0];
+    let mut normal = DVec3::ZERO;
     normal[min_axis] = if d[min_axis] >= 0.0 { 1.0 } else { -1.0 };
     let depth = overlap[min_axis];
 
@@ -1303,26 +1164,26 @@ fn aabb_aabb_3d(
 // ---------------------------------------------------------------------------
 // Capsule helpers
 
-fn closest_point_on_segment_3d(a: [f64; 3], b: [f64; 3], p: [f64; 3]) -> [f64; 3] {
-    let ab = v3_sub(b, a);
-    let len_sq = v3_dot(ab, ab);
+fn closest_point_on_segment_3d(a: DVec3, b: DVec3, p: DVec3) -> DVec3 {
+    let ab = b - a;
+    let len_sq = ab.dot(ab);
     if len_sq < 1e-20 {
         return a;
     }
-    let t = (v3_dot(v3_sub(p, a), ab) / len_sq).clamp(0.0, 1.0);
-    v3_add(a, v3_scale(ab, t))
+    let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
+    a + ab * t
 }
 
 fn capsule_sphere_3d(
-    cap_pos: [f64; 3],
+    cap_pos: DVec3,
     half_height: f64,
     cap_radius: f64,
-    sphere_pos: [f64; 3],
+    sphere_pos: DVec3,
     sphere_radius: f64,
-) -> Option<([f64; 3], f64, [f64; 3])> {
+) -> Option<(DVec3, f64, DVec3)> {
     // Capsule axis along Y in local space (no rotation transform here — pos is world center)
-    let ep_a = v3_add(cap_pos, [0.0, -half_height, 0.0]);
-    let ep_b = v3_add(cap_pos, [0.0, half_height, 0.0]);
+    let ep_a = cap_pos + DVec3::new(0.0, -half_height, 0.0);
+    let ep_b = cap_pos + DVec3::new(0.0, half_height, 0.0);
     let closest = closest_point_on_segment_3d(ep_a, ep_b, sphere_pos);
     sphere_sphere(closest, cap_radius, sphere_pos, sphere_radius)
 }
@@ -1332,14 +1193,14 @@ fn capsule_sphere_3d(
 // ---------------------------------------------------------------------------
 
 fn ray_sphere(
-    origin: [f64; 3],
-    dir: [f64; 3],
-    center: [f64; 3],
+    origin: DVec3,
+    dir: DVec3,
+    center: DVec3,
     radius: f64,
-) -> Option<(f64, [f64; 3])> {
-    let oc = v3_sub(origin, center);
-    let half_b = v3_dot(oc, dir);
-    let c = v3_dot(oc, oc) - radius * radius;
+) -> Option<(f64, DVec3)> {
+    let oc = origin - center;
+    let half_b = oc.dot(dir);
+    let c = oc.dot(oc) - radius * radius;
     let discriminant = half_b * half_b - c;
 
     if discriminant < 0.0 {
@@ -1358,20 +1219,20 @@ fn ray_sphere(
         return None;
     };
 
-    let point = v3_add(origin, v3_scale(dir, t));
-    let normal = v3_normalize(v3_sub(point, center));
+    let point = origin + dir * t;
+    let normal = (point - center).normalize_or(DVec3::Y);
     Some((t, normal))
 }
 
 fn ray_aabb_3d(
-    origin: [f64; 3],
-    dir: [f64; 3],
-    min: [f64; 3],
-    max: [f64; 3],
-) -> Option<(f64, [f64; 3])> {
+    origin: DVec3,
+    dir: DVec3,
+    min: DVec3,
+    max: DVec3,
+) -> Option<(f64, DVec3)> {
     let mut t_min = f64::NEG_INFINITY;
     let mut t_max = f64::INFINITY;
-    let mut normal = [0.0, 0.0, 0.0];
+    let mut normal = DVec3::ZERO;
 
     for i in 0..3 {
         if dir[i].abs() < 1e-10 {
@@ -1382,7 +1243,7 @@ fn ray_aabb_3d(
             let inv_d = 1.0 / dir[i];
             let mut t1 = (min[i] - origin[i]) * inv_d;
             let mut t2 = (max[i] - origin[i]) * inv_d;
-            let mut n = [0.0, 0.0, 0.0];
+            let mut n = DVec3::ZERO;
             n[i] = -1.0;
             if t1 > t2 {
                 std::mem::swap(&mut t1, &mut t2);
@@ -1422,52 +1283,68 @@ mod tests {
 
     #[test]
     fn sphere_sphere_overlap() {
-        let r = sphere_sphere([0.0, 0.0, 0.0], 1.0, [1.5, 0.0, 0.0], 1.0);
+        let r = sphere_sphere(DVec3::ZERO, 1.0, DVec3::new(1.5, 0.0, 0.0), 1.0);
         assert!(r.is_some());
         let (n, d, _) = r.unwrap();
-        assert!((n[0] - 1.0).abs() < EPS);
+        assert!((n.x - 1.0).abs() < EPS);
         assert!((d - 0.5).abs() < EPS);
     }
 
     #[test]
     fn sphere_sphere_no_overlap() {
-        assert!(sphere_sphere([0.0, 0.0, 0.0], 1.0, [5.0, 0.0, 0.0], 1.0).is_none());
+        assert!(sphere_sphere(DVec3::ZERO, 1.0, DVec3::new(5.0, 0.0, 0.0), 1.0).is_none());
     }
 
     #[test]
     fn sphere_aabb_overlap() {
-        let r = sphere_aabb([1.8, 0.0, 0.0], 0.5, [0.0, 0.0, 0.0], [1.5, 1.0, 1.0]);
+        let r = sphere_aabb(
+            DVec3::new(1.8, 0.0, 0.0),
+            0.5,
+            DVec3::ZERO,
+            DVec3::new(1.5, 1.0, 1.0),
+        );
         assert!(r.is_some());
     }
 
     #[test]
     fn sphere_aabb_miss() {
-        assert!(sphere_aabb([5.0, 0.0, 0.0], 0.5, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]).is_none());
+        assert!(sphere_aabb(
+            DVec3::new(5.0, 0.0, 0.0),
+            0.5,
+            DVec3::ZERO,
+            DVec3::new(1.0, 1.0, 1.0),
+        )
+        .is_none());
     }
 
     #[test]
     fn aabb_3d_overlap() {
-        let r = aabb_aabb_3d([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [1.5, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        let r = aabb_aabb_3d(
+            DVec3::ZERO,
+            DVec3::ONE,
+            DVec3::new(1.5, 0.0, 0.0),
+            DVec3::ONE,
+        );
         assert!(r.is_some());
         let (n, d, _) = r.unwrap();
-        assert!((n[0] - 1.0).abs() < EPS);
+        assert!((n.x - 1.0).abs() < EPS);
         assert!((d - 0.5).abs() < EPS);
     }
 
     #[test]
     fn aabb_3d_no_overlap() {
         assert!(aabb_aabb_3d(
-            [0.0, 0.0, 0.0],
-            [1.0, 1.0, 1.0],
-            [5.0, 0.0, 0.0],
-            [1.0, 1.0, 1.0]
+            DVec3::ZERO,
+            DVec3::ONE,
+            DVec3::new(5.0, 0.0, 0.0),
+            DVec3::ONE,
         )
         .is_none());
     }
 
     #[test]
     fn ray_sphere_hit() {
-        let r = ray_sphere([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [5.0, 0.0, 0.0], 1.0);
+        let r = ray_sphere(DVec3::ZERO, DVec3::X, DVec3::new(5.0, 0.0, 0.0), 1.0);
         assert!(r.is_some());
         let (t, _) = r.unwrap();
         assert!((t - 4.0).abs() < EPS);
@@ -1475,16 +1352,16 @@ mod tests {
 
     #[test]
     fn ray_sphere_miss() {
-        assert!(ray_sphere([0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [5.0, 0.0, 0.0], 1.0).is_none());
+        assert!(ray_sphere(DVec3::ZERO, DVec3::Y, DVec3::new(5.0, 0.0, 0.0), 1.0).is_none());
     }
 
     #[test]
     fn ray_aabb_3d_hit() {
         let r = ray_aabb_3d(
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [4.0, -1.0, -1.0],
-            [6.0, 1.0, 1.0],
+            DVec3::ZERO,
+            DVec3::X,
+            DVec3::new(4.0, -1.0, -1.0),
+            DVec3::new(6.0, 1.0, 1.0),
         );
         assert!(r.is_some());
         let (t, _) = r.unwrap();
@@ -1493,22 +1370,22 @@ mod tests {
 
     #[test]
     fn quaternion_identity_rotation() {
-        let q = q_identity();
-        let v = [1.0, 0.0, 0.0];
-        let result = q_rotate_vec(q, v);
-        assert!((result[0] - 1.0).abs() < EPS);
-        assert!(result[1].abs() < EPS);
-        assert!(result[2].abs() < EPS);
+        let q = DQuat::IDENTITY;
+        let v = DVec3::X;
+        let result = q * v;
+        assert!((result.x - 1.0).abs() < EPS);
+        assert!(result.y.abs() < EPS);
+        assert!(result.z.abs() < EPS);
     }
 
     #[test]
     fn quaternion_z_rotation() {
-        let q = q_from_z_rotation(std::f64::consts::FRAC_PI_2);
-        let v = [1.0, 0.0, 0.0];
-        let result = q_rotate_vec(q, v);
-        assert!(result[0].abs() < EPS);
-        assert!((result[1] - 1.0).abs() < EPS);
-        assert!(result[2].abs() < EPS);
+        let q = DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2);
+        let v = DVec3::X;
+        let result = q * v;
+        assert!(result.x.abs() < EPS);
+        assert!((result.y - 1.0).abs() < EPS);
+        assert!(result.z.abs() < EPS);
     }
 
     #[test]
@@ -1539,7 +1416,7 @@ mod tests {
             state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1);
         }
 
-        assert!(state.bodies[&bh].position[1] < 10.0, "body should fall");
+        assert!(state.bodies[&bh].position.y < 10.0, "body should fall");
     }
 
     #[test]
@@ -1702,13 +1579,13 @@ mod tests {
 
     #[test]
     fn capsule_sphere_3d_overlap() {
-        let r = capsule_sphere_3d([0.0, 0.0, 0.0], 1.0, 0.5, [0.8, 0.0, 0.0], 0.5);
+        let r = capsule_sphere_3d(DVec3::ZERO, 1.0, 0.5, DVec3::new(0.8, 0.0, 0.0), 0.5);
         assert!(r.is_some());
     }
 
     #[test]
     fn capsule_sphere_3d_miss() {
-        assert!(capsule_sphere_3d([0.0, 0.0, 0.0], 1.0, 0.5, [5.0, 0.0, 0.0], 0.5).is_none());
+        assert!(capsule_sphere_3d(DVec3::ZERO, 1.0, 0.5, DVec3::new(5.0, 0.0, 0.0), 0.5).is_none());
     }
 
     #[test]
@@ -1725,7 +1602,7 @@ mod tests {
         });
 
         state.apply_impulse(bh, &Impulse::new(10.0, 0.0, 0.0));
-        assert!(state.bodies[&bh].linear_velocity[0] > 0.0);
+        assert!(state.bodies[&bh].linear_velocity.x > 0.0);
     }
 
     #[test]
@@ -1801,19 +1678,19 @@ mod tests {
             state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1);
         }
         // Joint should prevent body from falling far
-        assert!(state.bodies[&b].position[1] > 2.0);
+        assert!(state.bodies[&b].position.y > 2.0);
     }
 
     #[test]
     fn spatial_hash_3d_finds_pair() {
         let mut grid = SpatialHash3d::new(2.0);
         grid.insert(ColliderHandle(0), &Aabb3d {
-            min: [0.0, 0.0, 0.0],
-            max: [1.0, 1.0, 1.0],
+            min: DVec3::ZERO,
+            max: DVec3::ONE,
         });
         grid.insert(ColliderHandle(1), &Aabb3d {
-            min: [0.5, 0.5, 0.5],
-            max: [1.5, 1.5, 1.5],
+            min: DVec3::splat(0.5),
+            max: DVec3::splat(1.5),
         });
         let pairs = grid.query_pairs();
         assert!(pairs.contains(&(ColliderHandle(0), ColliderHandle(1))));
@@ -1823,12 +1700,12 @@ mod tests {
     fn spatial_hash_3d_no_false_pair() {
         let mut grid = SpatialHash3d::new(1.0);
         grid.insert(ColliderHandle(0), &Aabb3d {
-            min: [0.0, 0.0, 0.0],
-            max: [0.5, 0.5, 0.5],
+            min: DVec3::ZERO,
+            max: DVec3::splat(0.5),
         });
         grid.insert(ColliderHandle(1), &Aabb3d {
-            min: [10.0, 10.0, 10.0],
-            max: [10.5, 10.5, 10.5],
+            min: DVec3::splat(10.0),
+            max: DVec3::splat(10.5),
         });
         assert!(grid.query_pairs().is_empty());
     }

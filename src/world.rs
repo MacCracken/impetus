@@ -241,8 +241,8 @@ impl PhysicsWorld {
                     p.position,
                     p.radius,
                     &collider.shape,
-                    rb.position,
-                    collider.offset,
+                    rb.position.into(),
+                    collider.offset.into(),
                 );
 
                 if let Some((normal, depth)) = contact {
@@ -574,24 +574,24 @@ impl PhysicsWorld {
         #[cfg(feature = "3d")]
         {
             for rb in self.backend_3d.bodies.values() {
-                let rotation = rb.rotation[2].atan2(rb.rotation[3]) * 2.0;
+                let rotation = rb.rotation.z.atan2(rb.rotation.w) * 2.0;
                 bodies.push(BodySnapshot {
                     handle: rb.handle,
                     desc: BodyDesc {
                         body_type: rb.body_type,
-                        position: rb.position,
+                        position: rb.position.into(),
                         rotation,
-                        linear_velocity: rb.linear_velocity,
-                        angular_velocity: rb.angular_velocity[2],
+                        linear_velocity: rb.linear_velocity.into(),
+                        angular_velocity: rb.angular_velocity.z,
                         linear_damping: rb.linear_damping,
                         angular_damping: rb.angular_damping,
                         fixed_rotation: rb.fixed_rotation,
                         gravity_scale: Some(rb.gravity_scale),
                     },
-                    position: rb.position,
+                    position: rb.position.into(),
                     rotation,
-                    linear_velocity: rb.linear_velocity,
-                    angular_velocity: rb.angular_velocity[2],
+                    linear_velocity: rb.linear_velocity.into(),
+                    angular_velocity: rb.angular_velocity.z,
                 });
             }
 
@@ -601,7 +601,7 @@ impl PhysicsWorld {
                     body: c.body,
                     desc: ColliderDesc {
                         shape: c.shape.clone(),
-                        offset: c.offset,
+                        offset: c.offset.into(),
                         material: c.material.clone(),
                         is_sensor: c.is_sensor,
                         mass: c.mass,
@@ -681,9 +681,9 @@ impl PhysicsWorld {
             for bs in &snapshot.bodies {
                 self.backend_3d.add_body(bs.handle, &bs.desc);
                 if let Some(rb) = self.backend_3d.bodies.get_mut(&bs.handle) {
-                    rb.position = bs.position;
-                    rb.linear_velocity = bs.linear_velocity;
-                    rb.angular_velocity[2] = bs.angular_velocity;
+                    rb.position = bs.position.into();
+                    rb.linear_velocity = bs.linear_velocity.into();
+                    rb.angular_velocity.z = bs.angular_velocity;
                 }
             }
 

@@ -42,3 +42,8 @@ name = "basic_physics"
 
 [[test]]
 name = "integration"
+
+# Local override — use local hisab with f64 re-exports until next hisab release.
+# Remove this section before `cargo publish`.
+[patch.crates-io]
+hisab = { path = "../hisab" }
