@@ -32,6 +32,7 @@ mod backend_2d;
 #[cfg(feature = "3d")]
 mod backend_3d;
 
+mod arena;
 mod spatial_hash;
 
 mod error;

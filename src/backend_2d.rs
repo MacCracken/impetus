@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::arena::{Arena, ArenaHandle};
 use crate::body::{BodyDesc, BodyHandle, BodyState, BodyType};
 use crate::spatial_hash::SpatialHashGrid;
 use crate::collider::{ColliderDesc, ColliderHandle, ColliderShape};
@@ -15,6 +16,23 @@ use crate::joint::{JointDesc, JointHandle, JointMotor, JointType};
 use crate::material::PhysicsMaterial;
 use crate::query::RayHit;
 use crate::ImpetusError;
+
+// ---------------------------------------------------------------------------
+// Handle ↔ ArenaHandle conversions (zero-cost — same u64 layout)
+// ---------------------------------------------------------------------------
+
+#[inline(always)]
+fn body_ah(h: BodyHandle) -> ArenaHandle { ArenaHandle(h.0) }
+#[inline(always)]
+fn body_from(ah: ArenaHandle) -> BodyHandle { BodyHandle(ah.0) }
+#[inline(always)]
+fn coll_ah(h: ColliderHandle) -> ArenaHandle { ArenaHandle(h.0) }
+#[inline(always)]
+fn coll_from(ah: ArenaHandle) -> ColliderHandle { ColliderHandle(ah.0) }
+#[inline(always)]
+fn joint_ah(h: JointHandle) -> ArenaHandle { ArenaHandle(h.0) }
+#[inline(always)]
+fn joint_from(ah: ArenaHandle) -> JointHandle { JointHandle(ah.0) }
 
 // ---------------------------------------------------------------------------
 // Named constants
@@ -388,9 +406,9 @@ pub(crate) struct Contact {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct PhysicsState2d {
-    pub bodies: HashMap<BodyHandle, RigidBody2d>,
-    pub colliders: HashMap<ColliderHandle, Collider2d>,
-    pub joints: HashMap<JointHandle, Joint2d>,
+    pub bodies: Arena<RigidBody2d>,
+    pub colliders: Arena<Collider2d>,
+    pub joints: Arena<Joint2d>,
     pub body_colliders: HashMap<BodyHandle, Vec<ColliderHandle>>,
     prev_collision_pairs: HashSet<(ColliderHandle, ColliderHandle)>,
 }
@@ -398,30 +416,33 @@ pub(crate) struct PhysicsState2d {
 impl PhysicsState2d {
     pub fn new() -> Self {
         Self {
-            bodies: HashMap::new(),
-            colliders: HashMap::new(),
-            joints: HashMap::new(),
+            bodies: Arena::new(),
+            colliders: Arena::new(),
+            joints: Arena::new(),
             body_colliders: HashMap::new(),
             prev_collision_pairs: HashSet::new(),
         }
     }
 
-    pub fn add_body(&mut self, handle: BodyHandle, desc: &BodyDesc) {
-        self.bodies
-            .insert(handle, RigidBody2d::from_desc(handle, desc));
+    pub fn add_body(&mut self, desc: &BodyDesc) -> BodyHandle {
+        // Insert with a placeholder handle; we'll patch it once the arena assigns the slot.
+        let ah = self.bodies.insert(RigidBody2d::from_desc(BodyHandle(0), desc));
+        let handle = body_from(ah);
+        self.bodies.get_mut(ah).unwrap().handle = handle;
         self.body_colliders.insert(handle, Vec::new());
+        handle
     }
 
     pub fn add_collider(
         &mut self,
-        handle: ColliderHandle,
         body: BodyHandle,
         desc: &ColliderDesc,
-    ) {
-        let collider = Collider2d::from_desc(handle, body, desc);
+    ) -> ColliderHandle {
+        // Insert with placeholder handle, patch after arena assigns slot.
+        let collider = Collider2d::from_desc(ColliderHandle(0), body, desc);
 
         // Accumulate mass properties onto the body
-        if let Some(rb) = self.bodies.get_mut(&body)
+        if let Some(rb) = self.bodies.get_mut(body_ah(body))
             && rb.is_dynamic()
         {
             let c_mass = collider.compute_mass();
@@ -436,27 +457,28 @@ impl PhysicsState2d {
             };
         }
 
+        let ah = self.colliders.insert(collider);
+        let handle = coll_from(ah);
+        self.colliders.get_mut(ah).unwrap().handle = handle;
         self.body_colliders.entry(body).or_default().push(handle);
-        self.colliders.insert(handle, collider);
+        handle
     }
 
-    pub fn add_joint(&mut self, handle: JointHandle, desc: &JointDesc) {
-        self.joints.insert(
-            handle,
-            Joint2d {
-                body_a: desc.body_a,
-                body_b: desc.body_b,
-                joint_type: desc.joint_type.clone(),
-                local_anchor_a: desc.local_anchor_a,
-                local_anchor_b: desc.local_anchor_b,
-                motor: desc.motor.clone(),
-                damping: desc.damping,
-            },
-        );
+    pub fn add_joint(&mut self, desc: &JointDesc) -> JointHandle {
+        let ah = self.joints.insert(Joint2d {
+            body_a: desc.body_a,
+            body_b: desc.body_b,
+            joint_type: desc.joint_type.clone(),
+            local_anchor_a: desc.local_anchor_a,
+            local_anchor_b: desc.local_anchor_b,
+            motor: desc.motor.clone(),
+            damping: desc.damping,
+        });
+        joint_from(ah)
     }
 
     pub fn apply_force(&mut self, body: BodyHandle, force: &Force) {
-        if let Some(rb) = self.bodies.get_mut(&body) {
+        if let Some(rb) = self.bodies.get_mut(body_ah(body)) {
             // Wake the body
             rb.is_sleeping = false;
             rb.sleep_timer = 0.0;
@@ -469,7 +491,7 @@ impl PhysicsState2d {
     }
 
     pub fn apply_impulse(&mut self, body: BodyHandle, impulse: &Impulse) {
-        if let Some(rb) = self.bodies.get_mut(&body)
+        if let Some(rb) = self.bodies.get_mut(body_ah(body))
             && rb.is_dynamic()
             && rb.inv_mass > 0.0
         {
@@ -487,7 +509,7 @@ impl PhysicsState2d {
     }
 
     pub fn apply_torque(&mut self, body: BodyHandle, torque: &Torque) {
-        if let Some(rb) = self.bodies.get_mut(&body) {
+        if let Some(rb) = self.bodies.get_mut(body_ah(body)) {
             // Wake the body
             rb.is_sleeping = false;
             rb.sleep_timer = 0.0;
@@ -496,10 +518,10 @@ impl PhysicsState2d {
     }
 
     pub fn remove_body(&mut self, handle: BodyHandle) {
-        self.bodies.remove(&handle);
+        self.bodies.remove(body_ah(handle));
         if let Some(collider_handles) = self.body_colliders.remove(&handle) {
             for ch in &collider_handles {
-                self.colliders.remove(ch);
+                self.colliders.remove(coll_ah(*ch));
             }
             // Clean stale collision pairs referencing removed colliders
             self.prev_collision_pairs
@@ -509,6 +531,47 @@ impl PhysicsState2d {
             .retain(|_, j| j.body_a != handle && j.body_b != handle);
     }
 
+    /// Insert a body at a specific handle (for snapshot restore).
+    #[cfg(feature = "serialize")]
+    pub fn add_body_at(&mut self, handle: BodyHandle, desc: &BodyDesc) {
+        let mut rb = RigidBody2d::from_desc(handle, desc);
+        rb.handle = handle;
+        self.bodies.insert_at(body_ah(handle), rb);
+        self.body_colliders.insert(handle, Vec::new());
+    }
+
+    /// Insert a collider at a specific handle (for snapshot restore).
+    #[cfg(feature = "serialize")]
+    pub fn add_collider_at(&mut self, handle: ColliderHandle, body: BodyHandle, desc: &ColliderDesc) {
+        let collider = Collider2d::from_desc(handle, body, desc);
+        if let Some(rb) = self.bodies.get_mut(body_ah(body))
+            && rb.is_dynamic()
+        {
+            let c_mass = collider.compute_mass();
+            let c_inertia = collider.compute_inertia(c_mass);
+            rb.mass += c_mass;
+            rb.inertia += c_inertia;
+            rb.inv_mass = 1.0 / rb.mass;
+            rb.inv_inertia = if rb.fixed_rotation { 0.0 } else { 1.0 / rb.inertia };
+        }
+        self.colliders.insert_at(coll_ah(handle), collider);
+        self.body_colliders.entry(body).or_default().push(handle);
+    }
+
+    /// Insert a joint at a specific handle (for snapshot restore).
+    #[cfg(feature = "serialize")]
+    pub fn add_joint_at(&mut self, handle: JointHandle, desc: &JointDesc) {
+        self.joints.insert_at(joint_ah(handle), Joint2d {
+            body_a: desc.body_a,
+            body_b: desc.body_b,
+            joint_type: desc.joint_type.clone(),
+            local_anchor_a: desc.local_anchor_a,
+            local_anchor_b: desc.local_anchor_b,
+            motor: desc.motor.clone(),
+            damping: desc.damping,
+        });
+    }
+
     pub fn body_count(&self) -> usize {
         self.bodies.len()
     }
@@ -516,7 +579,7 @@ impl PhysicsState2d {
     pub fn get_body_state(&self, handle: BodyHandle) -> Result<BodyState, ImpetusError> {
         let rb = self
             .bodies
-            .get(&handle)
+            .get(body_ah(handle))
             .ok_or_else(|| ImpetusError::BodyNotFound(format!("{:?}", handle)))?;
         Ok(BodyState {
             handle: rb.handle,
@@ -530,7 +593,7 @@ impl PhysicsState2d {
     }
 
     pub fn set_body_state(&mut self, handle: BodyHandle, state: &BodyState) -> Result<(), ImpetusError> {
-        let rb = self.bodies.get_mut(&handle)
+        let rb = self.bodies.get_mut(body_ah(handle))
             .ok_or_else(|| ImpetusError::BodyNotFound(format!("{:?}", handle)))?;
         rb.position = [state.position[0], state.position[1]];
         rb.rotation = state.rotation;
@@ -542,7 +605,7 @@ impl PhysicsState2d {
     }
 
     pub fn set_body_type(&mut self, handle: BodyHandle, body_type: BodyType) -> Result<(), ImpetusError> {
-        let rb = self.bodies.get_mut(&handle)
+        let rb = self.bodies.get_mut(body_ah(handle))
             .ok_or_else(|| ImpetusError::BodyNotFound(format!("{:?}", handle)))?;
         rb.body_type = body_type;
         // Reset mass properties if switching to/from static
@@ -595,20 +658,20 @@ impl PhysicsState2d {
         for contact in &contacts {
             let a_sleeping = self
                 .bodies
-                .get(&contact.body_a)
+                .get(body_ah(contact.body_a))
                 .is_some_and(|b| b.is_sleeping);
             let b_sleeping = self
                 .bodies
-                .get(&contact.body_b)
+                .get(body_ah(contact.body_b))
                 .is_some_and(|b| b.is_sleeping);
-            let a_moving = self.bodies.get(&contact.body_a).is_some_and(|b| {
+            let a_moving = self.bodies.get(body_ah(contact.body_a)).is_some_and(|b| {
                 !b.is_sleeping
                     && b.is_dynamic()
                     && (b.linear_velocity[0].abs() > SLEEP_VELOCITY_THRESHOLD
                         || b.linear_velocity[1].abs() > SLEEP_VELOCITY_THRESHOLD
                         || b.angular_velocity.abs() > SLEEP_VELOCITY_THRESHOLD)
             });
-            let b_moving = self.bodies.get(&contact.body_b).is_some_and(|b| {
+            let b_moving = self.bodies.get(body_ah(contact.body_b)).is_some_and(|b| {
                 !b.is_sleeping
                     && b.is_dynamic()
                     && (b.linear_velocity[0].abs() > SLEEP_VELOCITY_THRESHOLD
@@ -617,14 +680,14 @@ impl PhysicsState2d {
             });
             if a_sleeping
                 && b_moving
-                && let Some(ba) = self.bodies.get_mut(&contact.body_a)
+                && let Some(ba) = self.bodies.get_mut(body_ah(contact.body_a))
             {
                 ba.is_sleeping = false;
                 ba.sleep_timer = 0.0;
             }
             if b_sleeping
                 && a_moving
-                && let Some(bb) = self.bodies.get_mut(&contact.body_b)
+                && let Some(bb) = self.bodies.get_mut(body_ah(contact.body_b))
             {
                 bb.is_sleeping = false;
                 bb.sleep_timer = 0.0;
@@ -684,7 +747,7 @@ impl PhysicsState2d {
             .colliders
             .values()
             .filter_map(|c| {
-                let rb = self.bodies.get(&c.body)?;
+                let rb = self.bodies.get(body_ah(c.body))?;
                 Some((c.handle, c.world_aabb(rb.position, rb.rotation)))
             })
             .collect();
@@ -713,11 +776,11 @@ impl PhysicsState2d {
         // Filter candidates
         let mut pairs = Vec::with_capacity(candidates.len());
         for (ha, hb) in candidates {
-            let ca = match self.colliders.get(&ha) {
+            let ca = match self.colliders.get(coll_ah(ha)) {
                 Some(c) => c,
                 None => continue,
             };
-            let cb = match self.colliders.get(&hb) {
+            let cb = match self.colliders.get(coll_ah(hb)) {
                 Some(c) => c,
                 None => continue,
             };
@@ -726,7 +789,7 @@ impl PhysicsState2d {
                 continue;
             }
             // Skip static-static
-            if let (Some(ba), Some(bb)) = (self.bodies.get(&ca.body), self.bodies.get(&cb.body))
+            if let (Some(ba), Some(bb)) = (self.bodies.get(body_ah(ca.body)), self.bodies.get(body_ah(cb.body)))
                 && ba.is_static() && bb.is_static()
             {
                 continue;
@@ -762,19 +825,19 @@ impl PhysicsState2d {
         let mut contacts = Vec::new();
 
         for (ha, hb) in broad_pairs {
-            let ca = match self.colliders.get(ha) {
+            let ca = match self.colliders.get(coll_ah(*ha)) {
                 Some(c) => c,
                 None => continue,
             };
-            let cb = match self.colliders.get(hb) {
+            let cb = match self.colliders.get(coll_ah(*hb)) {
                 Some(c) => c,
                 None => continue,
             };
-            let ba = match self.bodies.get(&ca.body) {
+            let ba = match self.bodies.get(body_ah(ca.body)) {
                 Some(b) => b,
                 None => continue,
             };
-            let bb = match self.bodies.get(&cb.body) {
+            let bb = match self.bodies.get(body_ah(cb.body)) {
                 Some(b) => b,
                 None => continue,
             };
@@ -815,8 +878,8 @@ impl PhysicsState2d {
             .iter()
             .map(|c| {
                 let (rest, fric, sensor) = match (
-                    self.colliders.get(&c.collider_a),
-                    self.colliders.get(&c.collider_b),
+                    self.colliders.get(coll_ah(c.collider_a)),
+                    self.colliders.get(coll_ah(c.collider_b)),
                 ) {
                     (Some(a), Some(b)) => (
                         a.material.restitution.min(b.material.restitution),
@@ -841,14 +904,14 @@ impl PhysicsState2d {
                 }
 
                 let (inv_mass_a, inv_inertia_a, vel_a, angvel_a, pos_a) = {
-                    let ba = match self.bodies.get(&contact.body_a) {
+                    let ba = match self.bodies.get(body_ah(contact.body_a)) {
                         Some(b) => b,
                         None => continue,
                     };
                     (ba.inv_mass, ba.inv_inertia, ba.linear_velocity, ba.angular_velocity, ba.position)
                 };
                 let (inv_mass_b, inv_inertia_b, vel_b, angvel_b, pos_b) = {
-                    let bb = match self.bodies.get(&contact.body_b) {
+                    let bb = match self.bodies.get(body_ah(contact.body_b)) {
                         Some(b) => b,
                         None => continue,
                     };
@@ -891,14 +954,14 @@ impl PhysicsState2d {
                 let j = -(1.0 + materials[ci].restitution) * vel_along_normal / inv_mass_sum;
                 let impulse_n = [j * n[0], j * n[1]];
 
-                if let Some(ba) = self.bodies.get_mut(&contact.body_a)
+                if let Some(ba) = self.bodies.get_mut(body_ah(contact.body_a))
                     && ba.is_dynamic()
                 {
                     ba.linear_velocity[0] -= impulse_n[0] * ba.inv_mass;
                     ba.linear_velocity[1] -= impulse_n[1] * ba.inv_mass;
                     ba.angular_velocity -= ra_cross_n * j * ba.inv_inertia;
                 }
-                if let Some(bb) = self.bodies.get_mut(&contact.body_b)
+                if let Some(bb) = self.bodies.get_mut(body_ah(contact.body_b))
                     && bb.is_dynamic()
                 {
                     bb.linear_velocity[0] += impulse_n[0] * bb.inv_mass;
@@ -922,14 +985,14 @@ impl PhysicsState2d {
                         .clamp(-j.abs() * friction, j.abs() * friction);
                     let impulse_t = [jt * tangent[0], jt * tangent[1]];
 
-                    if let Some(ba) = self.bodies.get_mut(&contact.body_a)
+                    if let Some(ba) = self.bodies.get_mut(body_ah(contact.body_a))
                         && ba.is_dynamic()
                     {
                         ba.linear_velocity[0] -= impulse_t[0] * ba.inv_mass;
                         ba.linear_velocity[1] -= impulse_t[1] * ba.inv_mass;
                         ba.angular_velocity -= ra_cross_t * jt * ba.inv_inertia;
                     }
-                    if let Some(bb) = self.bodies.get_mut(&contact.body_b)
+                    if let Some(bb) = self.bodies.get_mut(body_ah(contact.body_b))
                         && bb.is_dynamic()
                     {
                         bb.linear_velocity[0] += impulse_t[0] * bb.inv_mass;
@@ -951,8 +1014,8 @@ impl PhysicsState2d {
             for contact in contacts {
                 // Skip sensors
                 let is_sensor = match (
-                    self.colliders.get(&contact.collider_a),
-                    self.colliders.get(&contact.collider_b),
+                    self.colliders.get(coll_ah(contact.collider_a)),
+                    self.colliders.get(coll_ah(contact.collider_b)),
                 ) {
                     (Some(a), Some(b)) => a.is_sensor || b.is_sensor,
                     _ => false,
@@ -961,8 +1024,8 @@ impl PhysicsState2d {
                     continue;
                 }
 
-                let inv_mass_a = self.bodies.get(&contact.body_a).map(|b| b.inv_mass).unwrap_or(0.0);
-                let inv_mass_b = self.bodies.get(&contact.body_b).map(|b| b.inv_mass).unwrap_or(0.0);
+                let inv_mass_a = self.bodies.get(body_ah(contact.body_a)).map(|b| b.inv_mass).unwrap_or(0.0);
+                let inv_mass_b = self.bodies.get(body_ah(contact.body_b)).map(|b| b.inv_mass).unwrap_or(0.0);
                 let inv_mass_sum = inv_mass_a + inv_mass_b;
 
                 if inv_mass_sum == 0.0 {
@@ -973,13 +1036,13 @@ impl PhysicsState2d {
                 let correction_mag = (contact.depth - slop).max(0.0) / inv_mass_sum * percent;
                 let correction = [correction_mag * n[0], correction_mag * n[1]];
 
-                if let Some(ba) = self.bodies.get_mut(&contact.body_a)
+                if let Some(ba) = self.bodies.get_mut(body_ah(contact.body_a))
                     && ba.is_dynamic()
                 {
                     ba.position[0] -= correction[0] * ba.inv_mass;
                     ba.position[1] -= correction[1] * ba.inv_mass;
                 }
-                if let Some(bb) = self.bodies.get_mut(&contact.body_b)
+                if let Some(bb) = self.bodies.get_mut(body_ah(contact.body_b))
                     && bb.is_dynamic()
                 {
                     bb.position[0] += correction[0] * bb.inv_mass;
@@ -1036,12 +1099,12 @@ impl PhysicsState2d {
         let anchor_a = self.world_anchor(joint.body_a, joint.local_anchor_a);
         let anchor_b = self.world_anchor(joint.body_b, joint.local_anchor_b);
 
-        let (vel_a, angvel_a, pos_a, inv_mass_a) = match self.bodies.get(&joint.body_a) {
+        let (vel_a, angvel_a, pos_a, inv_mass_a) = match self.bodies.get(body_ah(joint.body_a)) {
             Some(b) if b.is_dynamic() => (b.linear_velocity, b.angular_velocity, b.position, b.inv_mass),
             Some(b) => (b.linear_velocity, b.angular_velocity, b.position, 0.0),
             None => return,
         };
-        let (vel_b, angvel_b, pos_b, inv_mass_b) = match self.bodies.get(&joint.body_b) {
+        let (vel_b, angvel_b, pos_b, inv_mass_b) = match self.bodies.get(body_ah(joint.body_b)) {
             Some(b) if b.is_dynamic() => (b.linear_velocity, b.angular_velocity, b.position, b.inv_mass),
             Some(b) => (b.linear_velocity, b.angular_velocity, b.position, 0.0),
             None => return,
@@ -1070,13 +1133,13 @@ impl PhysicsState2d {
             -joint.damping * rel_vel[1] * dt,
         ];
 
-        if let Some(ba) = self.bodies.get_mut(&joint.body_a)
+        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
             && ba.is_dynamic()
         {
             ba.linear_velocity[0] -= impulse[0] * ba.inv_mass;
             ba.linear_velocity[1] -= impulse[1] * ba.inv_mass;
         }
-        if let Some(bb) = self.bodies.get_mut(&joint.body_b)
+        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
             && bb.is_dynamic()
         {
             bb.linear_velocity[0] += impulse[0] * bb.inv_mass;
@@ -1089,23 +1152,23 @@ impl PhysicsState2d {
     fn solve_revolute_motor(&mut self, joint: &Joint2d, motor: &JointMotor, dt: f64) {
         let angvel_a = self
             .bodies
-            .get(&joint.body_a)
+            .get(body_ah(joint.body_a))
             .map(|b| b.angular_velocity)
             .unwrap_or(0.0);
         let angvel_b = self
             .bodies
-            .get(&joint.body_b)
+            .get(body_ah(joint.body_b))
             .map(|b| b.angular_velocity)
             .unwrap_or(0.0);
         let inv_inertia_a = self
             .bodies
-            .get(&joint.body_a)
+            .get(body_ah(joint.body_a))
             .filter(|b| b.is_dynamic())
             .map(|b| b.inv_inertia)
             .unwrap_or(0.0);
         let inv_inertia_b = self
             .bodies
-            .get(&joint.body_b)
+            .get(body_ah(joint.body_b))
             .filter(|b| b.is_dynamic())
             .map(|b| b.inv_inertia)
             .unwrap_or(0.0);
@@ -1121,12 +1184,12 @@ impl PhysicsState2d {
         let max_impulse = motor.max_force * dt;
         let impulse = (error / inv_inertia_sum).clamp(-max_impulse, max_impulse);
 
-        if let Some(ba) = self.bodies.get_mut(&joint.body_a)
+        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
             && ba.is_dynamic()
         {
             ba.angular_velocity -= impulse * ba.inv_inertia;
         }
-        if let Some(bb) = self.bodies.get_mut(&joint.body_b)
+        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
             && bb.is_dynamic()
         {
             bb.angular_velocity += impulse * bb.inv_inertia;
@@ -1150,23 +1213,23 @@ impl PhysicsState2d {
 
         let vel_a = self
             .bodies
-            .get(&joint.body_a)
+            .get(body_ah(joint.body_a))
             .map(|b| b.linear_velocity)
             .unwrap_or([0.0, 0.0]);
         let vel_b = self
             .bodies
-            .get(&joint.body_b)
+            .get(body_ah(joint.body_b))
             .map(|b| b.linear_velocity)
             .unwrap_or([0.0, 0.0]);
         let inv_mass_a = self
             .bodies
-            .get(&joint.body_a)
+            .get(body_ah(joint.body_a))
             .filter(|b| b.is_dynamic())
             .map(|b| b.inv_mass)
             .unwrap_or(0.0);
         let inv_mass_b = self
             .bodies
-            .get(&joint.body_b)
+            .get(body_ah(joint.body_b))
             .filter(|b| b.is_dynamic())
             .map(|b| b.inv_mass)
             .unwrap_or(0.0);
@@ -1182,13 +1245,13 @@ impl PhysicsState2d {
         let max_impulse = motor.max_force * dt;
         let impulse = (error / inv_mass_sum).clamp(-max_impulse, max_impulse);
 
-        if let Some(ba) = self.bodies.get_mut(&joint.body_a)
+        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
             && ba.is_dynamic()
         {
             ba.linear_velocity[0] -= impulse * ax[0] * ba.inv_mass;
             ba.linear_velocity[1] -= impulse * ax[1] * ba.inv_mass;
         }
-        if let Some(bb) = self.bodies.get_mut(&joint.body_b)
+        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
             && bb.is_dynamic()
         {
             bb.linear_velocity[0] += impulse * ax[0] * bb.inv_mass;
@@ -1197,7 +1260,7 @@ impl PhysicsState2d {
     }
 
     fn world_anchor(&self, body: BodyHandle, local: [f64; 2]) -> [f64; 2] {
-        let rb = match self.bodies.get(&body) {
+        let rb = match self.bodies.get(body_ah(body)) {
             Some(b) => b,
             None => return local,
         };
@@ -1213,13 +1276,13 @@ impl PhysicsState2d {
         let anchor_b = self.world_anchor(joint.body_b, joint.local_anchor_b);
         let diff = [anchor_b[0] - anchor_a[0], anchor_b[1] - anchor_a[1]];
 
-        if let Some(ba) = self.bodies.get_mut(&joint.body_a)
+        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
             && ba.is_dynamic()
         {
             ba.position[0] += diff[0] * 0.5;
             ba.position[1] += diff[1] * 0.5;
         }
-        if let Some(bb) = self.bodies.get_mut(&joint.body_b)
+        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
             && bb.is_dynamic()
         {
             bb.position[0] -= diff[0] * 0.5;
@@ -1241,13 +1304,13 @@ impl PhysicsState2d {
         let n = [diff[0] / dist, diff[1] / dist];
         let correction = (dist - length) * 0.5;
 
-        if let Some(ba) = self.bodies.get_mut(&joint.body_a)
+        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
             && ba.is_dynamic()
         {
             ba.position[0] += n[0] * correction;
             ba.position[1] += n[1] * correction;
         }
-        if let Some(bb) = self.bodies.get_mut(&joint.body_b)
+        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
             && bb.is_dynamic()
         {
             bb.position[0] -= n[0] * correction;
@@ -1278,12 +1341,12 @@ impl PhysicsState2d {
 
         let vel_a = self
             .bodies
-            .get(&joint.body_a)
+            .get(body_ah(joint.body_a))
             .map(|b| b.linear_velocity)
             .unwrap_or([0.0, 0.0]);
         let vel_b = self
             .bodies
-            .get(&joint.body_b)
+            .get(body_ah(joint.body_b))
             .map(|b| b.linear_velocity)
             .unwrap_or([0.0, 0.0]);
         let rel_vel = [vel_b[0] - vel_a[0], vel_b[1] - vel_a[1]];
@@ -1292,13 +1355,13 @@ impl PhysicsState2d {
         let total_force = spring_force + damping_force;
         let force = [total_force * n[0] * dt, total_force * n[1] * dt];
 
-        if let Some(ba) = self.bodies.get_mut(&joint.body_a)
+        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
             && ba.is_dynamic()
         {
             ba.linear_velocity[0] += force[0] * ba.inv_mass;
             ba.linear_velocity[1] += force[1] * ba.inv_mass;
         }
-        if let Some(bb) = self.bodies.get_mut(&joint.body_b)
+        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
             && bb.is_dynamic()
         {
             bb.linear_velocity[0] -= force[0] * bb.inv_mass;
@@ -1312,36 +1375,36 @@ impl PhysicsState2d {
         if let Some([lo, hi]) = limits {
             let rot_a = self
                 .bodies
-                .get(&joint.body_a)
+                .get(body_ah(joint.body_a))
                 .map(|b| b.rotation)
                 .unwrap_or(0.0);
             let rot_b = self
                 .bodies
-                .get(&joint.body_b)
+                .get(body_ah(joint.body_b))
                 .map(|b| b.rotation)
                 .unwrap_or(0.0);
             let rel_angle = rot_b - rot_a;
 
             if rel_angle < *lo {
                 let c = (lo - rel_angle) * 0.5;
-                if let Some(ba) = self.bodies.get_mut(&joint.body_a)
+                if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
                     && ba.is_dynamic()
                 {
                     ba.rotation -= c;
                 }
-                if let Some(bb) = self.bodies.get_mut(&joint.body_b)
+                if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
                     && bb.is_dynamic()
                 {
                     bb.rotation += c;
                 }
             } else if rel_angle > *hi {
                 let c = (rel_angle - hi) * 0.5;
-                if let Some(ba) = self.bodies.get_mut(&joint.body_a)
+                if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
                     && ba.is_dynamic()
                 {
                     ba.rotation += c;
                 }
-                if let Some(bb) = self.bodies.get_mut(&joint.body_b)
+                if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
                     && bb.is_dynamic()
                 {
                     bb.rotation -= c;
@@ -1369,13 +1432,13 @@ impl PhysicsState2d {
         let perp_error = diff[0] * perp[0] + diff[1] * perp[1];
         let correction = perp_error * 0.5;
 
-        if let Some(ba) = self.bodies.get_mut(&joint.body_a)
+        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
             && ba.is_dynamic()
         {
             ba.position[0] += perp[0] * correction;
             ba.position[1] += perp[1] * correction;
         }
-        if let Some(bb) = self.bodies.get_mut(&joint.body_b)
+        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
             && bb.is_dynamic()
         {
             bb.position[0] -= perp[0] * correction;
@@ -1386,13 +1449,13 @@ impl PhysicsState2d {
             let along = diff[0] * ax[0] + diff[1] * ax[1];
             if along < *lo {
                 let c = (lo - along) * 0.5;
-                if let Some(ba) = self.bodies.get_mut(&joint.body_a)
+                if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
                     && ba.is_dynamic()
                 {
                     ba.position[0] -= ax[0] * c;
                     ba.position[1] -= ax[1] * c;
                 }
-                if let Some(bb) = self.bodies.get_mut(&joint.body_b)
+                if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
                     && bb.is_dynamic()
                 {
                     bb.position[0] += ax[0] * c;
@@ -1400,13 +1463,13 @@ impl PhysicsState2d {
                 }
             } else if along > *hi {
                 let c = (along - hi) * 0.5;
-                if let Some(ba) = self.bodies.get_mut(&joint.body_a)
+                if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
                     && ba.is_dynamic()
                 {
                     ba.position[0] += ax[0] * c;
                     ba.position[1] += ax[1] * c;
                 }
-                if let Some(bb) = self.bodies.get_mut(&joint.body_b)
+                if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
                     && bb.is_dynamic()
                 {
                     bb.position[0] -= ax[0] * c;
@@ -1477,7 +1540,7 @@ impl PhysicsState2d {
         let mut best: Option<(f64, ColliderHandle, [f64; 2], [f64; 2])> = None;
 
         for collider in self.colliders.values() {
-            let rb = match self.bodies.get(&collider.body) {
+            let rb = match self.bodies.get(body_ah(collider.body)) {
                 Some(b) => b,
                 None => continue,
             };
@@ -1531,7 +1594,7 @@ impl PhysicsState2d {
         let mut results = Vec::new();
 
         for collider in self.colliders.values() {
-            let rb = match self.bodies.get(&collider.body) {
+            let rb = match self.bodies.get(body_ah(collider.body)) {
                 Some(b) => b,
                 None => continue,
             };
@@ -1599,7 +1662,7 @@ impl PhysicsState2d {
         let mut results = Vec::new();
 
         for collider in self.colliders.values() {
-            let rb = match self.bodies.get(&collider.body) {
+            let rb = match self.bodies.get(body_ah(collider.body)) {
                 Some(b) => b,
                 None => continue,
             };
@@ -2748,10 +2811,9 @@ mod tests {
     #[test]
     fn multiple_colliders_accumulate_mass() {
         let mut state = PhysicsState2d::new();
-        let bh = BodyHandle(0);
-        state.add_body(bh, &BodyDesc::default());
+        let bh = state.add_body(&BodyDesc::default());
 
-        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+        state.add_collider(bh, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
@@ -2760,9 +2822,9 @@ mod tests {
             collision_layer: 0xFFFF_FFFF,
             collision_mask: 0xFFFF_FFFF,
         });
-        let mass_after_first = state.bodies[&bh].mass;
+        let mass_after_first = state.bodies.get(body_ah(bh)).unwrap().mass;
 
-        state.add_collider(ColliderHandle(1), bh, &ColliderDesc {
+        state.add_collider(bh, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [1.0, 0.0, 0.0],
             material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
@@ -2771,7 +2833,7 @@ mod tests {
             collision_layer: 0xFFFF_FFFF,
             collision_mask: 0xFFFF_FFFF,
         });
-        let mass_after_second = state.bodies[&bh].mass;
+        let mass_after_second = state.bodies.get(body_ah(bh)).unwrap().mass;
 
         assert!(mass_after_second > mass_after_first);
         assert!((mass_after_second - 2.0 * mass_after_first).abs() < EPS);
@@ -2947,13 +3009,12 @@ mod tests {
         let mut state = PhysicsState2d::new();
 
         // Static floor
-        let floor = BodyHandle(0);
-        state.add_body(floor, &BodyDesc {
+        let floor = state.add_body(&BodyDesc {
             body_type: BodyType::Static,
             position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(ColliderHandle(0), floor, &ColliderDesc {
+        state.add_collider(floor, &ColliderDesc {
             shape: ColliderShape::Box { half_extents: [10.0, 0.5, 0.0] },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -2964,13 +3025,12 @@ mod tests {
         });
 
         // Dynamic ball overlapping the sensor
-        let ball = BodyHandle(1);
-        state.add_body(ball, &BodyDesc {
+        let ball = state.add_body(&BodyDesc {
             body_type: BodyType::Dynamic,
             position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(ColliderHandle(1), ball, &ColliderDesc {
+        state.add_collider(ball, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 0.5 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -2980,13 +3040,13 @@ mod tests {
             collision_mask: 0xFFFF_FFFF,
         });
 
-        let vel_before = state.bodies[&ball].linear_velocity;
+        let vel_before = state.bodies.get(body_ah(ball)).unwrap().linear_velocity;
         let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
 
         // Should generate events
         assert!(!events.is_empty());
         // But sensor should not affect velocity (no physical response)
-        let vel_after = state.bodies[&ball].linear_velocity;
+        let vel_after = state.bodies.get(body_ah(ball)).unwrap().linear_velocity;
         assert!((vel_after[0] - vel_before[0]).abs() < EPS);
         assert!((vel_after[1] - vel_before[1]).abs() < EPS);
     }
@@ -2996,8 +3056,7 @@ mod tests {
     #[test]
     fn kinematic_body_moves_from_velocity() {
         let mut state = PhysicsState2d::new();
-        let bh = BodyHandle(0);
-        state.add_body(bh, &BodyDesc {
+        let bh = state.add_body(&BodyDesc {
             body_type: BodyType::Kinematic,
             position: [0.0, 0.0, 0.0],
             linear_velocity: [10.0, 0.0, 0.0],
@@ -3007,7 +3066,7 @@ mod tests {
         let dt = 1.0 / 60.0;
         state.step([0.0, -9.81, 0.0], dt, 4, 1, 0.01, 0.2, 100.0);
 
-        let rb = &state.bodies[&bh];
+        let rb = &state.bodies.get(body_ah(bh)).unwrap();
         // Should have moved from velocity
         assert!(rb.position[0] > 0.0);
         // Should NOT have been affected by gravity
@@ -3020,13 +3079,12 @@ mod tests {
     fn remove_body_cleans_collision_pairs() {
         let mut state = PhysicsState2d::new();
 
-        let a = BodyHandle(0);
-        state.add_body(a, &BodyDesc {
+        let a = state.add_body(&BodyDesc {
             body_type: BodyType::Static,
             position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(ColliderHandle(0), a, &ColliderDesc {
+        state.add_collider(a, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3036,13 +3094,12 @@ mod tests {
             collision_mask: 0xFFFF_FFFF,
         });
 
-        let b = BodyHandle(1);
-        state.add_body(b, &BodyDesc {
+        let b = state.add_body(&BodyDesc {
             body_type: BodyType::Dynamic,
             position: [0.5, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(ColliderHandle(1), b, &ColliderDesc {
+        state.add_collider(b, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3151,13 +3208,12 @@ mod tests {
     #[test]
     fn body_falls_asleep_when_stationary() {
         let mut state = PhysicsState2d::new();
-        let bh = BodyHandle(0);
-        state.add_body(bh, &BodyDesc {
+        let bh = state.add_body(&BodyDesc {
             body_type: BodyType::Dynamic,
             position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+        state.add_collider(bh, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3174,19 +3230,18 @@ mod tests {
             state.step([0.0, 0.0, 0.0], dt, 4, 1, 0.01, 0.2, 100.0);
         }
 
-        assert!(state.bodies[&bh].is_sleeping, "body should be sleeping after sitting still");
+        assert!(state.bodies.get(body_ah(bh)).unwrap().is_sleeping, "body should be sleeping after sitting still");
     }
 
     #[test]
     fn sleeping_body_skips_integration() {
         let mut state = PhysicsState2d::new();
-        let bh = BodyHandle(0);
-        state.add_body(bh, &BodyDesc {
+        let bh = state.add_body(&BodyDesc {
             body_type: BodyType::Dynamic,
             position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+        state.add_collider(bh, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3197,13 +3252,13 @@ mod tests {
         });
 
         // Manually put to sleep
-        state.bodies.get_mut(&bh).unwrap().is_sleeping = true;
+        state.bodies.get_mut(body_ah(bh)).unwrap().is_sleeping = true;
 
-        let pos_before = state.bodies[&bh].position;
+        let pos_before = state.bodies.get(body_ah(bh)).unwrap().position;
         // Step with gravity — sleeping body should not move
         state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
 
-        let pos_after = state.bodies[&bh].position;
+        let pos_after = state.bodies.get(body_ah(bh)).unwrap().position;
         assert!(
             (pos_after[0] - pos_before[0]).abs() < EPS
                 && (pos_after[1] - pos_before[1]).abs() < EPS,
@@ -3214,9 +3269,8 @@ mod tests {
     #[test]
     fn force_wakes_sleeping_body() {
         let mut state = PhysicsState2d::new();
-        let bh = BodyHandle(0);
-        state.add_body(bh, &BodyDesc::default());
-        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+        let bh = state.add_body(&BodyDesc::default());
+        state.add_collider(bh, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3227,21 +3281,20 @@ mod tests {
         });
 
         // Put to sleep
-        state.bodies.get_mut(&bh).unwrap().is_sleeping = true;
-        state.bodies.get_mut(&bh).unwrap().sleep_timer = 1.0;
+        state.bodies.get_mut(body_ah(bh)).unwrap().is_sleeping = true;
+        state.bodies.get_mut(body_ah(bh)).unwrap().sleep_timer = 1.0;
 
         // Apply force should wake it
         state.apply_force(bh, &Force::new(10.0, 0.0, 0.0));
-        assert!(!state.bodies[&bh].is_sleeping);
-        assert!((state.bodies[&bh].sleep_timer).abs() < EPS);
+        assert!(!state.bodies.get(body_ah(bh)).unwrap().is_sleeping);
+        assert!((state.bodies.get(body_ah(bh)).unwrap().sleep_timer).abs() < EPS);
     }
 
     #[test]
     fn impulse_wakes_sleeping_body() {
         let mut state = PhysicsState2d::new();
-        let bh = BodyHandle(0);
-        state.add_body(bh, &BodyDesc::default());
-        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+        let bh = state.add_body(&BodyDesc::default());
+        state.add_collider(bh, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3251,17 +3304,16 @@ mod tests {
             collision_mask: 0xFFFF_FFFF,
         });
 
-        state.bodies.get_mut(&bh).unwrap().is_sleeping = true;
+        state.bodies.get_mut(body_ah(bh)).unwrap().is_sleeping = true;
         state.apply_impulse(bh, &Impulse::new(10.0, 0.0, 0.0));
-        assert!(!state.bodies[&bh].is_sleeping);
+        assert!(!state.bodies.get(body_ah(bh)).unwrap().is_sleeping);
     }
 
     #[test]
     fn torque_wakes_sleeping_body() {
         let mut state = PhysicsState2d::new();
-        let bh = BodyHandle(0);
-        state.add_body(bh, &BodyDesc::default());
-        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+        let bh = state.add_body(&BodyDesc::default());
+        state.add_collider(bh, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3271,21 +3323,20 @@ mod tests {
             collision_mask: 0xFFFF_FFFF,
         });
 
-        state.bodies.get_mut(&bh).unwrap().is_sleeping = true;
+        state.bodies.get_mut(body_ah(bh)).unwrap().is_sleeping = true;
         state.apply_torque(bh, &Torque::new(5.0));
-        assert!(!state.bodies[&bh].is_sleeping);
+        assert!(!state.bodies.get(body_ah(bh)).unwrap().is_sleeping);
     }
 
     #[test]
     fn moving_body_does_not_sleep() {
         let mut state = PhysicsState2d::new();
-        let bh = BodyHandle(0);
-        state.add_body(bh, &BodyDesc {
+        let bh = state.add_body(&BodyDesc {
             body_type: BodyType::Dynamic,
             linear_velocity: [5.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+        state.add_collider(bh, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3299,15 +3350,14 @@ mod tests {
         for _ in 0..100 {
             state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
         }
-        assert!(!state.bodies[&bh].is_sleeping);
+        assert!(!state.bodies.get(body_ah(bh)).unwrap().is_sleeping);
     }
 
     #[test]
     fn get_body_state_reports_sleeping() {
         let mut state = PhysicsState2d::new();
-        let bh = BodyHandle(0);
-        state.add_body(bh, &BodyDesc::default());
-        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+        let bh = state.add_body(&BodyDesc::default());
+        state.add_collider(bh, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3319,7 +3369,7 @@ mod tests {
 
         assert!(!state.get_body_state(bh).unwrap().is_sleeping);
 
-        state.bodies.get_mut(&bh).unwrap().is_sleeping = true;
+        state.bodies.get_mut(body_ah(bh)).unwrap().is_sleeping = true;
         assert!(state.get_body_state(bh).unwrap().is_sleeping);
     }
 
@@ -3328,13 +3378,12 @@ mod tests {
         let mut state = PhysicsState2d::new();
 
         // A sleeping body at origin
-        let a = BodyHandle(0);
-        state.add_body(a, &BodyDesc {
+        let a = state.add_body(&BodyDesc {
             body_type: BodyType::Dynamic,
             position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(ColliderHandle(0), a, &ColliderDesc {
+        state.add_collider(a, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3343,17 +3392,16 @@ mod tests {
             collision_layer: 0xFFFF_FFFF,
             collision_mask: 0xFFFF_FFFF,
         });
-        state.bodies.get_mut(&a).unwrap().is_sleeping = true;
+        state.bodies.get_mut(body_ah(a)).unwrap().is_sleeping = true;
 
         // A moving body heading toward it
-        let b = BodyHandle(1);
-        state.add_body(b, &BodyDesc {
+        let b = state.add_body(&BodyDesc {
             body_type: BodyType::Dynamic,
             position: [3.0, 0.0, 0.0],
             linear_velocity: [-5.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(ColliderHandle(1), b, &ColliderDesc {
+        state.add_collider(b, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3369,7 +3417,7 @@ mod tests {
         }
 
         // The sleeping body should have been woken by the impact
-        assert!(!state.bodies[&a].is_sleeping, "sleeping body should wake on contact");
+        assert!(!state.bodies.get(body_ah(a)).unwrap().is_sleeping, "sleeping body should wake on contact");
     }
 
     // =======================================================================
@@ -3381,13 +3429,12 @@ mod tests {
         let mut state = PhysicsState2d::new();
 
         // Two overlapping bodies on different layers
-        let a = BodyHandle(0);
-        state.add_body(a, &BodyDesc {
+        let a = state.add_body(&BodyDesc {
             body_type: BodyType::Dynamic,
             position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(ColliderHandle(0), a, &ColliderDesc {
+        state.add_collider(a, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3397,13 +3444,12 @@ mod tests {
             collision_mask: 0x01,   // only collide with layer 1
         });
 
-        let b = BodyHandle(1);
-        state.add_body(b, &BodyDesc {
+        let b = state.add_body(&BodyDesc {
             body_type: BodyType::Dynamic,
             position: [0.5, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(ColliderHandle(1), b, &ColliderDesc {
+        state.add_collider(b, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3423,13 +3469,12 @@ mod tests {
         let mut state = PhysicsState2d::new();
 
         // Two overlapping bodies on the same layer
-        let a = BodyHandle(0);
-        state.add_body(a, &BodyDesc {
+        let a = state.add_body(&BodyDesc {
             body_type: BodyType::Dynamic,
             position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(ColliderHandle(0), a, &ColliderDesc {
+        state.add_collider(a, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3439,13 +3484,12 @@ mod tests {
             collision_mask: 0x01,
         });
 
-        let b = BodyHandle(1);
-        state.add_body(b, &BodyDesc {
+        let b = state.add_body(&BodyDesc {
             body_type: BodyType::Dynamic,
             position: [0.5, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(ColliderHandle(1), b, &ColliderDesc {
+        state.add_collider(b, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3464,13 +3508,12 @@ mod tests {
         let mut state = PhysicsState2d::new();
 
         // A can see B's layer, but B cannot see A's layer
-        let a = BodyHandle(0);
-        state.add_body(a, &BodyDesc {
+        let a = state.add_body(&BodyDesc {
             body_type: BodyType::Dynamic,
             position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(ColliderHandle(0), a, &ColliderDesc {
+        state.add_collider(a, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3480,13 +3523,12 @@ mod tests {
             collision_mask: 0x03, // sees layer 1 and 2
         });
 
-        let b = BodyHandle(1);
-        state.add_body(b, &BodyDesc {
+        let b = state.add_body(&BodyDesc {
             body_type: BodyType::Dynamic,
             position: [0.5, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(ColliderHandle(1), b, &ColliderDesc {
+        state.add_collider(b, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3506,13 +3548,12 @@ mod tests {
         // Default layers (0xFFFF_FFFF) should collide with everything
         let mut state = PhysicsState2d::new();
 
-        let a = BodyHandle(0);
-        state.add_body(a, &BodyDesc {
+        let a = state.add_body(&BodyDesc {
             body_type: BodyType::Dynamic,
             position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(ColliderHandle(0), a, &ColliderDesc {
+        state.add_collider(a, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3522,13 +3563,12 @@ mod tests {
             collision_mask: 0xFFFF_FFFF,
         });
 
-        let b = BodyHandle(1);
-        state.add_body(b, &BodyDesc {
+        let b = state.add_body(&BodyDesc {
             body_type: BodyType::Dynamic,
             position: [0.5, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(ColliderHandle(1), b, &ColliderDesc {
+        state.add_collider(b, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3549,14 +3589,13 @@ mod tests {
     #[test]
     fn overlap_sphere_finds_ball() {
         let mut state = PhysicsState2d::new();
-        let bh = BodyHandle(0);
-        state.add_body(bh, &BodyDesc {
+        let bh = state.add_body(&BodyDesc {
             body_type: BodyType::Static,
             position: [5.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
         let ch = ColliderHandle(0);
-        state.add_collider(ch, bh, &ColliderDesc {
+        state.add_collider(bh, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3578,14 +3617,13 @@ mod tests {
     #[test]
     fn overlap_sphere_finds_box() {
         let mut state = PhysicsState2d::new();
-        let bh = BodyHandle(0);
-        state.add_body(bh, &BodyDesc {
+        let bh = state.add_body(&BodyDesc {
             body_type: BodyType::Static,
             position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
         let ch = ColliderHandle(0);
-        state.add_collider(ch, bh, &ColliderDesc {
+        state.add_collider(bh, &ColliderDesc {
             shape: ColliderShape::Box { half_extents: [2.0, 2.0, 0.0] },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3605,13 +3643,12 @@ mod tests {
     #[test]
     fn overlap_sphere_misses_distant() {
         let mut state = PhysicsState2d::new();
-        let bh = BodyHandle(0);
-        state.add_body(bh, &BodyDesc {
+        let bh = state.add_body(&BodyDesc {
             body_type: BodyType::Static,
             position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+        state.add_collider(bh, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3629,14 +3666,13 @@ mod tests {
     fn overlap_aabb_finds_colliders() {
         let mut state = PhysicsState2d::new();
 
-        let b1 = BodyHandle(0);
-        state.add_body(b1, &BodyDesc {
+        let b1 = state.add_body(&BodyDesc {
             body_type: BodyType::Static,
             position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
         let c1 = ColliderHandle(0);
-        state.add_collider(c1, b1, &ColliderDesc {
+        state.add_collider(b1, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3646,14 +3682,13 @@ mod tests {
             collision_mask: 0xFFFF_FFFF,
         });
 
-        let b2 = BodyHandle(1);
-        state.add_body(b2, &BodyDesc {
+        let b2 = state.add_body(&BodyDesc {
             body_type: BodyType::Static,
             position: [10.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
         let c2 = ColliderHandle(1);
-        state.add_collider(c2, b2, &ColliderDesc {
+        state.add_collider(b2, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3677,13 +3712,12 @@ mod tests {
     #[test]
     fn overlap_aabb_empty() {
         let mut state = PhysicsState2d::new();
-        let bh = BodyHandle(0);
-        state.add_body(bh, &BodyDesc {
+        let bh = state.add_body(&BodyDesc {
             body_type: BodyType::Static,
             position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
-        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+        state.add_collider(bh, &ColliderDesc {
             shape: ColliderShape::Ball { radius: 1.0 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),
@@ -3700,14 +3734,13 @@ mod tests {
     #[test]
     fn overlap_sphere_finds_capsule() {
         let mut state = PhysicsState2d::new();
-        let bh = BodyHandle(0);
-        state.add_body(bh, &BodyDesc {
+        let bh = state.add_body(&BodyDesc {
             body_type: BodyType::Static,
             position: [0.0, 0.0, 0.0],
             ..BodyDesc::default()
         });
         let ch = ColliderHandle(0);
-        state.add_collider(ch, bh, &ColliderDesc {
+        state.add_collider(bh, &ColliderDesc {
             shape: ColliderShape::Capsule { half_height: 2.0, radius: 0.5 },
             offset: [0.0, 0.0, 0.0],
             material: PhysicsMaterial::default(),

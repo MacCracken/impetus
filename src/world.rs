@@ -1,5 +1,7 @@
 //! Physics world — the simulation container.
 
+#[cfg(any(feature = "2d", feature = "3d"))]
+use crate::arena::ArenaHandle;
 use crate::body::{BodyDesc, BodyHandle, BodyState};
 use crate::collider::{ColliderDesc, ColliderHandle};
 use crate::config::WorldConfig;
@@ -14,9 +16,6 @@ use crate::ImpetusError;
 /// The physics world — owns all bodies, colliders, joints, and the simulation pipeline.
 pub struct PhysicsWorld {
     config: WorldConfig,
-    next_body_id: u64,
-    next_collider_id: u64,
-    next_joint_id: u64,
     next_particle_id: u64,
     next_emitter_id: u64,
     collision_events: Vec<CollisionEvent>,
@@ -38,9 +37,6 @@ impl PhysicsWorld {
     pub fn new(config: WorldConfig) -> Self {
         Self {
             config,
-            next_body_id: 0,
-            next_collider_id: 0,
-            next_joint_id: 0,
             next_particle_id: 0,
             next_emitter_id: 0,
             collision_events: vec![],
@@ -202,7 +198,7 @@ impl PhysicsWorld {
                 if collider.is_sensor {
                     return None;
                 }
-                let rb = self.backend_2d.bodies.get(&collider.body)?;
+                let rb = self.backend_2d.bodies.get(ArenaHandle(collider.body.0))?;
                 let (sin, cos) = rb.rotation.sin_cos();
                 let cx = rb.position[0] + cos * collider.offset[0] - sin * collider.offset[1];
                 let cy = rb.position[1] + sin * collider.offset[0] + cos * collider.offset[1];
@@ -272,7 +268,7 @@ impl PhysicsWorld {
                 if collider.is_sensor {
                     continue;
                 }
-                let rb = match self.backend_3d.bodies.get(&collider.body) {
+                let rb = match self.backend_3d.bodies.get(ArenaHandle(collider.body.0)) {
                     Some(b) => b,
                     None => continue,
                 };
@@ -319,60 +315,60 @@ impl PhysicsWorld {
 
     /// Add a rigid body.
     pub fn add_body(&mut self, desc: BodyDesc) -> BodyHandle {
-        let handle = BodyHandle(self.next_body_id);
-        self.next_body_id = self.next_body_id.wrapping_add(1);
-
         #[cfg(all(feature = "2d", not(feature = "3d")))]
-        self.backend_2d.add_body(handle, &desc);
+        {
+            self.backend_2d.add_body(&desc)
+        }
 
         #[cfg(feature = "3d")]
-        self.backend_3d.add_body(handle, &desc);
+        {
+            self.backend_3d.add_body(&desc)
+        }
 
         #[cfg(not(any(feature = "2d", feature = "3d")))]
         {
             let _ = desc;
             self.body_count += 1;
+            BodyHandle(0)
         }
-
-        handle
     }
 
     /// Add a collider attached to a body.
     pub fn add_collider(&mut self, body: BodyHandle, desc: ColliderDesc) -> ColliderHandle {
-        let handle = ColliderHandle(self.next_collider_id);
-        self.next_collider_id = self.next_collider_id.wrapping_add(1);
-
         #[cfg(all(feature = "2d", not(feature = "3d")))]
-        self.backend_2d.add_collider(handle, body, &desc);
+        {
+            self.backend_2d.add_collider(body, &desc)
+        }
 
         #[cfg(feature = "3d")]
-        self.backend_3d.add_collider(handle, body, &desc);
+        {
+            self.backend_3d.add_collider(body, &desc)
+        }
 
         #[cfg(not(any(feature = "2d", feature = "3d")))]
         {
             let _ = (body, desc);
+            ColliderHandle(0)
         }
-
-        handle
     }
 
     /// Add a joint between two bodies.
     pub fn add_joint(&mut self, desc: JointDesc) -> JointHandle {
-        let handle = JointHandle(self.next_joint_id);
-        self.next_joint_id = self.next_joint_id.wrapping_add(1);
-
         #[cfg(all(feature = "2d", not(feature = "3d")))]
-        self.backend_2d.add_joint(handle, &desc);
+        {
+            self.backend_2d.add_joint(&desc)
+        }
 
         #[cfg(feature = "3d")]
-        self.backend_3d.add_joint(handle, &desc);
+        {
+            self.backend_3d.add_joint(&desc)
+        }
 
         #[cfg(not(any(feature = "2d", feature = "3d")))]
         {
             let _ = desc;
+            JointHandle(0)
         }
-
-        handle
     }
 
     /// Apply a force to a body (applied over the next step).
@@ -686,9 +682,9 @@ impl PhysicsWorld {
                 });
             }
 
-            for (handle, j) in &self.backend_2d.joints {
+            for (ah, j) in self.backend_2d.joints.iter() {
                 joints.push(JointSnapshot {
-                    handle: *handle,
+                    handle: JointHandle(ah.0),
                     desc: crate::joint::JointDesc {
                         body_a: j.body_a,
                         body_b: j.body_b,
@@ -747,9 +743,9 @@ impl PhysicsWorld {
                 });
             }
 
-            for (handle, j) in &self.backend_3d.joints {
+            for (ah, j) in self.backend_3d.joints.iter() {
                 joints.push(JointSnapshot {
-                    handle: *handle,
+                    handle: JointHandle(ah.0),
                     desc: crate::joint::JointDesc {
                         body_a: j.body_a,
                         body_b: j.body_b,
@@ -765,9 +761,6 @@ impl PhysicsWorld {
 
         WorldSnapshot {
             config: self.config.clone(),
-            next_body_id: self.next_body_id,
-            next_collider_id: self.next_collider_id,
-            next_joint_id: self.next_joint_id,
             next_particle_id: self.next_particle_id,
             next_emitter_id: self.next_emitter_id,
             bodies,
@@ -782,9 +775,6 @@ impl PhysicsWorld {
     #[cfg(feature = "serialize")]
     pub fn restore(&mut self, snapshot: &crate::serialize::WorldSnapshot) {
         self.config = snapshot.config.clone();
-        self.next_body_id = snapshot.next_body_id;
-        self.next_collider_id = snapshot.next_collider_id;
-        self.next_joint_id = snapshot.next_joint_id;
         self.next_particle_id = snapshot.next_particle_id;
         self.next_emitter_id = snapshot.next_emitter_id;
         self.collision_events.clear();
@@ -796,8 +786,8 @@ impl PhysicsWorld {
             self.backend_2d = crate::backend_2d::PhysicsState2d::new();
 
             for bs in &snapshot.bodies {
-                self.backend_2d.add_body(bs.handle, &bs.desc);
-                if let Some(rb) = self.backend_2d.bodies.get_mut(&bs.handle) {
+                self.backend_2d.add_body_at(bs.handle, &bs.desc);
+                if let Some(rb) = self.backend_2d.bodies.get_mut(ArenaHandle(bs.handle.0)) {
                     rb.position = [bs.position[0], bs.position[1]];
                     rb.rotation = bs.rotation;
                     rb.linear_velocity = [bs.linear_velocity[0], bs.linear_velocity[1]];
@@ -806,11 +796,11 @@ impl PhysicsWorld {
             }
 
             for cs in &snapshot.colliders {
-                self.backend_2d.add_collider(cs.handle, cs.body, &cs.desc);
+                self.backend_2d.add_collider_at(cs.handle, cs.body, &cs.desc);
             }
 
             for js in &snapshot.joints {
-                self.backend_2d.add_joint(js.handle, &js.desc);
+                self.backend_2d.add_joint_at(js.handle, &js.desc);
             }
         }
 
@@ -819,8 +809,8 @@ impl PhysicsWorld {
             self.backend_3d = crate::backend_3d::PhysicsState3d::new();
 
             for bs in &snapshot.bodies {
-                self.backend_3d.add_body(bs.handle, &bs.desc);
-                if let Some(rb) = self.backend_3d.bodies.get_mut(&bs.handle) {
+                self.backend_3d.add_body_at(bs.handle, &bs.desc);
+                if let Some(rb) = self.backend_3d.bodies.get_mut(ArenaHandle(bs.handle.0)) {
                     rb.position = bs.position.into();
                     rb.linear_velocity = bs.linear_velocity.into();
                     rb.angular_velocity.z = bs.angular_velocity;
@@ -828,11 +818,11 @@ impl PhysicsWorld {
             }
 
             for cs in &snapshot.colliders {
-                self.backend_3d.add_collider(cs.handle, cs.body, &cs.desc);
+                self.backend_3d.add_collider_at(cs.handle, cs.body, &cs.desc);
             }
 
             for js in &snapshot.joints {
-                self.backend_3d.add_joint(js.handle, &js.desc);
+                self.backend_3d.add_joint_at(js.handle, &js.desc);
             }
         }
 

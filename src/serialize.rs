@@ -18,9 +18,6 @@ use crate::PhysicsWorld;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldSnapshot {
     pub config: WorldConfig,
-    pub next_body_id: u64,
-    pub next_collider_id: u64,
-    pub next_joint_id: u64,
     pub next_particle_id: u64,
     pub next_emitter_id: u64,
     pub bodies: Vec<BodySnapshot>,
@@ -239,9 +236,6 @@ mod tests {
     fn snapshot_serde_json() {
         let snapshot = WorldSnapshot {
             config: WorldConfig::default(),
-            next_body_id: 5,
-            next_collider_id: 3,
-            next_joint_id: 1,
             next_particle_id: 0,
             next_emitter_id: 0,
             bodies: vec![],
@@ -252,6 +246,6 @@ mod tests {
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         let back: WorldSnapshot = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.next_body_id, 5);
+        assert_eq!(back.next_particle_id, 0);
     }
 }
