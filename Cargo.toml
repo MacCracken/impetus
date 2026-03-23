@@ -40,5 +40,8 @@ harness = false
 [[example]]
 name = "basic_physics"
 
+[[example]]
+name = "platformer"
+
 [[test]]
 name = "integration"

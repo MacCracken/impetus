@@ -8,7 +8,7 @@ use crate::config::WorldConfig;
 use crate::event::CollisionEvent;
 use crate::force::{Force, Impulse, Torque};
 use crate::joint::{JointDesc, JointHandle};
-use crate::particle::{EmitterHandle, Particle, ParticleEmitter, ParticleHandle};
+use crate::particle::{EmitterHandle, ForceField, Particle, ParticleEmitter, ParticleHandle};
 use crate::query::RayHit;
 #[cfg(not(any(feature = "2d", feature = "3d")))]
 use crate::ImpetusError;
@@ -21,6 +21,7 @@ pub struct PhysicsWorld {
     collision_events: Vec<CollisionEvent>,
     particles: Vec<Particle>,
     emitters: Vec<ParticleEmitter>,
+    force_fields: Vec<ForceField>,
 
     #[cfg(all(feature = "2d", not(feature = "3d")))]
     backend_2d: crate::backend_2d::PhysicsState2d,
@@ -44,6 +45,7 @@ impl PhysicsWorld {
             collision_events: vec![],
             particles: Vec::new(),
             emitters: Vec::new(),
+            force_fields: Vec::new(),
 
             #[cfg(all(feature = "2d", not(feature = "3d")))]
             backend_2d: crate::backend_2d::PhysicsState2d::new(),
@@ -142,6 +144,36 @@ impl PhysicsWorld {
             p.velocity[1] += gravity[1] * p.gravity_scale * dt;
             p.velocity[2] += gravity[2] * p.gravity_scale * dt;
 
+            // Force fields
+            for field in &self.force_fields {
+                match field {
+                    ForceField::Radial { center, strength, falloff, radius } => {
+                        let dx = center[0] - p.position[0];
+                        let dy = center[1] - p.position[1];
+                        let dz = center[2] - p.position[2];
+                        let dist_sq = dx * dx + dy * dy + dz * dz;
+                        let dist = dist_sq.sqrt();
+                        if dist < 1e-10 { continue; }
+                        if *radius > 0.0 && dist > *radius { continue; }
+                        let force_mag = strength / dist.powf(*falloff);
+                        let dir = [dx / dist, dy / dist, dz / dist];
+                        p.velocity[0] += dir[0] * force_mag * dt;
+                        p.velocity[1] += dir[1] * force_mag * dt;
+                        p.velocity[2] += dir[2] * force_mag * dt;
+                    }
+                    ForceField::Directional { force, min, max } => {
+                        if p.position[0] >= min[0] && p.position[0] <= max[0]
+                            && p.position[1] >= min[1] && p.position[1] <= max[1]
+                            && p.position[2] >= min[2] && p.position[2] <= max[2]
+                        {
+                            p.velocity[0] += force[0] * dt;
+                            p.velocity[1] += force[1] * dt;
+                            p.velocity[2] += force[2] * dt;
+                        }
+                    }
+                }
+            }
+
             // Quadratic drag (proportional to speed²)
             if p.drag > 0.0 {
                 let speed_sq = p.velocity[0] * p.velocity[0]
@@ -178,6 +210,29 @@ impl PhysicsWorld {
 
         #[cfg(feature = "3d")]
         self.collide_particles();
+
+        // Collect sub-emitter spawns from dying particles
+        let mut sub_spawns = Vec::new();
+        for p in &self.particles {
+            if !p.is_alive()
+                && let Some(sub) = &p.on_death_emit
+            {
+                for i in 0..sub.count {
+                    let angle = (i as f64 / sub.count as f64) * std::f64::consts::TAU;
+                    let vx = angle.cos() * sub.speed;
+                    let vy = angle.sin() * sub.speed;
+                    sub_spawns.push(Particle::new(p.position, [vx, vy, 0.0], sub.lifetime)
+                        .with_radius(sub.radius)
+                        .with_gravity_scale(sub.gravity_scale)
+                        .with_restitution(sub.restitution));
+                }
+            }
+        }
+        for mut child in sub_spawns {
+            child.handle = ParticleHandle(self.next_particle_id);
+            self.next_particle_id = self.next_particle_id.wrapping_add(1);
+            self.particles.push(child);
+        }
 
         // Remove dead particles
         self.particles.retain(|p| p.is_alive());
@@ -444,6 +499,47 @@ impl PhysicsWorld {
         Ok(())
     }
 
+    /// Remove a single collider by handle.
+    ///
+    /// The parent body's mass and inertia are recomputed from remaining
+    /// colliders.
+    pub fn remove_collider(&mut self, handle: ColliderHandle) -> crate::Result<()> {
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
+        {
+            self.backend_2d.remove_collider(handle)
+        }
+
+        #[cfg(feature = "3d")]
+        {
+            self.backend_3d.remove_collider(handle)
+        }
+
+        #[cfg(not(any(feature = "2d", feature = "3d")))]
+        {
+            let _ = handle;
+            Err(ImpetusError::ColliderNotFound(format!("{:?}", handle)))
+        }
+    }
+
+    /// Remove a joint by handle.
+    pub fn remove_joint(&mut self, handle: JointHandle) -> crate::Result<()> {
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
+        {
+            self.backend_2d.remove_joint(handle)
+        }
+
+        #[cfg(feature = "3d")]
+        {
+            self.backend_3d.remove_joint(handle)
+        }
+
+        #[cfg(not(any(feature = "2d", feature = "3d")))]
+        {
+            let _ = handle;
+            Err(ImpetusError::JointNotFound(format!("{:?}", handle)))
+        }
+    }
+
     /// Cast a ray and return the first hit.
     pub fn raycast(
         &self,
@@ -464,6 +560,35 @@ impl PhysicsWorld {
         #[cfg(not(any(feature = "2d", feature = "3d")))]
         {
             let _ = (origin, direction, max_dist);
+            None
+        }
+    }
+
+    /// Cast a ray with a collision layer filter and return the first hit.
+    ///
+    /// Only colliders whose `collision_layer` has at least one bit in common
+    /// with `layer_mask` are tested. Use `0xFFFF_FFFF` to hit everything
+    /// (equivalent to [`raycast`](Self::raycast)).
+    pub fn raycast_filtered(
+        &self,
+        origin: [f64; 3],
+        direction: [f64; 3],
+        max_dist: f64,
+        layer_mask: u32,
+    ) -> Option<RayHit> {
+        #[cfg(all(feature = "2d", not(feature = "3d")))]
+        {
+            self.backend_2d.raycast_filtered(origin, direction, max_dist, layer_mask)
+        }
+
+        #[cfg(feature = "3d")]
+        {
+            self.backend_3d.raycast_filtered(origin, direction, max_dist, layer_mask)
+        }
+
+        #[cfg(not(any(feature = "2d", feature = "3d")))]
+        {
+            let _ = (origin, direction, max_dist, layer_mask);
             None
         }
     }
@@ -642,6 +767,22 @@ impl PhysicsWorld {
         self.emitters.clear();
     }
 
+    /// Add a force field that affects particles.
+    pub fn add_force_field(&mut self, field: ForceField) {
+        self.force_fields.push(field);
+    }
+
+    /// Remove all force fields.
+    pub fn clear_force_fields(&mut self) {
+        self.force_fields.clear();
+    }
+
+    /// Get all force fields (read-only).
+    #[must_use]
+    pub fn force_fields(&self) -> &[ForceField] {
+        &self.force_fields
+    }
+
     /// Capture a snapshot of the current world state for serialization.
     #[cfg(feature = "serialize")]
     pub fn snapshot(&self) -> crate::serialize::WorldSnapshot {
@@ -703,6 +844,7 @@ impl PhysicsWorld {
                         local_anchor_b: j.local_anchor_b,
                         motor: j.motor.clone(),
                         damping: j.damping,
+                        break_force: j.break_force,
                     },
                 });
             }
@@ -764,6 +906,7 @@ impl PhysicsWorld {
                         local_anchor_b: [j.local_anchor_b[0], j.local_anchor_b[1]],
                         motor: j.motor.clone(),
                         damping: j.damping,
+                        break_force: j.break_force,
                     },
                 });
             }
@@ -1084,6 +1227,7 @@ mod tests {
             local_anchor_b: [0.0, 0.0],
             motor: None,
             damping: 0.0,
+            break_force: None,
         });
         world.step();
     }
@@ -1148,6 +1292,155 @@ mod tests {
             },
         );
         assert_ne!(c1, c2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Force field and sub-emitter tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn radial_force_field_attracts() {
+        let mut world = PhysicsWorld::new(WorldConfig {
+            gravity: [0.0, 0.0, 0.0],
+            ..Default::default()
+        });
+        // Attractor at origin
+        world.add_force_field(crate::particle::ForceField::Radial {
+            center: [0.0, 0.0, 0.0],
+            strength: 100.0,
+            falloff: 0.0,
+            radius: 0.0,
+        });
+        // Particle to the right
+        let h = world.spawn_particle(
+            Particle::new([10.0, 0.0, 0.0], [0.0, 0.0, 0.0], 5.0)
+                .with_gravity_scale(0.0),
+        );
+        let x_before = world.particles().iter().find(|p| p.handle == h).unwrap().position[0];
+        for _ in 0..10 {
+            world.step();
+        }
+        let x_after = world.particles().iter().find(|p| p.handle == h).unwrap().position[0];
+        assert!(x_after < x_before, "particle should move toward attractor");
+    }
+
+    #[test]
+    fn radial_force_field_repels() {
+        let mut world = PhysicsWorld::new(WorldConfig {
+            gravity: [0.0, 0.0, 0.0],
+            ..Default::default()
+        });
+        // Repulsor at origin (negative strength)
+        world.add_force_field(crate::particle::ForceField::Radial {
+            center: [0.0, 0.0, 0.0],
+            strength: -100.0,
+            falloff: 0.0,
+            radius: 0.0,
+        });
+        let h = world.spawn_particle(
+            Particle::new([5.0, 0.0, 0.0], [0.0, 0.0, 0.0], 5.0)
+                .with_gravity_scale(0.0),
+        );
+        let x_before = world.particles().iter().find(|p| p.handle == h).unwrap().position[0];
+        for _ in 0..10 {
+            world.step();
+        }
+        let x_after = world.particles().iter().find(|p| p.handle == h).unwrap().position[0];
+        assert!(x_after > x_before, "particle should be pushed away from repulsor");
+    }
+
+    #[test]
+    fn directional_force_field() {
+        let mut world = PhysicsWorld::new(WorldConfig {
+            gravity: [0.0, 0.0, 0.0],
+            ..Default::default()
+        });
+        // Wind zone pushing +X
+        world.add_force_field(crate::particle::ForceField::Directional {
+            force: [50.0, 0.0, 0.0],
+            min: [-100.0, -100.0, -100.0],
+            max: [100.0, 100.0, 100.0],
+        });
+        let h = world.spawn_particle(
+            Particle::new([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 5.0)
+                .with_gravity_scale(0.0),
+        );
+        for _ in 0..10 {
+            world.step();
+        }
+        let p = world.particles().iter().find(|p| p.handle == h).unwrap();
+        assert!(p.position[0] > 0.0, "particle should be pushed in +X by wind");
+    }
+
+    #[test]
+    fn directional_force_field_outside() {
+        let mut world = PhysicsWorld::new(WorldConfig {
+            gravity: [0.0, 0.0, 0.0],
+            ..Default::default()
+        });
+        // Wind zone far from the particle
+        world.add_force_field(crate::particle::ForceField::Directional {
+            force: [50.0, 0.0, 0.0],
+            min: [100.0, 100.0, 100.0],
+            max: [200.0, 200.0, 200.0],
+        });
+        let h = world.spawn_particle(
+            Particle::new([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 5.0)
+                .with_gravity_scale(0.0),
+        );
+        for _ in 0..10 {
+            world.step();
+        }
+        let p = world.particles().iter().find(|p| p.handle == h).unwrap();
+        assert!(
+            p.position[0].abs() < 1e-10,
+            "particle outside wind zone should not move"
+        );
+    }
+
+    #[test]
+    fn sub_emitter_on_death() {
+        use crate::particle::SubEmitter;
+
+        let mut world = PhysicsWorld::new(WorldConfig {
+            gravity: [0.0, 0.0, 0.0],
+            ..Default::default()
+        });
+        // Particle with short lifetime and a sub-emitter
+        let dt = world.timestep();
+        world.spawn_particle(
+            Particle::new([5.0, 5.0, 0.0], [0.0, 0.0, 0.0], dt * 1.5)
+                .with_gravity_scale(0.0)
+                .with_sub_emitter(SubEmitter {
+                    count: 4,
+                    speed: 3.0,
+                    lifetime: 2.0,
+                    radius: 0.02,
+                    gravity_scale: 0.0,
+                    restitution: 0.5,
+                }),
+        );
+        assert_eq!(world.particle_count(), 1);
+
+        // Step twice — the parent should die after ~1.5*dt and spawn 4 children
+        world.step();
+        world.step();
+
+        // Parent is dead and removed, 4 children remain
+        assert_eq!(
+            world.particle_count(),
+            4,
+            "sub-emitter should have spawned 4 children"
+        );
+        // All children should be near the parent's last position
+        for p in world.particles() {
+            let dx = p.position[0] - 5.0;
+            let dy = p.position[1] - 5.0;
+            assert!(
+                (dx * dx + dy * dy).sqrt() < 2.0,
+                "children should be near parent"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

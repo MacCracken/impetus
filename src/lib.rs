@@ -57,10 +57,10 @@ pub use force::{Force, Impulse, Torque};
 pub use joint::{JointDesc, JointHandle, JointMotor, JointType};
 
 // Material
-pub use material::PhysicsMaterial;
+pub use material::{CombineRule, PhysicsMaterial};
 
 // Particles
-pub use particle::{EmitterHandle, Particle, ParticleEmitter, ParticleHandle};
+pub use particle::{EmitterHandle, ForceField, Particle, ParticleEmitter, ParticleHandle, SubEmitter};
 
 // Queries
 pub use query::{PointQuery, RayHit};
@@ -105,6 +105,8 @@ const _: () = {
         assert_send_sync::<ParticleHandle>();
         assert_send_sync::<ParticleEmitter>();
         assert_send_sync::<EmitterHandle>();
+        assert_send_sync::<ForceField>();
+        assert_send_sync::<SubEmitter>();
         assert_send_sync::<Spring>();
         assert_send_sync::<Spring2d>();
         assert_send_sync::<Spring3d>();

@@ -31,6 +31,32 @@ pub enum JointType {
     },
     /// Distance — maintains fixed distance between anchors.
     Distance { length: f64 },
+    /// Wheel joint — suspension (prismatic along axis) + spin (revolute).
+    /// Constrains perpendicular movement, applies spring force along the axis,
+    /// and allows free rotation.
+    Wheel {
+        /// Suspension axis direction.
+        axis: [f64; 2],
+        /// Suspension spring stiffness.
+        stiffness: f64,
+        /// Suspension damping coefficient.
+        damping: f64,
+    },
+    /// Rope joint — prevents exceeding max distance (inequality constraint).
+    /// Only applies correction when bodies are farther apart than `max_length`.
+    Rope { max_length: f64 },
+    /// Mouse joint — drags body toward a world-space target point.
+    /// Only uses `body_a` (the dragged body). `body_b` is ignored.
+    Mouse {
+        /// World-space target position.
+        target: [f64; 3],
+        /// Spring stiffness for dragging.
+        stiffness: f64,
+        /// Damping coefficient.
+        damping: f64,
+        /// Maximum force the joint can apply.
+        max_force: f64,
+    },
 }
 
 /// Motor parameters for revolute and prismatic joints.
@@ -60,6 +86,10 @@ pub struct JointDesc {
     /// For Spring joints, use the Spring variant's own `damping` field instead.
     #[serde(default)]
     pub damping: f64,
+    /// If set, the joint breaks when the constraint force exceeds this value.
+    /// After breaking, the joint is automatically removed from the simulation.
+    #[serde(default)]
+    pub break_force: Option<f64>,
 }
 
 #[cfg(test)]
@@ -76,6 +106,7 @@ mod tests {
             local_anchor_b: [1.0, 0.0],
             motor: None,
             damping: 0.0,
+            break_force: None,
         };
         let json = serde_json::to_string(&desc).unwrap();
         let back: JointDesc = serde_json::from_str(&json).unwrap();
@@ -96,6 +127,7 @@ mod tests {
             local_anchor_b: [0.0, 0.0],
             motor: None,
             damping: 0.0,
+            break_force: None,
         };
         let json = serde_json::to_string(&desc).unwrap();
         let back: JointDesc = serde_json::from_str(&json).unwrap();
@@ -147,5 +179,64 @@ mod tests {
     fn joint_handle_eq() {
         assert_eq!(JointHandle(0), JointHandle(0));
         assert_ne!(JointHandle(0), JointHandle(1));
+    }
+
+    #[test]
+    fn wheel_joint_serde() {
+        let jt = JointType::Wheel {
+            axis: [0.0, 1.0],
+            stiffness: 500.0,
+            damping: 10.0,
+        };
+        let json = serde_json::to_string(&jt).unwrap();
+        let back: JointType = serde_json::from_str(&json).unwrap();
+        assert_eq!(jt, back);
+    }
+
+    #[test]
+    fn rope_joint_serde() {
+        let jt = JointType::Rope { max_length: 5.0 };
+        let json = serde_json::to_string(&jt).unwrap();
+        let back: JointType = serde_json::from_str(&json).unwrap();
+        assert_eq!(jt, back);
+    }
+
+    #[test]
+    fn mouse_joint_serde() {
+        let jt = JointType::Mouse {
+            target: [10.0, 20.0, 0.0],
+            stiffness: 1000.0,
+            damping: 50.0,
+            max_force: 500.0,
+        };
+        let json = serde_json::to_string(&jt).unwrap();
+        let back: JointType = serde_json::from_str(&json).unwrap();
+        assert_eq!(jt, back);
+    }
+
+    #[test]
+    fn break_force_serde() {
+        let desc = JointDesc {
+            body_a: BodyHandle(0),
+            body_b: BodyHandle(1),
+            joint_type: JointType::Fixed,
+            local_anchor_a: [0.0, 0.0],
+            local_anchor_b: [0.0, 0.0],
+            motor: None,
+            damping: 0.0,
+            break_force: Some(100.0),
+        };
+        let json = serde_json::to_string(&desc).unwrap();
+        let back: JointDesc = serde_json::from_str(&json).unwrap();
+        assert_eq!(desc, back);
+        assert_eq!(back.break_force, Some(100.0));
+    }
+
+    #[test]
+    fn break_force_default() {
+        // Old-style JSON without break_force should deserialize with None
+        let json = r#"{"body_a":0,"body_b":1,"joint_type":"Fixed","local_anchor_a":[0.0,0.0],"local_anchor_b":[0.0,0.0]}"#;
+        let desc: JointDesc = serde_json::from_str(json).unwrap();
+        assert_eq!(desc.break_force, None);
     }
 }

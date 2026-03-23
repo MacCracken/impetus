@@ -6,6 +6,43 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A force field that affects particles within its radius.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ForceField {
+    /// Radial attraction/repulsion: F = strength * dir / |r|^falloff
+    /// Positive strength = attraction, negative = repulsion.
+    Radial {
+        center: [f64; 3],
+        strength: f64,
+        falloff: f64,  // 0 = constant, 1 = linear, 2 = inverse-square
+        radius: f64,   // max effect radius (0 = infinite)
+    },
+    /// Constant directional force within a region (wind zone).
+    Directional {
+        force: [f64; 3],
+        min: [f64; 3], // AABB min of the affected region
+        max: [f64; 3], // AABB max of the affected region
+    },
+}
+
+/// Describes particles to spawn when a parent particle dies.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubEmitter {
+    /// Number of particles to spawn.
+    pub count: u32,
+    /// Velocity spread of spawned particles.
+    pub speed: f64,
+    /// Lifetime of spawned particles.
+    pub lifetime: f64,
+    /// Radius of spawned particles.
+    pub radius: f64,
+    /// Gravity scale of spawned particles.
+    pub gravity_scale: f64,
+    /// Restitution of spawned particles.
+    pub restitution: f64,
+}
+
 /// Unique handle to a particle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ParticleHandle(pub u64);
@@ -29,6 +66,9 @@ pub struct Particle {
     pub gravity_scale: f64,
     /// Linear damping (air resistance).
     pub damping: f64,
+    /// Optional sub-emitter: spawns particles when this particle dies.
+    #[serde(default)]
+    pub on_death_emit: Option<SubEmitter>,
 }
 
 impl Particle {
@@ -44,6 +84,7 @@ impl Particle {
             restitution: 0.3,
             gravity_scale: 1.0,
             damping: 0.0,
+            on_death_emit: None,
         }
     }
 
@@ -74,6 +115,12 @@ impl Particle {
     /// Set linear damping.
     pub fn with_damping(mut self, damping: f64) -> Self {
         self.damping = damping;
+        self
+    }
+
+    /// Set a sub-emitter that fires when this particle dies.
+    pub fn with_sub_emitter(mut self, sub: SubEmitter) -> Self {
+        self.on_death_emit = Some(sub);
         self
     }
 

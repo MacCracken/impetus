@@ -96,6 +96,7 @@ fn joint_connects_bodies() {
         local_anchor_b: [0.0, 0.0],
         motor: None,
         damping: 0.0,
+        break_force: None,
     });
 
     // Stepping should not panic with joints

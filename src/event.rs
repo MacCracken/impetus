@@ -17,6 +17,11 @@ pub enum CollisionEvent {
         collider_a: ColliderHandle,
         collider_b: ColliderHandle,
     },
+    /// Two colliders are still touching (ongoing contact).
+    Ongoing {
+        collider_a: ColliderHandle,
+        collider_b: ColliderHandle,
+    },
 }
 
 /// Detailed contact data for a collision pair.
@@ -57,6 +62,17 @@ mod tests {
         let event = CollisionEvent::Stopped {
             collider_a: ColliderHandle(3),
             collider_b: ColliderHandle(7),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: CollisionEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn collision_ongoing_serde() {
+        let event = CollisionEvent::Ongoing {
+            collider_a: ColliderHandle(2),
+            collider_b: ColliderHandle(5),
         };
         let json = serde_json::to_string(&event).unwrap();
         let back: CollisionEvent = serde_json::from_str(&json).unwrap();

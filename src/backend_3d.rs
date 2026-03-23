@@ -371,6 +371,7 @@ pub(crate) struct Joint3d {
     pub local_anchor_b: DVec3,
     pub motor: Option<JointMotor>,
     pub damping: f64,
+    pub break_force: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -482,6 +483,7 @@ impl PhysicsState3d {
             local_anchor_b: DVec3::new(desc.local_anchor_b[0], desc.local_anchor_b[1], 0.0),
             motor: desc.motor.clone(),
             damping: desc.damping,
+            break_force: desc.break_force,
         });
         joint_from(ah)
     }
@@ -540,6 +542,61 @@ impl PhysicsState3d {
             .retain(|_, j| j.body_a != handle && j.body_b != handle);
     }
 
+    /// Remove a single collider and recompute the parent body's mass properties.
+    pub fn remove_collider(&mut self, handle: ColliderHandle) -> Result<(), ImpetusError> {
+        let collider = self.colliders.remove(coll_ah(handle))
+            .ok_or_else(|| ImpetusError::ColliderNotFound(format!("{:?}", handle)))?;
+        let body = collider.body;
+
+        // Remove from parent body's collider list
+        if let Some(list) = self.body_colliders.get_mut(&body) {
+            list.retain(|ch| *ch != handle);
+        }
+
+        // Clean stale collision pairs
+        self.prev_collision_pairs
+            .retain(|(a, b)| *a != handle && *b != handle);
+
+        // Recompute mass/inertia from remaining colliders
+        if let Some(rb) = self.bodies.get_mut(body_ah(body))
+            && rb.is_dynamic()
+        {
+            let mut mass = 0.0_f64;
+            let mut inertia = DVec3::ZERO;
+            if let Some(collider_handles) = self.body_colliders.get(&body) {
+                for ch in collider_handles {
+                    if let Some(c) = self.colliders.get(coll_ah(*ch)) {
+                        let cm = c.compute_mass();
+                        mass += cm;
+                        inertia += c.compute_inertia(cm);
+                    }
+                }
+            }
+            rb.mass = mass;
+            rb.inertia = inertia;
+            if mass > 0.0 {
+                rb.inv_mass = 1.0 / mass;
+                rb.inv_inertia = if rb.fixed_rotation {
+                    DVec3::ZERO
+                } else {
+                    DVec3::new(1.0 / inertia.x, 1.0 / inertia.y, 1.0 / inertia.z)
+                };
+            } else {
+                rb.inv_mass = 0.0;
+                rb.inv_inertia = DVec3::ZERO;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove a joint by handle.
+    pub fn remove_joint(&mut self, handle: JointHandle) -> Result<(), ImpetusError> {
+        self.joints.remove(joint_ah(handle))
+            .ok_or_else(|| ImpetusError::JointNotFound(format!("{:?}", handle)))?;
+        Ok(())
+    }
+
     /// Insert a body at a specific handle (for snapshot restore).
     #[cfg(feature = "serialize")]
     pub fn add_body_at(&mut self, handle: BodyHandle, desc: &BodyDesc) {
@@ -582,6 +639,7 @@ impl PhysicsState3d {
             local_anchor_b: DVec3::new(desc.local_anchor_b[0], desc.local_anchor_b[1], 0.0),
             motor: desc.motor.clone(),
             damping: desc.damping,
+            break_force: desc.break_force,
         });
     }
 
@@ -865,28 +923,51 @@ impl PhysicsState3d {
     // -----------------------------------------------------------------------
 
     fn solve_contacts(&mut self, contacts: &[Contact3d], iterations: u32) {
+        use crate::material::CombineRule;
+
+        const RESTITUTION_VELOCITY_THRESHOLD: f64 = 1.0;
+
         struct ContactMat {
             restitution: f64,
             friction: f64,
+            rolling_friction: f64,
             is_sensor: bool,
         }
+
+        fn combine_property(a: f64, b: f64, rule_a: CombineRule, rule_b: CombineRule) -> f64 {
+            let rule = rule_a.max(rule_b);
+            rule.combine(a, b)
+        }
+
         let materials: Vec<ContactMat> = contacts
             .iter()
             .map(|c| {
-                let (r, f, s) = match (
+                let (r, f, rf, s) = match (
                     self.colliders.get(coll_ah(c.collider_a)),
                     self.colliders.get(coll_ah(c.collider_b)),
                 ) {
                     (Some(a), Some(b)) => (
-                        a.material.restitution.min(b.material.restitution),
-                        (a.material.friction * b.material.friction).sqrt(),
+                        combine_property(
+                            a.material.restitution,
+                            b.material.restitution,
+                            a.material.restitution_combine,
+                            b.material.restitution_combine,
+                        ),
+                        combine_property(
+                            a.material.friction,
+                            b.material.friction,
+                            a.material.friction_combine,
+                            b.material.friction_combine,
+                        ),
+                        (a.material.rolling_friction + b.material.rolling_friction) * 0.5,
                         a.is_sensor || b.is_sensor,
                     ),
-                    _ => (0.0, 0.0, false),
+                    _ => (0.0, 0.0, 0.0, false),
                 };
                 ContactMat {
                     restitution: r,
                     friction: f,
+                    rolling_friction: rf,
                     is_sensor: s,
                 }
             })
@@ -937,7 +1018,12 @@ impl PhysicsState3d {
                 let ang_eff_b = rb_cross_n.dot(rb_cross_n * inv_inertia_b);
                 let inv_mass_sum = inv_mass_a + inv_mass_b + ang_eff_a + ang_eff_b;
 
-                let j = -(1.0 + materials[ci].restitution) * vel_along_normal / inv_mass_sum;
+                let restitution = if vel_along_normal.abs() < RESTITUTION_VELOCITY_THRESHOLD {
+                    0.0
+                } else {
+                    materials[ci].restitution
+                };
+                let j = -(1.0 + restitution) * vel_along_normal / inv_mass_sum;
                 let impulse_n = n * j;
 
                 if let Some(ba) = self.bodies.get_mut(body_ah(contact.body_a))
@@ -979,6 +1065,34 @@ impl PhysicsState3d {
                             bb.linear_velocity += impulse_t * bb.inv_mass;
                             let ang_t = rb.cross(impulse_t);
                             bb.angular_velocity += ang_t * bb.inv_inertia;
+                        }
+                    }
+                }
+
+                // Rolling friction (3D) — apply torque opposing angular velocity
+                let rolling_friction = materials[ci].rolling_friction;
+                if rolling_friction > 0.0 {
+                    let normal_force = j.abs();
+                    let roll_torque = rolling_friction * normal_force;
+
+                    if let Some(ba) = self.bodies.get_mut(body_ah(contact.body_a))
+                        && ba.is_dynamic()
+                    {
+                        let angvel_len = ba.angular_velocity.length();
+                        if angvel_len > EPSILON {
+                            let dir = ba.angular_velocity / angvel_len;
+                            let reduction = (roll_torque * ba.inv_inertia.x).min(angvel_len);
+                            ba.angular_velocity -= dir * reduction;
+                        }
+                    }
+                    if let Some(bb) = self.bodies.get_mut(body_ah(contact.body_b))
+                        && bb.is_dynamic()
+                    {
+                        let angvel_len = bb.angular_velocity.length();
+                        if angvel_len > EPSILON {
+                            let dir = bb.angular_velocity / angvel_len;
+                            let reduction = (roll_torque * bb.inv_inertia.x).min(angvel_len);
+                            bb.angular_velocity -= dir * reduction;
                         }
                     }
                 }
@@ -1030,24 +1144,38 @@ impl PhysicsState3d {
     // -----------------------------------------------------------------------
 
     fn solve_joints(&mut self, dt: f64, iterations: u32) {
-        let joints: Vec<Joint3d> = self.joints.values().cloned().collect();
+        let joints: Vec<(ArenaHandle, Joint3d)> = self.joints.iter()
+            .map(|(ah, j)| (ah, j.clone()))
+            .collect();
+
+        let mut constraint_forces: Vec<f64> = vec![0.0; joints.len()];
 
         for _ in 0..iterations {
-            for joint in &joints {
-                match &joint.joint_type {
+            for (ji, (_ah, joint)) in joints.iter().enumerate() {
+                let force = match &joint.joint_type {
                     JointType::Fixed => self.solve_fixed_joint_3d(joint),
                     JointType::Distance { length } => {
-                        self.solve_distance_joint_3d(joint, *length);
+                        self.solve_distance_joint_3d(joint, *length)
                     }
                     JointType::Spring {
                         rest_length,
                         stiffness,
                         damping,
                     } => {
-                        self.solve_spring_joint_3d(joint, *rest_length, *stiffness, *damping, dt);
+                        self.solve_spring_joint_3d(joint, *rest_length, *stiffness, *damping, dt)
                     }
-                    _ => {} // Revolute/Prismatic: 3D versions need axis definitions, skip for now
-                }
+                    JointType::Wheel { axis, stiffness, damping } => {
+                        self.solve_wheel_joint_3d(joint, *axis, *stiffness, *damping, dt)
+                    }
+                    JointType::Rope { max_length } => {
+                        self.solve_rope_joint_3d(joint, *max_length)
+                    }
+                    JointType::Mouse { target, stiffness, damping, max_force } => {
+                        self.solve_mouse_joint_3d(joint, *target, *stiffness, *damping, *max_force, dt)
+                    }
+                    _ => 0.0, // Revolute/Prismatic: 3D versions need axis definitions, skip for now
+                };
+                constraint_forces[ji] = constraint_forces[ji].max(force);
                 // Apply joint damping for non-Spring joints (Spring has its own damping).
                 if joint.damping > 0.0 && !matches!(joint.joint_type, JointType::Spring { .. }) {
                     self.apply_joint_damping_3d(joint, dt);
@@ -1055,6 +1183,19 @@ impl PhysicsState3d {
                 // Motors: applied for Revolute/Prismatic when 3D axis support is added
                 let _ = &joint.motor;
             }
+        }
+
+        // Joint breaking
+        let mut broken: Vec<ArenaHandle> = Vec::new();
+        for (ji, (ah, joint)) in joints.iter().enumerate() {
+            if let Some(bf) = joint.break_force
+                && constraint_forces[ji] > bf
+            {
+                broken.push(*ah);
+            }
+        }
+        for ah in broken {
+            self.joints.remove(ah);
         }
     }
 
@@ -1111,10 +1252,11 @@ impl PhysicsState3d {
         rb.position + rb.rotation * local
     }
 
-    fn solve_fixed_joint_3d(&mut self, joint: &Joint3d) {
+    fn solve_fixed_joint_3d(&mut self, joint: &Joint3d) -> f64 {
         let anchor_a = self.world_anchor_3d(joint.body_a, joint.local_anchor_a);
         let anchor_b = self.world_anchor_3d(joint.body_b, joint.local_anchor_b);
         let diff = anchor_b - anchor_a;
+        let force = diff.length();
 
         if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
             && ba.is_dynamic()
@@ -1126,16 +1268,17 @@ impl PhysicsState3d {
         {
             bb.position -= diff * 0.5;
         }
+        force
     }
 
-    fn solve_distance_joint_3d(&mut self, joint: &Joint3d, length: f64) {
+    fn solve_distance_joint_3d(&mut self, joint: &Joint3d, length: f64) -> f64 {
         let anchor_a = self.world_anchor_3d(joint.body_a, joint.local_anchor_a);
         let anchor_b = self.world_anchor_3d(joint.body_b, joint.local_anchor_b);
         let diff = anchor_b - anchor_a;
         let dist_sq = diff.dot(diff);
 
         if dist_sq < EPSILON_SQ {
-            return;
+            return 0.0;
         }
         let dist = dist_sq.sqrt();
 
@@ -1152,6 +1295,7 @@ impl PhysicsState3d {
         {
             bb.position -= n * correction;
         }
+        (dist - length).abs()
     }
 
     fn solve_spring_joint_3d(
@@ -1161,14 +1305,14 @@ impl PhysicsState3d {
         stiffness: f64,
         damping: f64,
         dt: f64,
-    ) {
+    ) -> f64 {
         let anchor_a = self.world_anchor_3d(joint.body_a, joint.local_anchor_a);
         let anchor_b = self.world_anchor_3d(joint.body_b, joint.local_anchor_b);
         let diff = anchor_b - anchor_a;
         let dist_sq = diff.dot(diff);
 
         if dist_sq < EPSILON_SQ {
-            return;
+            return 0.0;
         }
         let dist = dist_sq.sqrt();
 
@@ -1201,6 +1345,137 @@ impl PhysicsState3d {
         {
             bb.linear_velocity -= force * bb.inv_mass;
         }
+        total_force.abs()
+    }
+
+    /// Wheel joint (3D) — suspension along axis + free rotation.
+    fn solve_wheel_joint_3d(
+        &mut self,
+        joint: &Joint3d,
+        axis: [f64; 2],
+        stiffness: f64,
+        damping: f64,
+        dt: f64,
+    ) -> f64 {
+        let anchor_a = self.world_anchor_3d(joint.body_a, joint.local_anchor_a);
+        let anchor_b = self.world_anchor_3d(joint.body_b, joint.local_anchor_b);
+        let diff = anchor_b - anchor_a;
+
+        let ax_2d_len = (axis[0] * axis[0] + axis[1] * axis[1]).sqrt();
+        if ax_2d_len < EPSILON {
+            return 0.0;
+        }
+        let ax = DVec3::new(axis[0] / ax_2d_len, axis[1] / ax_2d_len, 0.0);
+        let perp = DVec3::new(-ax.y, ax.x, 0.0);
+
+        // Constrain perpendicular
+        let perp_error = diff.dot(perp);
+        let correction = perp_error * 0.5;
+        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
+            && ba.is_dynamic()
+        {
+            ba.position += perp * correction;
+        }
+        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
+            && bb.is_dynamic()
+        {
+            bb.position -= perp * correction;
+        }
+
+        // Spring along axis
+        let along = diff.dot(ax);
+        let spring_force = stiffness * along;
+
+        let vel_a = self.bodies.get(body_ah(joint.body_a)).map(|b| b.linear_velocity).unwrap_or(DVec3::ZERO);
+        let vel_b = self.bodies.get(body_ah(joint.body_b)).map(|b| b.linear_velocity).unwrap_or(DVec3::ZERO);
+        let rel_vel_along = (vel_b - vel_a).dot(ax);
+        let damping_force = damping * rel_vel_along;
+
+        let total_force = spring_force + damping_force;
+        let force = ax * (total_force * dt);
+
+        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
+            && ba.is_dynamic()
+        {
+            ba.linear_velocity += force * ba.inv_mass;
+        }
+        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
+            && bb.is_dynamic()
+        {
+            bb.linear_velocity -= force * bb.inv_mass;
+        }
+        total_force.abs()
+    }
+
+    /// Rope joint (3D) — inequality constraint.
+    fn solve_rope_joint_3d(&mut self, joint: &Joint3d, max_length: f64) -> f64 {
+        let anchor_a = self.world_anchor_3d(joint.body_a, joint.local_anchor_a);
+        let anchor_b = self.world_anchor_3d(joint.body_b, joint.local_anchor_b);
+        let diff = anchor_b - anchor_a;
+        let dist_sq = diff.dot(diff);
+
+        if dist_sq < EPSILON_SQ {
+            return 0.0;
+        }
+        let dist = dist_sq.sqrt();
+
+        if dist <= max_length {
+            return 0.0;
+        }
+
+        let n = diff / dist;
+        let correction = (dist - max_length) * 0.5;
+
+        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
+            && ba.is_dynamic()
+        {
+            ba.position += n * correction;
+        }
+        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
+            && bb.is_dynamic()
+        {
+            bb.position -= n * correction;
+        }
+        dist - max_length
+    }
+
+    /// Mouse joint (3D) — drags body_a toward a world-space target.
+    fn solve_mouse_joint_3d(
+        &mut self,
+        joint: &Joint3d,
+        target: [f64; 3],
+        stiffness: f64,
+        damping: f64,
+        max_force: f64,
+        dt: f64,
+    ) -> f64 {
+        let anchor_a = self.world_anchor_3d(joint.body_a, joint.local_anchor_a);
+        let target_v = DVec3::from_array(target);
+        let diff = target_v - anchor_a;
+
+        if diff.dot(diff) < EPSILON_SQ {
+            return 0.0;
+        }
+
+        let spring_force = diff * stiffness;
+        let vel_a = self.bodies.get(body_ah(joint.body_a)).map(|b| b.linear_velocity).unwrap_or(DVec3::ZERO);
+        let damping_force = vel_a * (-damping);
+        let mut total = (spring_force + damping_force) * dt;
+
+        let force_mag = total.length();
+        let max_impulse = max_force * dt;
+        if force_mag > max_impulse && force_mag > EPSILON {
+            total *= max_impulse / force_mag;
+        }
+
+        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
+            && ba.is_dynamic()
+        {
+            ba.linear_velocity += total * ba.inv_mass;
+        }
+
+        let applied = total.length();
+        if dt > EPSILON { applied / dt } else { 0.0 }
     }
 
     // -----------------------------------------------------------------------
@@ -1223,6 +1498,11 @@ impl PhysicsState3d {
         for pair in &current_pairs {
             if !self.prev_collision_pairs.contains(pair) {
                 events.push(CollisionEvent::Started {
+                    collider_a: pair.0,
+                    collider_b: pair.1,
+                });
+            } else {
+                events.push(CollisionEvent::Ongoing {
                     collider_a: pair.0,
                     collider_b: pair.1,
                 });
@@ -1256,6 +1536,58 @@ impl PhysicsState3d {
         let mut best: Option<(f64, ColliderHandle, DVec3, DVec3)> = None;
 
         for collider in self.colliders.values() {
+            let rb = match self.bodies.get(body_ah(collider.body)) {
+                Some(b) => b,
+                None => continue,
+            };
+            let pos = rb.position + rb.rotation * collider.offset;
+
+            let hit = match &collider.shape {
+                ColliderShape::Ball { radius } => ray_sphere(origin, dir, pos, *radius),
+                ColliderShape::Box { half_extents } => {
+                    let he = DVec3::from_array(*half_extents);
+                    ray_aabb_3d(origin, dir, pos - he, pos + he)
+                }
+                _ => None,
+            };
+
+            if let Some((t, normal)) = hit
+                && t >= 0.0
+                && t <= max_dist
+                && (best.is_none() || t < best.as_ref().unwrap().0)
+            {
+                let point = origin + dir * t;
+                best = Some((t, collider.handle, point, normal));
+            }
+        }
+
+        best.map(|(distance, collider, point, normal)| RayHit {
+            collider,
+            point: point.to_array(),
+            normal: normal.to_array(),
+            distance,
+        })
+    }
+
+    /// Cast a ray with a collision layer filter. Only colliders whose
+    /// `collision_layer` has at least one bit in common with `layer_mask`
+    /// are considered.
+    pub fn raycast_filtered(
+        &self,
+        origin: [f64; 3],
+        direction: [f64; 3],
+        max_dist: f64,
+        layer_mask: u32,
+    ) -> Option<RayHit> {
+        let origin = DVec3::from_array(origin);
+        let dir = DVec3::from_array(direction).normalize_or(DVec3::Y);
+
+        let mut best: Option<(f64, ColliderHandle, DVec3, DVec3)> = None;
+
+        for collider in self.colliders.values() {
+            if (collider.collision_layer & layer_mask) == 0 {
+                continue;
+            }
             let rb = match self.bodies.get(body_ah(collider.body)) {
                 Some(b) => b,
                 None => continue,
@@ -2411,6 +2743,7 @@ mod tests {
             local_anchor_b: [0.0, 0.0],
             motor: None,
             damping: 0.0,
+            break_force: None,
         });
 
         for _ in 0..10 {

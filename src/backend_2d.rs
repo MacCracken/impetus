@@ -50,6 +50,10 @@ const SLEEP_TIME_THRESHOLD: f64 = 0.5;
 const MIN_MASS: f64 = 1e-6;
 /// Minimum inertia to avoid division by zero.
 const MIN_INERTIA: f64 = 1e-10;
+/// Distance threshold for matching manifold points across frames (body-local coords).
+const MANIFOLD_MATCH_THRESHOLD: f64 = 0.02;
+/// Warm starting scale factor — slightly less than 1.0 for stability.
+const WARM_START_FACTOR: f64 = 0.95;
 
 // ---------------------------------------------------------------------------
 // Internal body representation
@@ -361,6 +365,7 @@ pub(crate) struct Joint2d {
     pub local_anchor_b: [f64; 2],
     pub motor: Option<JointMotor>,
     pub damping: f64,
+    pub break_force: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -402,6 +407,39 @@ pub(crate) struct Contact {
 }
 
 // ---------------------------------------------------------------------------
+// Persistent contact manifold types
+// ---------------------------------------------------------------------------
+
+/// A cached contact point with accumulated impulses for warm starting.
+#[derive(Debug, Clone)]
+struct ManifoldPoint {
+    /// Contact point in body A's local space.
+    local_a: [f64; 2],
+    /// Contact point in body B's local space.
+    local_b: [f64; 2],
+    /// Accumulated normal impulse (for warm starting).
+    normal_impulse: f64,
+    /// Accumulated tangent impulse (for warm starting).
+    tangent_impulse: f64,
+    /// Penetration depth.
+    depth: f64,
+}
+
+/// A contact manifold between two colliders, persisted across frames.
+#[derive(Debug, Clone)]
+struct ContactManifold {
+    collider_a: ColliderHandle,
+    collider_b: ColliderHandle,
+    body_a: BodyHandle,
+    body_b: BodyHandle,
+    normal: [f64; 2],
+    points: Vec<ManifoldPoint>, // Up to 1 point (single-point manifolds for now)
+}
+
+/// Key for looking up manifolds between collider pairs.
+type ManifoldKey = (ColliderHandle, ColliderHandle);
+
+// ---------------------------------------------------------------------------
 // Physics state
 // ---------------------------------------------------------------------------
 
@@ -410,7 +448,10 @@ pub(crate) struct PhysicsState2d {
     pub colliders: Arena<Collider2d>,
     pub joints: Arena<Joint2d>,
     pub body_colliders: BTreeMap<BodyHandle, Vec<ColliderHandle>>,
-    prev_collision_pairs: BTreeSet<(ColliderHandle, ColliderHandle)>,
+    /// Persistent contact manifolds keyed by ordered collider pair.
+    manifolds: BTreeMap<ManifoldKey, ContactManifold>,
+    /// Previous frame's manifold keys for collision event generation.
+    prev_manifold_keys: BTreeSet<ManifoldKey>,
 }
 
 impl PhysicsState2d {
@@ -420,7 +461,8 @@ impl PhysicsState2d {
             colliders: Arena::new(),
             joints: Arena::new(),
             body_colliders: BTreeMap::new(),
-            prev_collision_pairs: BTreeSet::new(),
+            manifolds: BTreeMap::new(),
+            prev_manifold_keys: BTreeSet::new(),
         }
     }
 
@@ -475,6 +517,7 @@ impl PhysicsState2d {
             local_anchor_b: desc.local_anchor_b,
             motor: desc.motor.clone(),
             damping: desc.damping,
+            break_force: desc.break_force,
         });
         joint_from(ah)
     }
@@ -525,12 +568,63 @@ impl PhysicsState2d {
             for ch in &collider_handles {
                 self.colliders.remove(coll_ah(*ch));
             }
-            // Clean stale collision pairs referencing removed colliders
-            self.prev_collision_pairs
-                .retain(|(a, b)| !collider_handles.contains(a) && !collider_handles.contains(b));
+            // Clean stale manifolds referencing removed colliders
+            self.manifolds
+                .retain(|(a, b), _| !collider_handles.contains(a) && !collider_handles.contains(b));
         }
         self.joints
             .retain(|_, j| j.body_a != handle && j.body_b != handle);
+    }
+
+    /// Remove a single collider and recompute the parent body's mass properties.
+    pub fn remove_collider(&mut self, handle: ColliderHandle) -> Result<(), ImpetusError> {
+        let collider = self.colliders.remove(coll_ah(handle))
+            .ok_or_else(|| ImpetusError::ColliderNotFound(format!("{:?}", handle)))?;
+        let body = collider.body;
+
+        // Remove from parent body's collider list
+        if let Some(list) = self.body_colliders.get_mut(&body) {
+            list.retain(|ch| *ch != handle);
+        }
+
+        // Clean stale manifolds
+        self.manifolds
+            .retain(|(a, b), _| *a != handle && *b != handle);
+
+        // Recompute mass/inertia from remaining colliders
+        if let Some(rb) = self.bodies.get_mut(body_ah(body))
+            && rb.is_dynamic()
+        {
+            let mut mass = 0.0_f64;
+            let mut inertia = 0.0_f64;
+            if let Some(collider_handles) = self.body_colliders.get(&body) {
+                for ch in collider_handles {
+                    if let Some(c) = self.colliders.get(coll_ah(*ch)) {
+                        let cm = c.compute_mass();
+                        mass += cm;
+                        inertia += c.compute_inertia(cm);
+                    }
+                }
+            }
+            rb.mass = mass;
+            rb.inertia = inertia;
+            if mass > 0.0 {
+                rb.inv_mass = 1.0 / mass;
+                rb.inv_inertia = if rb.fixed_rotation { 0.0 } else { 1.0 / inertia };
+            } else {
+                rb.inv_mass = 0.0;
+                rb.inv_inertia = 0.0;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove a joint by handle.
+    pub fn remove_joint(&mut self, handle: JointHandle) -> Result<(), ImpetusError> {
+        self.joints.remove(joint_ah(handle))
+            .ok_or_else(|| ImpetusError::JointNotFound(format!("{:?}", handle)))?;
+        Ok(())
     }
 
     /// Insert a body at a specific handle (for snapshot restore).
@@ -571,6 +665,7 @@ impl PhysicsState2d {
             local_anchor_b: desc.local_anchor_b,
             motor: desc.motor.clone(),
             damping: desc.damping,
+            break_force: desc.break_force,
         });
     }
 
@@ -653,27 +748,30 @@ impl PhysicsState2d {
         // 2. Broadphase
         let broad_pairs = self.broadphase();
 
-        // 3. Narrowphase
+        // 3. Narrowphase — raw contacts
         let contacts = self.narrowphase(&broad_pairs);
 
-        // 4. Wake sleeping bodies on contact with non-sleeping moving bodies
-        for contact in &contacts {
+        // 4. Update manifold cache (match contacts to existing manifolds)
+        self.update_manifolds(&contacts);
+
+        // 5. Wake sleeping bodies on contact with non-sleeping moving bodies
+        for manifold in self.manifolds.values() {
             let a_sleeping = self
                 .bodies
-                .get(body_ah(contact.body_a))
+                .get(body_ah(manifold.body_a))
                 .is_some_and(|b| b.is_sleeping);
             let b_sleeping = self
                 .bodies
-                .get(body_ah(contact.body_b))
+                .get(body_ah(manifold.body_b))
                 .is_some_and(|b| b.is_sleeping);
-            let a_moving = self.bodies.get(body_ah(contact.body_a)).is_some_and(|b| {
+            let a_moving = self.bodies.get(body_ah(manifold.body_a)).is_some_and(|b| {
                 !b.is_sleeping
                     && b.is_dynamic()
                     && (b.linear_velocity[0].abs() > SLEEP_VELOCITY_THRESHOLD
                         || b.linear_velocity[1].abs() > SLEEP_VELOCITY_THRESHOLD
                         || b.angular_velocity.abs() > SLEEP_VELOCITY_THRESHOLD)
             });
-            let b_moving = self.bodies.get(body_ah(contact.body_b)).is_some_and(|b| {
+            let b_moving = self.bodies.get(body_ah(manifold.body_b)).is_some_and(|b| {
                 !b.is_sleeping
                     && b.is_dynamic()
                     && (b.linear_velocity[0].abs() > SLEEP_VELOCITY_THRESHOLD
@@ -682,35 +780,38 @@ impl PhysicsState2d {
             });
             if a_sleeping
                 && b_moving
-                && let Some(ba) = self.bodies.get_mut(body_ah(contact.body_a))
+                && let Some(ba) = self.bodies.get_mut(body_ah(manifold.body_a))
             {
                 ba.is_sleeping = false;
                 ba.sleep_timer = 0.0;
             }
             if b_sleeping
                 && a_moving
-                && let Some(bb) = self.bodies.get_mut(body_ah(contact.body_b))
+                && let Some(bb) = self.bodies.get_mut(body_ah(manifold.body_b))
             {
                 bb.is_sleeping = false;
                 bb.sleep_timer = 0.0;
             }
         }
 
-        // 5. Solve velocity constraints
-        self.solve_contacts(&contacts, velocity_iterations);
+        // 6. Warm start — apply cached impulses from previous frame
+        self.warm_start();
 
-        // 6. Solve joint constraints
+        // 7. Solve velocity constraints (using manifolds with accumulation)
+        self.solve_contacts(velocity_iterations);
+
+        // 8. Solve joint constraints
         self.solve_joints(dt, velocity_iterations);
 
-        // 7. Positional correction
-        self.solve_positions(&contacts, position_iterations, slop, correction);
+        // 9. Positional correction
+        self.solve_positions(position_iterations, slop, correction);
 
-        // 8. Integrate positions
+        // 10. Integrate positions
         for rb in self.bodies.values_mut() {
             rb.integrate_positions(dt);
         }
 
-        // 9. Sleep check: put nearly-stationary dynamic bodies to sleep
+        // 11. Sleep check: put nearly-stationary dynamic bodies to sleep
         for rb in self.bodies.values_mut() {
             if !rb.is_dynamic() || rb.inv_mass == 0.0 {
                 continue;
@@ -730,13 +831,13 @@ impl PhysicsState2d {
             }
         }
 
-        // 10. Clear forces
+        // 12. Clear forces
         for rb in self.bodies.values_mut() {
             rb.clear_forces();
         }
 
-        // 11. Generate collision events
-        self.generate_events(&contacts)
+        // 13. Generate collision events (from manifold keys)
+        self.generate_events()
     }
 
     // -----------------------------------------------------------------------
@@ -866,140 +967,456 @@ impl PhysicsState2d {
     }
 
     // -----------------------------------------------------------------------
-    // Contact constraint solver with friction and angular response
+    // Manifold update — match new contacts to existing manifolds
     // -----------------------------------------------------------------------
 
-    fn solve_contacts(&mut self, contacts: &[Contact], iterations: u32) {
-        // Pre-extract material properties to avoid repeated BTreeMap lookups
-        struct ContactMaterial {
+    fn update_manifolds(&mut self, contacts: &[Contact]) {
+        // Track which manifold keys appear in this frame's contacts
+        let mut current_keys: BTreeSet<ManifoldKey> = BTreeSet::new();
+
+        for contact in contacts {
+            let key = ordered_manifold_key(contact.collider_a, contact.collider_b);
+            current_keys.insert(key);
+
+            // Transform contact point to body-local coordinates
+            let (local_a, local_b) = {
+                let pos_a = self.bodies.get(body_ah(contact.body_a))
+                    .map(|b| (b.position, b.rotation))
+                    .unwrap_or(([0.0, 0.0], 0.0));
+                let pos_b = self.bodies.get(body_ah(contact.body_b))
+                    .map(|b| (b.position, b.rotation))
+                    .unwrap_or(([0.0, 0.0], 0.0));
+                (
+                    world_to_local(contact.point, pos_a.0, pos_a.1),
+                    world_to_local(contact.point, pos_b.0, pos_b.1),
+                )
+            };
+
+            if let Some(manifold) = self.manifolds.get_mut(&key) {
+                // Existing manifold — update normal and match points
+                manifold.normal = if key.0 == contact.collider_a {
+                    contact.normal
+                } else {
+                    [-contact.normal[0], -contact.normal[1]]
+                };
+                manifold.body_a = if key.0 == contact.collider_a { contact.body_a } else { contact.body_b };
+                manifold.body_b = if key.0 == contact.collider_a { contact.body_b } else { contact.body_a };
+
+                let new_local_a = if key.0 == contact.collider_a { local_a } else { local_b };
+                let new_local_b = if key.0 == contact.collider_a { local_b } else { local_a };
+
+                // Try to match the new contact point to an existing manifold point
+                let mut best_idx: Option<usize> = None;
+                let mut best_dist_sq = MANIFOLD_MATCH_THRESHOLD * MANIFOLD_MATCH_THRESHOLD;
+                for (i, mp) in manifold.points.iter().enumerate() {
+                    let dx = mp.local_a[0] - new_local_a[0];
+                    let dy = mp.local_a[1] - new_local_a[1];
+                    let dist_sq = dx * dx + dy * dy;
+                    if dist_sq < best_dist_sq {
+                        best_dist_sq = dist_sq;
+                        best_idx = Some(i);
+                    }
+                }
+
+                if let Some(idx) = best_idx {
+                    // Update the matched point, preserving accumulated impulses
+                    manifold.points[idx].local_a = new_local_a;
+                    manifold.points[idx].local_b = new_local_b;
+                    manifold.points[idx].depth = contact.depth;
+                } else {
+                    // New point — zero impulses
+                    manifold.points.clear(); // single-point manifold: replace
+                    manifold.points.push(ManifoldPoint {
+                        local_a: new_local_a,
+                        local_b: new_local_b,
+                        normal_impulse: 0.0,
+                        tangent_impulse: 0.0,
+                        depth: contact.depth,
+                    });
+                }
+            } else {
+                // New manifold
+                let (ca, cb, ba, bb, normal, la, lb) = if key.0 == contact.collider_a {
+                    (contact.collider_a, contact.collider_b, contact.body_a, contact.body_b, contact.normal, local_a, local_b)
+                } else {
+                    (contact.collider_b, contact.collider_a, contact.body_b, contact.body_a,
+                     [-contact.normal[0], -contact.normal[1]], local_b, local_a)
+                };
+                self.manifolds.insert(key, ContactManifold {
+                    collider_a: ca,
+                    collider_b: cb,
+                    body_a: ba,
+                    body_b: bb,
+                    normal,
+                    points: vec![ManifoldPoint {
+                        local_a: la,
+                        local_b: lb,
+                        normal_impulse: 0.0,
+                        tangent_impulse: 0.0,
+                        depth: contact.depth,
+                    }],
+                });
+            }
+        }
+
+        // Remove manifolds for pairs no longer in contact
+        self.manifolds.retain(|k, _| current_keys.contains(k));
+    }
+
+    // -----------------------------------------------------------------------
+    // Warm starting — apply cached impulses from previous frame
+    // -----------------------------------------------------------------------
+
+    fn warm_start(&mut self) {
+        // Collect warm-start data to avoid borrow conflicts
+        struct WarmData {
+            body_a: BodyHandle,
+            body_b: BodyHandle,
+            impulse_n: [f64; 2],
+            impulse_t: [f64; 2],
+            ra_cross_n: f64,
+            rb_cross_n: f64,
+            ra_cross_t: f64,
+            rb_cross_t: f64,
+            j_n: f64,
+            jt: f64,
+        }
+
+        let warm_data: Vec<WarmData> = self.manifolds.values().flat_map(|manifold| {
+            let pos_a = self.bodies.get(body_ah(manifold.body_a))
+                .map(|b| b.position)
+                .unwrap_or([0.0, 0.0]);
+            let pos_b = self.bodies.get(body_ah(manifold.body_b))
+                .map(|b| b.position)
+                .unwrap_or([0.0, 0.0]);
+
+            // Check if this is a sensor contact
+            let is_sensor = match (
+                self.colliders.get(coll_ah(manifold.collider_a)),
+                self.colliders.get(coll_ah(manifold.collider_b)),
+            ) {
+                (Some(a), Some(b)) => a.is_sensor || b.is_sensor,
+                _ => false,
+            };
+            if is_sensor {
+                return Vec::new();
+            }
+
+            let n = manifold.normal;
+            let tangent = [-n[1], n[0]];
+
+            manifold.points.iter().filter_map(|mp| {
+                let j_n = mp.normal_impulse * WARM_START_FACTOR;
+                let jt = mp.tangent_impulse * WARM_START_FACTOR;
+                if j_n.abs() < EPSILON && jt.abs() < EPSILON {
+                    return None;
+                }
+
+                // Reconstruct world-space contact point from body A's local coords
+                let rot_a = self.bodies.get(body_ah(manifold.body_a))
+                    .map(|b| b.rotation).unwrap_or(0.0);
+                let cp = local_to_world(mp.local_a, pos_a, rot_a);
+
+                let ra = [cp[0] - pos_a[0], cp[1] - pos_a[1]];
+                let rb = [cp[0] - pos_b[0], cp[1] - pos_b[1]];
+
+                Some(WarmData {
+                    body_a: manifold.body_a,
+                    body_b: manifold.body_b,
+                    impulse_n: [j_n * n[0], j_n * n[1]],
+                    impulse_t: [jt * tangent[0], jt * tangent[1]],
+                    ra_cross_n: ra[0] * n[1] - ra[1] * n[0],
+                    rb_cross_n: rb[0] * n[1] - rb[1] * n[0],
+                    ra_cross_t: ra[0] * tangent[1] - ra[1] * tangent[0],
+                    rb_cross_t: rb[0] * tangent[1] - rb[1] * tangent[0],
+                    j_n,
+                    jt,
+                })
+            }).collect::<Vec<_>>()
+        }).collect();
+
+        for wd in &warm_data {
+            let total_impulse = [
+                wd.impulse_n[0] + wd.impulse_t[0],
+                wd.impulse_n[1] + wd.impulse_t[1],
+            ];
+            if let Some(ba) = self.bodies.get_mut(body_ah(wd.body_a))
+                && ba.is_dynamic()
+            {
+                ba.linear_velocity[0] -= total_impulse[0] * ba.inv_mass;
+                ba.linear_velocity[1] -= total_impulse[1] * ba.inv_mass;
+                ba.angular_velocity -= (wd.ra_cross_n * wd.j_n + wd.ra_cross_t * wd.jt) * ba.inv_inertia;
+            }
+            if let Some(bb) = self.bodies.get_mut(body_ah(wd.body_b))
+                && bb.is_dynamic()
+            {
+                bb.linear_velocity[0] += total_impulse[0] * bb.inv_mass;
+                bb.linear_velocity[1] += total_impulse[1] * bb.inv_mass;
+                bb.angular_velocity += (wd.rb_cross_n * wd.j_n + wd.rb_cross_t * wd.jt) * bb.inv_inertia;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Contact constraint solver with accumulated impulses, friction, angular response
+    // -----------------------------------------------------------------------
+
+    fn solve_contacts(&mut self, iterations: u32) {
+        use crate::material::CombineRule;
+
+        /// Velocity threshold below which restitution is zeroed to prevent
+        /// micro-bouncing of resting objects.
+        const RESTITUTION_VELOCITY_THRESHOLD: f64 = 1.0;
+
+        // Pre-extract material properties per manifold to avoid repeated lookups
+        struct ManifoldMaterial {
             restitution: f64,
             friction: f64,
+            rolling_friction: f64,
             is_sensor: bool,
         }
-        let materials: Vec<ContactMaterial> = contacts
-            .iter()
-            .map(|c| {
-                let (rest, fric, sensor) = match (
-                    self.colliders.get(coll_ah(c.collider_a)),
-                    self.colliders.get(coll_ah(c.collider_b)),
-                ) {
-                    (Some(a), Some(b)) => (
-                        a.material.restitution.min(b.material.restitution),
-                        (a.material.friction * b.material.friction).sqrt(),
-                        a.is_sensor || b.is_sensor,
+
+        /// Pick the higher-priority combine rule, then apply it.
+        fn combine_property(a: f64, b: f64, rule_a: CombineRule, rule_b: CombineRule) -> f64 {
+            let rule = rule_a.max(rule_b);
+            rule.combine(a, b)
+        }
+
+        let keys: Vec<ManifoldKey> = self.manifolds.keys().copied().collect();
+        let materials: Vec<ManifoldMaterial> = keys.iter().map(|key| {
+            let manifold = &self.manifolds[key];
+            let (rest, fric, roll_fric, sensor) = match (
+                self.colliders.get(coll_ah(manifold.collider_a)),
+                self.colliders.get(coll_ah(manifold.collider_b)),
+            ) {
+                (Some(a), Some(b)) => (
+                    combine_property(
+                        a.material.restitution,
+                        b.material.restitution,
+                        a.material.restitution_combine,
+                        b.material.restitution_combine,
                     ),
-                    _ => (0.0, 0.0, false),
-                };
-                ContactMaterial {
-                    restitution: rest,
-                    friction: fric,
-                    is_sensor: sensor,
-                }
-            })
-            .collect();
+                    combine_property(
+                        a.material.friction,
+                        b.material.friction,
+                        a.material.friction_combine,
+                        b.material.friction_combine,
+                    ),
+                    (a.material.rolling_friction + b.material.rolling_friction) * 0.5,
+                    a.is_sensor || b.is_sensor,
+                ),
+                _ => (0.0, 0.0, 0.0, false),
+            };
+            ManifoldMaterial {
+                restitution: rest,
+                friction: fric,
+                rolling_friction: roll_fric,
+                is_sensor: sensor,
+            }
+        }).collect();
 
         for _ in 0..iterations {
-            for (ci, contact) in contacts.iter().enumerate() {
-                // Sensors generate events but no physical response
-                if materials[ci].is_sensor {
+            for (ki, key) in keys.iter().enumerate() {
+                if materials[ki].is_sensor {
                     continue;
                 }
 
-                let (inv_mass_a, inv_inertia_a, vel_a, angvel_a, pos_a) = {
-                    let ba = match self.bodies.get(body_ah(contact.body_a)) {
-                        Some(b) => b,
-                        None => continue,
-                    };
-                    (ba.inv_mass, ba.inv_inertia, ba.linear_velocity, ba.angular_velocity, ba.position)
+                let manifold = match self.manifolds.get(key) {
+                    Some(m) => m,
+                    None => continue,
                 };
-                let (inv_mass_b, inv_inertia_b, vel_b, angvel_b, pos_b) = {
-                    let bb = match self.bodies.get(body_ah(contact.body_b)) {
+
+                let (inv_mass_a, inv_inertia_a, pos_a, rot_a) = {
+                    let ba = match self.bodies.get(body_ah(manifold.body_a)) {
                         Some(b) => b,
                         None => continue,
                     };
-                    (bb.inv_mass, bb.inv_inertia, bb.linear_velocity, bb.angular_velocity, bb.position)
+                    (ba.inv_mass, ba.inv_inertia, ba.position, ba.rotation)
+                };
+                let (inv_mass_b, inv_inertia_b, pos_b) = {
+                    let bb = match self.bodies.get(body_ah(manifold.body_b)) {
+                        Some(b) => b,
+                        None => continue,
+                    };
+                    (bb.inv_mass, bb.inv_inertia, bb.position)
                 };
 
                 if inv_mass_a == 0.0 && inv_mass_b == 0.0 {
                     continue;
                 }
 
-                let n = contact.normal;
-                let cp = contact.point;
-                let ra = [cp[0] - pos_a[0], cp[1] - pos_a[1]];
-                let rb = [cp[0] - pos_b[0], cp[1] - pos_b[1]];
+                let n = manifold.normal;
+                let body_a_handle = manifold.body_a;
+                let body_b_handle = manifold.body_b;
+                let num_points = manifold.points.len();
 
-                // Relative velocity at contact point (including angular)
-                let vel_a_at_cp = [
-                    vel_a[0] - angvel_a * ra[1],
-                    vel_a[1] + angvel_a * ra[0],
-                ];
-                let vel_b_at_cp = [
-                    vel_b[0] - angvel_b * rb[1],
-                    vel_b[1] + angvel_b * rb[0],
-                ];
-                let rel_vel = [vel_b_at_cp[0] - vel_a_at_cp[0], vel_b_at_cp[1] - vel_a_at_cp[1]];
-                let vel_along_normal = rel_vel[0] * n[0] + rel_vel[1] * n[1];
+                // Process each manifold point
+                for pi in 0..num_points {
+                    let mp = &self.manifolds[key].points[pi];
 
-                if vel_along_normal > 0.0 {
-                    continue;
-                }
+                    // Reconstruct world-space contact point from body A's local coords
+                    let cp = local_to_world(mp.local_a, pos_a, rot_a);
+                    let ra = [cp[0] - pos_a[0], cp[1] - pos_a[1]];
+                    let rb = [cp[0] - pos_b[0], cp[1] - pos_b[1]];
 
-                // Angular effective mass
-                let ra_cross_n = ra[0] * n[1] - ra[1] * n[0];
-                let rb_cross_n = rb[0] * n[1] - rb[1] * n[0];
-                let inv_mass_sum = inv_mass_a + inv_mass_b
-                    + ra_cross_n * ra_cross_n * inv_inertia_a
-                    + rb_cross_n * rb_cross_n * inv_inertia_b;
+                    // Re-read velocities (they change during iteration)
+                    let (vel_a, angvel_a) = {
+                        let ba = match self.bodies.get(body_ah(body_a_handle)) {
+                            Some(b) => b,
+                            None => continue,
+                        };
+                        (ba.linear_velocity, ba.angular_velocity)
+                    };
+                    let (vel_b, angvel_b) = {
+                        let bb = match self.bodies.get(body_ah(body_b_handle)) {
+                            Some(b) => b,
+                            None => continue,
+                        };
+                        (bb.linear_velocity, bb.angular_velocity)
+                    };
 
-                // Normal impulse
-                let j = -(1.0 + materials[ci].restitution) * vel_along_normal / inv_mass_sum;
-                let impulse_n = [j * n[0], j * n[1]];
+                    // Relative velocity at contact point (including angular)
+                    let vel_a_at_cp = [
+                        vel_a[0] - angvel_a * ra[1],
+                        vel_a[1] + angvel_a * ra[0],
+                    ];
+                    let vel_b_at_cp = [
+                        vel_b[0] - angvel_b * rb[1],
+                        vel_b[1] + angvel_b * rb[0],
+                    ];
+                    let rel_vel = [vel_b_at_cp[0] - vel_a_at_cp[0], vel_b_at_cp[1] - vel_a_at_cp[1]];
+                    let vel_along_normal = rel_vel[0] * n[0] + rel_vel[1] * n[1];
 
-                if let Some(ba) = self.bodies.get_mut(body_ah(contact.body_a))
-                    && ba.is_dynamic()
-                {
-                    ba.linear_velocity[0] -= impulse_n[0] * ba.inv_mass;
-                    ba.linear_velocity[1] -= impulse_n[1] * ba.inv_mass;
-                    ba.angular_velocity -= ra_cross_n * j * ba.inv_inertia;
-                }
-                if let Some(bb) = self.bodies.get_mut(body_ah(contact.body_b))
-                    && bb.is_dynamic()
-                {
-                    bb.linear_velocity[0] += impulse_n[0] * bb.inv_mass;
-                    bb.linear_velocity[1] += impulse_n[1] * bb.inv_mass;
-                    bb.angular_velocity += rb_cross_n * j * bb.inv_inertia;
-                }
+                    // Angular effective mass
+                    let ra_cross_n = ra[0] * n[1] - ra[1] * n[0];
+                    let rb_cross_n = rb[0] * n[1] - rb[1] * n[0];
+                    let inv_mass_sum = inv_mass_a + inv_mass_b
+                        + ra_cross_n * ra_cross_n * inv_inertia_a
+                        + rb_cross_n * rb_cross_n * inv_inertia_b;
 
-                // Friction impulse
-                let friction = materials[ci].friction;
-                if friction > 0.0 {
-                    let tangent = [-n[1], n[0]];
-                    let vel_along_tangent = rel_vel[0] * tangent[0] + rel_vel[1] * tangent[1];
+                    // Normal impulse with accumulation
+                    // Suppress restitution at low velocities to prevent micro-bouncing.
+                    let restitution = if vel_along_normal.abs() < RESTITUTION_VELOCITY_THRESHOLD {
+                        0.0
+                    } else {
+                        materials[ki].restitution
+                    };
+                    let j_new = -(1.0 + restitution) * vel_along_normal / inv_mass_sum;
+                    let j_old = self.manifolds[key].points[pi].normal_impulse;
+                    let j_accumulated = (j_old + j_new).max(0.0);
+                    let j_applied = j_accumulated - j_old;
+                    self.manifolds.get_mut(key).unwrap().points[pi].normal_impulse = j_accumulated;
 
-                    let ra_cross_t = ra[0] * tangent[1] - ra[1] * tangent[0];
-                    let rb_cross_t = rb[0] * tangent[1] - rb[1] * tangent[0];
-                    let inv_mass_sum_t = inv_mass_a + inv_mass_b
-                        + ra_cross_t * ra_cross_t * inv_inertia_a
-                        + rb_cross_t * rb_cross_t * inv_inertia_b;
+                    let impulse_n = [j_applied * n[0], j_applied * n[1]];
 
-                    let jt = (-vel_along_tangent / inv_mass_sum_t)
-                        .clamp(-j.abs() * friction, j.abs() * friction);
-                    let impulse_t = [jt * tangent[0], jt * tangent[1]];
-
-                    if let Some(ba) = self.bodies.get_mut(body_ah(contact.body_a))
+                    if let Some(ba) = self.bodies.get_mut(body_ah(body_a_handle))
                         && ba.is_dynamic()
                     {
-                        ba.linear_velocity[0] -= impulse_t[0] * ba.inv_mass;
-                        ba.linear_velocity[1] -= impulse_t[1] * ba.inv_mass;
-                        ba.angular_velocity -= ra_cross_t * jt * ba.inv_inertia;
+                        ba.linear_velocity[0] -= impulse_n[0] * ba.inv_mass;
+                        ba.linear_velocity[1] -= impulse_n[1] * ba.inv_mass;
+                        ba.angular_velocity -= ra_cross_n * j_applied * ba.inv_inertia;
                     }
-                    if let Some(bb) = self.bodies.get_mut(body_ah(contact.body_b))
+                    if let Some(bb) = self.bodies.get_mut(body_ah(body_b_handle))
                         && bb.is_dynamic()
                     {
-                        bb.linear_velocity[0] += impulse_t[0] * bb.inv_mass;
-                        bb.linear_velocity[1] += impulse_t[1] * bb.inv_mass;
-                        bb.angular_velocity += rb_cross_t * jt * bb.inv_inertia;
+                        bb.linear_velocity[0] += impulse_n[0] * bb.inv_mass;
+                        bb.linear_velocity[1] += impulse_n[1] * bb.inv_mass;
+                        bb.angular_velocity += rb_cross_n * j_applied * bb.inv_inertia;
+                    }
+
+                    // Friction impulse with accumulation
+                    let friction = materials[ki].friction;
+                    if friction > 0.0 {
+                        // Re-read velocities after normal impulse application
+                        let (vel_a, angvel_a) = {
+                            let ba = match self.bodies.get(body_ah(body_a_handle)) {
+                                Some(b) => b,
+                                None => continue,
+                            };
+                            (ba.linear_velocity, ba.angular_velocity)
+                        };
+                        let (vel_b, angvel_b) = {
+                            let bb = match self.bodies.get(body_ah(body_b_handle)) {
+                                Some(b) => b,
+                                None => continue,
+                            };
+                            (bb.linear_velocity, bb.angular_velocity)
+                        };
+
+                        let vel_a_at_cp = [
+                            vel_a[0] - angvel_a * ra[1],
+                            vel_a[1] + angvel_a * ra[0],
+                        ];
+                        let vel_b_at_cp = [
+                            vel_b[0] - angvel_b * rb[1],
+                            vel_b[1] + angvel_b * rb[0],
+                        ];
+                        let rel_vel = [vel_b_at_cp[0] - vel_a_at_cp[0], vel_b_at_cp[1] - vel_a_at_cp[1]];
+
+                        let tangent = [-n[1], n[0]];
+                        let vel_along_tangent = rel_vel[0] * tangent[0] + rel_vel[1] * tangent[1];
+
+                        let ra_cross_t = ra[0] * tangent[1] - ra[1] * tangent[0];
+                        let rb_cross_t = rb[0] * tangent[1] - rb[1] * tangent[0];
+                        let inv_mass_sum_t = inv_mass_a + inv_mass_b
+                            + ra_cross_t * ra_cross_t * inv_inertia_a
+                            + rb_cross_t * rb_cross_t * inv_inertia_b;
+
+                        let jt_new = -vel_along_tangent / inv_mass_sum_t;
+                        let jt_old = self.manifolds[key].points[pi].tangent_impulse;
+                        let max_friction = j_accumulated.abs() * friction;
+                        let jt_accumulated = (jt_old + jt_new).clamp(-max_friction, max_friction);
+                        let jt_applied = jt_accumulated - jt_old;
+                        self.manifolds.get_mut(key).unwrap().points[pi].tangent_impulse = jt_accumulated;
+
+                        let impulse_t = [jt_applied * tangent[0], jt_applied * tangent[1]];
+
+                        if let Some(ba) = self.bodies.get_mut(body_ah(body_a_handle))
+                            && ba.is_dynamic()
+                        {
+                            ba.linear_velocity[0] -= impulse_t[0] * ba.inv_mass;
+                            ba.linear_velocity[1] -= impulse_t[1] * ba.inv_mass;
+                            ba.angular_velocity -= ra_cross_t * jt_applied * ba.inv_inertia;
+                        }
+                        if let Some(bb) = self.bodies.get_mut(body_ah(body_b_handle))
+                            && bb.is_dynamic()
+                        {
+                            bb.linear_velocity[0] += impulse_t[0] * bb.inv_mass;
+                            bb.linear_velocity[1] += impulse_t[1] * bb.inv_mass;
+                            bb.angular_velocity += rb_cross_t * jt_applied * bb.inv_inertia;
+                        }
+                    }
+
+                    // Rolling friction — apply torque opposing angular velocity
+                    let rolling_friction = materials[ki].rolling_friction;
+                    if rolling_friction > 0.0 {
+                        let normal_force = j_accumulated.abs();
+                        let roll_torque = rolling_friction * normal_force;
+
+                        if let Some(ba) = self.bodies.get_mut(body_ah(body_a_handle))
+                            && ba.is_dynamic()
+                            && ba.angular_velocity.abs() > EPSILON
+                        {
+                            let old_sign = ba.angular_velocity > 0.0;
+                            let sign = if old_sign { -1.0 } else { 1.0 };
+                            ba.angular_velocity += sign * roll_torque * ba.inv_inertia;
+                            // Don't reverse direction
+                            if (ba.angular_velocity > 0.0) != old_sign {
+                                ba.angular_velocity = 0.0;
+                            }
+                        }
+                        if let Some(bb) = self.bodies.get_mut(body_ah(body_b_handle))
+                            && bb.is_dynamic()
+                            && bb.angular_velocity.abs() > EPSILON
+                        {
+                            let old_sign = bb.angular_velocity > 0.0;
+                            let sign = if old_sign { -1.0 } else { 1.0 };
+                            bb.angular_velocity += sign * roll_torque * bb.inv_inertia;
+                            // Don't reverse direction
+                            if (bb.angular_velocity > 0.0) != old_sign {
+                                bb.angular_velocity = 0.0;
+                            }
+                        }
                     }
                 }
             }
@@ -1010,41 +1427,58 @@ impl PhysicsState2d {
     // Positional correction (Baumgarte stabilization)
     // -----------------------------------------------------------------------
 
-    fn solve_positions(&mut self, contacts: &[Contact], iterations: u32, slop: f64, percent: f64) {
+    fn solve_positions(&mut self, iterations: u32, slop: f64, percent: f64) {
+        // Collect positional correction data from manifolds
+        struct PosCorrection {
+            body_a: BodyHandle,
+            body_b: BodyHandle,
+            normal: [f64; 2],
+            depth: f64,
+            is_sensor: bool,
+        }
+
+        let corrections: Vec<PosCorrection> = self.manifolds.values().flat_map(|manifold| {
+            let is_sensor = match (
+                self.colliders.get(coll_ah(manifold.collider_a)),
+                self.colliders.get(coll_ah(manifold.collider_b)),
+            ) {
+                (Some(a), Some(b)) => a.is_sensor || b.is_sensor,
+                _ => false,
+            };
+            manifold.points.iter().map(move |mp| PosCorrection {
+                body_a: manifold.body_a,
+                body_b: manifold.body_b,
+                normal: manifold.normal,
+                depth: mp.depth,
+                is_sensor,
+            })
+        }).collect();
 
         for _ in 0..iterations {
-            for contact in contacts {
-                // Skip sensors
-                let is_sensor = match (
-                    self.colliders.get(coll_ah(contact.collider_a)),
-                    self.colliders.get(coll_ah(contact.collider_b)),
-                ) {
-                    (Some(a), Some(b)) => a.is_sensor || b.is_sensor,
-                    _ => false,
-                };
-                if is_sensor {
+            for corr in &corrections {
+                if corr.is_sensor {
                     continue;
                 }
 
-                let inv_mass_a = self.bodies.get(body_ah(contact.body_a)).map(|b| b.inv_mass).unwrap_or(0.0);
-                let inv_mass_b = self.bodies.get(body_ah(contact.body_b)).map(|b| b.inv_mass).unwrap_or(0.0);
+                let inv_mass_a = self.bodies.get(body_ah(corr.body_a)).map(|b| b.inv_mass).unwrap_or(0.0);
+                let inv_mass_b = self.bodies.get(body_ah(corr.body_b)).map(|b| b.inv_mass).unwrap_or(0.0);
                 let inv_mass_sum = inv_mass_a + inv_mass_b;
 
                 if inv_mass_sum == 0.0 {
                     continue;
                 }
 
-                let n = contact.normal;
-                let correction_mag = (contact.depth - slop).max(0.0) / inv_mass_sum * percent;
+                let n = corr.normal;
+                let correction_mag = (corr.depth - slop).max(0.0) / inv_mass_sum * percent;
                 let correction = [correction_mag * n[0], correction_mag * n[1]];
 
-                if let Some(ba) = self.bodies.get_mut(body_ah(contact.body_a))
+                if let Some(ba) = self.bodies.get_mut(body_ah(corr.body_a))
                     && ba.is_dynamic()
                 {
                     ba.position[0] -= correction[0] * ba.inv_mass;
                     ba.position[1] -= correction[1] * ba.inv_mass;
                 }
-                if let Some(bb) = self.bodies.get_mut(body_ah(contact.body_b))
+                if let Some(bb) = self.bodies.get_mut(body_ah(corr.body_b))
                     && bb.is_dynamic()
                 {
                     bb.position[0] += correction[0] * bb.inv_mass;
@@ -1059,40 +1493,72 @@ impl PhysicsState2d {
     // -----------------------------------------------------------------------
 
     fn solve_joints(&mut self, dt: f64, iterations: u32) {
-        let joints: Vec<Joint2d> = self.joints.values().cloned().collect();
+        // Collect (ArenaHandle, Joint2d) pairs so we can track handles for breaking.
+        let joints: Vec<(ArenaHandle, Joint2d)> = self.joints.iter()
+            .map(|(ah, j)| (ah, j.clone()))
+            .collect();
+
+        // Track constraint forces for joint breaking.
+        // We accumulate the maximum constraint force per joint across iterations.
+        let mut constraint_forces: Vec<f64> = vec![0.0; joints.len()];
 
         for _ in 0..iterations {
-            for joint in &joints {
-                match &joint.joint_type {
+            for (ji, (_ah, joint)) in joints.iter().enumerate() {
+                let force = match &joint.joint_type {
                     JointType::Fixed => self.solve_fixed_joint(joint),
                     JointType::Distance { length } => {
-                        self.solve_distance_joint(joint, *length);
+                        self.solve_distance_joint(joint, *length)
                     }
                     JointType::Spring {
                         rest_length,
                         stiffness,
                         damping,
                     } => {
-                        self.solve_spring_joint(joint, *rest_length, *stiffness, *damping, dt);
+                        self.solve_spring_joint(joint, *rest_length, *stiffness, *damping, dt)
                     }
                     JointType::Revolute { limits, .. } => {
-                        self.solve_revolute_joint(joint, limits.as_ref());
+                        let f = self.solve_revolute_joint(joint, limits.as_ref());
                         if let Some(motor) = &joint.motor {
                             self.solve_revolute_motor(joint, motor, dt);
                         }
+                        f
                     }
                     JointType::Prismatic { axis, limits } => {
-                        self.solve_prismatic_joint(joint, *axis, limits.as_ref());
+                        let f = self.solve_prismatic_joint(joint, *axis, limits.as_ref());
                         if let Some(motor) = &joint.motor {
                             self.solve_prismatic_motor(joint, *axis, motor, dt);
                         }
+                        f
                     }
-                }
+                    JointType::Wheel { axis, stiffness, damping } => {
+                        self.solve_wheel_joint(joint, *axis, *stiffness, *damping, dt)
+                    }
+                    JointType::Rope { max_length } => {
+                        self.solve_rope_joint(joint, *max_length)
+                    }
+                    JointType::Mouse { target, stiffness, damping, max_force } => {
+                        self.solve_mouse_joint(joint, *target, *stiffness, *damping, *max_force, dt)
+                    }
+                };
+                constraint_forces[ji] = constraint_forces[ji].max(force);
                 // Apply joint damping for non-Spring joints (Spring has its own damping).
                 if joint.damping > 0.0 && !matches!(joint.joint_type, JointType::Spring { .. }) {
                     self.apply_joint_damping(joint, dt);
                 }
             }
+        }
+
+        // Joint breaking — remove joints whose constraint force exceeded break_force.
+        let mut broken: Vec<ArenaHandle> = Vec::new();
+        for (ji, (ah, joint)) in joints.iter().enumerate() {
+            if let Some(bf) = joint.break_force
+                && constraint_forces[ji] > bf
+            {
+                broken.push(*ah);
+            }
+        }
+        for ah in broken {
+            self.joints.remove(ah);
         }
     }
 
@@ -1273,10 +1739,11 @@ impl PhysicsState2d {
         ]
     }
 
-    fn solve_fixed_joint(&mut self, joint: &Joint2d) {
+    fn solve_fixed_joint(&mut self, joint: &Joint2d) -> f64 {
         let anchor_a = self.world_anchor(joint.body_a, joint.local_anchor_a);
         let anchor_b = self.world_anchor(joint.body_b, joint.local_anchor_b);
         let diff = [anchor_b[0] - anchor_a[0], anchor_b[1] - anchor_a[1]];
+        let force = (diff[0] * diff[0] + diff[1] * diff[1]).sqrt();
 
         if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
             && ba.is_dynamic()
@@ -1290,18 +1757,20 @@ impl PhysicsState2d {
             bb.position[0] -= diff[0] * 0.5;
             bb.position[1] -= diff[1] * 0.5;
         }
+        force
     }
 
-    fn solve_distance_joint(&mut self, joint: &Joint2d, length: f64) {
+    fn solve_distance_joint(&mut self, joint: &Joint2d, length: f64) -> f64 {
         let anchor_a = self.world_anchor(joint.body_a, joint.local_anchor_a);
         let anchor_b = self.world_anchor(joint.body_b, joint.local_anchor_b);
         let diff = [anchor_b[0] - anchor_a[0], anchor_b[1] - anchor_a[1]];
         let dist_sq = diff[0] * diff[0] + diff[1] * diff[1];
 
         if dist_sq < EPSILON_SQ {
-            return;
+            return 0.0;
         }
         let dist = dist_sq.sqrt();
+        let force = (dist - length).abs();
 
         let n = [diff[0] / dist, diff[1] / dist];
         let correction = (dist - length) * 0.5;
@@ -1318,6 +1787,7 @@ impl PhysicsState2d {
             bb.position[0] -= n[0] * correction;
             bb.position[1] -= n[1] * correction;
         }
+        force
     }
 
     fn solve_spring_joint(
@@ -1327,14 +1797,14 @@ impl PhysicsState2d {
         stiffness: f64,
         damping: f64,
         dt: f64,
-    ) {
+    ) -> f64 {
         let anchor_a = self.world_anchor(joint.body_a, joint.local_anchor_a);
         let anchor_b = self.world_anchor(joint.body_b, joint.local_anchor_b);
         let diff = [anchor_b[0] - anchor_a[0], anchor_b[1] - anchor_a[1]];
         let dist_sq = diff[0] * diff[0] + diff[1] * diff[1];
 
         if dist_sq < EPSILON_SQ {
-            return;
+            return 0.0;
         }
         let dist = dist_sq.sqrt();
 
@@ -1369,10 +1839,11 @@ impl PhysicsState2d {
             bb.linear_velocity[0] -= force[0] * bb.inv_mass;
             bb.linear_velocity[1] -= force[1] * bb.inv_mass;
         }
+        total_force.abs()
     }
 
-    fn solve_revolute_joint(&mut self, joint: &Joint2d, limits: Option<&[f64; 2]>) {
-        self.solve_fixed_joint(joint);
+    fn solve_revolute_joint(&mut self, joint: &Joint2d, limits: Option<&[f64; 2]>) -> f64 {
+        let force = self.solve_fixed_joint(joint);
 
         if let Some([lo, hi]) = limits {
             let rot_a = self
@@ -1413,6 +1884,7 @@ impl PhysicsState2d {
                 }
             }
         }
+        force
     }
 
     fn solve_prismatic_joint(
@@ -1420,14 +1892,14 @@ impl PhysicsState2d {
         joint: &Joint2d,
         axis: [f64; 2],
         limits: Option<&[f64; 2]>,
-    ) {
+    ) -> f64 {
         let anchor_a = self.world_anchor(joint.body_a, joint.local_anchor_a);
         let anchor_b = self.world_anchor(joint.body_b, joint.local_anchor_b);
         let diff = [anchor_b[0] - anchor_a[0], anchor_b[1] - anchor_a[1]];
 
         let axis_len = (axis[0] * axis[0] + axis[1] * axis[1]).sqrt();
         if axis_len < EPSILON {
-            return;
+            return 0.0;
         }
         let ax = [axis[0] / axis_len, axis[1] / axis_len];
         let perp = [-ax[1], ax[0]];
@@ -1479,45 +1951,208 @@ impl PhysicsState2d {
                 }
             }
         }
+        perp_error.abs()
+    }
+
+    /// Wheel joint — constrains perpendicular to axis (like prismatic), applies
+    /// spring force along axis, allows free rotation.
+    fn solve_wheel_joint(
+        &mut self,
+        joint: &Joint2d,
+        axis: [f64; 2],
+        stiffness: f64,
+        damping: f64,
+        dt: f64,
+    ) -> f64 {
+        let anchor_a = self.world_anchor(joint.body_a, joint.local_anchor_a);
+        let anchor_b = self.world_anchor(joint.body_b, joint.local_anchor_b);
+        let diff = [anchor_b[0] - anchor_a[0], anchor_b[1] - anchor_a[1]];
+
+        let axis_len = (axis[0] * axis[0] + axis[1] * axis[1]).sqrt();
+        if axis_len < EPSILON {
+            return 0.0;
+        }
+        let ax = [axis[0] / axis_len, axis[1] / axis_len];
+        let perp = [-ax[1], ax[0]];
+
+        // 1. Constrain perpendicular movement (like prismatic)
+        let perp_error = diff[0] * perp[0] + diff[1] * perp[1];
+        let correction = perp_error * 0.5;
+
+        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
+            && ba.is_dynamic()
+        {
+            ba.position[0] += perp[0] * correction;
+            ba.position[1] += perp[1] * correction;
+        }
+        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
+            && bb.is_dynamic()
+        {
+            bb.position[0] -= perp[0] * correction;
+            bb.position[1] -= perp[1] * correction;
+        }
+
+        // 2. Spring force along the axis (suspension)
+        let along = diff[0] * ax[0] + diff[1] * ax[1];
+        let spring_force = stiffness * along;
+
+        let vel_a = self
+            .bodies
+            .get(body_ah(joint.body_a))
+            .map(|b| b.linear_velocity)
+            .unwrap_or([0.0, 0.0]);
+        let vel_b = self
+            .bodies
+            .get(body_ah(joint.body_b))
+            .map(|b| b.linear_velocity)
+            .unwrap_or([0.0, 0.0]);
+        let rel_vel = [vel_b[0] - vel_a[0], vel_b[1] - vel_a[1]];
+        let rel_vel_along = rel_vel[0] * ax[0] + rel_vel[1] * ax[1];
+        let damping_force = damping * rel_vel_along;
+
+        let total_force = spring_force + damping_force;
+        let force = [total_force * ax[0] * dt, total_force * ax[1] * dt];
+
+        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
+            && ba.is_dynamic()
+        {
+            ba.linear_velocity[0] += force[0] * ba.inv_mass;
+            ba.linear_velocity[1] += force[1] * ba.inv_mass;
+        }
+        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
+            && bb.is_dynamic()
+        {
+            bb.linear_velocity[0] -= force[0] * bb.inv_mass;
+            bb.linear_velocity[1] -= force[1] * bb.inv_mass;
+        }
+
+        // No angular constraint — free rotation
+        total_force.abs()
+    }
+
+    /// Rope joint — inequality constraint, only prevents exceeding max distance.
+    fn solve_rope_joint(&mut self, joint: &Joint2d, max_length: f64) -> f64 {
+        let anchor_a = self.world_anchor(joint.body_a, joint.local_anchor_a);
+        let anchor_b = self.world_anchor(joint.body_b, joint.local_anchor_b);
+        let diff = [anchor_b[0] - anchor_a[0], anchor_b[1] - anchor_a[1]];
+        let dist_sq = diff[0] * diff[0] + diff[1] * diff[1];
+
+        if dist_sq < EPSILON_SQ {
+            return 0.0;
+        }
+        let dist = dist_sq.sqrt();
+
+        // Inequality: only act when distance exceeds max_length
+        if dist <= max_length {
+            return 0.0;
+        }
+
+        let n = [diff[0] / dist, diff[1] / dist];
+        let correction = (dist - max_length) * 0.5;
+
+        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
+            && ba.is_dynamic()
+        {
+            ba.position[0] += n[0] * correction;
+            ba.position[1] += n[1] * correction;
+        }
+        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
+            && bb.is_dynamic()
+        {
+            bb.position[0] -= n[0] * correction;
+            bb.position[1] -= n[1] * correction;
+        }
+        dist - max_length
+    }
+
+    /// Mouse joint — drags body_a toward a world-space target with clamped spring force.
+    fn solve_mouse_joint(
+        &mut self,
+        joint: &Joint2d,
+        target: [f64; 3],
+        stiffness: f64,
+        damping: f64,
+        max_force: f64,
+        dt: f64,
+    ) -> f64 {
+        let anchor_a = self.world_anchor(joint.body_a, joint.local_anchor_a);
+        let target_2d = [target[0], target[1]];
+        let diff = [target_2d[0] - anchor_a[0], target_2d[1] - anchor_a[1]];
+        let dist_sq = diff[0] * diff[0] + diff[1] * diff[1];
+
+        if dist_sq < EPSILON_SQ {
+            return 0.0;
+        }
+
+        // Spring force toward target
+        let spring_force = [stiffness * diff[0], stiffness * diff[1]];
+
+        // Damping force
+        let vel_a = self
+            .bodies
+            .get(body_ah(joint.body_a))
+            .map(|b| b.linear_velocity)
+            .unwrap_or([0.0, 0.0]);
+        let damping_force = [-damping * vel_a[0], -damping * vel_a[1]];
+
+        let mut total = [
+            (spring_force[0] + damping_force[0]) * dt,
+            (spring_force[1] + damping_force[1]) * dt,
+        ];
+
+        // Clamp by max_force
+        let force_mag = (total[0] * total[0] + total[1] * total[1]).sqrt();
+        let max_impulse = max_force * dt;
+        if force_mag > max_impulse && force_mag > EPSILON {
+            let scale = max_impulse / force_mag;
+            total[0] *= scale;
+            total[1] *= scale;
+        }
+
+        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
+            && ba.is_dynamic()
+        {
+            ba.linear_velocity[0] += total[0] * ba.inv_mass;
+            ba.linear_velocity[1] += total[1] * ba.inv_mass;
+        }
+
+        let applied = (total[0] * total[0] + total[1] * total[1]).sqrt();
+        if dt > EPSILON { applied / dt } else { 0.0 }
     }
 
     // -----------------------------------------------------------------------
     // Collision event generation
     // -----------------------------------------------------------------------
 
-    fn generate_events(&mut self, contacts: &[Contact]) -> Vec<CollisionEvent> {
+    fn generate_events(&mut self) -> Vec<CollisionEvent> {
         let mut events = Vec::new();
 
-        let current_pairs: BTreeSet<(ColliderHandle, ColliderHandle)> = contacts
-            .iter()
-            .map(|c| {
-                if c.collider_a.0 < c.collider_b.0 {
-                    (c.collider_a, c.collider_b)
-                } else {
-                    (c.collider_b, c.collider_a)
-                }
-            })
-            .collect();
+        let current_keys: BTreeSet<ManifoldKey> = self.manifolds.keys().copied().collect();
 
-        for pair in &current_pairs {
-            if !self.prev_collision_pairs.contains(pair) {
+        for key in &current_keys {
+            if !self.prev_manifold_keys.contains(key) {
                 events.push(CollisionEvent::Started {
-                    collider_a: pair.0,
-                    collider_b: pair.1,
+                    collider_a: key.0,
+                    collider_b: key.1,
+                });
+            } else {
+                events.push(CollisionEvent::Ongoing {
+                    collider_a: key.0,
+                    collider_b: key.1,
                 });
             }
         }
 
-        for pair in &self.prev_collision_pairs {
-            if !current_pairs.contains(pair) {
+        for key in &self.prev_manifold_keys {
+            if !current_keys.contains(key) {
                 events.push(CollisionEvent::Stopped {
-                    collider_a: pair.0,
-                    collider_b: pair.1,
+                    collider_a: key.0,
+                    collider_b: key.1,
                 });
             }
         }
 
-        self.prev_collision_pairs = current_pairs;
+        self.prev_manifold_keys = current_keys;
         events
     }
 
@@ -1542,6 +2177,69 @@ impl PhysicsState2d {
         let mut best: Option<(f64, ColliderHandle, [f64; 2], [f64; 2])> = None;
 
         for collider in self.colliders.values() {
+            let rb = match self.bodies.get(body_ah(collider.body)) {
+                Some(b) => b,
+                None => continue,
+            };
+            let pos = world_pos(rb.position, rb.rotation, collider.offset);
+
+            let hit = match &collider.shape {
+                ColliderShape::Ball { radius } => ray_circle(origin_2d, dir, pos, *radius),
+                ColliderShape::Box { half_extents } => ray_aabb_2d(
+                    origin_2d,
+                    dir,
+                    [pos[0] - half_extents[0], pos[1] - half_extents[1]],
+                    [pos[0] + half_extents[0], pos[1] + half_extents[1]],
+                ),
+                ColliderShape::Capsule {
+                    half_height,
+                    radius,
+                } => ray_capsule(origin_2d, dir, pos, rb.rotation, *half_height, *radius),
+                _ => None,
+            };
+
+            if let Some((t, normal)) = hit
+                && t >= 0.0
+                && t <= max_dist
+                && (best.is_none() || t < best.as_ref().unwrap().0)
+            {
+                let point = [origin_2d[0] + dir[0] * t, origin_2d[1] + dir[1] * t];
+                best = Some((t, collider.handle, point, normal));
+            }
+        }
+
+        best.map(|(distance, collider, point, normal)| RayHit {
+            collider,
+            point: [point[0], point[1], 0.0],
+            normal: [normal[0], normal[1], 0.0],
+            distance,
+        })
+    }
+
+    /// Cast a ray with a collision layer filter. Only colliders whose
+    /// `collision_layer` has at least one bit in common with `layer_mask`
+    /// are considered.
+    pub fn raycast_filtered(
+        &self,
+        origin: [f64; 3],
+        direction: [f64; 3],
+        max_dist: f64,
+        layer_mask: u32,
+    ) -> Option<RayHit> {
+        let origin_2d = [origin[0], origin[1]];
+        let direction_2d = [direction[0], direction[1]];
+        let dir_len = (direction_2d[0] * direction_2d[0] + direction_2d[1] * direction_2d[1]).sqrt();
+        if dir_len < EPSILON {
+            return None;
+        }
+        let dir = [direction_2d[0] / dir_len, direction_2d[1] / dir_len];
+
+        let mut best: Option<(f64, ColliderHandle, [f64; 2], [f64; 2])> = None;
+
+        for collider in self.colliders.values() {
+            if (collider.collision_layer & layer_mask) == 0 {
+                continue;
+            }
             let rb = match self.bodies.get(body_ah(collider.body)) {
                 Some(b) => b,
                 None => continue,
@@ -1690,6 +2388,29 @@ fn world_pos(body_pos: [f64; 2], body_rot: f64, offset: [f64; 2]) -> [f64; 2] {
         body_pos[0] + cos * offset[0] - sin * offset[1],
         body_pos[1] + sin * offset[0] + cos * offset[1],
     ]
+}
+
+/// Transform a world-space point into body-local coordinates.
+fn world_to_local(world_pt: [f64; 2], body_pos: [f64; 2], body_rot: f64) -> [f64; 2] {
+    let dx = world_pt[0] - body_pos[0];
+    let dy = world_pt[1] - body_pos[1];
+    let (sin, cos) = body_rot.sin_cos();
+    // Inverse rotation: transpose of rotation matrix
+    [cos * dx + sin * dy, -sin * dx + cos * dy]
+}
+
+/// Transform a body-local point into world-space coordinates.
+fn local_to_world(local_pt: [f64; 2], body_pos: [f64; 2], body_rot: f64) -> [f64; 2] {
+    let (sin, cos) = body_rot.sin_cos();
+    [
+        body_pos[0] + cos * local_pt[0] - sin * local_pt[1],
+        body_pos[1] + sin * local_pt[0] + cos * local_pt[1],
+    ]
+}
+
+/// Create an ordered manifold key from a collider pair (smaller handle first).
+fn ordered_manifold_key(a: ColliderHandle, b: ColliderHandle) -> ManifoldKey {
+    if a.0 <= b.0 { (a, b) } else { (b, a) }
 }
 
 // ---------------------------------------------------------------------------
@@ -3111,13 +3832,13 @@ mod tests {
             collision_mask: 0xFFFF_FFFF,
         });
 
-        // Step to generate collision pairs
+        // Step to generate collision manifolds
         state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
-        assert!(!state.prev_collision_pairs.is_empty());
+        assert!(!state.manifolds.is_empty());
 
-        // Remove body b — should clean pairs
+        // Remove body b — should clean manifolds
         state.remove_body(b);
-        assert!(state.prev_collision_pairs.is_empty());
+        assert!(state.manifolds.is_empty());
     }
 
     // -- Spatial hash tests (delegated to spatial_hash module, but verify integration) --
@@ -3758,5 +4479,414 @@ mod tests {
 
         let misses = state.overlap_sphere([5.0, 0.0, 0.0], 0.5);
         assert!(misses.is_empty(), "distant sphere should not overlap capsule");
+    }
+
+    // =======================================================================
+    // Feature: Persistent contact manifolds & warm starting
+    // =======================================================================
+
+    #[test]
+    fn manifold_persistence() {
+        let mut state = PhysicsState2d::new();
+
+        // Static floor
+        let floor = state.add_body(&BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, -1.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(floor, &ColliderDesc {
+            shape: ColliderShape::Box { half_extents: [10.0, 1.0, 0.0] },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial { friction: 0.5, restitution: 0.0, density: 1.0, ..PhysicsMaterial::default() },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        // Dynamic box sitting on floor (overlapping slightly — bottom at y=-0.1, floor top at y=0)
+        let box_body = state.add_body(&BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, 0.4, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(box_body, &ColliderDesc {
+            shape: ColliderShape::Box { half_extents: [0.5, 0.5, 0.0] },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial { friction: 0.5, restitution: 0.0, density: 1.0, ..PhysicsMaterial::default() },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        // Step once — manifold should be created
+        state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 8, 4, 0.01, 0.2, 100.0);
+        assert!(!state.manifolds.is_empty(), "manifold should exist after first step with contact");
+
+        // Step again — manifold should persist and accumulate impulses
+        state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 8, 4, 0.01, 0.2, 100.0);
+        assert!(!state.manifolds.is_empty(), "manifold should persist across frames");
+
+        // Check that accumulated impulse is non-zero (warm starting cached from previous frame)
+        let has_nonzero_impulse = state.manifolds.values().any(|m| {
+            m.points.iter().any(|p| p.normal_impulse.abs() > EPS)
+        });
+        assert!(has_nonzero_impulse, "manifold should have non-zero accumulated impulse after two frames");
+    }
+
+    #[test]
+    fn warm_start_stabilizes_stack() {
+        let mut state = PhysicsState2d::new();
+
+        // Static floor
+        let floor = state.add_body(&BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, -0.5, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(floor, &ColliderDesc {
+            shape: ColliderShape::Box { half_extents: [20.0, 0.5, 0.0] },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial { friction: 0.8, restitution: 0.0, density: 1.0, ..PhysicsMaterial::default() },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+
+        // Stack of 5 boxes
+        let box_size = 0.5;
+        let mut top_handle = BodyHandle(0);
+        for i in 0..5 {
+            let y = box_size + (i as f64) * (2.0 * box_size);
+            let bh = state.add_body(&BodyDesc {
+                body_type: BodyType::Dynamic,
+                position: [0.0, y, 0.0],
+                ..BodyDesc::default()
+            });
+            state.add_collider(bh, &ColliderDesc {
+                shape: ColliderShape::Box { half_extents: [box_size, box_size, 0.0] },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial { friction: 0.8, restitution: 0.0, density: 1.0, ..PhysicsMaterial::default() },
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
+            });
+            if i == 4 {
+                top_handle = bh;
+            }
+        }
+
+        let initial_y = state.bodies.get(body_ah(top_handle)).unwrap().position[1];
+
+        // Step 300 frames
+        let dt = 1.0 / 60.0;
+        for _ in 0..300 {
+            state.step([0.0, -9.81, 0.0], dt, 8, 4, 0.01, 0.2, 100.0);
+        }
+
+        let final_y = state.bodies.get(body_ah(top_handle)).unwrap().position[1];
+
+        // The top box should have settled near its expected resting position.
+        // Expected: floor is at y=-0.5..0.0, boxes are stacked starting at y=0.
+        // Top of 5th box should be near y = 5 * 1.0 = 5.0, center near y = 4.5.
+        // With warm starting, the stack should be stable. Allow some settling.
+        assert!(
+            final_y > 3.0,
+            "top box should be stable in stack (y={final_y}), expected > 3.0"
+        );
+        // It should have settled (not flying upward)
+        assert!(
+            final_y < initial_y + 1.0,
+            "top box should not have been launched (y={final_y})"
+        );
+    }
+
+    // -- Wheel joint tests --
+
+    #[test]
+    fn wheel_joint_constrains_perpendicular() {
+        let mut state = PhysicsState2d::new();
+        let a = state.add_body(&BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 0.0, 0.0],
+            ..Default::default()
+        });
+        let b = state.add_body(&BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, -1.0, 0.0],
+            ..Default::default()
+        });
+        state.add_collider(b, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+        state.add_joint(&JointDesc {
+            body_a: a,
+            body_b: b,
+            joint_type: JointType::Wheel {
+                axis: [0.0, 1.0],
+                stiffness: 500.0,
+                damping: 10.0,
+            },
+            local_anchor_a: [0.0, 0.0],
+            local_anchor_b: [0.0, 0.0],
+            motor: None,
+            damping: 0.0,
+            break_force: None,
+        });
+
+        for _ in 0..60 {
+            state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+        }
+
+        let pos = state.bodies.get(body_ah(b)).unwrap().position;
+        // Should be constrained horizontally near x=0
+        assert!(pos[0].abs() < 0.1, "wheel should constrain x (x={})", pos[0]);
+    }
+
+    // -- Rope joint tests --
+
+    #[test]
+    fn rope_joint_allows_closer_than_max() {
+        let mut state = PhysicsState2d::new();
+        let a = state.add_body(&BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 0.0, 0.0],
+            ..Default::default()
+        });
+        let b = state.add_body(&BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [1.0, 0.0, 0.0],
+            ..Default::default()
+        });
+        state.add_collider(b, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+        state.add_joint(&JointDesc {
+            body_a: a,
+            body_b: b,
+            joint_type: JointType::Rope { max_length: 5.0 },
+            local_anchor_a: [0.0, 0.0],
+            local_anchor_b: [0.0, 0.0],
+            motor: None,
+            damping: 0.0,
+            break_force: None,
+        });
+
+        // Body is within max_length, should fall freely with gravity
+        let initial_y = state.bodies.get(body_ah(b)).unwrap().position[1];
+        for _ in 0..30 {
+            state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+        }
+        let final_y = state.bodies.get(body_ah(b)).unwrap().position[1];
+        assert!(final_y < initial_y, "body should fall under gravity (y={})", final_y);
+    }
+
+    #[test]
+    fn rope_joint_prevents_exceeding_max_length() {
+        let mut state = PhysicsState2d::new();
+        let a = state.add_body(&BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 0.0, 0.0],
+            ..Default::default()
+        });
+        let b = state.add_body(&BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, -1.0, 0.0],
+            ..Default::default()
+        });
+        state.add_collider(b, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+        state.add_joint(&JointDesc {
+            body_a: a,
+            body_b: b,
+            joint_type: JointType::Rope { max_length: 2.0 },
+            local_anchor_a: [0.0, 0.0],
+            local_anchor_b: [0.0, 0.0],
+            motor: None,
+            damping: 0.0,
+            break_force: None,
+        });
+
+        // Let gravity pull body down
+        for _ in 0..120 {
+            state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+        }
+
+        let pos = state.bodies.get(body_ah(b)).unwrap().position;
+        let dist = (pos[0] * pos[0] + pos[1] * pos[1]).sqrt();
+        assert!(
+            dist < 2.5,
+            "rope should constrain distance (dist={dist}), max_length=2.0"
+        );
+    }
+
+    // -- Mouse joint tests --
+
+    #[test]
+    fn mouse_joint_drags_body_toward_target() {
+        let mut state = PhysicsState2d::new();
+        let a = state.add_body(&BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, 0.0, 0.0],
+            ..Default::default()
+        });
+        state.add_collider(a, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+        // body_b is ignored for Mouse joint, but still required
+        let b = state.add_body(&BodyDesc {
+            body_type: BodyType::Static,
+            ..Default::default()
+        });
+        state.add_joint(&JointDesc {
+            body_a: a,
+            body_b: b,
+            joint_type: JointType::Mouse {
+                target: [5.0, 0.0, 0.0],
+                stiffness: 500.0,
+                damping: 20.0,
+                max_force: 1000.0,
+            },
+            local_anchor_a: [0.0, 0.0],
+            local_anchor_b: [0.0, 0.0],
+            motor: None,
+            damping: 0.0,
+            break_force: None,
+        });
+
+        for _ in 0..120 {
+            state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+        }
+
+        let pos = state.bodies.get(body_ah(a)).unwrap().position;
+        assert!(pos[0] > 2.0, "mouse joint should pull body toward x=5 (x={})", pos[0]);
+    }
+
+    // -- Joint breaking tests --
+
+    #[test]
+    fn joint_breaking_removes_joint() {
+        let mut state = PhysicsState2d::new();
+        let a = state.add_body(&BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 0.0, 0.0],
+            ..Default::default()
+        });
+        let b = state.add_body(&BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, -3.0, 0.0],
+            ..Default::default()
+        });
+        state.add_collider(b, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+        // Very weak joint that should break under gravity
+        let jh = state.add_joint(&JointDesc {
+            body_a: a,
+            body_b: b,
+            joint_type: JointType::Fixed,
+            local_anchor_a: [0.0, 0.0],
+            local_anchor_b: [0.0, 0.0],
+            motor: None,
+            damping: 0.0,
+            break_force: Some(0.001), // very low break force
+        });
+
+        assert!(state.joints.contains(joint_ah(jh)));
+
+        for _ in 0..10 {
+            state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+        }
+
+        // Joint should have been broken and removed
+        assert!(!state.joints.contains(joint_ah(jh)), "joint should be broken");
+    }
+
+    #[test]
+    fn joint_not_broken_when_force_below_threshold() {
+        let mut state = PhysicsState2d::new();
+        let a = state.add_body(&BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 0.0, 0.0],
+            ..Default::default()
+        });
+        let b = state.add_body(&BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, 0.0, 0.0],
+            ..Default::default()
+        });
+        state.add_collider(b, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        });
+        // Strong joint that should NOT break
+        let jh = state.add_joint(&JointDesc {
+            body_a: a,
+            body_b: b,
+            joint_type: JointType::Fixed,
+            local_anchor_a: [0.0, 0.0],
+            local_anchor_b: [0.0, 0.0],
+            motor: None,
+            damping: 0.0,
+            break_force: Some(100000.0),
+        });
+
+        for _ in 0..10 {
+            state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+        }
+
+        assert!(state.joints.contains(joint_ah(jh)), "strong joint should survive");
+    }
+
+    // -- Combine rule tests --
+
+    #[test]
+    fn combine_rule_max_priority_wins() {
+        use crate::material::CombineRule;
+        // Max rule should override Average
+        assert_eq!(CombineRule::Max.max(CombineRule::Average), CombineRule::Max);
+        // When one material wants Max and other wants Min, Max wins
+        let val = CombineRule::Max.combine(0.2, 0.8);
+        assert!((val - 0.8).abs() < EPS);
     }
 }

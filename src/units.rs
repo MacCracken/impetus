@@ -33,34 +33,44 @@ pub enum PhysicsUnit {
 }
 
 impl Quantity {
+    /// Create a quantity with the given value and unit.
     pub fn new(value: f64, unit: PhysicsUnit) -> Self {
         Self { value, unit }
     }
 
+    /// Create a distance quantity in meters.
     pub fn meters(value: f64) -> Self {
         Self::new(value, PhysicsUnit::Meters)
     }
+    /// Create a mass quantity in kilograms.
     pub fn kilograms(value: f64) -> Self {
         Self::new(value, PhysicsUnit::Kilograms)
     }
+    /// Create a time quantity in seconds.
     pub fn seconds(value: f64) -> Self {
         Self::new(value, PhysicsUnit::Seconds)
     }
+    /// Create a force quantity in Newtons.
     pub fn newtons(value: f64) -> Self {
         Self::new(value, PhysicsUnit::Newtons)
     }
+    /// Create an energy quantity in Joules.
     pub fn joules(value: f64) -> Self {
         Self::new(value, PhysicsUnit::Joules)
     }
+    /// Create an angle quantity in radians.
     pub fn radians(value: f64) -> Self {
         Self::new(value, PhysicsUnit::Radians)
     }
+    /// Create an angle quantity in degrees.
     pub fn degrees(value: f64) -> Self {
         Self::new(value, PhysicsUnit::Degrees)
     }
+    /// Create a velocity quantity in meters per second.
     pub fn meters_per_second(value: f64) -> Self {
         Self::new(value, PhysicsUnit::MetersPerSecond)
     }
+    /// Create a pressure quantity in Pascals.
     pub fn pascals(value: f64) -> Self {
         Self::new(value, PhysicsUnit::Pascals)
     }
