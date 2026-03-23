@@ -311,6 +311,80 @@ impl Aabb2d {
 }
 
 // ---------------------------------------------------------------------------
+// Spatial hash broadphase
+// ---------------------------------------------------------------------------
+
+struct SpatialHash {
+    inv_cell_size: f64,
+    cells: HashMap<(i32, i32), Vec<ColliderHandle>>,
+}
+
+impl SpatialHash {
+    fn new(cell_size: f64) -> Self {
+        Self {
+            inv_cell_size: 1.0 / cell_size,
+            cells: HashMap::new(),
+        }
+    }
+
+    /// Auto-compute cell size from collider AABBs. Uses 2x the average AABB max dimension.
+    fn auto_cell_size(aabbs: &[(ColliderHandle, Aabb2d)]) -> f64 {
+        if aabbs.is_empty() {
+            return 1.0;
+        }
+        let total: f64 = aabbs
+            .iter()
+            .map(|(_, aabb)| {
+                let w = aabb.max[0] - aabb.min[0];
+                let h = aabb.max[1] - aabb.min[1];
+                w.max(h)
+            })
+            .sum();
+        let avg = total / aabbs.len() as f64;
+        (avg * 2.0).max(0.1) // at least 0.1 to avoid degenerate cells
+    }
+
+    fn cell(&self, x: f64, y: f64) -> (i32, i32) {
+        (
+            (x * self.inv_cell_size).floor() as i32,
+            (y * self.inv_cell_size).floor() as i32,
+        )
+    }
+
+    fn insert(&mut self, handle: ColliderHandle, aabb: &Aabb2d) {
+        let (min_cx, min_cy) = self.cell(aabb.min[0], aabb.min[1]);
+        let (max_cx, max_cy) = self.cell(aabb.max[0], aabb.max[1]);
+
+        for cx in min_cx..=max_cx {
+            for cy in min_cy..=max_cy {
+                self.cells.entry((cx, cy)).or_default().push(handle);
+            }
+        }
+    }
+
+    fn query_pairs(&self) -> HashSet<(ColliderHandle, ColliderHandle)> {
+        let mut pairs = HashSet::new();
+
+        for cell in self.cells.values() {
+            for i in 0..cell.len() {
+                for j in (i + 1)..cell.len() {
+                    let a = cell[i];
+                    let b = cell[j];
+                    // Canonical ordering for dedup
+                    if a.0 < b.0 {
+                        pairs.insert((a, b));
+                    } else {
+                        pairs.insert((b, a));
+                    }
+                }
+            }
+        }
+
+        pairs
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Contact for narrowphase
 // ---------------------------------------------------------------------------
 
@@ -506,11 +580,11 @@ impl PhysicsState2d {
     }
 
     // -----------------------------------------------------------------------
-    // Broadphase — O(n²) AABB overlap
-    // TODO: upgrade to spatial hash for large body counts
+    // Broadphase — spatial hash grid
     // -----------------------------------------------------------------------
 
     fn broadphase(&self) -> Vec<(ColliderHandle, ColliderHandle)> {
+        // Compute AABBs for all colliders
         let collider_aabbs: Vec<(ColliderHandle, Aabb2d)> = self
             .colliders
             .values()
@@ -520,30 +594,50 @@ impl PhysicsState2d {
             })
             .collect();
 
-        let mut pairs = Vec::new();
-        for i in 0..collider_aabbs.len() {
-            for j in (i + 1)..collider_aabbs.len() {
-                let (ha, aabb_a) = &collider_aabbs[i];
-                let (hb, aabb_b) = &collider_aabbs[j];
-                let ca = &self.colliders[ha];
-                let cb = &self.colliders[hb];
-                if ca.body == cb.body {
-                    continue;
-                }
-                let ba = self.bodies.get(&ca.body);
-                let bb = self.bodies.get(&cb.body);
-                if let (Some(ba), Some(bb)) = (ba, bb)
-                    && ba.is_static() && bb.is_static()
-                {
-                    continue;
-                }
-                // Skip sensor-sensor pairs
-                if ca.is_sensor && cb.is_sensor {
-                    continue;
-                }
-                if aabb_a.overlaps(aabb_b) {
-                    pairs.push((*ha, *hb));
-                }
+        // Build spatial hash
+        let cell_size = SpatialHash::auto_cell_size(&collider_aabbs);
+        let mut grid = SpatialHash::new(cell_size);
+        for (handle, aabb) in &collider_aabbs {
+            grid.insert(*handle, aabb);
+        }
+
+        // Collect candidate pairs from shared cells
+        let candidates = grid.query_pairs();
+
+        // Build AABB lookup for overlap verification
+        let aabb_map: HashMap<ColliderHandle, Aabb2d> =
+            collider_aabbs.into_iter().collect();
+
+        // Filter candidates
+        let mut pairs = Vec::with_capacity(candidates.len());
+        for (ha, hb) in candidates {
+            let ca = match self.colliders.get(&ha) {
+                Some(c) => c,
+                None => continue,
+            };
+            let cb = match self.colliders.get(&hb) {
+                Some(c) => c,
+                None => continue,
+            };
+            // Skip same-body
+            if ca.body == cb.body {
+                continue;
+            }
+            // Skip static-static
+            if let (Some(ba), Some(bb)) = (self.bodies.get(&ca.body), self.bodies.get(&cb.body))
+                && ba.is_static() && bb.is_static()
+            {
+                continue;
+            }
+            // Skip sensor-sensor
+            if ca.is_sensor && cb.is_sensor {
+                continue;
+            }
+            // Verify AABB overlap (spatial hash cells are conservative)
+            if let (Some(aabb_a), Some(aabb_b)) = (aabb_map.get(&ha), aabb_map.get(&hb))
+                && aabb_a.overlaps(aabb_b)
+            {
+                pairs.push((ha, hb));
             }
         }
         pairs
@@ -1112,6 +1206,10 @@ impl PhysicsState2d {
                     [pos[0] - half_extents[0], pos[1] - half_extents[1]],
                     [pos[0] + half_extents[0], pos[1] + half_extents[1]],
                 ),
+                ColliderShape::Capsule {
+                    half_height,
+                    radius,
+                } => ray_capsule(origin, dir, pos, rb.rotation, *half_height, *radius),
                 _ => None,
             };
 
@@ -1153,15 +1251,17 @@ fn world_pos(body_pos: [f64; 2], body_rot: f64, offset: [f64; 2]) -> [f64; 2] {
 fn generate_contact(
     shape_a: &ColliderShape,
     pos_a: [f64; 2],
-    _rot_a: f64,
+    rot_a: f64,
     shape_b: &ColliderShape,
     pos_b: [f64; 2],
-    _rot_b: f64,
+    rot_b: f64,
 ) -> Option<([f64; 2], f64, [f64; 2])> {
     match (shape_a, shape_b) {
+        // Ball vs Ball
         (ColliderShape::Ball { radius: ra }, ColliderShape::Ball { radius: rb }) => {
             circle_circle(pos_a, *ra, pos_b, *rb)
         }
+        // Ball vs Box
         (ColliderShape::Ball { radius }, ColliderShape::Box { half_extents }) => {
             circle_aabb(pos_a, *radius, pos_b, *half_extents)
         }
@@ -1169,10 +1269,58 @@ fn generate_contact(
             circle_aabb(pos_b, *radius, pos_a, *half_extents)
                 .map(|(n, d, p)| ([-n[0], -n[1]], d, p))
         }
+        // Box vs Box
         (
             ColliderShape::Box { half_extents: he_a },
             ColliderShape::Box { half_extents: he_b },
         ) => aabb_aabb_contact(pos_a, *he_a, pos_b, *he_b),
+        // Capsule vs Ball
+        (
+            ColliderShape::Capsule {
+                half_height: hh,
+                radius: cr,
+            },
+            ColliderShape::Ball { radius: br },
+        ) => capsule_circle(pos_a, rot_a, *hh, *cr, pos_b, *br),
+        (
+            ColliderShape::Ball { radius: br },
+            ColliderShape::Capsule {
+                half_height: hh,
+                radius: cr,
+            },
+        ) => {
+            capsule_circle(pos_b, rot_b, *hh, *cr, pos_a, *br)
+                .map(|(n, d, p)| ([-n[0], -n[1]], d, p))
+        }
+        // Capsule vs Box
+        (
+            ColliderShape::Capsule {
+                half_height: hh,
+                radius: cr,
+            },
+            ColliderShape::Box { half_extents },
+        ) => capsule_aabb(pos_a, rot_a, *hh, *cr, pos_b, *half_extents),
+        (
+            ColliderShape::Box { half_extents },
+            ColliderShape::Capsule {
+                half_height: hh,
+                radius: cr,
+            },
+        ) => {
+            capsule_aabb(pos_b, rot_b, *hh, *cr, pos_a, *half_extents)
+                .map(|(n, d, p)| ([-n[0], -n[1]], d, p))
+        }
+        // Capsule vs Capsule
+        (
+            ColliderShape::Capsule {
+                half_height: hh_a,
+                radius: cr_a,
+            },
+            ColliderShape::Capsule {
+                half_height: hh_b,
+                radius: cr_b,
+            },
+        ) => capsule_capsule(pos_a, rot_a, *hh_a, *cr_a, pos_b, rot_b, *hh_b, *cr_b),
         _ => None,
     }
 }
@@ -1273,6 +1421,168 @@ fn aabb_aabb_contact(
 }
 
 // ---------------------------------------------------------------------------
+// Capsule helpers
+// ---------------------------------------------------------------------------
+
+/// Capsule endpoints in world space. A 2D capsule is a segment with radius.
+fn capsule_endpoints(pos: [f64; 2], rot: f64, half_height: f64) -> ([f64; 2], [f64; 2]) {
+    let (sin, cos) = rot.sin_cos();
+    // Capsule axis is along local Y
+    let dx = -sin * half_height;
+    let dy = cos * half_height;
+    (
+        [pos[0] - dx, pos[1] - dy],
+        [pos[0] + dx, pos[1] + dy],
+    )
+}
+
+/// Closest point on segment (a, b) to point p. Returns (closest_point, t_parameter).
+fn closest_point_on_segment(a: [f64; 2], b: [f64; 2], p: [f64; 2]) -> ([f64; 2], f64) {
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let len_sq = ab[0] * ab[0] + ab[1] * ab[1];
+    if len_sq < 1e-20 {
+        return (a, 0.0);
+    }
+    let t = ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / len_sq;
+    let t = t.clamp(0.0, 1.0);
+    ([a[0] + ab[0] * t, a[1] + ab[1] * t], t)
+}
+
+/// Closest points between two segments. Returns (point_on_ab, point_on_cd).
+/// Closest points between two segments.
+fn closest_points_segments(
+    a: [f64; 2],
+    b: [f64; 2],
+    c: [f64; 2],
+    d: [f64; 2],
+) -> ([f64; 2], [f64; 2]) {
+    fn dist_sq(p: [f64; 2], q: [f64; 2]) -> f64 {
+        (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)
+    }
+
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let cd = [d[0] - c[0], d[1] - c[1]];
+
+    let d1 = ab[0] * ab[0] + ab[1] * ab[1];
+    let d2 = cd[0] * cd[0] + cd[1] * cd[1];
+
+    // Start with 4 endpoint-to-segment projections
+    let (pa, _) = closest_point_on_segment(c, d, a);
+    let (pb, _) = closest_point_on_segment(c, d, b);
+    let (pc, _) = closest_point_on_segment(a, b, c);
+    let (pd, _) = closest_point_on_segment(a, b, d);
+
+    let mut best_p1 = a;
+    let mut best_p2 = pa;
+    let mut best_d = dist_sq(a, pa);
+
+    for (p1, p2) in [(b, pb), (pc, c), (pd, d)] {
+        let dd = dist_sq(p1, p2);
+        if dd < best_d {
+            best_p1 = p1;
+            best_p2 = p2;
+            best_d = dd;
+        }
+    }
+
+    // Also try the analytical closest pair with iterative clamping.
+    // Uses r = a - c (not c - a) so the formula signs are standard:
+    //   s = (d4*d2 + d5*d3) / denom, t = (d3*s - d5) / d2
+    if d1 > 1e-20 && d2 > 1e-20 {
+        let r = [a[0] - c[0], a[1] - c[1]];
+        let d3 = ab[0] * cd[0] + ab[1] * cd[1]; // AB·CD
+        let d4 = ab[0] * r[0] + ab[1] * r[1]; // AB·r
+        let d5 = cd[0] * r[0] + cd[1] * r[1]; // CD·r
+        let denom = d1 * d2 - d3 * d3;
+
+        if denom.abs() > 1e-20 {
+            let mut s = ((d3 * d5 - d4 * d2) / denom).clamp(0.0, 1.0);
+            let mut t = ((d3 * s + d5) / d2).clamp(0.0, 1.0);
+            s = ((t * d3 - d4) / d1).clamp(0.0, 1.0);
+            t = ((d3 * s + d5) / d2).clamp(0.0, 1.0);
+
+            let p1 = [a[0] + ab[0] * s, a[1] + ab[1] * s];
+            let p2 = [c[0] + cd[0] * t, c[1] + cd[1] * t];
+            let dd = dist_sq(p1, p2);
+            if dd < best_d {
+                best_p1 = p1;
+                best_p2 = p2;
+            }
+        }
+    }
+
+    (best_p1, best_p2)
+}
+
+/// Capsule vs circle contact.
+fn capsule_circle(
+    cap_pos: [f64; 2],
+    cap_rot: f64,
+    half_height: f64,
+    cap_radius: f64,
+    circle_pos: [f64; 2],
+    circle_radius: f64,
+) -> Option<([f64; 2], f64, [f64; 2])> {
+    let (ep_a, ep_b) = capsule_endpoints(cap_pos, cap_rot, half_height);
+    let (closest, _) = closest_point_on_segment(ep_a, ep_b, circle_pos);
+    // Now it's a circle-circle test between closest point (with cap_radius) and the ball
+    circle_circle(closest, cap_radius, circle_pos, circle_radius)
+}
+
+/// Capsule vs AABB contact. Treats capsule as circle at closest segment point to box.
+fn capsule_aabb(
+    cap_pos: [f64; 2],
+    cap_rot: f64,
+    half_height: f64,
+    cap_radius: f64,
+    box_pos: [f64; 2],
+    half_extents: [f64; 2],
+) -> Option<([f64; 2], f64, [f64; 2])> {
+    let (ep_a, ep_b) = capsule_endpoints(cap_pos, cap_rot, half_height);
+
+    // Find closest point on capsule segment to box center, then test as circle vs AABB
+    // For better accuracy, test both endpoints and midpoint, take deepest
+    let candidates = [ep_a, ep_b, cap_pos];
+    let mut best: Option<([f64; 2], f64, [f64; 2])> = None;
+
+    for &pt in &candidates {
+        if let Some((n, d, p)) = circle_aabb(pt, cap_radius, box_pos, half_extents)
+            && (best.is_none() || d > best.as_ref().unwrap().1)
+        {
+            best = Some((n, d, p));
+        }
+    }
+
+    // Also test closest point on segment to box center
+    let (closest, _) = closest_point_on_segment(ep_a, ep_b, box_pos);
+    if let Some((n, d, p)) = circle_aabb(closest, cap_radius, box_pos, half_extents)
+        && (best.is_none() || d > best.as_ref().unwrap().1)
+    {
+        best = Some((n, d, p));
+    }
+
+    best
+}
+
+/// Capsule vs capsule contact.
+#[allow(clippy::too_many_arguments)]
+fn capsule_capsule(
+    pos_a: [f64; 2],
+    rot_a: f64,
+    hh_a: f64,
+    r_a: f64,
+    pos_b: [f64; 2],
+    rot_b: f64,
+    hh_b: f64,
+    r_b: f64,
+) -> Option<([f64; 2], f64, [f64; 2])> {
+    let (a1, a2) = capsule_endpoints(pos_a, rot_a, hh_a);
+    let (b1, b2) = capsule_endpoints(pos_b, rot_b, hh_b);
+    let (cp_a, cp_b) = closest_points_segments(a1, a2, b1, b2);
+    circle_circle(cp_a, r_a, cp_b, r_b)
+}
+
+// ---------------------------------------------------------------------------
 // Ray intersection helpers
 // ---------------------------------------------------------------------------
 
@@ -1358,6 +1668,62 @@ fn ray_aabb_2d(
     };
 
     Some((t, normal))
+}
+
+fn ray_capsule(
+    origin: [f64; 2],
+    dir: [f64; 2],
+    cap_pos: [f64; 2],
+    cap_rot: f64,
+    half_height: f64,
+    radius: f64,
+) -> Option<(f64, [f64; 2])> {
+    let (ep_a, ep_b) = capsule_endpoints(cap_pos, cap_rot, half_height);
+
+    // Test ray against circles at both endpoints and pick closest hit
+    let hit_a = ray_circle(origin, dir, ep_a, radius);
+    let hit_b = ray_circle(origin, dir, ep_b, radius);
+
+    let mut best = hit_a;
+    if let Some((tb, nb)) = hit_b
+        && (best.is_none() || tb < best.unwrap().0)
+    {
+        best = Some((tb, nb));
+    }
+
+    // Test ray against the rectangle between endpoints (the shaft)
+    // Project onto capsule axis and check if ray hits the swept region
+    let axis = [ep_b[0] - ep_a[0], ep_b[1] - ep_a[1]];
+    let axis_len = (axis[0] * axis[0] + axis[1] * axis[1]).sqrt();
+    if axis_len > 1e-10 {
+        let ax = [axis[0] / axis_len, axis[1] / axis_len];
+        let perp = [-ax[1], ax[0]];
+
+        // The shaft is an AABB in capsule-local space: along axis [-hh, hh], perpendicular [-r, r]
+        // Transform ray to capsule-local coordinates
+        let local_ox = (origin[0] - cap_pos[0]) * ax[0] + (origin[1] - cap_pos[1]) * ax[1];
+        let local_oy = (origin[0] - cap_pos[0]) * perp[0] + (origin[1] - cap_pos[1]) * perp[1];
+        let local_dx = dir[0] * ax[0] + dir[1] * ax[1];
+        let local_dy = dir[0] * perp[0] + dir[1] * perp[1];
+
+        if let Some((t, local_n)) = ray_aabb_2d(
+            [local_ox, local_oy],
+            [local_dx, local_dy],
+            [-half_height, -radius],
+            [half_height, radius],
+        ) {
+            // Transform normal back to world space
+            let world_n = [
+                local_n[0] * ax[0] + local_n[1] * perp[0],
+                local_n[0] * ax[1] + local_n[1] * perp[1],
+            ];
+            if best.is_none() || t < best.unwrap().0 {
+                best = Some((t, world_n));
+            }
+        }
+    }
+
+    best
 }
 
 // ---------------------------------------------------------------------------
@@ -1595,6 +1961,103 @@ mod tests {
         assert!((mass_after_second - 2.0 * mass_after_first).abs() < EPS);
     }
 
+    // -- Capsule contact tests --
+
+    #[test]
+    fn capsule_circle_overlap() {
+        // Vertical capsule at origin, circle to the right
+        let r = capsule_circle([0.0, 0.0], 0.0, 1.0, 0.5, [0.8, 0.0], 0.5);
+        assert!(r.is_some());
+        let (n, d, _) = r.unwrap();
+        assert!(d > 0.0);
+        assert!((n[0] - 1.0).abs() < EPS); // normal points toward circle
+    }
+
+    #[test]
+    fn capsule_circle_miss() {
+        assert!(capsule_circle([0.0, 0.0], 0.0, 1.0, 0.5, [5.0, 0.0], 0.5).is_none());
+    }
+
+    #[test]
+    fn capsule_circle_endpoint() {
+        // Circle near the top endpoint of a vertical capsule
+        let r = capsule_circle([0.0, 0.0], 0.0, 1.0, 0.5, [0.0, 1.3], 0.5);
+        assert!(r.is_some());
+        let (n, d, _) = r.unwrap();
+        assert!(d > 0.0);
+        assert!(n[1] > 0.5); // normal should point upward
+    }
+
+    #[test]
+    fn capsule_aabb_overlap() {
+        let r = capsule_aabb([0.0, 0.0], 0.0, 1.0, 0.5, [0.8, 0.0], [0.5, 0.5]);
+        assert!(r.is_some());
+        let (_, d, _) = r.unwrap();
+        assert!(d > 0.0);
+    }
+
+    #[test]
+    fn capsule_aabb_miss() {
+        assert!(capsule_aabb([0.0, 0.0], 0.0, 1.0, 0.5, [5.0, 0.0], [0.5, 0.5]).is_none());
+    }
+
+    #[test]
+    fn capsule_capsule_overlap() {
+        // Two vertical capsules side by side
+        let r = capsule_capsule(
+            [0.0, 0.0], 0.0, 1.0, 0.5,
+            [0.8, 0.0], 0.0, 1.0, 0.5,
+        );
+        assert!(r.is_some());
+        let (n, d, _) = r.unwrap();
+        assert!(d > 0.0);
+        assert!((n[0] - 1.0).abs() < EPS);
+    }
+
+    #[test]
+    fn capsule_capsule_miss() {
+        assert!(capsule_capsule(
+            [0.0, 0.0], 0.0, 1.0, 0.5,
+            [5.0, 0.0], 0.0, 1.0, 0.5,
+        ).is_none());
+    }
+
+    #[test]
+    fn capsule_capsule_perpendicular() {
+        // Vertical capsule at x=0, horizontal capsule at x=0.2
+        // With radius 0.5 each, sum=1.0, so overlap when segment dist < 1.0
+        let r = capsule_capsule(
+            [0.0, 0.0], 0.0, 1.0, 0.5,
+            [0.2, 0.0], std::f64::consts::FRAC_PI_2, 1.0, 0.5,
+        );
+        assert!(r.is_some(), "capsule-capsule should overlap");
+        let (_, d, _) = r.unwrap();
+        assert!(d > 0.0);
+    }
+
+    // -- Capsule ray tests --
+
+    #[test]
+    fn ray_capsule_hit_shaft() {
+        // Horizontal ray hitting the shaft of a vertical capsule
+        let r = ray_capsule([0.0, 0.0], [1.0, 0.0], [5.0, 0.0], 0.0, 1.0, 0.5);
+        assert!(r.is_some());
+        let (t, _) = r.unwrap();
+        assert!((t - 4.5).abs() < 0.1); // should hit at ~4.5 (5 - radius 0.5)
+    }
+
+    #[test]
+    fn ray_capsule_hit_endpoint() {
+        // Ray aimed at the top endpoint
+        let r = ray_capsule([0.0, 2.0], [1.0, 0.0], [5.0, 0.0], 0.0, 2.0, 0.5);
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn ray_capsule_miss() {
+        assert!(ray_capsule([0.0, 5.0], [1.0, 0.0], [5.0, 0.0], 0.0, 1.0, 0.5).is_none());
+    }
+
     // -- World AABB tests --
 
     #[test]
@@ -1766,5 +2229,107 @@ mod tests {
         // Remove body b — should clean pairs
         state.remove_body(b);
         assert!(state.prev_collision_pairs.is_empty());
+    }
+
+    // -- Spatial hash tests --
+
+    #[test]
+    fn spatial_hash_single_insert() {
+        let mut grid = SpatialHash::new(1.0);
+        grid.insert(ColliderHandle(0), &Aabb2d { min: [0.0, 0.0], max: [0.5, 0.5] });
+        assert!(grid.cells.contains_key(&(0, 0)));
+        assert_eq!(grid.cells[&(0, 0)].len(), 1);
+    }
+
+    #[test]
+    fn spatial_hash_spanning_cells() {
+        let mut grid = SpatialHash::new(1.0);
+        // AABB spans 4 cells: (0,0), (0,1), (1,0), (1,1)
+        grid.insert(ColliderHandle(0), &Aabb2d { min: [0.5, 0.5], max: [1.5, 1.5] });
+        assert!(grid.cells.len() >= 4);
+    }
+
+    #[test]
+    fn spatial_hash_finds_nearby_pair() {
+        let mut grid = SpatialHash::new(2.0);
+        grid.insert(ColliderHandle(0), &Aabb2d { min: [0.0, 0.0], max: [1.0, 1.0] });
+        grid.insert(ColliderHandle(1), &Aabb2d { min: [0.5, 0.5], max: [1.5, 1.5] });
+        let pairs = grid.query_pairs();
+        assert!(pairs.contains(&(ColliderHandle(0), ColliderHandle(1))));
+    }
+
+    #[test]
+    fn spatial_hash_no_false_pair() {
+        let mut grid = SpatialHash::new(1.0);
+        grid.insert(ColliderHandle(0), &Aabb2d { min: [0.0, 0.0], max: [0.5, 0.5] });
+        grid.insert(ColliderHandle(1), &Aabb2d { min: [10.0, 10.0], max: [10.5, 10.5] });
+        let pairs = grid.query_pairs();
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn spatial_hash_auto_cell_size() {
+        let aabbs = vec![
+            (ColliderHandle(0), Aabb2d { min: [0.0, 0.0], max: [1.0, 1.0] }),
+            (ColliderHandle(1), Aabb2d { min: [0.0, 0.0], max: [2.0, 2.0] }),
+        ];
+        let size = SpatialHash::auto_cell_size(&aabbs);
+        // avg max dimension = (1+2)/2 = 1.5, *2 = 3.0
+        assert!((size - 3.0).abs() < EPS);
+    }
+
+    #[test]
+    fn spatial_hash_empty() {
+        let size = SpatialHash::auto_cell_size(&[]);
+        assert!((size - 1.0).abs() < EPS);
+    }
+
+    // -- Segment closest point tests --
+
+    #[test]
+    fn closest_point_on_segment_midpoint() {
+        let (pt, t) = closest_point_on_segment([0.0, 0.0], [10.0, 0.0], [5.0, 3.0]);
+        assert!((pt[0] - 5.0).abs() < EPS);
+        assert!(pt[1].abs() < EPS);
+        assert!((t - 0.5).abs() < EPS);
+    }
+
+    #[test]
+    fn closest_point_on_segment_endpoint_a() {
+        let (pt, t) = closest_point_on_segment([0.0, 0.0], [10.0, 0.0], [-5.0, 0.0]);
+        assert!(pt[0].abs() < EPS);
+        assert!((t).abs() < EPS);
+    }
+
+    #[test]
+    fn closest_point_on_segment_endpoint_b() {
+        let (pt, t) = closest_point_on_segment([0.0, 0.0], [10.0, 0.0], [15.0, 0.0]);
+        assert!((pt[0] - 10.0).abs() < EPS);
+        assert!((t - 1.0).abs() < EPS);
+    }
+
+    #[test]
+    fn closest_points_segments_perpendicular() {
+        // Vertical (0,-1)→(0,1) vs horizontal (1,0)→(3,0)
+        let (p1, p2) = closest_points_segments(
+            [0.0, -1.0], [0.0, 1.0],
+            [1.0, 0.0], [3.0, 0.0],
+        );
+        assert!((p1[0]).abs() < EPS);
+        assert!((p1[1]).abs() < EPS);
+        assert!((p2[0] - 1.0).abs() < EPS);
+        assert!((p2[1]).abs() < EPS);
+    }
+
+    #[test]
+    fn closest_points_segments_parallel() {
+        // Two parallel horizontal segments offset in Y
+        let (p1, p2) = closest_points_segments(
+            [0.0, 0.0], [10.0, 0.0],
+            [0.0, 2.0], [10.0, 2.0],
+        );
+        // Should find closest pair — any point pair with dist=2
+        let dist = ((p2[0] - p1[0]).powi(2) + (p2[1] - p1[1]).powi(2)).sqrt();
+        assert!((dist - 2.0).abs() < 0.01);
     }
 }
