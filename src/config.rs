@@ -17,6 +17,20 @@ pub struct WorldConfig {
     pub deterministic: bool,
     /// Simulation step counter.
     pub step: u64,
+    /// Baumgarte positional correction: allowed penetration before correction (default: 0.01).
+    #[serde(default = "default_slop")]
+    pub position_slop: f64,
+    /// Baumgarte positional correction: fraction of penetration corrected per iteration (default: 0.2).
+    #[serde(default = "default_correction")]
+    pub position_correction: f64,
+}
+
+fn default_slop() -> f64 {
+    0.01
+}
+
+fn default_correction() -> f64 {
+    0.2
 }
 
 impl Default for WorldConfig {
@@ -28,6 +42,8 @@ impl Default for WorldConfig {
             position_iterations: 1,
             deterministic: true,
             step: 0,
+            position_slop: default_slop(),
+            position_correction: default_correction(),
         }
     }
 }
@@ -64,6 +80,8 @@ mod tests {
             position_iterations: 3,
             deterministic: false,
             step: 0,
+            position_slop: 0.02,
+            position_correction: 0.3,
         };
         let json = serde_json::to_string(&config).unwrap();
         let back: WorldConfig = serde_json::from_str(&json).unwrap();

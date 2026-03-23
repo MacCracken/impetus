@@ -1,3 +1,6 @@
 /target
 /coverage
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
 benchmarks.md

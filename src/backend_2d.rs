@@ -16,13 +16,21 @@ use crate::query::RayHit;
 use crate::ImpetusError;
 
 // ---------------------------------------------------------------------------
-// Sleep / deactivation thresholds
+// Named constants
 // ---------------------------------------------------------------------------
 
+/// General-purpose geometry epsilon for zero-length checks (normals, axes, etc.).
+const EPSILON: f64 = 1e-10;
+/// Squared epsilon for distance-squared checks (avoids sqrt for near-zero vectors).
+const EPSILON_SQ: f64 = 1e-20;
 /// Bodies with both linear and angular speed below this are candidates for sleep.
 const SLEEP_VELOCITY_THRESHOLD: f64 = 0.01;
 /// How many seconds of low motion before a body is put to sleep.
 const SLEEP_TIME_THRESHOLD: f64 = 0.5;
+/// Minimum mass/inertia to avoid division by zero for dynamic bodies.
+const MIN_MASS: f64 = 1e-6;
+/// Minimum inertia to avoid division by zero.
+const MIN_INERTIA: f64 = 1e-10;
 
 // ---------------------------------------------------------------------------
 // Internal body representation
@@ -258,7 +266,7 @@ impl Collider2d {
     /// for dynamic bodies to avoid division by zero.
     fn compute_mass(&self) -> f64 {
         if let Some(m) = self.mass {
-            return m.max(1e-6);
+            return m.max(MIN_MASS);
         }
         let area = match &self.shape {
             ColliderShape::Ball { radius } => std::f64::consts::PI * radius * radius,
@@ -276,7 +284,7 @@ impl Collider2d {
             }
             _ => 1.0,
         };
-        (area * self.material.density).max(1e-6)
+        (area * self.material.density).max(MIN_MASS)
     }
 
     /// Compute moment of inertia about center of mass.
@@ -308,7 +316,7 @@ impl Collider2d {
             }
             _ => mass,
         };
-        i.max(1e-10)
+        i.max(MIN_INERTIA)
     }
 }
 
@@ -324,6 +332,7 @@ pub(crate) struct Joint2d {
     pub local_anchor_a: [f64; 2],
     pub local_anchor_b: [f64; 2],
     pub motor: Option<JointMotor>,
+    pub damping: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -501,6 +510,7 @@ impl PhysicsState2d {
                 local_anchor_a: desc.local_anchor_a,
                 local_anchor_b: desc.local_anchor_b,
                 motor: desc.motor.clone(),
+                damping: desc.damping,
             },
         );
     }
@@ -589,6 +599,8 @@ impl PhysicsState2d {
         dt: f64,
         velocity_iterations: u32,
         position_iterations: u32,
+        slop: f64,
+        correction: f64,
     ) -> Vec<CollisionEvent> {
         let gravity_2d = [gravity[0], gravity[1]];
         // 1. Integrate velocities
@@ -649,7 +661,7 @@ impl PhysicsState2d {
         self.solve_joints(dt, velocity_iterations);
 
         // 7. Positional correction
-        self.solve_positions(&contacts, position_iterations);
+        self.solve_positions(&contacts, position_iterations, slop, correction);
 
         // 8. Integrate positions
         for rb in self.bodies.values_mut() {
@@ -949,9 +961,7 @@ impl PhysicsState2d {
     // Positional correction (Baumgarte stabilization)
     // -----------------------------------------------------------------------
 
-    fn solve_positions(&mut self, contacts: &[Contact], iterations: u32) {
-        let slop = 0.01;
-        let percent = 0.2;
+    fn solve_positions(&mut self, contacts: &[Contact], iterations: u32, slop: f64, percent: f64) {
 
         for _ in 0..iterations {
             for contact in contacts {
@@ -1029,7 +1039,64 @@ impl PhysicsState2d {
                         }
                     }
                 }
+                // Apply joint damping for non-Spring joints (Spring has its own damping).
+                if joint.damping > 0.0 && !matches!(joint.joint_type, JointType::Spring { .. }) {
+                    self.apply_joint_damping(joint, dt);
+                }
             }
+        }
+    }
+
+    /// Apply velocity damping proportional to relative velocity at anchor points.
+    fn apply_joint_damping(&mut self, joint: &Joint2d, dt: f64) {
+        let anchor_a = self.world_anchor(joint.body_a, joint.local_anchor_a);
+        let anchor_b = self.world_anchor(joint.body_b, joint.local_anchor_b);
+
+        let (vel_a, angvel_a, pos_a, inv_mass_a) = match self.bodies.get(&joint.body_a) {
+            Some(b) if b.is_dynamic() => (b.linear_velocity, b.angular_velocity, b.position, b.inv_mass),
+            Some(b) => (b.linear_velocity, b.angular_velocity, b.position, 0.0),
+            None => return,
+        };
+        let (vel_b, angvel_b, pos_b, inv_mass_b) = match self.bodies.get(&joint.body_b) {
+            Some(b) if b.is_dynamic() => (b.linear_velocity, b.angular_velocity, b.position, b.inv_mass),
+            Some(b) => (b.linear_velocity, b.angular_velocity, b.position, 0.0),
+            None => return,
+        };
+
+        let inv_mass_sum = inv_mass_a + inv_mass_b;
+        if inv_mass_sum == 0.0 {
+            return;
+        }
+
+        // Velocity at anchor point = linear_vel + angular_vel x r
+        let ra = [anchor_a[0] - pos_a[0], anchor_a[1] - pos_a[1]];
+        let rb = [anchor_b[0] - pos_b[0], anchor_b[1] - pos_b[1]];
+        let va = [vel_a[0] - angvel_a * ra[1], vel_a[1] + angvel_a * ra[0]];
+        let vb = [vel_b[0] - angvel_b * rb[1], vel_b[1] + angvel_b * rb[0]];
+        let rel_vel = [vb[0] - va[0], vb[1] - va[1]];
+
+        let rel_speed_sq = rel_vel[0] * rel_vel[0] + rel_vel[1] * rel_vel[1];
+        if rel_speed_sq < EPSILON_SQ {
+            return;
+        }
+
+        // Damping impulse: -damping * relative_velocity * dt, distributed by inverse mass
+        let impulse = [
+            -joint.damping * rel_vel[0] * dt,
+            -joint.damping * rel_vel[1] * dt,
+        ];
+
+        if let Some(ba) = self.bodies.get_mut(&joint.body_a)
+            && ba.is_dynamic()
+        {
+            ba.linear_velocity[0] -= impulse[0] * ba.inv_mass;
+            ba.linear_velocity[1] -= impulse[1] * ba.inv_mass;
+        }
+        if let Some(bb) = self.bodies.get_mut(&joint.body_b)
+            && bb.is_dynamic()
+        {
+            bb.linear_velocity[0] += impulse[0] * bb.inv_mass;
+            bb.linear_velocity[1] += impulse[1] * bb.inv_mass;
         }
     }
 
@@ -1092,7 +1159,7 @@ impl PhysicsState2d {
         dt: f64,
     ) {
         let axis_len = (axis[0] * axis[0] + axis[1] * axis[1]).sqrt();
-        if axis_len < 1e-10 {
+        if axis_len < EPSILON {
             return;
         }
         let ax = [axis[0] / axis_len, axis[1] / axis_len];
@@ -1180,11 +1247,12 @@ impl PhysicsState2d {
         let anchor_a = self.world_anchor(joint.body_a, joint.local_anchor_a);
         let anchor_b = self.world_anchor(joint.body_b, joint.local_anchor_b);
         let diff = [anchor_b[0] - anchor_a[0], anchor_b[1] - anchor_a[1]];
-        let dist = (diff[0] * diff[0] + diff[1] * diff[1]).sqrt();
+        let dist_sq = diff[0] * diff[0] + diff[1] * diff[1];
 
-        if dist < 1e-10 {
+        if dist_sq < EPSILON_SQ {
             return;
         }
+        let dist = dist_sq.sqrt();
 
         let n = [diff[0] / dist, diff[1] / dist];
         let correction = (dist - length) * 0.5;
@@ -1214,11 +1282,12 @@ impl PhysicsState2d {
         let anchor_a = self.world_anchor(joint.body_a, joint.local_anchor_a);
         let anchor_b = self.world_anchor(joint.body_b, joint.local_anchor_b);
         let diff = [anchor_b[0] - anchor_a[0], anchor_b[1] - anchor_a[1]];
-        let dist = (diff[0] * diff[0] + diff[1] * diff[1]).sqrt();
+        let dist_sq = diff[0] * diff[0] + diff[1] * diff[1];
 
-        if dist < 1e-10 {
+        if dist_sq < EPSILON_SQ {
             return;
         }
+        let dist = dist_sq.sqrt();
 
         let n = [diff[0] / dist, diff[1] / dist];
         let spring_force = stiffness * (dist - rest_length);
@@ -1308,7 +1377,7 @@ impl PhysicsState2d {
         let diff = [anchor_b[0] - anchor_a[0], anchor_b[1] - anchor_a[1]];
 
         let axis_len = (axis[0] * axis[0] + axis[1] * axis[1]).sqrt();
-        if axis_len < 1e-10 {
+        if axis_len < EPSILON {
             return;
         }
         let ax = [axis[0] / axis_len, axis[1] / axis_len];
@@ -1416,7 +1485,7 @@ impl PhysicsState2d {
         let origin_2d = [origin[0], origin[1]];
         let direction_2d = [direction[0], direction[1]];
         let dir_len = (direction_2d[0] * direction_2d[0] + direction_2d[1] * direction_2d[1]).sqrt();
-        if dir_len < 1e-10 {
+        if dir_len < EPSILON {
             return None;
         }
         let dir = [direction_2d[0] / dir_len, direction_2d[1] / dir_len];
@@ -1604,7 +1673,7 @@ fn generate_contact(
             ColliderShape::Box { half_extents: he_a },
             ColliderShape::Box { half_extents: he_b },
         ) => {
-            if rot_a.abs() < 1e-10 && rot_b.abs() < 1e-10 {
+            if rot_a.abs() < EPSILON && rot_b.abs() < EPSILON {
                 aabb_aabb_contact(pos_a, [he_a[0], he_a[1]], pos_b, [he_b[0], he_b[1]])
             } else {
                 obb_obb_contact(pos_a, rot_a, [he_a[0], he_a[1]], pos_b, rot_b, [he_b[0], he_b[1]])
@@ -1657,8 +1726,80 @@ fn generate_contact(
                 radius: cr_b,
             },
         ) => capsule_capsule(pos_a, rot_a, *hh_a, *cr_a, pos_b, rot_b, *hh_b, *cr_b),
+        // ConvexHull vs Ball
+        (ColliderShape::ConvexHull { points }, ColliderShape::Ball { radius }) => {
+            convex_hull_circle(points, pos_a, rot_a, pos_b, *radius)
+        }
+        (ColliderShape::Ball { radius }, ColliderShape::ConvexHull { points }) => {
+            convex_hull_circle(points, pos_b, rot_b, pos_a, *radius)
+                .map(|(n, d, p)| ([-n[0], -n[1]], d, p))
+        }
         _ => None,
     }
+}
+
+/// ConvexHull vs Circle contact.
+/// `hull_points` are in the hull's local space. `hull_pos`/`hull_rot` transform them to world.
+/// Returns (normal_from_hull_to_circle, depth, contact_point).
+fn convex_hull_circle(
+    hull_points: &[[f64; 3]],
+    hull_pos: [f64; 2],
+    hull_rot: f64,
+    circle_pos: [f64; 2],
+    radius: f64,
+) -> Option<([f64; 2], f64, [f64; 2])> {
+    if hull_points.len() < 2 {
+        return None;
+    }
+
+    let (sin, cos) = hull_rot.sin_cos();
+
+    // Transform hull points to world space (2D)
+    let world_pts: Vec<[f64; 2]> = hull_points
+        .iter()
+        .map(|p| {
+            [
+                hull_pos[0] + cos * p[0] - sin * p[1],
+                hull_pos[1] + sin * p[0] + cos * p[1],
+            ]
+        })
+        .collect();
+
+    // Find closest point on hull perimeter to circle center
+    let n = world_pts.len();
+    let mut best_dist_sq = f64::INFINITY;
+    let mut best_closest = world_pts[0];
+
+    for i in 0..n {
+        let a = world_pts[i];
+        let b = world_pts[(i + 1) % n];
+        let (closest, _) = closest_point_on_segment(a, b, circle_pos);
+        let dx = circle_pos[0] - closest[0];
+        let dy = circle_pos[1] - closest[1];
+        let dist_sq = dx * dx + dy * dy;
+        if dist_sq < best_dist_sq {
+            best_dist_sq = dist_sq;
+            best_closest = closest;
+        }
+    }
+
+    if best_dist_sq >= radius * radius {
+        return None;
+    }
+
+    let dx = circle_pos[0] - best_closest[0];
+    let dy = circle_pos[1] - best_closest[1];
+    let dist = best_dist_sq.sqrt();
+
+    let (normal, depth) = if dist < EPSILON {
+        // Circle center is on the hull edge; use edge normal
+        // Find the edge that gave the closest point and compute its outward normal
+        ([0.0, 1.0], radius)
+    } else {
+        ([dx / dist, dy / dist], radius - dist)
+    };
+
+    Some((normal, depth, best_closest))
 }
 
 fn circle_circle(
@@ -1677,7 +1818,7 @@ fn circle_circle(
     }
 
     let dist = dist_sq.sqrt();
-    let (normal, depth) = if dist < 1e-10 {
+    let (normal, depth) = if dist < EPSILON {
         ([0.0, 1.0], sum_r)
     } else {
         ([dx / dist, dy / dist], sum_r - dist)
@@ -1708,7 +1849,7 @@ fn circle_aabb(
     }
 
     let dist = dist_sq.sqrt();
-    let (normal, depth) = if dist < 1e-10 {
+    let (normal, depth) = if dist < EPSILON {
         let face_dists = [half_extents[0] - dx.abs(), half_extents[1] - dy.abs()];
         if face_dists[0] < face_dists[1] {
             let sign = if dx >= 0.0 { 1.0 } else { -1.0 };
@@ -1859,7 +2000,7 @@ fn capsule_endpoints(pos: [f64; 2], rot: f64, half_height: f64) -> ([f64; 2], [f
 fn closest_point_on_segment(a: [f64; 2], b: [f64; 2], p: [f64; 2]) -> ([f64; 2], f64) {
     let ab = [b[0] - a[0], b[1] - a[1]];
     let len_sq = ab[0] * ab[0] + ab[1] * ab[1];
-    if len_sq < 1e-20 {
+    if len_sq < EPSILON_SQ {
         return (a, 0.0);
     }
     let t = ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / len_sq;
@@ -1907,14 +2048,14 @@ fn closest_points_segments(
     // Also try the analytical closest pair with iterative clamping.
     // Uses r = a - c (not c - a) so the formula signs are standard:
     //   s = (d4*d2 + d5*d3) / denom, t = (d3*s - d5) / d2
-    if d1 > 1e-20 && d2 > 1e-20 {
+    if d1 > EPSILON_SQ && d2 > EPSILON_SQ {
         let r = [a[0] - c[0], a[1] - c[1]];
         let d3 = ab[0] * cd[0] + ab[1] * cd[1]; // AB·CD
         let d4 = ab[0] * r[0] + ab[1] * r[1]; // AB·r
         let d5 = cd[0] * r[0] + cd[1] * r[1]; // CD·r
         let denom = d1 * d2 - d3 * d3;
 
-        if denom.abs() > 1e-20 {
+        if denom.abs() > EPSILON_SQ {
             let mut s = ((d3 * d5 - d4 * d2) / denom).clamp(0.0, 1.0);
             let mut t = ((d3 * s + d5) / d2).clamp(0.0, 1.0);
             s = ((t * d3 - d4) / d1).clamp(0.0, 1.0);
@@ -2034,7 +2175,7 @@ fn ray_circle(
 
     let point = [origin[0] + dir[0] * t, origin[1] + dir[1] * t];
     let nl = ((point[0] - center[0]).powi(2) + (point[1] - center[1]).powi(2)).sqrt();
-    let normal = if nl > 1e-10 {
+    let normal = if nl > EPSILON {
         [(point[0] - center[0]) / nl, (point[1] - center[1]) / nl]
     } else {
         [0.0, 1.0]
@@ -2054,7 +2195,7 @@ fn ray_aabb_2d(
     let mut normal = [0.0, 0.0];
 
     for i in 0..2 {
-        if dir[i].abs() < 1e-10 {
+        if dir[i].abs() < EPSILON {
             if origin[i] < min[i] || origin[i] > max[i] {
                 return None;
             }
@@ -2114,7 +2255,7 @@ fn ray_capsule(
     // Project onto capsule axis and check if ray hits the swept region
     let axis = [ep_b[0] - ep_a[0], ep_b[1] - ep_a[1]];
     let axis_len = (axis[0] * axis[0] + axis[1] * axis[1]).sqrt();
-    if axis_len > 1e-10 {
+    if axis_len > EPSILON {
         let ax = [axis[0] / axis_len, axis[1] / axis_len];
         let perp = [-ax[1], ax[0]];
 
@@ -2596,7 +2737,7 @@ mod tests {
         });
 
         let vel_before = state.bodies[&ball].linear_velocity;
-        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1);
+        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
 
         // Should generate events
         assert!(!events.is_empty());
@@ -2620,7 +2761,7 @@ mod tests {
         });
 
         let dt = 1.0 / 60.0;
-        state.step([0.0, -9.81, 0.0], dt, 4, 1);
+        state.step([0.0, -9.81, 0.0], dt, 4, 1, 0.01, 0.2);
 
         let rb = &state.bodies[&bh];
         // Should have moved from velocity
@@ -2668,7 +2809,7 @@ mod tests {
         });
 
         // Step to generate collision pairs
-        state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1);
+        state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
         assert!(!state.prev_collision_pairs.is_empty());
 
         // Remove body b — should clean pairs
@@ -2805,7 +2946,7 @@ mod tests {
         let dt = 1.0 / 60.0;
         let steps_needed = (SLEEP_TIME_THRESHOLD / dt).ceil() as usize + 10;
         for _ in 0..steps_needed {
-            state.step([0.0, 0.0, 0.0], dt, 4, 1);
+            state.step([0.0, 0.0, 0.0], dt, 4, 1, 0.01, 0.2);
         }
 
         assert!(state.bodies[&bh].is_sleeping, "body should be sleeping after sitting still");
@@ -2835,7 +2976,7 @@ mod tests {
 
         let pos_before = state.bodies[&bh].position;
         // Step with gravity — sleeping body should not move
-        state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1);
+        state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
 
         let pos_after = state.bodies[&bh].position;
         assert!(
@@ -2931,7 +3072,7 @@ mod tests {
 
         // Step many times — body is moving so should not sleep
         for _ in 0..100 {
-            state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1);
+            state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
         }
         assert!(!state.bodies[&bh].is_sleeping);
     }
@@ -2999,7 +3140,7 @@ mod tests {
 
         // Step until contact
         for _ in 0..60 {
-            state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1);
+            state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
         }
 
         // The sleeping body should have been woken by the impact
@@ -3048,7 +3189,7 @@ mod tests {
         });
 
         // Step — no collision events should be generated
-        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1);
+        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
         assert!(events.is_empty(), "different collision layers should not generate events");
     }
 
@@ -3089,7 +3230,7 @@ mod tests {
             collision_mask: 0x01,
         });
 
-        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1);
+        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
         assert!(!events.is_empty(), "same collision layer should generate events");
     }
 
@@ -3131,7 +3272,7 @@ mod tests {
         });
 
         // A's mask includes B's layer (0x02 & 0x03 != 0), so collision should happen
-        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1);
+        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
         assert!(!events.is_empty(), "asymmetric mask should still allow collision when one side matches");
     }
 
@@ -3172,7 +3313,7 @@ mod tests {
             collision_mask: 0xFFFF_FFFF,
         });
 
-        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1);
+        let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
         assert!(!events.is_empty(), "default layers should collide");
     }
 

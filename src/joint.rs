@@ -56,6 +56,10 @@ pub struct JointDesc {
     /// Optional motor (only used for Revolute and Prismatic joints).
     #[serde(default)]
     pub motor: Option<JointMotor>,
+    /// Velocity damping applied to relative motion at anchor points.
+    /// For Spring joints, use the Spring variant's own `damping` field instead.
+    #[serde(default)]
+    pub damping: f64,
 }
 
 #[cfg(test)]
@@ -71,6 +75,7 @@ mod tests {
             local_anchor_a: [0.0, 0.0],
             local_anchor_b: [1.0, 0.0],
             motor: None,
+            damping: 0.0,
         };
         let json = serde_json::to_string(&desc).unwrap();
         let back: JointDesc = serde_json::from_str(&json).unwrap();
@@ -90,6 +95,7 @@ mod tests {
             local_anchor_a: [0.0, 0.0],
             local_anchor_b: [0.0, 0.0],
             motor: None,
+            damping: 0.0,
         };
         let json = serde_json::to_string(&desc).unwrap();
         let back: JointDesc = serde_json::from_str(&json).unwrap();

@@ -159,6 +159,7 @@ fn bench_bodies(c: &mut Criterion) {
                 local_anchor_a: [0.0, 0.0],
                 local_anchor_b: [0.0, 0.0],
                 motor: None,
+                damping: 0.0,
             }));
         })
     });

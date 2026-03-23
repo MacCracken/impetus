@@ -18,13 +18,21 @@ use crate::query::RayHit;
 use crate::ImpetusError;
 
 // ---------------------------------------------------------------------------
-// Sleep / deactivation thresholds
+// Named constants
 // ---------------------------------------------------------------------------
 
+/// General-purpose geometry epsilon for zero-length checks.
+const EPSILON: f64 = 1e-10;
+/// Squared epsilon for distance-squared checks.
+const EPSILON_SQ: f64 = 1e-20;
 /// Bodies with both linear and angular speed below this are candidates for sleep.
 const SLEEP_VELOCITY_THRESHOLD_3D: f64 = 0.01;
 /// How many seconds of low motion before a body is put to sleep.
 const SLEEP_TIME_THRESHOLD_3D: f64 = 0.5;
+/// Minimum mass to avoid division by zero for dynamic bodies.
+const MIN_MASS: f64 = 1e-6;
+/// Minimum inertia to avoid division by zero.
+const MIN_INERTIA: f64 = 1e-10;
 
 // ---------------------------------------------------------------------------
 // Internal body representation
@@ -253,7 +261,7 @@ impl Collider3d {
 
     fn compute_mass(&self) -> f64 {
         if let Some(m) = self.mass {
-            return m.max(1e-6);
+            return m.max(MIN_MASS);
         }
         let vol = match &self.shape {
             ColliderShape::Ball { radius } => (4.0 / 3.0) * std::f64::consts::PI * radius.powi(3),
@@ -269,7 +277,7 @@ impl Collider3d {
             }
             _ => 1.0,
         };
-        (vol * self.material.density).max(1e-6)
+        (vol * self.material.density).max(MIN_MASS)
     }
 
     fn compute_inertia(&self, mass: f64) -> DVec3 {
@@ -302,7 +310,7 @@ impl Collider3d {
             }
             _ => DVec3::splat(mass),
         };
-        i.max(DVec3::splat(1e-10))
+        i.max(DVec3::splat(MIN_INERTIA))
     }
 }
 
@@ -318,6 +326,7 @@ pub(crate) struct Joint3d {
     pub local_anchor_a: DVec3,
     pub local_anchor_b: DVec3,
     pub motor: Option<JointMotor>,
+    pub damping: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -492,6 +501,7 @@ impl PhysicsState3d {
                 local_anchor_a: DVec3::new(desc.local_anchor_a[0], desc.local_anchor_a[1], 0.0),
                 local_anchor_b: DVec3::new(desc.local_anchor_b[0], desc.local_anchor_b[1], 0.0),
                 motor: desc.motor.clone(),
+                damping: desc.damping,
             },
         );
     }
@@ -580,6 +590,8 @@ impl PhysicsState3d {
         dt: f64,
         velocity_iterations: u32,
         position_iterations: u32,
+        slop: f64,
+        correction: f64,
     ) -> Vec<CollisionEvent> {
         let g = DVec3::from_array(gravity);
         // 1. Integrate velocities
@@ -636,7 +648,7 @@ impl PhysicsState3d {
         self.solve_joints(dt, velocity_iterations);
 
         // 7. Positional correction
-        self.solve_positions(&contacts, position_iterations);
+        self.solve_positions(&contacts, position_iterations, slop, correction);
 
         // 8. Integrate positions
         for rb in self.bodies.values_mut() {
@@ -868,7 +880,7 @@ impl PhysicsState3d {
                 if friction > 0.0 {
                     let tangent_vel = rel_vel - n * vel_along_normal;
                     let tangent_speed = tangent_vel.length();
-                    if tangent_speed > 1e-10 {
+                    if tangent_speed > EPSILON {
                         let tangent = tangent_vel / tangent_speed;
                         let jt = (-tangent_speed / inv_mass_sum)
                             .clamp(-j.abs() * friction, j.abs() * friction);
@@ -894,9 +906,7 @@ impl PhysicsState3d {
         }
     }
 
-    fn solve_positions(&mut self, contacts: &[Contact3d], iterations: u32) {
-        let slop = 0.01;
-        let percent = 0.2;
+    fn solve_positions(&mut self, contacts: &[Contact3d], iterations: u32, slop: f64, percent: f64) {
 
         for _ in 0..iterations {
             for contact in contacts {
@@ -958,7 +968,56 @@ impl PhysicsState3d {
                     }
                     _ => {} // Revolute/Prismatic: 3D versions need axis definitions, skip for now
                 }
+                // Apply joint damping for non-Spring joints (Spring has its own damping).
+                if joint.damping > 0.0 && !matches!(joint.joint_type, JointType::Spring { .. }) {
+                    self.apply_joint_damping_3d(joint, dt);
+                }
             }
+        }
+    }
+
+    /// Apply velocity damping proportional to relative velocity at anchor points.
+    fn apply_joint_damping_3d(&mut self, joint: &Joint3d, dt: f64) {
+        let anchor_a = self.world_anchor_3d(joint.body_a, joint.local_anchor_a);
+        let anchor_b = self.world_anchor_3d(joint.body_b, joint.local_anchor_b);
+
+        let (vel_a, angvel_a, pos_a, inv_mass_a) = match self.bodies.get(&joint.body_a) {
+            Some(b) if b.is_dynamic() => (b.linear_velocity, b.angular_velocity, b.position, b.inv_mass),
+            Some(b) => (b.linear_velocity, b.angular_velocity, b.position, 0.0),
+            None => return,
+        };
+        let (vel_b, angvel_b, pos_b, inv_mass_b) = match self.bodies.get(&joint.body_b) {
+            Some(b) if b.is_dynamic() => (b.linear_velocity, b.angular_velocity, b.position, b.inv_mass),
+            Some(b) => (b.linear_velocity, b.angular_velocity, b.position, 0.0),
+            None => return,
+        };
+
+        let inv_mass_sum = inv_mass_a + inv_mass_b;
+        if inv_mass_sum == 0.0 {
+            return;
+        }
+
+        let ra = anchor_a - pos_a;
+        let rb = anchor_b - pos_b;
+        let va = vel_a + angvel_a.cross(ra);
+        let vb = vel_b + angvel_b.cross(rb);
+        let rel_vel = vb - va;
+
+        if rel_vel.dot(rel_vel) < EPSILON_SQ {
+            return;
+        }
+
+        let impulse = rel_vel * (-joint.damping * dt);
+
+        if let Some(ba) = self.bodies.get_mut(&joint.body_a)
+            && ba.is_dynamic()
+        {
+            ba.linear_velocity -= impulse * ba.inv_mass;
+        }
+        if let Some(bb) = self.bodies.get_mut(&joint.body_b)
+            && bb.is_dynamic()
+        {
+            bb.linear_velocity += impulse * bb.inv_mass;
         }
     }
 
@@ -991,11 +1050,12 @@ impl PhysicsState3d {
         let anchor_a = self.world_anchor_3d(joint.body_a, joint.local_anchor_a);
         let anchor_b = self.world_anchor_3d(joint.body_b, joint.local_anchor_b);
         let diff = anchor_b - anchor_a;
-        let dist = diff.length();
+        let dist_sq = diff.dot(diff);
 
-        if dist < 1e-10 {
+        if dist_sq < EPSILON_SQ {
             return;
         }
+        let dist = dist_sq.sqrt();
 
         let n = diff / dist;
         let correction = (dist - length) * 0.5;
@@ -1023,11 +1083,12 @@ impl PhysicsState3d {
         let anchor_a = self.world_anchor_3d(joint.body_a, joint.local_anchor_a);
         let anchor_b = self.world_anchor_3d(joint.body_b, joint.local_anchor_b);
         let diff = anchor_b - anchor_a;
-        let dist = diff.length();
+        let dist_sq = diff.dot(diff);
 
-        if dist < 1e-10 {
+        if dist_sq < EPSILON_SQ {
             return;
         }
+        let dist = dist_sq.sqrt();
 
         let n = diff / dist;
         let spring_force = stiffness * (dist - rest_length);
@@ -1209,7 +1270,7 @@ fn sphere_sphere(
     }
 
     let dist = dist_sq.sqrt();
-    let (normal, depth) = if dist < 1e-10 {
+    let (normal, depth) = if dist < EPSILON {
         (DVec3::Y, sum_r)
     } else {
         (d / dist, sum_r - dist)
@@ -1235,7 +1296,7 @@ fn sphere_aabb(
     }
 
     let dist = dist_sq.sqrt();
-    let (normal, depth) = if dist < 1e-10 {
+    let (normal, depth) = if dist < EPSILON {
         let face_dists = DVec3::new(
             half_extents.x - d.x.abs(),
             half_extents.y - d.y.abs(),
@@ -1300,7 +1361,7 @@ fn aabb_aabb_3d(
 fn closest_point_on_segment_3d(a: DVec3, b: DVec3, p: DVec3) -> DVec3 {
     let ab = b - a;
     let len_sq = ab.dot(ab);
-    if len_sq < 1e-20 {
+    if len_sq < EPSILON_SQ {
         return a;
     }
     let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
@@ -1368,7 +1429,7 @@ fn ray_aabb_3d(
     let mut normal = DVec3::ZERO;
 
     for i in 0..3 {
-        if dir[i].abs() < 1e-10 {
+        if dir[i].abs() < EPSILON {
             if origin[i] < min[i] || origin[i] > max[i] {
                 return None;
             }
@@ -1548,7 +1609,7 @@ mod tests {
         );
 
         for _ in 0..60 {
-            state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1);
+            state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
         }
 
         assert!(state.bodies[&bh].position.y < 10.0, "body should fall");
@@ -1608,7 +1669,7 @@ mod tests {
 
         let mut found_event = false;
         for _ in 0..120 {
-            let events = state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1);
+            let events = state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
             if !events.is_empty() {
                 found_event = true;
                 break;
@@ -1792,7 +1853,7 @@ mod tests {
             collision_mask: 0xFFFF_FFFF,
         });
 
-        state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1);
+        state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
         assert!(!state.prev_collision_pairs.is_empty());
 
         state.remove_body(b);
@@ -1830,10 +1891,11 @@ mod tests {
             local_anchor_a: [0.0, 0.0],
             local_anchor_b: [0.0, 0.0],
             motor: None,
+            damping: 0.0,
         });
 
         for _ in 0..10 {
-            state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1);
+            state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2);
         }
         // Joint should prevent body from falling far
         assert!(state.bodies[&b].position.y > 2.0);

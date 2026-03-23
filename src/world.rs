@@ -69,6 +69,8 @@ impl PhysicsWorld {
                 self.config.timestep,
                 self.config.velocity_iterations,
                 self.config.position_iterations,
+                self.config.position_slop,
+                self.config.position_correction,
             );
         }
 
@@ -79,6 +81,8 @@ impl PhysicsWorld {
                 self.config.timestep,
                 self.config.velocity_iterations,
                 self.config.position_iterations,
+                self.config.position_slop,
+                self.config.position_correction,
             );
         }
 
@@ -119,7 +123,7 @@ impl PhysicsWorld {
                     .with_gravity_scale(emitter.particle_gravity_scale)
                     .with_damping(emitter.particle_damping);
                 p.handle = ParticleHandle(self.next_particle_id);
-                self.next_particle_id += 1;
+                self.next_particle_id = self.next_particle_id.wrapping_add(1);
                 new_particles.push(p);
             }
         }
@@ -314,7 +318,7 @@ impl PhysicsWorld {
     /// Add a rigid body.
     pub fn add_body(&mut self, desc: BodyDesc) -> BodyHandle {
         let handle = BodyHandle(self.next_body_id);
-        self.next_body_id += 1;
+        self.next_body_id = self.next_body_id.wrapping_add(1);
 
         #[cfg(all(feature = "2d", not(feature = "3d")))]
         self.backend_2d.add_body(handle, &desc);
@@ -334,7 +338,7 @@ impl PhysicsWorld {
     /// Add a collider attached to a body.
     pub fn add_collider(&mut self, body: BodyHandle, desc: ColliderDesc) -> ColliderHandle {
         let handle = ColliderHandle(self.next_collider_id);
-        self.next_collider_id += 1;
+        self.next_collider_id = self.next_collider_id.wrapping_add(1);
 
         #[cfg(all(feature = "2d", not(feature = "3d")))]
         self.backend_2d.add_collider(handle, body, &desc);
@@ -353,7 +357,7 @@ impl PhysicsWorld {
     /// Add a joint between two bodies.
     pub fn add_joint(&mut self, desc: JointDesc) -> JointHandle {
         let handle = JointHandle(self.next_joint_id);
-        self.next_joint_id += 1;
+        self.next_joint_id = self.next_joint_id.wrapping_add(1);
 
         #[cfg(all(feature = "2d", not(feature = "3d")))]
         self.backend_2d.add_joint(handle, &desc);
@@ -550,7 +554,7 @@ impl PhysicsWorld {
     /// Spawn a particle. Returns its handle.
     pub fn spawn_particle(&mut self, mut particle: Particle) -> ParticleHandle {
         let handle = ParticleHandle(self.next_particle_id);
-        self.next_particle_id += 1;
+        self.next_particle_id = self.next_particle_id.wrapping_add(1);
         particle.handle = handle;
         self.particles.push(particle);
         handle
@@ -559,7 +563,7 @@ impl PhysicsWorld {
     /// Add a particle emitter. Returns its handle.
     pub fn add_emitter(&mut self, mut emitter: ParticleEmitter) -> EmitterHandle {
         let handle = EmitterHandle(self.next_emitter_id);
-        self.next_emitter_id += 1;
+        self.next_emitter_id = self.next_emitter_id.wrapping_add(1);
         emitter.handle = handle;
         self.emitters.push(emitter);
         handle
@@ -652,6 +656,7 @@ impl PhysicsWorld {
                         local_anchor_a: j.local_anchor_a,
                         local_anchor_b: j.local_anchor_b,
                         motor: j.motor.clone(),
+                        damping: j.damping,
                     },
                 });
             }
@@ -712,6 +717,7 @@ impl PhysicsWorld {
                         local_anchor_a: [j.local_anchor_a[0], j.local_anchor_a[1]],
                         local_anchor_b: [j.local_anchor_b[0], j.local_anchor_b[1]],
                         motor: j.motor.clone(),
+                        damping: j.damping,
                     },
                 });
             }
@@ -1037,6 +1043,7 @@ mod tests {
             local_anchor_a: [0.0, 0.0],
             local_anchor_b: [0.0, 0.0],
             motor: None,
+            damping: 0.0,
         });
         world.step();
     }

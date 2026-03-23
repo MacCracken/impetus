@@ -95,6 +95,7 @@ fn joint_connects_bodies() {
         local_anchor_a: [0.0, 0.0],
         local_anchor_b: [0.0, 0.0],
         motor: None,
+        damping: 0.0,
     });
 
     // Stepping should not panic with joints
@@ -156,6 +157,7 @@ fn config_serde_roundtrip() {
         position_iterations: 3,
         deterministic: true,
         step: 0,
+        ..Default::default()
     };
 
     let json = serde_json::to_string(&config).unwrap();
