@@ -22,6 +22,7 @@ pub mod particle;
 pub mod query;
 #[cfg(feature = "serialize")]
 pub mod serialize;
+pub mod spring;
 pub mod units;
 pub mod world;
 
@@ -61,6 +62,9 @@ pub use particle::{EmitterHandle, Particle, ParticleEmitter, ParticleHandle};
 // Queries
 pub use query::{PointQuery, RayHit};
 
+// Springs (standalone, no world needed)
+pub use spring::{Spring, Spring2d, Spring3d};
+
 // Units
 pub use units::{PhysicsUnit, Quantity};
 
@@ -98,6 +102,9 @@ const _: () = {
         assert_send_sync::<ParticleHandle>();
         assert_send_sync::<ParticleEmitter>();
         assert_send_sync::<EmitterHandle>();
+        assert_send_sync::<Spring>();
+        assert_send_sync::<Spring2d>();
+        assert_send_sync::<Spring3d>();
         assert_send_sync::<ImpetusError>();
     }
 };

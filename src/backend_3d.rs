@@ -343,7 +343,6 @@ impl Collider3d {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct Joint3d {
     pub body_a: BodyHandle,
     pub body_b: BodyHandle,
@@ -615,6 +614,7 @@ impl PhysicsState3d {
         let broad_pairs = self.broadphase();
         let contacts = self.narrowphase(&broad_pairs);
         self.solve_contacts(&contacts, velocity_iterations);
+        self.solve_joints(dt, velocity_iterations);
         self.solve_positions(&contacts, position_iterations);
 
         for rb in self.bodies.values_mut() {
@@ -864,12 +864,30 @@ impl PhysicsState3d {
                         {
                             ba.linear_velocity =
                                 v3_sub(ba.linear_velocity, v3_scale(impulse_t, ba.inv_mass));
+                            let ang_t = v3_cross(ra, impulse_t);
+                            ba.angular_velocity = v3_sub(
+                                ba.angular_velocity,
+                                [
+                                    ang_t[0] * ba.inv_inertia[0],
+                                    ang_t[1] * ba.inv_inertia[1],
+                                    ang_t[2] * ba.inv_inertia[2],
+                                ],
+                            );
                         }
                         if let Some(bb) = self.bodies.get_mut(&contact.body_b)
                             && bb.is_dynamic()
                         {
                             bb.linear_velocity =
                                 v3_add(bb.linear_velocity, v3_scale(impulse_t, bb.inv_mass));
+                            let ang_t = v3_cross(rb, impulse_t);
+                            bb.angular_velocity = v3_add(
+                                bb.angular_velocity,
+                                [
+                                    ang_t[0] * bb.inv_inertia[0],
+                                    ang_t[1] * bb.inv_inertia[1],
+                                    ang_t[2] * bb.inv_inertia[2],
+                                ],
+                            );
                         }
                     }
                 }
@@ -915,6 +933,131 @@ impl PhysicsState3d {
                     bb.position = v3_add(bb.position, v3_scale(correction, bb.inv_mass));
                 }
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Joint solver
+    // -----------------------------------------------------------------------
+
+    fn solve_joints(&mut self, dt: f64, iterations: u32) {
+        let joints: Vec<Joint3d> = self.joints.values().cloned().collect();
+
+        for _ in 0..iterations {
+            for joint in &joints {
+                match &joint.joint_type {
+                    JointType::Fixed => self.solve_fixed_joint_3d(joint),
+                    JointType::Distance { length } => {
+                        self.solve_distance_joint_3d(joint, *length);
+                    }
+                    JointType::Spring {
+                        rest_length,
+                        stiffness,
+                        damping,
+                    } => {
+                        self.solve_spring_joint_3d(joint, *rest_length, *stiffness, *damping, dt);
+                    }
+                    _ => {} // Revolute/Prismatic: 3D versions need axis definitions, skip for now
+                }
+            }
+        }
+    }
+
+    fn world_anchor_3d(&self, body: BodyHandle, local: [f64; 3]) -> [f64; 3] {
+        let rb = match self.bodies.get(&body) {
+            Some(b) => b,
+            None => return local,
+        };
+        v3_add(rb.position, q_rotate_vec(rb.rotation, local))
+    }
+
+    fn solve_fixed_joint_3d(&mut self, joint: &Joint3d) {
+        let anchor_a = self.world_anchor_3d(joint.body_a, joint.local_anchor_a);
+        let anchor_b = self.world_anchor_3d(joint.body_b, joint.local_anchor_b);
+        let diff = v3_sub(anchor_b, anchor_a);
+
+        if let Some(ba) = self.bodies.get_mut(&joint.body_a)
+            && ba.is_dynamic()
+        {
+            ba.position = v3_add(ba.position, v3_scale(diff, 0.5));
+        }
+        if let Some(bb) = self.bodies.get_mut(&joint.body_b)
+            && bb.is_dynamic()
+        {
+            bb.position = v3_sub(bb.position, v3_scale(diff, 0.5));
+        }
+    }
+
+    fn solve_distance_joint_3d(&mut self, joint: &Joint3d, length: f64) {
+        let anchor_a = self.world_anchor_3d(joint.body_a, joint.local_anchor_a);
+        let anchor_b = self.world_anchor_3d(joint.body_b, joint.local_anchor_b);
+        let diff = v3_sub(anchor_b, anchor_a);
+        let dist = v3_len(diff);
+
+        if dist < 1e-10 {
+            return;
+        }
+
+        let n = v3_scale(diff, 1.0 / dist);
+        let correction = (dist - length) * 0.5;
+
+        if let Some(ba) = self.bodies.get_mut(&joint.body_a)
+            && ba.is_dynamic()
+        {
+            ba.position = v3_add(ba.position, v3_scale(n, correction));
+        }
+        if let Some(bb) = self.bodies.get_mut(&joint.body_b)
+            && bb.is_dynamic()
+        {
+            bb.position = v3_sub(bb.position, v3_scale(n, correction));
+        }
+    }
+
+    fn solve_spring_joint_3d(
+        &mut self,
+        joint: &Joint3d,
+        rest_length: f64,
+        stiffness: f64,
+        damping: f64,
+        dt: f64,
+    ) {
+        let anchor_a = self.world_anchor_3d(joint.body_a, joint.local_anchor_a);
+        let anchor_b = self.world_anchor_3d(joint.body_b, joint.local_anchor_b);
+        let diff = v3_sub(anchor_b, anchor_a);
+        let dist = v3_len(diff);
+
+        if dist < 1e-10 {
+            return;
+        }
+
+        let n = v3_scale(diff, 1.0 / dist);
+        let spring_force = stiffness * (dist - rest_length);
+
+        let vel_a = self
+            .bodies
+            .get(&joint.body_a)
+            .map(|b| b.linear_velocity)
+            .unwrap_or([0.0, 0.0, 0.0]);
+        let vel_b = self
+            .bodies
+            .get(&joint.body_b)
+            .map(|b| b.linear_velocity)
+            .unwrap_or([0.0, 0.0, 0.0]);
+        let rel_vel = v3_sub(vel_b, vel_a);
+        let damping_force = damping * v3_dot(rel_vel, n);
+
+        let total_force = spring_force + damping_force;
+        let force = v3_scale(n, total_force * dt);
+
+        if let Some(ba) = self.bodies.get_mut(&joint.body_a)
+            && ba.is_dynamic()
+        {
+            ba.linear_velocity = v3_add(ba.linear_velocity, v3_scale(force, ba.inv_mass));
+        }
+        if let Some(bb) = self.bodies.get_mut(&joint.body_b)
+            && bb.is_dynamic()
+        {
+            bb.linear_velocity = v3_sub(bb.linear_velocity, v3_scale(force, bb.inv_mass));
         }
     }
 
@@ -1031,6 +1174,24 @@ fn generate_contact_3d(
             ColliderShape::Box { half_extents: he_a },
             ColliderShape::Box { half_extents: he_b },
         ) => aabb_aabb_3d(pos_a, *he_a, pos_b, *he_b),
+        // Capsule vs Sphere
+        (
+            ColliderShape::Capsule {
+                half_height,
+                radius: cr,
+            },
+            ColliderShape::Ball { radius: br },
+        ) => capsule_sphere_3d(pos_a, *half_height, *cr, pos_b, *br),
+        (
+            ColliderShape::Ball { radius: br },
+            ColliderShape::Capsule {
+                half_height,
+                radius: cr,
+            },
+        ) => {
+            capsule_sphere_3d(pos_b, *half_height, *cr, pos_a, *br)
+                .map(|(n, d, p)| (v3_scale(n, -1.0), d, p))
+        }
         _ => None,
     }
 }
@@ -1137,6 +1298,33 @@ fn aabb_aabb_3d(
     point[min_axis] += normal[min_axis] * he_a[min_axis];
 
     Some((normal, depth, point))
+}
+
+// ---------------------------------------------------------------------------
+// Capsule helpers
+
+fn closest_point_on_segment_3d(a: [f64; 3], b: [f64; 3], p: [f64; 3]) -> [f64; 3] {
+    let ab = v3_sub(b, a);
+    let len_sq = v3_dot(ab, ab);
+    if len_sq < 1e-20 {
+        return a;
+    }
+    let t = (v3_dot(v3_sub(p, a), ab) / len_sq).clamp(0.0, 1.0);
+    v3_add(a, v3_scale(ab, t))
+}
+
+fn capsule_sphere_3d(
+    cap_pos: [f64; 3],
+    half_height: f64,
+    cap_radius: f64,
+    sphere_pos: [f64; 3],
+    sphere_radius: f64,
+) -> Option<([f64; 3], f64, [f64; 3])> {
+    // Capsule axis along Y in local space (no rotation transform here — pos is world center)
+    let ep_a = v3_add(cap_pos, [0.0, -half_height, 0.0]);
+    let ep_b = v3_add(cap_pos, [0.0, half_height, 0.0]);
+    let closest = closest_point_on_segment_3d(ep_a, ep_b, sphere_pos);
+    sphere_sphere(closest, cap_radius, sphere_pos, sphere_radius)
 }
 
 // ---------------------------------------------------------------------------
@@ -1451,5 +1639,197 @@ mod tests {
         assert_eq!(state.body_count(), 1);
         state.remove_body(BodyHandle(0));
         assert_eq!(state.body_count(), 0);
+    }
+
+    #[test]
+    fn sphere_mass_3d() {
+        let c = Collider3d::from_desc(
+            ColliderHandle(0),
+            BodyHandle(0),
+            &ColliderDesc {
+                shape: ColliderShape::Ball { radius: 1.0 },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
+                is_sensor: false,
+                mass: None,
+            },
+        );
+        let m = c.compute_mass();
+        let expected = (4.0 / 3.0) * std::f64::consts::PI;
+        assert!((m - expected).abs() < EPS);
+    }
+
+    #[test]
+    fn box_mass_3d() {
+        let c = Collider3d::from_desc(
+            ColliderHandle(0),
+            BodyHandle(0),
+            &ColliderDesc {
+                shape: ColliderShape::Box { half_extents: [1.0, 1.0, 1.0] },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
+                is_sensor: false,
+                mass: None,
+            },
+        );
+        assert!((c.compute_mass() - 8.0).abs() < EPS);
+    }
+
+    #[test]
+    fn multiple_colliders_accumulate_mass_3d() {
+        let mut state = PhysicsState3d::new();
+        let bh = BodyHandle(0);
+        state.add_body(bh, &BodyDesc::default());
+
+        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
+            is_sensor: false,
+            mass: None,
+        });
+        let mass_first = state.bodies[&bh].mass;
+
+        state.add_collider(ColliderHandle(1), bh, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [2.0, 0.0, 0.0],
+            material: PhysicsMaterial { density: 1.0, ..PhysicsMaterial::default() },
+            is_sensor: false,
+            mass: None,
+        });
+        assert!((state.bodies[&bh].mass - 2.0 * mass_first).abs() < EPS);
+    }
+
+    #[test]
+    fn capsule_sphere_3d_overlap() {
+        let r = capsule_sphere_3d([0.0, 0.0, 0.0], 1.0, 0.5, [0.8, 0.0, 0.0], 0.5);
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn capsule_sphere_3d_miss() {
+        assert!(capsule_sphere_3d([0.0, 0.0, 0.0], 1.0, 0.5, [5.0, 0.0, 0.0], 0.5).is_none());
+    }
+
+    #[test]
+    fn impulse_changes_velocity_3d() {
+        let mut state = PhysicsState3d::new();
+        let bh = BodyHandle(0);
+        state.add_body(bh, &BodyDesc::default());
+        state.add_collider(ColliderHandle(0), bh, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+        });
+
+        state.apply_impulse(bh, &Impulse::new(10.0, 0.0, 0.0));
+        assert!(state.bodies[&bh].linear_velocity[0] > 0.0);
+    }
+
+    #[test]
+    fn remove_cleans_collision_pairs_3d() {
+        let mut state = PhysicsState3d::new();
+
+        let a = BodyHandle(0);
+        state.add_body(a, &BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(0), a, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+        });
+
+        let b = BodyHandle(1);
+        state.add_body(b, &BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.5, 0.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(1), b, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+        });
+
+        state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1);
+        assert!(!state.prev_collision_pairs.is_empty());
+
+        state.remove_body(b);
+        assert!(state.prev_collision_pairs.is_empty());
+    }
+
+    #[test]
+    fn fixed_joint_3d() {
+        let mut state = PhysicsState3d::new();
+        let a = BodyHandle(0);
+        let b = BodyHandle(1);
+        state.add_body(a, &BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 5.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_body(b, &BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, 3.0, 0.0],
+            ..BodyDesc::default()
+        });
+        state.add_collider(ColliderHandle(0), b, &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+        });
+        state.add_joint(JointHandle(0), &JointDesc {
+            body_a: a,
+            body_b: b,
+            joint_type: JointType::Fixed,
+            local_anchor_a: [0.0, 0.0],
+            local_anchor_b: [0.0, 0.0],
+        });
+
+        for _ in 0..10 {
+            state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1);
+        }
+        // Joint should prevent body from falling far
+        assert!(state.bodies[&b].position[1] > 2.0);
+    }
+
+    #[test]
+    fn spatial_hash_3d_finds_pair() {
+        let mut grid = SpatialHash3d::new(2.0);
+        grid.insert(ColliderHandle(0), &Aabb3d {
+            min: [0.0, 0.0, 0.0],
+            max: [1.0, 1.0, 1.0],
+        });
+        grid.insert(ColliderHandle(1), &Aabb3d {
+            min: [0.5, 0.5, 0.5],
+            max: [1.5, 1.5, 1.5],
+        });
+        let pairs = grid.query_pairs();
+        assert!(pairs.contains(&(ColliderHandle(0), ColliderHandle(1))));
+    }
+
+    #[test]
+    fn spatial_hash_3d_no_false_pair() {
+        let mut grid = SpatialHash3d::new(1.0);
+        grid.insert(ColliderHandle(0), &Aabb3d {
+            min: [0.0, 0.0, 0.0],
+            max: [0.5, 0.5, 0.5],
+        });
+        grid.insert(ColliderHandle(1), &Aabb3d {
+            min: [10.0, 10.0, 10.0],
+            max: [10.5, 10.5, 10.5],
+        });
+        assert!(grid.query_pairs().is_empty());
     }
 }
