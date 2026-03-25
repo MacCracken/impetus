@@ -2,6 +2,16 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Broadphase algorithm selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum BroadphaseKind {
+    /// Spatial hash grid (default). Good for uniform-sized objects.
+    SpatialHash,
+    /// Dynamic AABB tree (BVH). Better for heterogeneous object sizes.
+    AabbTree,
+}
+
 /// Physics world configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorldConfig {
@@ -30,6 +40,18 @@ pub struct WorldConfig {
     /// Higher values improve stacking stability at a cost of performance.
     #[serde(default = "default_sub_steps")]
     pub sub_steps: u32,
+    /// Soft constraint frequency in Hz (default: 30.0).
+    /// Controls how stiff contact constraints are — higher values make them stiffer.
+    /// Set to 0.0 to disable soft constraints and use Baumgarte correction.
+    #[serde(default = "default_constraint_frequency")]
+    pub constraint_frequency: f64,
+    /// Soft constraint damping ratio (default: 1.0 = critically damped).
+    /// Values < 1.0 are under-damped (bouncy), > 1.0 are over-damped.
+    #[serde(default = "default_constraint_damping_ratio")]
+    pub constraint_damping_ratio: f64,
+    /// Broadphase algorithm (default: SpatialHash).
+    #[serde(default = "default_broadphase")]
+    pub broadphase: BroadphaseKind,
 }
 
 fn default_slop() -> f64 {
@@ -48,6 +70,18 @@ fn default_sub_steps() -> u32 {
     1
 }
 
+fn default_constraint_frequency() -> f64 {
+    30.0
+}
+
+fn default_constraint_damping_ratio() -> f64 {
+    1.0
+}
+
+fn default_broadphase() -> BroadphaseKind {
+    BroadphaseKind::SpatialHash
+}
+
 impl Default for WorldConfig {
     fn default() -> Self {
         Self {
@@ -61,6 +95,9 @@ impl Default for WorldConfig {
             position_correction: default_correction(),
             max_velocity: default_max_velocity(),
             sub_steps: default_sub_steps(),
+            constraint_frequency: default_constraint_frequency(),
+            constraint_damping_ratio: default_constraint_damping_ratio(),
+            broadphase: default_broadphase(),
         }
     }
 }
@@ -101,6 +138,9 @@ mod tests {
             position_correction: 0.3,
             max_velocity: 100.0,
             sub_steps: 1,
+            constraint_frequency: 30.0,
+            constraint_damping_ratio: 1.0,
+            broadphase: BroadphaseKind::SpatialHash,
         };
         let json = serde_json::to_string(&config).unwrap();
         let back: WorldConfig = serde_json::from_str(&json).unwrap();

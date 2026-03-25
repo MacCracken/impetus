@@ -52,6 +52,9 @@ pub(crate) struct RigidBody2d {
     pub inv_mass: f64,
     pub inertia: f64,
     pub inv_inertia: f64,
+    // Split impulse — pseudo-velocities for position correction only
+    pub pseudo_velocity: [f64; 2],
+    pub pseudo_angular_velocity: f64,
     // Sleep state
     pub is_sleeping: bool,
     pub sleep_timer: f64,
@@ -78,6 +81,8 @@ impl RigidBody2d {
             inv_mass: 0.0,
             inertia: 0.0,
             inv_inertia: 0.0,
+            pseudo_velocity: [0.0, 0.0],
+            pseudo_angular_velocity: 0.0,
             is_sleeping: false,
             sleep_timer: 0.0,
             island_id: 0,
@@ -138,12 +143,22 @@ impl RigidBody2d {
             return;
         }
 
+        // Real velocity integration
         self.position[0] += self.linear_velocity[0] * dt;
         self.position[1] += self.linear_velocity[1] * dt;
 
+        // Split impulse: apply pseudo-velocities for position correction
+        self.position[0] += self.pseudo_velocity[0] * dt;
+        self.position[1] += self.pseudo_velocity[1] * dt;
+
         if !self.fixed_rotation {
             self.rotation += self.angular_velocity * dt;
+            self.rotation += self.pseudo_angular_velocity * dt;
         }
+
+        // Clear pseudo-velocities after integration
+        self.pseudo_velocity = [0.0, 0.0];
+        self.pseudo_angular_velocity = 0.0;
     }
 
     pub(super) fn clear_forces(&mut self) {

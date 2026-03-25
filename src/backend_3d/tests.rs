@@ -164,7 +164,18 @@ fn gravity_moves_body_3d() {
     );
 
     for _ in 0..60 {
-        state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+        state.step(
+            [0.0, -9.81, 0.0],
+            1.0 / 60.0,
+            4,
+            1,
+            0.01,
+            0.2,
+            100.0,
+            30.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+        );
     }
 
     assert!(
@@ -217,7 +228,18 @@ fn sphere_collision_3d() {
 
     let mut found_event = false;
     for _ in 0..120 {
-        let events = state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+        let events = state.step(
+            [0.0, -9.81, 0.0],
+            1.0 / 60.0,
+            4,
+            1,
+            0.01,
+            0.2,
+            100.0,
+            30.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+        );
         if !events.is_empty() {
             found_event = true;
             break;
@@ -438,7 +460,18 @@ fn remove_cleans_collision_pairs_3d() {
         },
     );
 
-    state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+    state.step(
+        [0.0, 0.0, 0.0],
+        1.0 / 60.0,
+        4,
+        1,
+        0.01,
+        0.2,
+        100.0,
+        30.0,
+        1.0,
+        crate::config::BroadphaseKind::SpatialHash,
+    );
     assert!(!state.prev_collision_pairs.is_empty());
 
     state.remove_body(b);
@@ -483,7 +516,18 @@ fn fixed_joint_3d() {
     });
 
     for _ in 0..10 {
-        state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+        state.step(
+            [0.0, -9.81, 0.0],
+            1.0 / 60.0,
+            4,
+            1,
+            0.01,
+            0.2,
+            100.0,
+            30.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+        );
     }
     // Joint should prevent body from falling far
     assert!(state.bodies.get(body_ah(b)).unwrap().position.y > 2.0);

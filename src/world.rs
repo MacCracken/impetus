@@ -77,6 +77,9 @@ impl PhysicsWorld {
                     self.config.position_slop,
                     self.config.position_correction,
                     self.config.max_velocity,
+                    self.config.constraint_frequency,
+                    self.config.constraint_damping_ratio,
+                    self.config.broadphase,
                 );
             }
         }
@@ -91,6 +94,9 @@ impl PhysicsWorld {
                 self.config.position_slop,
                 self.config.position_correction,
                 self.config.max_velocity,
+                self.config.constraint_frequency,
+                self.config.constraint_damping_ratio,
+                self.config.broadphase,
             );
         }
 

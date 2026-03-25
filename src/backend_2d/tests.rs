@@ -649,7 +649,18 @@ fn sensor_generates_events_no_physics() {
     );
 
     let vel_before = state.bodies.get(body_ah(ball)).unwrap().linear_velocity;
-    let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+    let events = state.step(
+        [0.0, 0.0, 0.0],
+        1.0 / 60.0,
+        4,
+        1,
+        0.01,
+        0.2,
+        100.0,
+        30.0,
+        1.0,
+        crate::config::BroadphaseKind::SpatialHash,
+    );
 
     // Should generate events
     assert!(!events.is_empty());
@@ -672,7 +683,18 @@ fn kinematic_body_moves_from_velocity() {
     });
 
     let dt = 1.0 / 60.0;
-    state.step([0.0, -9.81, 0.0], dt, 4, 1, 0.01, 0.2, 100.0);
+    state.step(
+        [0.0, -9.81, 0.0],
+        dt,
+        4,
+        1,
+        0.01,
+        0.2,
+        100.0,
+        30.0,
+        1.0,
+        crate::config::BroadphaseKind::SpatialHash,
+    );
 
     let rb = &state.bodies.get(body_ah(bh)).unwrap();
     // Should have moved from velocity
@@ -724,7 +746,18 @@ fn remove_body_cleans_collision_pairs() {
     );
 
     // Step to generate collision manifolds
-    state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+    state.step(
+        [0.0, 0.0, 0.0],
+        1.0 / 60.0,
+        4,
+        1,
+        0.01,
+        0.2,
+        100.0,
+        30.0,
+        1.0,
+        crate::config::BroadphaseKind::SpatialHash,
+    );
     assert!(!state.manifolds.is_empty());
 
     // Remove body b — should clean manifolds
@@ -831,7 +864,18 @@ fn body_falls_asleep_when_stationary() {
     let dt = 1.0 / 60.0;
     let steps_needed = (SLEEP_TIME_THRESHOLD / dt).ceil() as usize + 10;
     for _ in 0..steps_needed {
-        state.step([0.0, 0.0, 0.0], dt, 4, 1, 0.01, 0.2, 100.0);
+        state.step(
+            [0.0, 0.0, 0.0],
+            dt,
+            4,
+            1,
+            0.01,
+            0.2,
+            100.0,
+            30.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+        );
     }
 
     assert!(
@@ -866,7 +910,18 @@ fn sleeping_body_skips_integration() {
 
     let pos_before = state.bodies.get(body_ah(bh)).unwrap().position;
     // Step with gravity — sleeping body should not move
-    state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+    state.step(
+        [0.0, -9.81, 0.0],
+        1.0 / 60.0,
+        4,
+        1,
+        0.01,
+        0.2,
+        100.0,
+        30.0,
+        1.0,
+        crate::config::BroadphaseKind::SpatialHash,
+    );
 
     let pos_after = state.bodies.get(body_ah(bh)).unwrap().position;
     assert!(
@@ -969,7 +1024,18 @@ fn moving_body_does_not_sleep() {
 
     // Step many times — body is moving so should not sleep
     for _ in 0..100 {
-        state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+        state.step(
+            [0.0, 0.0, 0.0],
+            1.0 / 60.0,
+            4,
+            1,
+            0.01,
+            0.2,
+            100.0,
+            30.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+        );
     }
     assert!(!state.bodies.get(body_ah(bh)).unwrap().is_sleeping);
 }
@@ -1043,7 +1109,18 @@ fn contact_wakes_sleeping_body() {
 
     // Step until contact
     for _ in 0..60 {
-        state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+        state.step(
+            [0.0, 0.0, 0.0],
+            1.0 / 60.0,
+            4,
+            1,
+            0.01,
+            0.2,
+            100.0,
+            30.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+        );
     }
 
     // The sleeping body should have been woken by the impact
@@ -1097,7 +1174,18 @@ fn collision_layers_prevent_collision() {
         },
     );
 
-    let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+    let events = state.step(
+        [0.0, 0.0, 0.0],
+        1.0 / 60.0,
+        4,
+        1,
+        0.01,
+        0.2,
+        100.0,
+        30.0,
+        1.0,
+        crate::config::BroadphaseKind::SpatialHash,
+    );
     assert!(
         events.is_empty(),
         "different collision layers should not generate events"
@@ -1144,7 +1232,18 @@ fn collision_layers_allow_same_layer() {
         },
     );
 
-    let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+    let events = state.step(
+        [0.0, 0.0, 0.0],
+        1.0 / 60.0,
+        4,
+        1,
+        0.01,
+        0.2,
+        100.0,
+        30.0,
+        1.0,
+        crate::config::BroadphaseKind::SpatialHash,
+    );
     assert!(
         !events.is_empty(),
         "same collision layer should generate events"
@@ -1191,7 +1290,18 @@ fn collision_layers_asymmetric_mask() {
         },
     );
 
-    let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+    let events = state.step(
+        [0.0, 0.0, 0.0],
+        1.0 / 60.0,
+        4,
+        1,
+        0.01,
+        0.2,
+        100.0,
+        30.0,
+        1.0,
+        crate::config::BroadphaseKind::SpatialHash,
+    );
     assert!(
         !events.is_empty(),
         "asymmetric mask should still allow collision when one side matches"
@@ -1238,7 +1348,18 @@ fn collision_layers_default_collide_everything() {
         },
     );
 
-    let events = state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+    let events = state.step(
+        [0.0, 0.0, 0.0],
+        1.0 / 60.0,
+        4,
+        1,
+        0.01,
+        0.2,
+        100.0,
+        30.0,
+        1.0,
+        crate::config::BroadphaseKind::SpatialHash,
+    );
     assert!(!events.is_empty(), "default layers should collide");
 }
 
@@ -1503,13 +1624,35 @@ fn manifold_persistence() {
         },
     );
 
-    state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 8, 4, 0.01, 0.2, 100.0);
+    state.step(
+        [0.0, -9.81, 0.0],
+        1.0 / 60.0,
+        8,
+        4,
+        0.01,
+        0.2,
+        100.0,
+        30.0,
+        1.0,
+        crate::config::BroadphaseKind::SpatialHash,
+    );
     assert!(
         !state.manifolds.is_empty(),
         "manifold should exist after first step with contact"
     );
 
-    state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 8, 4, 0.01, 0.2, 100.0);
+    state.step(
+        [0.0, -9.81, 0.0],
+        1.0 / 60.0,
+        8,
+        4,
+        0.01,
+        0.2,
+        100.0,
+        30.0,
+        1.0,
+        crate::config::BroadphaseKind::SpatialHash,
+    );
     assert!(
         !state.manifolds.is_empty(),
         "manifold should persist across frames"
@@ -1591,7 +1734,18 @@ fn warm_start_stabilizes_stack() {
 
     let dt = 1.0 / 60.0;
     for _ in 0..300 {
-        state.step([0.0, -9.81, 0.0], dt, 8, 4, 0.01, 0.2, 100.0);
+        state.step(
+            [0.0, -9.81, 0.0],
+            dt,
+            8,
+            4,
+            0.01,
+            0.2,
+            100.0,
+            30.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+        );
     }
 
     let final_y = state.bodies.get(body_ah(top_handle)).unwrap().position[1];
@@ -1652,7 +1806,18 @@ fn wheel_joint_constrains_perpendicular() {
     });
 
     for _ in 0..60 {
-        state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+        state.step(
+            [0.0, -9.81, 0.0],
+            1.0 / 60.0,
+            4,
+            1,
+            0.01,
+            0.2,
+            100.0,
+            30.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+        );
     }
 
     let pos = state.bodies.get(body_ah(b)).unwrap().position;
@@ -1706,7 +1871,18 @@ fn rope_joint_allows_closer_than_max() {
 
     let initial_y = state.bodies.get(body_ah(b)).unwrap().position[1];
     for _ in 0..30 {
-        state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+        state.step(
+            [0.0, -9.81, 0.0],
+            1.0 / 60.0,
+            4,
+            1,
+            0.01,
+            0.2,
+            100.0,
+            30.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+        );
     }
     let final_y = state.bodies.get(body_ah(b)).unwrap().position[1];
     assert!(
@@ -1756,7 +1932,18 @@ fn rope_joint_prevents_exceeding_max_length() {
     });
 
     for _ in 0..120 {
-        state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+        state.step(
+            [0.0, -9.81, 0.0],
+            1.0 / 60.0,
+            4,
+            1,
+            0.01,
+            0.2,
+            100.0,
+            30.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+        );
     }
 
     let pos = state.bodies.get(body_ah(b)).unwrap().position;
@@ -1813,7 +2000,18 @@ fn mouse_joint_drags_body_toward_target() {
     });
 
     for _ in 0..120 {
-        state.step([0.0, 0.0, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+        state.step(
+            [0.0, 0.0, 0.0],
+            1.0 / 60.0,
+            4,
+            1,
+            0.01,
+            0.2,
+            100.0,
+            30.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+        );
     }
 
     let pos = state.bodies.get(body_ah(a)).unwrap().position;
@@ -1868,7 +2066,18 @@ fn joint_breaking_removes_joint() {
     assert!(state.joints.contains(joint_ah(jh)));
 
     for _ in 0..10 {
-        state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+        state.step(
+            [0.0, -9.81, 0.0],
+            1.0 / 60.0,
+            4,
+            1,
+            0.01,
+            0.2,
+            100.0,
+            30.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+        );
     }
 
     assert!(
@@ -1917,7 +2126,18 @@ fn joint_not_broken_when_force_below_threshold() {
     });
 
     for _ in 0..10 {
-        state.step([0.0, -9.81, 0.0], 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0);
+        state.step(
+            [0.0, -9.81, 0.0],
+            1.0 / 60.0,
+            4,
+            1,
+            0.01,
+            0.2,
+            100.0,
+            30.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+        );
     }
 
     assert!(
@@ -2002,7 +2222,18 @@ fn multi_point_manifold() {
     let mut found_impulse = false;
     let mut max_points = 0;
     for _ in 0..120 {
-        state.step([0.0, -9.81, 0.0], dt, 8, 4, 0.01, 0.2, 100.0);
+        state.step(
+            [0.0, -9.81, 0.0],
+            dt,
+            8,
+            4,
+            0.01,
+            0.2,
+            100.0,
+            30.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+        );
         for manifold in state.manifolds.values() {
             max_points = max_points.max(manifold.points.len());
             if manifold.points.iter().any(|p| p.normal_impulse.abs() > EPS) {
@@ -2126,7 +2357,18 @@ fn simulation_islands_sleep() {
     let dt = 1.0 / 60.0;
     let steps_needed = (SLEEP_TIME_THRESHOLD / dt).ceil() as usize + 30;
     for _ in 0..steps_needed {
-        state.step([0.0, 0.0, 0.0], dt, 4, 1, 0.01, 0.2, 100.0);
+        state.step(
+            [0.0, 0.0, 0.0],
+            dt,
+            4,
+            1,
+            0.01,
+            0.2,
+            100.0,
+            30.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+        );
     }
 
     // Both should be sleeping now (zero velocity, zero gravity)
@@ -2137,7 +2379,18 @@ fn simulation_islands_sleep() {
 
     // Wake cluster B by applying a force
     state.apply_force(body_b1, &Force::new(100.0, 0.0, 0.0));
-    state.step([0.0, 0.0, 0.0], dt, 4, 1, 0.01, 0.2, 100.0);
+    state.step(
+        [0.0, 0.0, 0.0],
+        dt,
+        4,
+        1,
+        0.01,
+        0.2,
+        100.0,
+        30.0,
+        1.0,
+        crate::config::BroadphaseKind::SpatialHash,
+    );
 
     // Cluster A should remain sleeping (they're on a separate island)
     let a1_still_sleeping = state.bodies.get(body_ah(body_a1)).unwrap().is_sleeping;
@@ -2215,7 +2468,18 @@ fn static_friction_holds() {
     // Let the box settle on the floor
     let dt = 1.0 / 60.0;
     for _ in 0..60 {
-        state.step([0.0, -9.81, 0.0], dt, 8, 4, 0.01, 0.2, 100.0);
+        state.step(
+            [0.0, -9.81, 0.0],
+            dt,
+            8,
+            4,
+            0.01,
+            0.2,
+            100.0,
+            30.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+        );
     }
 
     let pos_after_settle = state.bodies.get(body_ah(box_body)).unwrap().position[0];
@@ -2223,7 +2487,18 @@ fn static_friction_holds() {
     // Apply a small horizontal force — should be held by static friction
     for _ in 0..30 {
         state.apply_force(box_body, &Force::new(1.0, 0.0, 0.0));
-        state.step([0.0, -9.81, 0.0], dt, 8, 4, 0.01, 0.2, 100.0);
+        state.step(
+            [0.0, -9.81, 0.0],
+            dt,
+            8,
+            4,
+            0.01,
+            0.2,
+            100.0,
+            30.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+        );
     }
 
     let pos_after_small_force = state.bodies.get(body_ah(box_body)).unwrap().position[0];

@@ -28,6 +28,9 @@ impl PhysicsState3d {
         slop: f64,
         correction: f64,
         max_velocity: f64,
+        constraint_frequency: f64,
+        constraint_damping_ratio: f64,
+        broadphase_kind: crate::config::BroadphaseKind,
     ) -> Vec<CollisionEvent> {
         let g = DVec3::from_array(gravity);
         // 1. Integrate velocities
@@ -35,8 +38,8 @@ impl PhysicsState3d {
             rb.integrate_velocities(g, dt, max_velocity);
         }
 
-        // 2-3. Broadphase + narrowphase
-        let broad_pairs = self.broadphase();
+        // 2-3. Broadphase (with speculative velocity expansion) + narrowphase
+        let broad_pairs = self.broadphase(broadphase_kind, dt);
         let contacts = self.narrowphase(&broad_pairs);
 
         // 4. Wake sleeping bodies on contact with non-sleeping moving bodies
@@ -77,14 +80,67 @@ impl PhysicsState3d {
             }
         }
 
-        // 5. Solve velocity constraints
+        // 5. Shock propagation: sort contacts bottom-up (closer to static bodies first)
+        let contacts = {
+            let mut contacts = contacts;
+            let mut body_level: BTreeMap<crate::body::BodyHandle, u32> = BTreeMap::new();
+            for rb in self.bodies.values() {
+                if rb.is_static() || !rb.is_dynamic() {
+                    body_level.insert(rb.handle, 0);
+                }
+            }
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for c in &contacts {
+                    let level_a = body_level.get(&c.body_a).copied();
+                    let level_b = body_level.get(&c.body_b).copied();
+                    match (level_a, level_b) {
+                        (Some(la), None) => {
+                            body_level.insert(c.body_b, la + 1);
+                            changed = true;
+                        }
+                        (None, Some(lb)) => {
+                            body_level.insert(c.body_a, lb + 1);
+                            changed = true;
+                        }
+                        (Some(la), Some(lb)) => {
+                            if la + 1 < lb {
+                                body_level.insert(c.body_b, la + 1);
+                                changed = true;
+                            } else if lb + 1 < la {
+                                body_level.insert(c.body_a, lb + 1);
+                                changed = true;
+                            }
+                        }
+                        (None, None) => {}
+                    }
+                }
+            }
+            contacts.sort_by_key(|c| {
+                let la = body_level.get(&c.body_a).copied().unwrap_or(u32::MAX);
+                let lb = body_level.get(&c.body_b).copied().unwrap_or(u32::MAX);
+                la.min(lb)
+            });
+            contacts
+        };
+
+        // 6. Solve velocity constraints
         self.solve_contacts(&contacts, velocity_iterations);
 
         // 6. Solve joint constraints
         self.solve_joints(dt, velocity_iterations);
 
-        // 7. Positional correction
-        self.solve_positions(&contacts, position_iterations, slop, correction);
+        // 7. Positional correction (soft constraint or Baumgarte)
+        self.solve_positions(
+            &contacts,
+            position_iterations,
+            slop,
+            correction,
+            dt,
+            constraint_frequency,
+            constraint_damping_ratio,
+        );
 
         // 8. Integrate positions
         for rb in self.bodies.values_mut() {
@@ -122,29 +178,54 @@ impl PhysicsState3d {
     // Broadphase
     // -----------------------------------------------------------------------
 
-    fn broadphase(&self) -> Vec<(ColliderHandle, ColliderHandle)> {
+    fn broadphase(
+        &self,
+        kind: crate::config::BroadphaseKind,
+        dt: f64,
+    ) -> Vec<(ColliderHandle, ColliderHandle)> {
+        use crate::aabb_tree::{AabbTree, TreeAabb};
+
         let collider_aabbs: Vec<(ColliderHandle, Aabb3d)> = self
             .colliders
             .values()
             .filter_map(|c| {
                 let rb = self.bodies.get(body_ah(c.body))?;
-                Some((c.handle, c.world_aabb(rb.position, rb.rotation)))
+                let mut aabb = c.world_aabb(rb.position, rb.rotation);
+                // Speculative expansion: expand AABB along velocity direction
+                let vel = rb.linear_velocity * dt;
+                aabb.min = aabb.min.min(aabb.min + vel);
+                aabb.max = aabb.max.max(aabb.max + vel);
+                Some((c.handle, aabb))
             })
             .collect();
 
-        let cell_size = SpatialHashGrid::<ColliderHandle>::auto_cell_size(
-            collider_aabbs.iter().map(|(_, aabb)| {
-                let size = aabb.max - aabb.min;
-                size.x.max(size.y).max(size.z)
-            }),
-            collider_aabbs.len(),
-        );
-        let mut grid = SpatialHashGrid::new(cell_size);
-        for (handle, aabb) in &collider_aabbs {
-            grid.insert_3d(*handle, aabb.min.to_array(), aabb.max.to_array());
-        }
+        let candidates = match kind {
+            crate::config::BroadphaseKind::SpatialHash => {
+                let cell_size = SpatialHashGrid::<ColliderHandle>::auto_cell_size(
+                    collider_aabbs.iter().map(|(_, aabb)| {
+                        let size = aabb.max - aabb.min;
+                        size.x.max(size.y).max(size.z)
+                    }),
+                    collider_aabbs.len(),
+                );
+                let mut grid = SpatialHashGrid::new(cell_size);
+                for (handle, aabb) in &collider_aabbs {
+                    grid.insert_3d(*handle, aabb.min.to_array(), aabb.max.to_array());
+                }
+                grid.query_pairs()
+            }
+            crate::config::BroadphaseKind::AabbTree => {
+                let mut tree = AabbTree::new();
+                for (handle, aabb) in &collider_aabbs {
+                    tree.insert(
+                        *handle,
+                        TreeAabb::from_3d(aabb.min.to_array(), aabb.max.to_array()),
+                    );
+                }
+                tree.query_pairs()
+            }
+        };
 
-        let candidates = grid.query_pairs();
         let aabb_map: BTreeMap<ColliderHandle, Aabb3d> = collider_aabbs.into_iter().collect();
 
         let mut pairs = Vec::with_capacity(candidates.len());
@@ -425,13 +506,23 @@ impl PhysicsState3d {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn solve_positions(
         &mut self,
         contacts: &[Contact3d],
         iterations: u32,
         slop: f64,
         percent: f64,
+        dt: f64,
+        constraint_frequency: f64,
+        constraint_damping_ratio: f64,
     ) {
+        // Reset pseudo-velocities before position solve
+        for rb in self.bodies.values_mut() {
+            rb.pseudo_velocity = DVec3::ZERO;
+            rb.pseudo_angular_velocity = DVec3::ZERO;
+        }
+
         for _ in 0..iterations {
             for contact in contacts {
                 let is_sensor = match (
@@ -460,18 +551,28 @@ impl PhysicsState3d {
                     continue;
                 }
 
-                let correction_mag = (contact.depth - slop).max(0.0) / inv_mass_sum * percent;
-                let correction = contact.normal * correction_mag;
+                let penetration = (contact.depth - slop).max(0.0);
+
+                // Soft constraint (ERP/CFM spring-damper) or Baumgarte fallback
+                let bias = if constraint_frequency > 0.0 && dt > 0.0 {
+                    let omega = 2.0 * std::f64::consts::PI * constraint_frequency;
+                    let d = 2.0 * constraint_damping_ratio * omega;
+                    let k = omega * omega;
+                    let erp = dt * k / (d + dt * k);
+                    erp * penetration / (inv_mass_sum * dt)
+                } else {
+                    penetration * percent / inv_mass_sum
+                };
 
                 if let Some(ba) = self.bodies.get_mut(body_ah(contact.body_a))
                     && ba.is_dynamic()
                 {
-                    ba.position -= correction * ba.inv_mass;
+                    ba.pseudo_velocity -= contact.normal * (bias * ba.inv_mass);
                 }
                 if let Some(bb) = self.bodies.get_mut(body_ah(contact.body_b))
                     && bb.is_dynamic()
                 {
-                    bb.position += correction * bb.inv_mass;
+                    bb.pseudo_velocity += contact.normal * (bias * bb.inv_mass);
                 }
             }
         }

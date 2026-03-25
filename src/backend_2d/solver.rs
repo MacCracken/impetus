@@ -26,6 +26,9 @@ impl PhysicsState2d {
         slop: f64,
         correction: f64,
         max_velocity: f64,
+        constraint_frequency: f64,
+        constraint_damping_ratio: f64,
+        broadphase_kind: crate::config::BroadphaseKind,
     ) -> Vec<CollisionEvent> {
         let gravity_2d = [gravity[0], gravity[1]];
         // 1. Integrate velocities
@@ -33,8 +36,8 @@ impl PhysicsState2d {
             rb.integrate_velocities(gravity_2d, dt, max_velocity);
         }
 
-        // 2. Broadphase
-        let broad_pairs = self.broadphase();
+        // 2. Broadphase (with speculative expansion by velocity)
+        let broad_pairs = self.broadphase(broadphase_kind, dt);
 
         // 3. Narrowphase — raw contacts
         let contacts = self.narrowphase(&broad_pairs);
@@ -91,8 +94,15 @@ impl PhysicsState2d {
         // 8. Solve joint constraints
         self.solve_joints(dt, velocity_iterations);
 
-        // 9. Positional correction
-        self.solve_positions(position_iterations, slop, correction);
+        // 9. Positional correction (soft constraint or Baumgarte)
+        self.solve_positions(
+            position_iterations,
+            slop,
+            correction,
+            dt,
+            constraint_frequency,
+            constraint_damping_ratio,
+        );
 
         // 10. Integrate positions
         for rb in self.bodies.values_mut() {
@@ -115,33 +125,62 @@ impl PhysicsState2d {
     // Broadphase — spatial hash grid
     // -----------------------------------------------------------------------
 
-    fn broadphase(&self) -> Vec<(ColliderHandle, ColliderHandle)> {
-        // Compute AABBs for all colliders
+    fn broadphase(
+        &self,
+        kind: crate::config::BroadphaseKind,
+        dt: f64,
+    ) -> Vec<(ColliderHandle, ColliderHandle)> {
+        use crate::aabb_tree::{AabbTree, TreeAabb};
+
+        // Compute AABBs for all colliders, expanded by velocity for speculative contacts
         let collider_aabbs: Vec<(ColliderHandle, Aabb2d)> = self
             .colliders
             .values()
             .filter_map(|c| {
                 let rb = self.bodies.get(body_ah(c.body))?;
-                Some((c.handle, c.world_aabb(rb.position, rb.rotation)))
+                let mut aabb = c.world_aabb(rb.position, rb.rotation);
+                // Speculative expansion: expand AABB along velocity direction
+                let dx = rb.linear_velocity[0] * dt;
+                let dy = rb.linear_velocity[1] * dt;
+                if dx > 0.0 {
+                    aabb.max[0] += dx;
+                } else {
+                    aabb.min[0] += dx;
+                }
+                if dy > 0.0 {
+                    aabb.max[1] += dy;
+                } else {
+                    aabb.min[1] += dy;
+                }
+                Some((c.handle, aabb))
             })
             .collect();
 
-        // Build spatial hash
-        let cell_size = SpatialHashGrid::<ColliderHandle>::auto_cell_size(
-            collider_aabbs.iter().map(|(_, aabb)| {
-                let w = aabb.max[0] - aabb.min[0];
-                let h = aabb.max[1] - aabb.min[1];
-                w.max(h)
-            }),
-            collider_aabbs.len(),
-        );
-        let mut grid = SpatialHashGrid::new(cell_size);
-        for (handle, aabb) in &collider_aabbs {
-            grid.insert_2d(*handle, aabb.min, aabb.max);
-        }
-
-        // Collect candidate pairs from shared cells
-        let candidates = grid.query_pairs();
+        // Get candidate pairs from broadphase algorithm
+        let candidates = match kind {
+            crate::config::BroadphaseKind::SpatialHash => {
+                let cell_size = SpatialHashGrid::<ColliderHandle>::auto_cell_size(
+                    collider_aabbs.iter().map(|(_, aabb)| {
+                        let w = aabb.max[0] - aabb.min[0];
+                        let h = aabb.max[1] - aabb.min[1];
+                        w.max(h)
+                    }),
+                    collider_aabbs.len(),
+                );
+                let mut grid = SpatialHashGrid::new(cell_size);
+                for (handle, aabb) in &collider_aabbs {
+                    grid.insert_2d(*handle, aabb.min, aabb.max);
+                }
+                grid.query_pairs()
+            }
+            crate::config::BroadphaseKind::AabbTree => {
+                let mut tree = AabbTree::new();
+                for (handle, aabb) in &collider_aabbs {
+                    tree.insert(*handle, TreeAabb::from_2d(aabb.min, aabb.max));
+                }
+                tree.query_pairs()
+            }
+        };
 
         // Build AABB lookup for overlap verification
         let aabb_map: BTreeMap<ColliderHandle, Aabb2d> = collider_aabbs.into_iter().collect();
@@ -553,7 +592,60 @@ impl PhysicsState2d {
             rule.combine(a, b)
         }
 
-        let keys: Vec<ManifoldKey> = self.manifolds.keys().copied().collect();
+        // Shock propagation: order manifolds bottom-up so contacts touching
+        // static/kinematic bodies are solved first, improving stacking stability.
+        let keys: Vec<ManifoldKey> = {
+            let mut keys: Vec<ManifoldKey> = self.manifolds.keys().copied().collect();
+
+            // Compute "level" per body: 0 = static/kinematic, then BFS from those
+            let mut body_level: BTreeMap<crate::body::BodyHandle, u32> = BTreeMap::new();
+            for rb in self.bodies.values() {
+                if rb.is_static() || !rb.is_dynamic() {
+                    body_level.insert(rb.handle, 0);
+                }
+            }
+
+            // BFS propagation through contact graph
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for manifold in self.manifolds.values() {
+                    let level_a = body_level.get(&manifold.body_a).copied();
+                    let level_b = body_level.get(&manifold.body_b).copied();
+
+                    match (level_a, level_b) {
+                        (Some(la), None) => {
+                            body_level.insert(manifold.body_b, la + 1);
+                            changed = true;
+                        }
+                        (None, Some(lb)) => {
+                            body_level.insert(manifold.body_a, lb + 1);
+                            changed = true;
+                        }
+                        (Some(la), Some(lb)) => {
+                            if la + 1 < lb {
+                                body_level.insert(manifold.body_b, la + 1);
+                                changed = true;
+                            } else if lb + 1 < la {
+                                body_level.insert(manifold.body_a, lb + 1);
+                                changed = true;
+                            }
+                        }
+                        (None, None) => {}
+                    }
+                }
+            }
+
+            // Sort manifolds: lower min-level contacts first (closer to ground)
+            keys.sort_by_key(|key| {
+                let m = &self.manifolds[key];
+                let la = body_level.get(&m.body_a).copied().unwrap_or(u32::MAX);
+                let lb = body_level.get(&m.body_b).copied().unwrap_or(u32::MAX);
+                la.min(lb)
+            });
+
+            keys
+        };
         let materials: Vec<ManifoldMaterial> = keys
             .iter()
             .map(|key| {
@@ -631,7 +723,176 @@ impl PhysicsState2d {
                 let body_b_handle = manifold.body_b;
                 let num_points = manifold.points.len();
 
-                // Process each manifold point
+                // --- Block solver: coupled 2x2 normal solve for 2-point manifolds ---
+                if num_points == 2 {
+                    // Pre-compute contact geometry for both points
+                    let mut ra = [[0.0; 2]; 2];
+                    let mut rb = [[0.0; 2]; 2];
+                    let mut ra_cross_n = [0.0; 2];
+                    let mut rb_cross_n = [0.0; 2];
+
+                    for pi in 0..2 {
+                        let mp = &self.manifolds[key].points[pi];
+                        let cp = local_to_world(mp.local_a, pos_a, rot_a);
+                        ra[pi] = [cp[0] - pos_a[0], cp[1] - pos_a[1]];
+                        rb[pi] = [cp[0] - pos_b[0], cp[1] - pos_b[1]];
+                        ra_cross_n[pi] = ra[pi][0] * n[1] - ra[pi][1] * n[0];
+                        rb_cross_n[pi] = rb[pi][0] * n[1] - rb[pi][1] * n[0];
+                    }
+
+                    // Build 2x2 effective mass matrix K
+                    // K[i][j] = inv_mass_a + inv_mass_b
+                    //         + ra_cross_n[i] * ra_cross_n[j] * inv_inertia_a
+                    //         + rb_cross_n[i] * rb_cross_n[j] * inv_inertia_b
+                    let k00 = inv_mass_a
+                        + inv_mass_b
+                        + ra_cross_n[0] * ra_cross_n[0] * inv_inertia_a
+                        + rb_cross_n[0] * rb_cross_n[0] * inv_inertia_b;
+                    let k01 = inv_mass_a
+                        + inv_mass_b
+                        + ra_cross_n[0] * ra_cross_n[1] * inv_inertia_a
+                        + rb_cross_n[0] * rb_cross_n[1] * inv_inertia_b;
+                    let k11 = inv_mass_a
+                        + inv_mass_b
+                        + ra_cross_n[1] * ra_cross_n[1] * inv_inertia_a
+                        + rb_cross_n[1] * rb_cross_n[1] * inv_inertia_b;
+
+                    // Invert the 2x2 matrix K
+                    let det = k00 * k11 - k01 * k01;
+                    if det.abs() > EPSILON {
+                        let inv_det = 1.0 / det;
+
+                        // Read current velocities
+                        let (vel_a, angvel_a) = {
+                            let ba = match self.bodies.get(body_ah(body_a_handle)) {
+                                Some(b) => b,
+                                None => continue,
+                            };
+                            (ba.linear_velocity, ba.angular_velocity)
+                        };
+                        let (vel_b, angvel_b) = {
+                            let bb = match self.bodies.get(body_ah(body_b_handle)) {
+                                Some(b) => b,
+                                None => continue,
+                            };
+                            (bb.linear_velocity, bb.angular_velocity)
+                        };
+
+                        // Compute velocity errors at both points
+                        let mut vn = [0.0; 2];
+                        for pi in 0..2 {
+                            let va = [
+                                vel_a[0] - angvel_a * ra[pi][1],
+                                vel_a[1] + angvel_a * ra[pi][0],
+                            ];
+                            let vb = [
+                                vel_b[0] - angvel_b * rb[pi][1],
+                                vel_b[1] + angvel_b * rb[pi][0],
+                            ];
+                            vn[pi] = (vb[0] - va[0]) * n[0] + (vb[1] - va[1]) * n[1];
+                        }
+
+                        // Restitution bias
+                        let rest = materials[ki].restitution;
+                        let bias0 = if vn[0].abs() < RESTITUTION_VELOCITY_THRESHOLD {
+                            0.0
+                        } else {
+                            rest * vn[0]
+                        };
+                        let bias1 = if vn[1].abs() < RESTITUTION_VELOCITY_THRESHOLD {
+                            0.0
+                        } else {
+                            rest * vn[1]
+                        };
+
+                        // RHS: b = -(vn + restitution * vn)
+                        let b0 = -(vn[0] + bias0);
+                        let b1 = -(vn[1] + bias1);
+
+                        // Solve K * delta_j = b  =>  delta_j = K_inv * b
+                        let dj0 = (k11 * b0 - k01 * b1) * inv_det;
+                        let dj1 = (-k01 * b0 + k00 * b1) * inv_det;
+
+                        // Accumulated clamping: j_new = max(j_old + dj, 0)
+                        let j_old0 = self.manifolds[key].points[0].normal_impulse;
+                        let j_old1 = self.manifolds[key].points[1].normal_impulse;
+
+                        let mut j_new0 = j_old0 + dj0;
+                        let mut j_new1 = j_old1 + dj1;
+
+                        // Four-case clamping for the non-negative constraint
+                        if j_new0 >= 0.0 && j_new1 >= 0.0 {
+                            // Case 1: both non-negative, accept
+                        } else if j_new0 >= 0.0 {
+                            // Case 2: j1 < 0, clamp j1 = 0, re-solve j0
+                            j_new1 = 0.0;
+                            j_new0 = (-(vn[0] + bias0) / k00 + j_old0).max(0.0);
+                        } else if j_new1 >= 0.0 {
+                            // Case 3: j0 < 0, clamp j0 = 0, re-solve j1
+                            j_new0 = 0.0;
+                            j_new1 = (-(vn[1] + bias1) / k11 + j_old1).max(0.0);
+                        } else {
+                            // Case 4: both negative, clamp both to 0
+                            j_new0 = 0.0;
+                            j_new1 = 0.0;
+                        }
+
+                        let j_applied0 = j_new0 - j_old0;
+                        let j_applied1 = j_new1 - j_old1;
+
+                        {
+                            let m = self.manifolds.get_mut(key).expect("manifold exists");
+                            m.points[0].normal_impulse = j_new0;
+                            m.points[1].normal_impulse = j_new1;
+                        }
+
+                        // Apply combined impulse from both points
+                        let total_impulse_x = (j_applied0 + j_applied1) * n[0];
+                        let total_impulse_y = (j_applied0 + j_applied1) * n[1];
+                        let total_ang_a = ra_cross_n[0] * j_applied0 + ra_cross_n[1] * j_applied1;
+                        let total_ang_b = rb_cross_n[0] * j_applied0 + rb_cross_n[1] * j_applied1;
+
+                        if let Some(ba) = self.bodies.get_mut(body_ah(body_a_handle))
+                            && ba.is_dynamic()
+                        {
+                            ba.linear_velocity[0] -= total_impulse_x * ba.inv_mass;
+                            ba.linear_velocity[1] -= total_impulse_y * ba.inv_mass;
+                            ba.angular_velocity -= total_ang_a * ba.inv_inertia;
+                        }
+                        if let Some(bb) = self.bodies.get_mut(body_ah(body_b_handle))
+                            && bb.is_dynamic()
+                        {
+                            bb.linear_velocity[0] += total_impulse_x * bb.inv_mass;
+                            bb.linear_velocity[1] += total_impulse_y * bb.inv_mass;
+                            bb.angular_velocity += total_ang_b * bb.inv_inertia;
+                        }
+                    }
+
+                    // Friction + rolling friction still per-point after block normal solve
+                    for pi in 0..2 {
+                        let j_accumulated = self.manifolds[key].points[pi].normal_impulse;
+                        self.solve_contact_friction(
+                            key,
+                            pi,
+                            &ra[pi],
+                            &rb[pi],
+                            &n,
+                            inv_mass_a,
+                            inv_mass_b,
+                            inv_inertia_a,
+                            inv_inertia_b,
+                            body_a_handle,
+                            body_b_handle,
+                            materials[ki].friction,
+                            materials[ki].static_friction,
+                            materials[ki].rolling_friction,
+                            j_accumulated,
+                        );
+                    }
+                    continue;
+                }
+
+                // --- Single-point solver (num_points == 1) ---
                 for pi in 0..num_points {
                     let mp = &self.manifolds[key].points[pi];
 
@@ -674,7 +935,6 @@ impl PhysicsState2d {
                         + rb_cross_n * rb_cross_n * inv_inertia_b;
 
                     // Normal impulse with accumulation
-                    // Suppress restitution at low velocities to prevent micro-bouncing.
                     let restitution = if vel_along_normal.abs() < RESTITUTION_VELOCITY_THRESHOLD {
                         0.0
                     } else {
@@ -684,7 +944,8 @@ impl PhysicsState2d {
                     let j_old = self.manifolds[key].points[pi].normal_impulse;
                     let j_accumulated = (j_old + j_new).max(0.0);
                     let j_applied = j_accumulated - j_old;
-                    self.manifolds.get_mut(key).unwrap().points[pi].normal_impulse = j_accumulated;
+                    self.manifolds.get_mut(key).expect("manifold exists").points[pi]
+                        .normal_impulse = j_accumulated;
 
                     let impulse_n = [j_applied * n[0], j_applied * n[1]];
 
@@ -703,120 +964,158 @@ impl PhysicsState2d {
                         bb.angular_velocity += rb_cross_n * j_applied * bb.inv_inertia;
                     }
 
-                    // Friction impulse with accumulation (static vs kinetic)
-                    let kinetic_friction = materials[ki].friction;
-                    let static_friction = materials[ki].static_friction;
-                    if kinetic_friction > 0.0 || static_friction > 0.0 {
-                        // Re-read velocities after normal impulse application
-                        let (vel_a, angvel_a) = {
-                            let ba = match self.bodies.get(body_ah(body_a_handle)) {
-                                Some(b) => b,
-                                None => continue,
-                            };
-                            (ba.linear_velocity, ba.angular_velocity)
-                        };
-                        let (vel_b, angvel_b) = {
-                            let bb = match self.bodies.get(body_ah(body_b_handle)) {
-                                Some(b) => b,
-                                None => continue,
-                            };
-                            (bb.linear_velocity, bb.angular_velocity)
-                        };
+                    // Friction + rolling friction
+                    self.solve_contact_friction(
+                        key,
+                        pi,
+                        &ra,
+                        &rb,
+                        &n,
+                        inv_mass_a,
+                        inv_mass_b,
+                        inv_inertia_a,
+                        inv_inertia_b,
+                        body_a_handle,
+                        body_b_handle,
+                        materials[ki].friction,
+                        materials[ki].static_friction,
+                        materials[ki].rolling_friction,
+                        j_accumulated,
+                    );
+                }
+            }
+        }
+    }
 
-                        let vel_a_at_cp =
-                            [vel_a[0] - angvel_a * ra[1], vel_a[1] + angvel_a * ra[0]];
-                        let vel_b_at_cp =
-                            [vel_b[0] - angvel_b * rb[1], vel_b[1] + angvel_b * rb[0]];
-                        let rel_vel = [
-                            vel_b_at_cp[0] - vel_a_at_cp[0],
-                            vel_b_at_cp[1] - vel_a_at_cp[1],
-                        ];
+    /// Shared friction + rolling friction solver for a single contact point.
+    #[allow(clippy::too_many_arguments)]
+    fn solve_contact_friction(
+        &mut self,
+        key: &ManifoldKey,
+        pi: usize,
+        ra: &[f64; 2],
+        rb: &[f64; 2],
+        n: &[f64; 2],
+        inv_mass_a: f64,
+        inv_mass_b: f64,
+        inv_inertia_a: f64,
+        inv_inertia_b: f64,
+        body_a_handle: crate::body::BodyHandle,
+        body_b_handle: crate::body::BodyHandle,
+        kinetic_friction: f64,
+        static_friction: f64,
+        rolling_friction: f64,
+        j_accumulated: f64,
+    ) {
+        if kinetic_friction > 0.0 || static_friction > 0.0 {
+            let (vel_a, angvel_a) = {
+                let ba = match self.bodies.get(body_ah(body_a_handle)) {
+                    Some(b) => b,
+                    None => return,
+                };
+                (ba.linear_velocity, ba.angular_velocity)
+            };
+            let (vel_b, angvel_b) = {
+                let bb = match self.bodies.get(body_ah(body_b_handle)) {
+                    Some(b) => b,
+                    None => return,
+                };
+                (bb.linear_velocity, bb.angular_velocity)
+            };
 
-                        let tangent = [-n[1], n[0]];
-                        let vel_along_tangent = rel_vel[0] * tangent[0] + rel_vel[1] * tangent[1];
+            let vel_a_at_cp = [vel_a[0] - angvel_a * ra[1], vel_a[1] + angvel_a * ra[0]];
+            let vel_b_at_cp = [vel_b[0] - angvel_b * rb[1], vel_b[1] + angvel_b * rb[0]];
+            let rel_vel = [
+                vel_b_at_cp[0] - vel_a_at_cp[0],
+                vel_b_at_cp[1] - vel_a_at_cp[1],
+            ];
 
-                        let ra_cross_t = ra[0] * tangent[1] - ra[1] * tangent[0];
-                        let rb_cross_t = rb[0] * tangent[1] - rb[1] * tangent[0];
-                        let inv_mass_sum_t = inv_mass_a
-                            + inv_mass_b
-                            + ra_cross_t * ra_cross_t * inv_inertia_a
-                            + rb_cross_t * rb_cross_t * inv_inertia_b;
+            let tangent = [-n[1], n[0]];
+            let vel_along_tangent = rel_vel[0] * tangent[0] + rel_vel[1] * tangent[1];
 
-                        let jt_new = -vel_along_tangent / inv_mass_sum_t;
-                        let jt_old = self.manifolds[key].points[pi].tangent_impulse;
+            let ra_cross_t = ra[0] * tangent[1] - ra[1] * tangent[0];
+            let rb_cross_t = rb[0] * tangent[1] - rb[1] * tangent[0];
+            let inv_mass_sum_t = inv_mass_a
+                + inv_mass_b
+                + ra_cross_t * ra_cross_t * inv_inertia_a
+                + rb_cross_t * rb_cross_t * inv_inertia_b;
 
-                        // Use static friction when tangential velocity is very low,
-                        // kinetic friction otherwise.
-                        let mu = if vel_along_tangent.abs() < 0.01 {
-                            static_friction
-                        } else {
-                            kinetic_friction
-                        };
-                        let max_friction = j_accumulated.abs() * mu;
-                        let jt_accumulated = (jt_old + jt_new).clamp(-max_friction, max_friction);
-                        let jt_applied = jt_accumulated - jt_old;
-                        self.manifolds.get_mut(key).unwrap().points[pi].tangent_impulse =
-                            jt_accumulated;
+            let jt_new = -vel_along_tangent / inv_mass_sum_t;
+            let jt_old = self.manifolds[key].points[pi].tangent_impulse;
 
-                        let impulse_t = [jt_applied * tangent[0], jt_applied * tangent[1]];
+            let mu = if vel_along_tangent.abs() < 0.01 {
+                static_friction
+            } else {
+                kinetic_friction
+            };
+            let max_friction = j_accumulated.abs() * mu;
+            let jt_accumulated = (jt_old + jt_new).clamp(-max_friction, max_friction);
+            let jt_applied = jt_accumulated - jt_old;
+            self.manifolds.get_mut(key).expect("manifold exists").points[pi].tangent_impulse =
+                jt_accumulated;
 
-                        if let Some(ba) = self.bodies.get_mut(body_ah(body_a_handle))
-                            && ba.is_dynamic()
-                        {
-                            ba.linear_velocity[0] -= impulse_t[0] * ba.inv_mass;
-                            ba.linear_velocity[1] -= impulse_t[1] * ba.inv_mass;
-                            ba.angular_velocity -= ra_cross_t * jt_applied * ba.inv_inertia;
-                        }
-                        if let Some(bb) = self.bodies.get_mut(body_ah(body_b_handle))
-                            && bb.is_dynamic()
-                        {
-                            bb.linear_velocity[0] += impulse_t[0] * bb.inv_mass;
-                            bb.linear_velocity[1] += impulse_t[1] * bb.inv_mass;
-                            bb.angular_velocity += rb_cross_t * jt_applied * bb.inv_inertia;
-                        }
-                    }
+            let impulse_t = [jt_applied * tangent[0], jt_applied * tangent[1]];
 
-                    // Rolling friction — apply torque opposing angular velocity
-                    let rolling_friction = materials[ki].rolling_friction;
-                    if rolling_friction > 0.0 {
-                        let normal_force = j_accumulated.abs();
-                        let roll_torque = rolling_friction * normal_force;
+            if let Some(ba) = self.bodies.get_mut(body_ah(body_a_handle))
+                && ba.is_dynamic()
+            {
+                ba.linear_velocity[0] -= impulse_t[0] * ba.inv_mass;
+                ba.linear_velocity[1] -= impulse_t[1] * ba.inv_mass;
+                ba.angular_velocity -= ra_cross_t * jt_applied * ba.inv_inertia;
+            }
+            if let Some(bb) = self.bodies.get_mut(body_ah(body_b_handle))
+                && bb.is_dynamic()
+            {
+                bb.linear_velocity[0] += impulse_t[0] * bb.inv_mass;
+                bb.linear_velocity[1] += impulse_t[1] * bb.inv_mass;
+                bb.angular_velocity += rb_cross_t * jt_applied * bb.inv_inertia;
+            }
+        }
 
-                        if let Some(ba) = self.bodies.get_mut(body_ah(body_a_handle))
-                            && ba.is_dynamic()
-                            && ba.angular_velocity.abs() > EPSILON
-                        {
-                            let old_sign = ba.angular_velocity > 0.0;
-                            let sign = if old_sign { -1.0 } else { 1.0 };
-                            ba.angular_velocity += sign * roll_torque * ba.inv_inertia;
-                            // Don't reverse direction
-                            if (ba.angular_velocity > 0.0) != old_sign {
-                                ba.angular_velocity = 0.0;
-                            }
-                        }
-                        if let Some(bb) = self.bodies.get_mut(body_ah(body_b_handle))
-                            && bb.is_dynamic()
-                            && bb.angular_velocity.abs() > EPSILON
-                        {
-                            let old_sign = bb.angular_velocity > 0.0;
-                            let sign = if old_sign { -1.0 } else { 1.0 };
-                            bb.angular_velocity += sign * roll_torque * bb.inv_inertia;
-                            // Don't reverse direction
-                            if (bb.angular_velocity > 0.0) != old_sign {
-                                bb.angular_velocity = 0.0;
-                            }
-                        }
-                    }
+        // Rolling friction
+        if rolling_friction > 0.0 {
+            let normal_force = j_accumulated.abs();
+            let roll_torque = rolling_friction * normal_force;
+
+            if let Some(ba) = self.bodies.get_mut(body_ah(body_a_handle))
+                && ba.is_dynamic()
+                && ba.angular_velocity.abs() > EPSILON
+            {
+                let old_sign = ba.angular_velocity > 0.0;
+                let sign = if old_sign { -1.0 } else { 1.0 };
+                ba.angular_velocity += sign * roll_torque * ba.inv_inertia;
+                if (ba.angular_velocity > 0.0) != old_sign {
+                    ba.angular_velocity = 0.0;
+                }
+            }
+            if let Some(bb) = self.bodies.get_mut(body_ah(body_b_handle))
+                && bb.is_dynamic()
+                && bb.angular_velocity.abs() > EPSILON
+            {
+                let old_sign = bb.angular_velocity > 0.0;
+                let sign = if old_sign { -1.0 } else { 1.0 };
+                bb.angular_velocity += sign * roll_torque * bb.inv_inertia;
+                if (bb.angular_velocity > 0.0) != old_sign {
+                    bb.angular_velocity = 0.0;
                 }
             }
         }
     }
 
     // -----------------------------------------------------------------------
-    // Positional correction (Baumgarte stabilization)
+    // Positional correction (split impulse — pseudo-velocity based)
     // -----------------------------------------------------------------------
 
-    fn solve_positions(&mut self, iterations: u32, slop: f64, percent: f64) {
+    #[allow(clippy::too_many_arguments)]
+    fn solve_positions(
+        &mut self,
+        iterations: u32,
+        slop: f64,
+        percent: f64,
+        dt: f64,
+        constraint_frequency: f64,
+        constraint_damping_ratio: f64,
+    ) {
         // Collect positional correction data from manifolds
         struct PosCorrection {
             body_a: crate::body::BodyHandle,
@@ -847,6 +1146,12 @@ impl PhysicsState2d {
             })
             .collect();
 
+        // Reset pseudo-velocities before position solve
+        for rb in self.bodies.values_mut() {
+            rb.pseudo_velocity = [0.0, 0.0];
+            rb.pseudo_angular_velocity = 0.0;
+        }
+
         for _ in 0..iterations {
             for corr in &corrections {
                 if corr.is_sensor {
@@ -870,20 +1175,31 @@ impl PhysicsState2d {
                 }
 
                 let n = corr.normal;
-                let correction_mag = (corr.depth - slop).max(0.0) / inv_mass_sum * percent;
-                let correction = [correction_mag * n[0], correction_mag * n[1]];
+                let penetration = (corr.depth - slop).max(0.0);
+
+                // Soft constraint (ERP/CFM spring-damper) or Baumgarte fallback
+                let bias = if constraint_frequency > 0.0 && dt > 0.0 {
+                    // Derive ERP from spring frequency and damping ratio
+                    let omega = 2.0 * std::f64::consts::PI * constraint_frequency;
+                    let d = 2.0 * constraint_damping_ratio * omega;
+                    let k = omega * omega;
+                    let erp = dt * k / (d + dt * k);
+                    erp * penetration / (inv_mass_sum * dt)
+                } else {
+                    penetration * percent / inv_mass_sum
+                };
 
                 if let Some(ba) = self.bodies.get_mut(body_ah(corr.body_a))
                     && ba.is_dynamic()
                 {
-                    ba.position[0] -= correction[0] * ba.inv_mass;
-                    ba.position[1] -= correction[1] * ba.inv_mass;
+                    ba.pseudo_velocity[0] -= bias * n[0] * ba.inv_mass;
+                    ba.pseudo_velocity[1] -= bias * n[1] * ba.inv_mass;
                 }
                 if let Some(bb) = self.bodies.get_mut(body_ah(corr.body_b))
                     && bb.is_dynamic()
                 {
-                    bb.position[0] += correction[0] * bb.inv_mass;
-                    bb.position[1] += correction[1] * bb.inv_mass;
+                    bb.pseudo_velocity[0] += bias * n[0] * bb.inv_mass;
+                    bb.pseudo_velocity[1] += bias * n[1] * bb.inv_mass;
                 }
             }
         }

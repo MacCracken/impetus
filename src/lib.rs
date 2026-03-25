@@ -32,6 +32,7 @@ mod backend_2d;
 #[cfg(feature = "3d")]
 mod backend_3d;
 
+mod aabb_tree;
 mod arena;
 mod spatial_hash;
 
@@ -45,7 +46,7 @@ pub use body::{BodyDesc, BodyHandle, BodyState, BodyType};
 pub use collider::{ColliderDesc, ColliderHandle, ColliderShape};
 
 // Config
-pub use config::WorldConfig;
+pub use config::{BroadphaseKind, WorldConfig};
 
 // Events
 pub use event::{CollisionEvent, ContactData, ContactPoint};

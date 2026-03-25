@@ -246,8 +246,380 @@ pub(super) fn generate_contact_3d(
         (ColliderShape::Ball { radius }, ColliderShape::ConvexHull { points }) => {
             convex_hull_sphere_3d(points, pos_b, rot_b, pos_a, *radius).map(|(n, d, p)| (-n, d, p))
         }
+        // ConvexHull vs Box — GJK+EPA fallback
+        (ColliderShape::ConvexHull { points: _ }, ColliderShape::Box { half_extents: _ }) => {
+            gjk_epa_shapes(shape_a, pos_a, rot_a, shape_b, pos_b, rot_b)
+        }
+        (ColliderShape::Box { half_extents: _ }, ColliderShape::ConvexHull { points: _ }) => {
+            gjk_epa_shapes(shape_b, pos_b, rot_b, shape_a, pos_a, rot_a).map(|(n, d, p)| (-n, d, p))
+        }
+        // ConvexHull vs ConvexHull — GJK+EPA
+        (ColliderShape::ConvexHull { .. }, ColliderShape::ConvexHull { .. }) => {
+            gjk_epa_shapes(shape_a, pos_a, rot_a, shape_b, pos_b, rot_b)
+        }
+        // ConvexHull vs Capsule — GJK+EPA fallback
+        (ColliderShape::ConvexHull { .. }, ColliderShape::Capsule { .. }) => {
+            gjk_epa_shapes(shape_a, pos_a, rot_a, shape_b, pos_b, rot_b)
+        }
+        (ColliderShape::Capsule { .. }, ColliderShape::ConvexHull { .. }) => {
+            gjk_epa_shapes(shape_b, pos_b, rot_b, shape_a, pos_a, rot_a).map(|(n, d, p)| (-n, d, p))
+        }
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// GJK + EPA (f64, native implementation)
+// ---------------------------------------------------------------------------
+
+/// Support function: furthest point in a direction for a shape in world space.
+#[inline]
+fn shape_support(shape: &ColliderShape, pos: DVec3, rot: DQuat, dir: DVec3) -> DVec3 {
+    let local_dir = rot.inverse() * dir;
+    let local_pt = match shape {
+        ColliderShape::Ball { radius } => {
+            let len = local_dir.length();
+            if len < EPSILON {
+                DVec3::new(0.0, *radius, 0.0)
+            } else {
+                local_dir / len * *radius
+            }
+        }
+        ColliderShape::Box { half_extents } => DVec3::new(
+            if local_dir.x >= 0.0 {
+                half_extents[0]
+            } else {
+                -half_extents[0]
+            },
+            if local_dir.y >= 0.0 {
+                half_extents[1]
+            } else {
+                -half_extents[1]
+            },
+            if local_dir.z >= 0.0 {
+                half_extents[2]
+            } else {
+                -half_extents[2]
+            },
+        ),
+        ColliderShape::Capsule {
+            half_height,
+            radius,
+        } => {
+            let axis_pt = if local_dir.y >= 0.0 {
+                DVec3::new(0.0, *half_height, 0.0)
+            } else {
+                DVec3::new(0.0, -*half_height, 0.0)
+            };
+            let len = local_dir.length();
+            if len < EPSILON {
+                axis_pt
+            } else {
+                axis_pt + local_dir / len * *radius
+            }
+        }
+        ColliderShape::ConvexHull { points } => {
+            let mut best = DVec3::ZERO;
+            let mut best_dot = f64::NEG_INFINITY;
+            for p in points {
+                let v = DVec3::new(p[0], p[1], p[2]);
+                let d = v.dot(local_dir);
+                if d > best_dot {
+                    best_dot = d;
+                    best = v;
+                }
+            }
+            best
+        }
+        // For unsupported shapes, return position (degenerate)
+        _ => DVec3::ZERO,
+    };
+    pos + rot * local_pt
+}
+
+/// Minkowski difference support: support_A(dir) - support_B(-dir).
+#[inline]
+fn minkowski_support(
+    shape_a: &ColliderShape,
+    pos_a: DVec3,
+    rot_a: DQuat,
+    shape_b: &ColliderShape,
+    pos_b: DVec3,
+    rot_b: DQuat,
+    dir: DVec3,
+) -> DVec3 {
+    shape_support(shape_a, pos_a, rot_a, dir) - shape_support(shape_b, pos_b, rot_b, -dir)
+}
+
+/// GJK+EPA collision detection for arbitrary convex shapes.
+/// Returns (normal_A_to_B, depth, contact_point).
+fn gjk_epa_shapes(
+    shape_a: &ColliderShape,
+    pos_a: DVec3,
+    rot_a: DQuat,
+    shape_b: &ColliderShape,
+    pos_b: DVec3,
+    rot_b: DQuat,
+) -> Option<(DVec3, f64, DVec3)> {
+    const GJK_MAX_ITER: usize = 64;
+    const EPA_MAX_ITER: usize = 64;
+
+    let initial_dir = pos_b - pos_a;
+    let dir = if initial_dir.length_squared() < EPSILON_SQ {
+        DVec3::X
+    } else {
+        initial_dir
+    };
+
+    // GJK phase: build simplex
+    let mut simplex: Vec<DVec3> = Vec::with_capacity(4);
+    simplex.push(minkowski_support(
+        shape_a, pos_a, rot_a, shape_b, pos_b, rot_b, dir,
+    ));
+
+    let mut search_dir = -simplex[0];
+
+    for _ in 0..GJK_MAX_ITER {
+        if search_dir.length_squared() < EPSILON_SQ {
+            break;
+        }
+        let new_pt = minkowski_support(shape_a, pos_a, rot_a, shape_b, pos_b, rot_b, search_dir);
+
+        if new_pt.dot(search_dir) < 0.0 {
+            return None; // No intersection
+        }
+
+        simplex.push(new_pt);
+
+        if gjk_do_simplex(&mut simplex, &mut search_dir) {
+            // Intersection found — run EPA
+            return epa_penetration(
+                shape_a,
+                pos_a,
+                rot_a,
+                shape_b,
+                pos_b,
+                rot_b,
+                &simplex,
+                EPA_MAX_ITER,
+            );
+        }
+    }
+
+    None
+}
+
+/// GJK simplex evolution. Returns true if origin is enclosed.
+fn gjk_do_simplex(simplex: &mut Vec<DVec3>, dir: &mut DVec3) -> bool {
+    match simplex.len() {
+        2 => {
+            // Line case
+            let a = simplex[1];
+            let b = simplex[0];
+            let ab = b - a;
+            let ao = -a;
+            if ab.dot(ao) > 0.0 {
+                *dir = ab.cross(ao).cross(ab);
+            } else {
+                simplex.clear();
+                simplex.push(a);
+                *dir = ao;
+            }
+            false
+        }
+        3 => {
+            // Triangle case
+            let a = simplex[2];
+            let b = simplex[1];
+            let c = simplex[0];
+            let ab = b - a;
+            let ac = c - a;
+            let ao = -a;
+            let abc = ab.cross(ac);
+
+            if abc.cross(ac).dot(ao) > 0.0 {
+                if ac.dot(ao) > 0.0 {
+                    simplex.clear();
+                    simplex.push(c);
+                    simplex.push(a);
+                    *dir = ac.cross(ao).cross(ac);
+                } else {
+                    simplex.clear();
+                    simplex.push(b);
+                    simplex.push(a);
+                    return gjk_do_simplex(simplex, dir);
+                }
+            } else if ab.cross(abc).dot(ao) > 0.0 {
+                simplex.clear();
+                simplex.push(b);
+                simplex.push(a);
+                return gjk_do_simplex(simplex, dir);
+            } else if abc.dot(ao) > 0.0 {
+                *dir = abc;
+            } else {
+                // Below triangle
+                simplex.swap(0, 1);
+                *dir = -abc;
+            }
+            false
+        }
+        4 => {
+            // Tetrahedron case
+            let a = simplex[3];
+            let b = simplex[2];
+            let c = simplex[1];
+            let d = simplex[0];
+            let ao = -a;
+
+            let ab = b - a;
+            let ac = c - a;
+            let ad = d - a;
+
+            let abc = ab.cross(ac);
+            let acd = ac.cross(ad);
+            let adb = ad.cross(ab);
+
+            if abc.dot(ao) > 0.0 {
+                simplex.clear();
+                simplex.push(c);
+                simplex.push(b);
+                simplex.push(a);
+                return gjk_do_simplex(simplex, dir);
+            }
+            if acd.dot(ao) > 0.0 {
+                simplex.clear();
+                simplex.push(d);
+                simplex.push(c);
+                simplex.push(a);
+                return gjk_do_simplex(simplex, dir);
+            }
+            if adb.dot(ao) > 0.0 {
+                simplex.clear();
+                simplex.push(b);
+                simplex.push(d);
+                simplex.push(a);
+                return gjk_do_simplex(simplex, dir);
+            }
+            true // Origin is inside tetrahedron
+        }
+        _ => false,
+    }
+}
+
+/// EPA: expand the simplex polytope to find the penetration normal and depth.
+#[allow(clippy::too_many_arguments)]
+fn epa_penetration(
+    shape_a: &ColliderShape,
+    pos_a: DVec3,
+    rot_a: DQuat,
+    shape_b: &ColliderShape,
+    pos_b: DVec3,
+    rot_b: DQuat,
+    simplex: &[DVec3],
+    max_iterations: usize,
+) -> Option<(DVec3, f64, DVec3)> {
+    if simplex.len() < 4 {
+        return None;
+    }
+
+    // Build initial polytope from tetrahedron
+    let mut vertices: Vec<DVec3> = simplex.to_vec();
+    // Faces as vertex index triples, wound so normal points outward
+    let mut faces: Vec<[usize; 3]> = vec![[0, 1, 2], [0, 3, 1], [0, 2, 3], [1, 3, 2]];
+
+    for _ in 0..max_iterations {
+        // Find the closest face to the origin
+        let mut min_dist = f64::INFINITY;
+        let mut min_normal = DVec3::ZERO;
+
+        for face in faces.iter() {
+            let a = vertices[face[0]];
+            let b = vertices[face[1]];
+            let c = vertices[face[2]];
+            let normal = (b - a).cross(c - a);
+            let len = normal.length();
+            if len < EPSILON {
+                continue;
+            }
+            let normal = normal / len;
+            let dist = normal.dot(a);
+
+            // Ensure normal points away from origin
+            let (normal, dist) = if dist < 0.0 {
+                (-normal, -dist)
+            } else {
+                (normal, dist)
+            };
+
+            if dist < min_dist {
+                min_dist = dist;
+                min_normal = normal;
+            }
+        }
+
+        if min_normal.length_squared() < EPSILON_SQ {
+            return None;
+        }
+
+        // Get new support point along the closest face normal
+        let new_pt = minkowski_support(shape_a, pos_a, rot_a, shape_b, pos_b, rot_b, min_normal);
+        let new_dist = new_pt.dot(min_normal);
+
+        if new_dist - min_dist < 1e-6 {
+            // Converged — compute contact point
+            let sa = shape_support(shape_a, pos_a, rot_a, min_normal);
+            let sb = shape_support(shape_b, pos_b, rot_b, -min_normal);
+            let contact_point = (sa + sb) * 0.5;
+            return Some((min_normal, min_dist, contact_point));
+        }
+
+        // Expand polytope: remove faces visible from new point, add new faces
+        let new_idx = vertices.len();
+        vertices.push(new_pt);
+
+        let mut edges: Vec<[usize; 2]> = Vec::new();
+        faces.retain(|face| {
+            let a = vertices[face[0]];
+            let b = vertices[face[1]];
+            let c = vertices[face[2]];
+            let normal = (b - a).cross(c - a);
+            let len = normal.length();
+            if len < EPSILON {
+                return false;
+            }
+            let normal = normal / len;
+            // If face is visible from new point, remove it and collect edges
+            if normal.dot(new_pt - a) > 0.0 {
+                // Add edges (in reverse order for proper winding)
+                let edge_pairs = [[face[0], face[1]], [face[1], face[2]], [face[2], face[0]]];
+                for edge in &edge_pairs {
+                    // Check if reverse edge already exists (shared edge)
+                    if let Some(pos) = edges
+                        .iter()
+                        .position(|e| e[0] == edge[1] && e[1] == edge[0])
+                    {
+                        edges.swap_remove(pos);
+                    } else {
+                        edges.push(*edge);
+                    }
+                }
+                false
+            } else {
+                true
+            }
+        });
+
+        // Create new faces from horizon edges to new point
+        for edge in &edges {
+            faces.push([edge[0], edge[1], new_idx]);
+        }
+
+        if faces.is_empty() {
+            return None;
+        }
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------

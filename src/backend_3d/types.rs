@@ -46,6 +46,9 @@ pub(crate) struct RigidBody3d {
     pub inv_mass: f64,
     pub inertia: DVec3, // diagonal inertia tensor
     pub inv_inertia: DVec3,
+    // Split impulse — pseudo-velocities for position correction only
+    pub pseudo_velocity: DVec3,
+    pub pseudo_angular_velocity: DVec3,
     // Sleep state
     pub is_sleeping: bool,
     pub sleep_timer: f64,
@@ -70,6 +73,8 @@ impl RigidBody3d {
             inv_mass: 0.0,
             inertia: DVec3::ZERO,
             inv_inertia: DVec3::ZERO,
+            pseudo_velocity: DVec3::ZERO,
+            pseudo_angular_velocity: DVec3::ZERO,
             is_sleeping: false,
             sleep_timer: 0.0,
         }
@@ -120,10 +125,12 @@ impl RigidBody3d {
             return;
         }
 
-        self.position += self.linear_velocity * dt;
+        // Real velocity + split impulse pseudo-velocity
+        let total_linear = self.linear_velocity + self.pseudo_velocity;
+        self.position += total_linear * dt;
 
         if !self.fixed_rotation {
-            let w = self.angular_velocity;
+            let w = self.angular_velocity + self.pseudo_angular_velocity;
             let half_dt = dt * 0.5;
             let dq =
                 DQuat::from_xyzw(w.x * half_dt, w.y * half_dt, w.z * half_dt, 0.0) * self.rotation;
@@ -135,6 +142,10 @@ impl RigidBody3d {
             )
             .normalize();
         }
+
+        // Clear pseudo-velocities after integration
+        self.pseudo_velocity = DVec3::ZERO;
+        self.pseudo_angular_velocity = DVec3::ZERO;
     }
 
     pub(super) fn clear_forces(&mut self) {
