@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hisab::{DQuat, DVec3};
+use hisab::{DMat3, DQuat, DVec3};
 
 use crate::ImpetusError;
 use crate::arena::Arena;
@@ -59,9 +59,9 @@ impl PhysicsState3d {
             rb.inertia += c_inertia;
             rb.inv_mass = 1.0 / rb.mass;
             rb.inv_inertia = if rb.fixed_rotation {
-                DVec3::ZERO
+                DMat3::ZERO
             } else {
-                DVec3::new(1.0 / rb.inertia.x, 1.0 / rb.inertia.y, 1.0 / rb.inertia.z)
+                rb.inertia.inverse()
             };
         }
 
@@ -116,7 +116,7 @@ impl PhysicsState3d {
             if let Some(point) = impulse.point {
                 let p = DVec3::from_array(point);
                 let ang = p.cross(iv);
-                rb.angular_velocity += ang * rb.inv_inertia;
+                rb.angular_velocity += rb.inv_inertia * ang;
             }
         }
     }
@@ -165,7 +165,7 @@ impl PhysicsState3d {
             && rb.is_dynamic()
         {
             let mut mass = 0.0_f64;
-            let mut inertia = DVec3::ZERO;
+            let mut inertia = DMat3::ZERO;
             if let Some(collider_handles) = self.body_colliders.get(&body) {
                 for ch in collider_handles {
                     if let Some(c) = self.colliders.get(coll_ah(*ch)) {
@@ -180,13 +180,13 @@ impl PhysicsState3d {
             if mass > 0.0 {
                 rb.inv_mass = 1.0 / mass;
                 rb.inv_inertia = if rb.fixed_rotation {
-                    DVec3::ZERO
+                    DMat3::ZERO
                 } else {
-                    DVec3::new(1.0 / inertia.x, 1.0 / inertia.y, 1.0 / inertia.z)
+                    inertia.inverse()
                 };
             } else {
                 rb.inv_mass = 0.0;
-                rb.inv_inertia = DVec3::ZERO;
+                rb.inv_inertia = DMat3::ZERO;
             }
         }
 
@@ -228,9 +228,9 @@ impl PhysicsState3d {
             rb.inertia += c_inertia;
             rb.inv_mass = 1.0 / rb.mass;
             rb.inv_inertia = if rb.fixed_rotation {
-                DVec3::ZERO
+                DMat3::ZERO
             } else {
-                DVec3::new(1.0 / rb.inertia.x, 1.0 / rb.inertia.y, 1.0 / rb.inertia.z)
+                rb.inertia.inverse()
             };
         }
         self.colliders.insert_at(coll_ah(handle), collider);
@@ -306,7 +306,7 @@ impl PhysicsState3d {
         match body_type {
             BodyType::Static | BodyType::Kinematic => {
                 rb.inv_mass = 0.0;
-                rb.inv_inertia = DVec3::ZERO;
+                rb.inv_inertia = DMat3::ZERO;
                 rb.linear_velocity = DVec3::ZERO;
                 rb.angular_velocity = DVec3::ZERO;
             }
@@ -314,9 +314,9 @@ impl PhysicsState3d {
                 if rb.mass > 0.0 {
                     rb.inv_mass = 1.0 / rb.mass;
                     rb.inv_inertia = if rb.fixed_rotation {
-                        DVec3::ZERO
+                        DMat3::ZERO
                     } else {
-                        DVec3::new(1.0 / rb.inertia.x, 1.0 / rb.inertia.y, 1.0 / rb.inertia.z)
+                        rb.inertia.inverse()
                     };
                 }
             }

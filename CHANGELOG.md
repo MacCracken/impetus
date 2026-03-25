@@ -27,6 +27,9 @@ v1.0 release — solver quality, broadphase, and collision overhaul.
 - `WorldConfig::constraint_damping_ratio` — soft constraint damping (default: 1.0, critically damped)
 - `WorldConfig::broadphase` — broadphase algorithm selection (default: `SpatialHash`)
 
+#### 3D Backend
+- **Full 3x3 inertia tensor** — `DMat3` replaces diagonal `DVec3` for inertia/inv_inertia; accurate angular response for asymmetric meshes, compound shapes, and off-axis colliders
+
 ### Changed
 - `hisab` dependency upgraded from 0.22.4 to 1.1
 - `criterion` dev-dependency upgraded from 0.5 to 0.8

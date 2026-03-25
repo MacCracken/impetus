@@ -1,6 +1,6 @@
 //! Internal types for the 3D physics backend.
 
-use hisab::{DQuat, DVec3};
+use hisab::{DMat3, DQuat, DVec3};
 
 use crate::body::{BodyHandle, BodyType};
 use crate::collider::{ColliderDesc, ColliderHandle, ColliderShape};
@@ -44,8 +44,8 @@ pub(crate) struct RigidBody3d {
     pub torque_accumulator: DVec3,
     pub mass: f64,
     pub inv_mass: f64,
-    pub inertia: DVec3, // diagonal inertia tensor
-    pub inv_inertia: DVec3,
+    pub inertia: DMat3, // full 3x3 inertia tensor
+    pub inv_inertia: DMat3,
     // Split impulse — pseudo-velocities for position correction only
     pub pseudo_velocity: DVec3,
     pub pseudo_angular_velocity: DVec3,
@@ -71,8 +71,8 @@ impl RigidBody3d {
             torque_accumulator: DVec3::ZERO,
             mass: 0.0,
             inv_mass: 0.0,
-            inertia: DVec3::ZERO,
-            inv_inertia: DVec3::ZERO,
+            inertia: DMat3::ZERO,
+            inv_inertia: DMat3::ZERO,
             pseudo_velocity: DVec3::ZERO,
             pseudo_angular_velocity: DVec3::ZERO,
             is_sleeping: false,
@@ -100,8 +100,7 @@ impl RigidBody3d {
         self.linear_velocity += self.force_accumulator * (self.inv_mass * dt);
 
         if !self.fixed_rotation {
-            let torque_effect = self.torque_accumulator * self.inv_inertia * dt;
-            self.angular_velocity += torque_effect;
+            self.angular_velocity += self.inv_inertia * self.torque_accumulator * dt;
         }
 
         let damp = 1.0 / (1.0 + dt * self.linear_damping);
@@ -299,8 +298,8 @@ impl Collider3d {
         (vol * self.material.density).max(MIN_MASS)
     }
 
-    pub(super) fn compute_inertia(&self, mass: f64) -> DVec3 {
-        let i = match &self.shape {
+    pub(super) fn compute_inertia(&self, mass: f64) -> DMat3 {
+        let diag = match &self.shape {
             ColliderShape::Ball { radius } => {
                 let i = 0.4 * mass * radius * radius;
                 DVec3::splat(i)
@@ -319,7 +318,6 @@ impl Collider3d {
                 half_height,
                 radius,
             } => {
-                // Proper capsule inertia: cylinder + two hemispheres with parallel axis theorem
                 let r = *radius;
                 let hh = *half_height;
                 let r2 = r * r;
@@ -333,11 +331,9 @@ impl Collider3d {
                 let cyl_mass = mass * cyl_frac;
                 let sph_mass = mass * (1.0 - cyl_frac);
 
-                // Cylinder (axis along Y): Ixx = Izz = m*(3r²+h²)/12, Iyy = m*r²/2
                 let ix_cyl = cyl_mass * (3.0 * r2 + h * h) / 12.0;
                 let iy_cyl = cyl_mass * r2 / 2.0;
 
-                // Two hemispheres: I_cm = 2/5 * m * r², offset from center by (hh + 3r/8)
                 let offset = hh + 3.0 * r / 8.0;
                 let ix_sph = sph_mass * (2.0 * r2 / 5.0 + offset * offset);
                 let iy_sph = sph_mass * 2.0 * r2 / 5.0;
@@ -346,7 +342,11 @@ impl Collider3d {
             }
             _ => DVec3::splat(mass),
         };
-        i.max(DVec3::splat(MIN_INERTIA))
+        // Diagonal inertia tensor for primitive shapes; off-diagonal terms
+        // will be non-zero when colliders have offsets (parallel axis theorem
+        // applied during accumulation in state.rs).
+        let clamped = diag.max(DVec3::splat(MIN_INERTIA));
+        DMat3::from_diagonal(clamped)
     }
 }
 

@@ -420,8 +420,8 @@ impl PhysicsState3d {
 
                 let ra_cross_n = ra.cross(n);
                 let rb_cross_n = rb.cross(n);
-                let ang_eff_a = ra_cross_n.dot(ra_cross_n * inv_inertia_a);
-                let ang_eff_b = rb_cross_n.dot(rb_cross_n * inv_inertia_b);
+                let ang_eff_a = (inv_inertia_a * ra_cross_n).cross(ra).dot(n);
+                let ang_eff_b = (inv_inertia_b * rb_cross_n).cross(rb).dot(n);
                 let inv_mass_sum = inv_mass_a + inv_mass_b + ang_eff_a + ang_eff_b;
 
                 let restitution = if vel_along_normal.abs() < RESTITUTION_VELOCITY_THRESHOLD {
@@ -437,14 +437,14 @@ impl PhysicsState3d {
                 {
                     ba.linear_velocity -= impulse_n * ba.inv_mass;
                     let ang_imp = ra.cross(impulse_n);
-                    ba.angular_velocity -= ang_imp * ba.inv_inertia;
+                    ba.angular_velocity -= ba.inv_inertia * ang_imp;
                 }
                 if let Some(bb) = self.bodies.get_mut(body_ah(contact.body_b))
                     && bb.is_dynamic()
                 {
                     bb.linear_velocity += impulse_n * bb.inv_mass;
                     let ang_imp = rb.cross(impulse_n);
-                    bb.angular_velocity += ang_imp * bb.inv_inertia;
+                    bb.angular_velocity += bb.inv_inertia * ang_imp;
                 }
 
                 // Friction
@@ -463,14 +463,14 @@ impl PhysicsState3d {
                         {
                             ba.linear_velocity -= impulse_t * ba.inv_mass;
                             let ang_t = ra.cross(impulse_t);
-                            ba.angular_velocity -= ang_t * ba.inv_inertia;
+                            ba.angular_velocity -= ba.inv_inertia * ang_t;
                         }
                         if let Some(bb) = self.bodies.get_mut(body_ah(contact.body_b))
                             && bb.is_dynamic()
                         {
                             bb.linear_velocity += impulse_t * bb.inv_mass;
                             let ang_t = rb.cross(impulse_t);
-                            bb.angular_velocity += ang_t * bb.inv_inertia;
+                            bb.angular_velocity += bb.inv_inertia * ang_t;
                         }
                     }
                 }
@@ -487,7 +487,9 @@ impl PhysicsState3d {
                         let angvel_len = ba.angular_velocity.length();
                         if angvel_len > EPSILON {
                             let dir = ba.angular_velocity / angvel_len;
-                            let reduction = (roll_torque * ba.inv_inertia.x).min(angvel_len);
+                            // Use effective scalar inertia along angular velocity direction
+                            let eff_inv_inertia = dir.dot(ba.inv_inertia * dir);
+                            let reduction = (roll_torque * eff_inv_inertia).min(angvel_len);
                             ba.angular_velocity -= dir * reduction;
                         }
                     }
@@ -497,7 +499,8 @@ impl PhysicsState3d {
                         let angvel_len = bb.angular_velocity.length();
                         if angvel_len > EPSILON {
                             let dir = bb.angular_velocity / angvel_len;
-                            let reduction = (roll_torque * bb.inv_inertia.x).min(angvel_len);
+                            let eff_inv_inertia = dir.dot(bb.inv_inertia * dir);
+                            let reduction = (roll_torque * eff_inv_inertia).min(angvel_len);
                             bb.angular_velocity -= dir * reduction;
                         }
                     }
