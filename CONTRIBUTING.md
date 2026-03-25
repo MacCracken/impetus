@@ -7,7 +7,7 @@ workflow, coding standards, and review process.
 
 ```bash
 # Clone the repository
-git clone https://github.com/<owner>/impetus.git
+git clone https://github.com/MacCracken/impetus.git
 cd impetus
 
 # Ensure you have the correct toolchain (see rust-toolchain.toml)
