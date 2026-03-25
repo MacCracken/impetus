@@ -17,19 +17,19 @@
 
 ## Current Status
 
-All essential and important items complete. 227 tests (2D), 190 tests (3D), 35 benchmarks. Backends refactored into sub-modules. Kiran builds clean.
+v1.0 complete. 207 tests, 35 benchmarks. All simulation quality items shipped. Kiran builds clean.
 
-## Road to v1.0
+## Completed in v1.0
 
-### Important — Simulation Quality
+### Simulation Quality
 
-- [ ] **Soft constraints** — spring-damper formulation replacing Baumgarte.
-- [ ] **Shock propagation** — bottom-up solve order in contact graph.
-- [ ] **Block solver** — solve 2-point manifold normal+friction as coupled system.
-- [ ] **Split impulse** — separate position correction from velocity.
-- [ ] **GJK + EPA** — general convex-convex collision via support functions.
-- [ ] **Speculative contacts** — expand broadphase AABB by velocity for true CCD.
-- [ ] **Dynamic AABB tree** — tree-based broadphase for heterogeneous object sizes.
+- [x] **Split impulse** — pseudo-velocity position correction, no energy injection
+- [x] **Block solver** — coupled 2x2 normal solve for 2-point manifolds (Box2D-style)
+- [x] **Shock propagation** — BFS bottom-up contact ordering for stacking stability
+- [x] **Soft constraints** — ERP/CFM spring-damper with configurable frequency/damping
+- [x] **GJK + EPA** — native f64 convex-convex 3D collision
+- [x] **Speculative contacts** — velocity-expanded broadphase AABBs for CCD
+- [x] **Dynamic AABB tree** — BVH broadphase with SAH insertion and fattened AABBs
 
 ### Nice to Have (post v1.0)
 

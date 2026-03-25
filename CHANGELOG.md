@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.0] — 2026-03-25
+
+v1.0 release — solver quality, broadphase, and collision overhaul.
+
+### Added
+
+#### Solver
+- **Split impulse** — pseudo-velocity position correction prevents energy injection from Baumgarte leaking into real velocities
+- **Block solver** — coupled 2x2 normal impulse solve for 2-point manifolds with four-case clamping (Box2D-style), improves box stacking
+- **Shock propagation** — BFS bottom-up contact ordering so bodies closer to static geometry are solved first, stabilizes deep stacks
+- **Soft constraints** — ERP/CFM spring-damper formulation with configurable `constraint_frequency` (Hz) and `constraint_damping_ratio` on `WorldConfig`; set frequency to 0 for legacy Baumgarte
+
+#### Collision Detection
+- **GJK + EPA** — native f64 implementation for general convex-convex 3D collision; handles ConvexHull vs Box, ConvexHull vs ConvexHull, ConvexHull vs Capsule
+- **Speculative contacts** — broadphase AABBs expanded along velocity to detect contacts before penetration, preventing tunneling for fast-moving objects
+- **Dynamic AABB tree** — balanced BVH broadphase with surface-area heuristic insertion and fattened AABBs; better for heterogeneous object sizes; selectable via `WorldConfig::broadphase`
+
+#### API
+- `BroadphaseKind` enum (`SpatialHash`, `AabbTree`) — public, `#[non_exhaustive]`
+- `WorldConfig::constraint_frequency` — soft constraint spring frequency (default: 30 Hz)
+- `WorldConfig::constraint_damping_ratio` — soft constraint damping (default: 1.0, critically damped)
+- `WorldConfig::broadphase` — broadphase algorithm selection (default: `SpatialHash`)
+
+### Changed
+- `hisab` dependency upgraded from 0.22.4 to 1.1
+- `criterion` dev-dependency upgraded from 0.5 to 0.8
+- Benchmarks use `std::hint::black_box` instead of deprecated `criterion::black_box`
+- Position solver uses split impulse pseudo-velocities instead of direct position mutation
+- 2D solver friction/rolling friction extracted into shared `solve_contact_friction` method
+
 ## [0.23.3] — 2026-03-23
 
 Initial public release.

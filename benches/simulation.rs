@@ -1,5 +1,4 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use impetus::{
     PhysicsWorld,
     body::{BodyDesc, BodyState, BodyType},
@@ -12,6 +11,7 @@ use impetus::{
     spring::{Spring, Spring2d},
     units::{PhysicsUnit, Quantity},
 };
+use std::hint::black_box;
 
 // ---------------------------------------------------------------------------
 // World stepping
