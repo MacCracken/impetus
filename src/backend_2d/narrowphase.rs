@@ -8,6 +8,7 @@ use crate::collider::ColliderShape;
 // Helpers
 // ---------------------------------------------------------------------------
 
+#[inline]
 pub(super) fn world_pos(body_pos: [f64; 2], body_rot: f64, offset: [f64; 2]) -> [f64; 2] {
     let (sin, cos) = body_rot.sin_cos();
     [
@@ -17,6 +18,7 @@ pub(super) fn world_pos(body_pos: [f64; 2], body_rot: f64, offset: [f64; 2]) -> 
 }
 
 /// Transform a world-space point into body-local coordinates.
+#[inline]
 pub(super) fn world_to_local(world_pt: [f64; 2], body_pos: [f64; 2], body_rot: f64) -> [f64; 2] {
     let dx = world_pt[0] - body_pos[0];
     let dy = world_pt[1] - body_pos[1];
@@ -26,6 +28,7 @@ pub(super) fn world_to_local(world_pt: [f64; 2], body_pos: [f64; 2], body_rot: f
 }
 
 /// Transform a body-local point into world-space coordinates.
+#[inline]
 pub(super) fn local_to_world(local_pt: [f64; 2], body_pos: [f64; 2], body_rot: f64) -> [f64; 2] {
     let (sin, cos) = body_rot.sin_cos();
     [
@@ -438,6 +441,7 @@ fn obb_obb_contact(
 
 /// Compute the support point of an OBB in a given direction.
 /// Returns the corner of the box that is furthest in `dir`.
+#[inline]
 fn obb_support_point(
     center: [f64; 2],
     half_extents: [f64; 2],
@@ -468,6 +472,7 @@ pub(super) fn capsule_endpoints(pos: [f64; 2], rot: f64, half_height: f64) -> ([
 }
 
 /// Closest point on segment (a, b) to point p. Returns (closest_point, t_parameter).
+#[inline]
 pub(super) fn closest_point_on_segment(a: [f64; 2], b: [f64; 2], p: [f64; 2]) -> ([f64; 2], f64) {
     let ab = [b[0] - a[0], b[1] - a[1]];
     let len_sq = ab[0] * ab[0] + ab[1] * ab[1];
@@ -710,6 +715,7 @@ fn convex_convex_contact(
 }
 
 /// Project all points of a 2D polygon onto an axis, return (min, max).
+#[inline]
 fn project_hull(points: &[[f64; 2]], axis: [f64; 2]) -> (f64, f64) {
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
@@ -722,6 +728,7 @@ fn project_hull(points: &[[f64; 2]], axis: [f64; 2]) -> (f64, f64) {
 }
 
 /// Find the vertex of a 2D polygon furthest in a given direction.
+#[inline]
 fn support_point_poly(points: &[[f64; 2]], dir: [f64; 2]) -> [f64; 2] {
     let mut best = points[0];
     let mut best_dot = best[0] * dir[0] + best[1] * dir[1];
@@ -1028,8 +1035,11 @@ fn clip_segment_to_line(points: &[[f64; 2]], normal: [f64; 2], offset: f64) -> V
         }
         if (da >= 0.0) != (db >= 0.0) {
             // Edge crosses the plane — compute intersection
-            let t = da / (da - db);
-            output.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
+            let denom = da - db;
+            if denom.abs() > EPSILON {
+                let t = da / denom;
+                output.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
+            }
         }
     }
     output
@@ -1043,7 +1053,13 @@ fn reduce_contacts(contacts: Vec<([f64; 2], f64, [f64; 2])>) -> Vec<([f64; 2], f
         return contacts;
     }
 
+    /// Pick the first index not already in `selected`.
+    fn first_unselected(n: usize, selected: &[usize]) -> usize {
+        (0..n).find(|i| !selected.contains(i)).unwrap_or(0)
+    }
+
     let mut selected = Vec::with_capacity(max_pts);
+    let n = contacts.len();
 
     // 1. Start with deepest penetration point
     let deepest = contacts
@@ -1066,11 +1082,11 @@ fn reduce_contacts(contacts: Vec<([f64; 2], f64, [f64; 2])>) -> Vec<([f64; 2], f
             da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|(i, _)| i)
-        .unwrap_or(0);
+        .unwrap_or_else(|| first_unselected(n, &selected));
     selected.push(farthest);
 
     // 3. Pick point that maximizes triangle area with first two
-    if contacts.len() > 2 && max_pts > 2 {
+    if n > 2 && max_pts > 2 {
         let p1 = contacts[farthest].2;
         let third = contacts
             .iter()
@@ -1084,12 +1100,12 @@ fn reduce_contacts(contacts: Vec<([f64; 2], f64, [f64; 2])>) -> Vec<([f64; 2], f
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(i, _)| i)
-            .unwrap_or(0);
+            .unwrap_or_else(|| first_unselected(n, &selected));
         selected.push(third);
     }
 
     // 4. Pick point that maximizes quadrilateral area
-    if contacts.len() > 3 && max_pts > 3 {
+    if n > 3 && max_pts > 3 {
         let p1 = contacts[selected[1]].2;
         let p2 = contacts[selected[2]].2;
         let fourth = contacts
@@ -1104,7 +1120,7 @@ fn reduce_contacts(contacts: Vec<([f64; 2], f64, [f64; 2])>) -> Vec<([f64; 2], f
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(i, _)| i)
-            .unwrap_or(0);
+            .unwrap_or_else(|| first_unselected(n, &selected));
         selected.push(fourth);
     }
 

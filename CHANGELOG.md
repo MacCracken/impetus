@@ -22,6 +22,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - **narrowphase** — convex hull circle contact now computes actual edge outward normal when circle center coincides with hull edge, instead of using arbitrary `[0, 1]` fallback
 - **aabb_tree** — replaced `expect()` panics with graceful fallbacks in `update()` and `query_pairs()`
 - **narrowphase** — manifold point replacement uses `unwrap_or` for NaN-safe comparison
+- **narrowphase** — `reduce_contacts()` area maximization now uses `first_unselected()` fallback to prevent duplicate index selection
+- **narrowphase** — epsilon guard added to Sutherland-Hodgman clip plane intersection to prevent division by near-zero
+- **solver** — XPBD compliance calculation guarded against zero timestep (`dt > EPSILON`)
+- **state** — replaced remaining `expect()` calls in `add_body`/`add_collider` with defensive `if let`
 
 ### Changed
 

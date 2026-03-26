@@ -174,11 +174,11 @@ impl PhysicsState2d {
 
         // 5. XPBD constraint solving — position-level with compliance
         // Compliance: α̃ = 1 / (stiffness * dt²)
-        let alpha_tilde = if constraint_frequency > 0.0 {
+        let alpha_tilde = if constraint_frequency > 0.0 && dt > EPSILON {
             let omega = 2.0 * std::f64::consts::PI * constraint_frequency;
             1.0 / (omega * omega * dt * dt)
         } else {
-            0.0 // infinite stiffness
+            0.0 // infinite stiffness (or dt too small for compliance)
         };
 
         // Initialize Lagrange multipliers for each manifold point
@@ -1594,7 +1594,7 @@ impl PhysicsState2d {
                     let n = [dx / dist, dy / dist];
                     let c = dist - rest_length;
                     // Spring compliance: α̃ = 1/(k·dt²)
-                    let spring_alpha = if *stiffness > EPSILON {
+                    let spring_alpha = if *stiffness > EPSILON && dt > EPSILON {
                         1.0 / (stiffness * dt * dt)
                     } else {
                         alpha_tilde
@@ -1715,32 +1715,10 @@ impl PhysicsState2d {
             let rel_vel = [vel_b[0] - vel_a[0], vel_b[1] - vel_a[1]];
             let vn = rel_vel[0] * normal[0] + rel_vel[1] * normal[1];
 
-            // Restitution: if separating, apply bounce
+            // Restitution: if bodies are approaching along normal, apply bounce.
+            // Uses the derived velocity (from position delta) which already
+            // reflects the XPBD position correction.
             if vn < -EPSILON {
-                // Compute pre-solve relative velocity from prev positions
-                let prev_a = self
-                    .bodies
-                    .get(body_ah(body_a))
-                    .map(|b| b.prev_position)
-                    .unwrap_or([0.0, 0.0]);
-                let prev_b = self
-                    .bodies
-                    .get(body_ah(body_b))
-                    .map(|b| b.prev_position)
-                    .unwrap_or([0.0, 0.0]);
-                let pos_a_cur = self
-                    .bodies
-                    .get(body_ah(body_a))
-                    .map(|b| b.position)
-                    .unwrap_or([0.0, 0.0]);
-                let pos_b_cur = self
-                    .bodies
-                    .get(body_ah(body_b))
-                    .map(|b| b.position)
-                    .unwrap_or([0.0, 0.0]);
-                // Approximate pre-collision normal velocity from position delta before solve
-                let _ = (prev_a, prev_b, pos_a_cur, pos_b_cur);
-
                 let delta_vn = -vn * (1.0 + restitution);
                 let j = delta_vn / w_sum;
 

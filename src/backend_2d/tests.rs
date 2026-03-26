@@ -2248,11 +2248,10 @@ fn multi_point_manifold() {
         }
     }
 
-    // The manifold system should support up to 2 points per manifold.
-    // Verify no manifold ever had more than 2 points.
+    // The manifold system supports up to MAX_MANIFOLD_POINTS (4) per manifold.
     assert!(
-        max_points <= 2,
-        "manifold should have at most 2 points, observed {}",
+        max_points <= 4,
+        "manifold should have at most 4 points, observed {}",
         max_points
     );
     // Check that manifolds existed and had non-zero impulses at some point during sim
@@ -2676,4 +2675,193 @@ fn sub_steps_config_serde_default() {
     let json = r#"{"timestep":0.016666666666666666,"gravity":[0.0,-9.81,0.0],"velocity_iterations":4,"position_iterations":1,"deterministic":true,"step":0}"#;
     let config: crate::config::WorldConfig = serde_json::from_str(json).unwrap();
     assert_eq!(config.sub_steps, 1);
+}
+
+// =======================================================================
+// XPBD solver backend tests
+// =======================================================================
+
+#[test]
+fn xpbd_ball_on_floor_rests() {
+    let mut state = PhysicsState2d::new();
+    let floor = state.add_body(&BodyDesc {
+        body_type: BodyType::Static,
+        position: [0.0, -1.0, 0.0],
+        ..BodyDesc::default()
+    });
+    state.add_collider(
+        floor,
+        &ColliderDesc {
+            shape: ColliderShape::Box {
+                half_extents: [10.0, 1.0, 0.0],
+            },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
+    let ball = state.add_body(&BodyDesc {
+        body_type: BodyType::Dynamic,
+        position: [0.0, 2.0, 0.0],
+        ..BodyDesc::default()
+    });
+    state.add_collider(
+        ball,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
+
+    let dt = 1.0 / 60.0;
+    for _ in 0..300 {
+        state.step(
+            [0.0, -9.81, 0.0],
+            dt,
+            20,
+            4,
+            0.01,
+            0.2,
+            100.0,
+            0.0, // infinite stiffness
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+            crate::config::SolverKind::Xpbd,
+        );
+    }
+
+    let y = state.bodies.get(body_ah(ball)).unwrap().position[1];
+    assert!(
+        y > -1.0,
+        "XPBD: ball should not fall through floor, got y={}",
+        y
+    );
+}
+
+#[test]
+fn xpbd_zero_gravity_no_drift() {
+    let mut state = PhysicsState2d::new();
+    let body = state.add_body(&BodyDesc {
+        body_type: BodyType::Dynamic,
+        position: [5.0, 5.0, 0.0],
+        ..BodyDesc::default()
+    });
+    state.add_collider(
+        body,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0xFFFF_FFFF,
+            collision_mask: 0xFFFF_FFFF,
+        },
+    );
+
+    let dt = 1.0 / 60.0;
+    for _ in 0..60 {
+        state.step(
+            [0.0, 0.0, 0.0],
+            dt,
+            4,
+            1,
+            0.01,
+            0.2,
+            100.0,
+            30.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+            crate::config::SolverKind::Xpbd,
+        );
+    }
+
+    let rb = state.bodies.get(body_ah(body)).unwrap();
+    assert!(
+        (rb.position[0] - 5.0).abs() < 0.01 && (rb.position[1] - 5.0).abs() < 0.01,
+        "XPBD: body should not drift in zero gravity, pos={:?}",
+        rb.position
+    );
+}
+
+#[test]
+fn xpbd_distance_joint_maintains_length() {
+    let mut state = PhysicsState2d::new();
+    let a = state.add_body(&BodyDesc {
+        body_type: BodyType::Static,
+        position: [0.0, 0.0, 0.0],
+        ..BodyDesc::default()
+    });
+    state.add_collider(
+        a,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.1 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0,
+            collision_mask: 0,
+        },
+    );
+    let b = state.add_body(&BodyDesc {
+        body_type: BodyType::Dynamic,
+        position: [5.0, 0.0, 0.0],
+        ..BodyDesc::default()
+    });
+    state.add_collider(
+        b,
+        &ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.1 },
+            offset: [0.0, 0.0, 0.0],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: 0,
+            collision_mask: 0,
+        },
+    );
+    state.add_joint(&crate::joint::JointDesc {
+        body_a: a,
+        body_b: b,
+        joint_type: crate::joint::JointType::Distance { length: 3.0 },
+        local_anchor_a: [0.0, 0.0],
+        local_anchor_b: [0.0, 0.0],
+        motor: None,
+        damping: 0.0,
+        break_force: None,
+    });
+
+    let dt = 1.0 / 60.0;
+    for _ in 0..120 {
+        state.step(
+            [0.0, 0.0, 0.0],
+            dt,
+            8,
+            1,
+            0.01,
+            0.2,
+            100.0,
+            0.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+            crate::config::SolverKind::Xpbd,
+        );
+    }
+
+    let pos = state.bodies.get(body_ah(b)).unwrap().position;
+    let dist = (pos[0] * pos[0] + pos[1] * pos[1]).sqrt();
+    assert!(
+        (dist - 3.0).abs() < 0.5,
+        "XPBD: distance joint should converge to length=3, got dist={}",
+        dist
+    );
 }

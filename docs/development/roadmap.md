@@ -10,10 +10,6 @@
 | 1.0 | Split impulse, block solver, shock propagation, soft constraints, GJK+EPA, speculative contacts, dynamic AABB tree, full 3x3 inertia tensor |
 | 1.1 | XPBD solver (2D), one-shot manifold generation (Sutherland-Hodgman clipping), contact point reduction (area maximization), gyroscopic torque (3D), SolverKind config, audit fixes (div-by-zero guards, panic removal) |
 
-## 1.1.0 — Solver Precision (complete)
-
-All items delivered. XPBD solver logic implemented for 2D backend.
-
 ## 1.2.0 — Collision Completeness
 
 Handle every geometry a game throws at you.
