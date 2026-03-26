@@ -120,6 +120,9 @@ impl PhysicsWorld {
             if !emitter.active {
                 continue;
             }
+            if emitter.rate <= 0.0 {
+                continue;
+            }
             emitter.accumulator += dt;
             let interval = 1.0 / emitter.rate;
             while emitter.accumulator >= interval {

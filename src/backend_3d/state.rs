@@ -42,7 +42,9 @@ impl PhysicsState3d {
             .bodies
             .insert(RigidBody3d::from_desc(BodyHandle(0), desc));
         let handle = body_from(ah);
-        self.bodies.get_mut(ah).expect("just-inserted body").handle = handle;
+        if let Some(rb) = self.bodies.get_mut(ah) {
+            rb.handle = handle;
+        }
         self.body_colliders.insert(handle, Vec::new());
         handle
     }
@@ -67,10 +69,9 @@ impl PhysicsState3d {
 
         let ah = self.colliders.insert(collider);
         let handle = coll_from(ah);
-        self.colliders
-            .get_mut(ah)
-            .expect("just-inserted collider")
-            .handle = handle;
+        if let Some(c) = self.colliders.get_mut(ah) {
+            c.handle = handle;
+        }
         self.body_colliders.entry(body).or_default().push(handle);
         handle
     }

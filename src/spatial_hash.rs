@@ -12,8 +12,13 @@ pub(crate) struct SpatialHashGrid<K: Copy + Eq + Ord> {
 
 impl<K: Copy + Eq + Ord> SpatialHashGrid<K> {
     pub fn new(cell_size: f64) -> Self {
+        let safe_size = if cell_size.abs() < 1e-10 {
+            1.0
+        } else {
+            cell_size
+        };
         Self {
-            inv_cell_size: 1.0 / cell_size,
+            inv_cell_size: 1.0 / safe_size,
             cells: BTreeMap::new(),
         }
     }
