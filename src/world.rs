@@ -561,6 +561,7 @@ impl PhysicsWorld {
     }
 
     /// Cast a ray and return the first hit.
+    #[must_use]
     pub fn raycast(&self, origin: [f64; 3], direction: [f64; 3], max_dist: f64) -> Option<RayHit> {
         #[cfg(all(feature = "2d", not(feature = "3d")))]
         {
@@ -584,6 +585,7 @@ impl PhysicsWorld {
     /// Only colliders whose `collision_layer` has at least one bit in common
     /// with `layer_mask` are tested. Use `0xFFFF_FFFF` to hit everything
     /// (equivalent to [`raycast`](Self::raycast)).
+    #[must_use]
     pub fn raycast_filtered(
         &self,
         origin: [f64; 3],
@@ -611,6 +613,7 @@ impl PhysicsWorld {
     }
 
     /// Find all colliders overlapping a sphere at the given position.
+    #[must_use]
     pub fn overlap_sphere(&self, center: [f64; 3], radius: f64) -> Vec<ColliderHandle> {
         #[cfg(all(feature = "2d", not(feature = "3d")))]
         {
@@ -632,6 +635,7 @@ impl PhysicsWorld {
     }
 
     /// Find all colliders overlapping an AABB.
+    #[must_use]
     pub fn overlap_aabb(&self, min: [f64; 3], max: [f64; 3]) -> Vec<ColliderHandle> {
         #[cfg(all(feature = "2d", not(feature = "3d")))]
         {

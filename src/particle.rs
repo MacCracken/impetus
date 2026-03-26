@@ -88,9 +88,10 @@ impl Particle {
         }
     }
 
-    /// Set the collision radius.
+    /// Set the collision radius (must be non-negative).
     pub fn with_radius(mut self, radius: f64) -> Self {
-        self.radius = radius;
+        debug_assert!(radius >= 0.0, "particle radius must be non-negative");
+        self.radius = radius.max(0.0);
         self
     }
 

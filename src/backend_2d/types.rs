@@ -23,7 +23,8 @@ pub(super) const MIN_INERTIA: f64 = 1e-10;
 /// Distance threshold for matching manifold points across frames (body-local coords).
 pub(super) const MANIFOLD_MATCH_THRESHOLD: f64 = 0.02;
 /// Maximum number of contact points per manifold in 2D.
-pub(super) const MAX_MANIFOLD_POINTS: usize = 2;
+/// Increased from 2 to 4 for one-shot manifold generation (edge clipping).
+pub(super) const MAX_MANIFOLD_POINTS: usize = 4;
 /// Separation tolerance for re-validating old manifold points.
 pub(super) const MANIFOLD_REVALIDATION_TOLERANCE: f64 = 0.02;
 /// Warm starting scale factor — slightly less than 1.0 for stability.
@@ -420,7 +421,7 @@ pub(super) struct ContactManifold {
     pub body_a: BodyHandle,
     pub body_b: BodyHandle,
     pub normal: [f64; 2],
-    pub points: Vec<ManifoldPoint>, // Up to MAX_MANIFOLD_POINTS (2 in 2D)
+    pub points: Vec<ManifoldPoint>, // Up to MAX_MANIFOLD_POINTS (4 in 2D)
 }
 
 /// Key for looking up manifolds between collider pairs.

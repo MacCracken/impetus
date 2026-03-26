@@ -257,9 +257,16 @@ impl PhysicsState2d {
             let pos_a = world_pos(ba.position, ba.rotation, ca.offset);
             let pos_b = world_pos(bb.position, bb.rotation, cb.offset);
 
-            if let Some((normal, depth, point)) =
-                generate_contact(&ca.shape, pos_a, ba.rotation, &cb.shape, pos_b, bb.rotation)
-            {
+            // One-shot manifold generation: get all contact points in a single pass
+            let multi = generate_contacts_multi(
+                &ca.shape,
+                pos_a,
+                ba.rotation,
+                &cb.shape,
+                pos_b,
+                bb.rotation,
+            );
+            for (normal, depth, point) in multi {
                 contacts.push(Contact {
                     collider_a: *ha,
                     collider_b: *hb,
@@ -370,10 +377,12 @@ impl PhysicsState2d {
                             .iter()
                             .enumerate()
                             .min_by(|(_, a), (_, b)| {
-                                a.normal_impulse.partial_cmp(&b.normal_impulse).unwrap()
+                                a.normal_impulse
+                                    .partial_cmp(&b.normal_impulse)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
                             })
                             .map(|(i, _)| i)
-                            .unwrap();
+                            .unwrap_or(0);
                         manifold.points[min_idx] = ManifoldPoint {
                             local_a: new_local_a,
                             local_b: new_local_b,
@@ -826,11 +835,19 @@ impl PhysicsState2d {
                         } else if j_new0 >= 0.0 {
                             // Case 2: j1 < 0, clamp j1 = 0, re-solve j0
                             j_new1 = 0.0;
-                            j_new0 = (-(vn[0] + bias0) / k00 + j_old0).max(0.0);
+                            j_new0 = if k00.abs() > EPSILON {
+                                (-(vn[0] + bias0) / k00 + j_old0).max(0.0)
+                            } else {
+                                0.0
+                            };
                         } else if j_new1 >= 0.0 {
                             // Case 3: j0 < 0, clamp j0 = 0, re-solve j1
                             j_new0 = 0.0;
-                            j_new1 = (-(vn[1] + bias1) / k11 + j_old1).max(0.0);
+                            j_new1 = if k11.abs() > EPSILON {
+                                (-(vn[1] + bias1) / k11 + j_old1).max(0.0)
+                            } else {
+                                0.0
+                            };
                         } else {
                             // Case 4: both negative, clamp both to 0
                             j_new0 = 0.0;
@@ -840,8 +857,7 @@ impl PhysicsState2d {
                         let j_applied0 = j_new0 - j_old0;
                         let j_applied1 = j_new1 - j_old1;
 
-                        {
-                            let m = self.manifolds.get_mut(key).expect("manifold exists");
+                        if let Some(m) = self.manifolds.get_mut(key) {
                             m.points[0].normal_impulse = j_new0;
                             m.points[1].normal_impulse = j_new1;
                         }
@@ -935,6 +951,9 @@ impl PhysicsState2d {
                         + rb_cross_n * rb_cross_n * inv_inertia_b;
 
                     // Normal impulse with accumulation
+                    if inv_mass_sum < EPSILON {
+                        continue;
+                    }
                     let restitution = if vel_along_normal.abs() < RESTITUTION_VELOCITY_THRESHOLD {
                         0.0
                     } else {
@@ -944,8 +963,9 @@ impl PhysicsState2d {
                     let j_old = self.manifolds[key].points[pi].normal_impulse;
                     let j_accumulated = (j_old + j_new).max(0.0);
                     let j_applied = j_accumulated - j_old;
-                    self.manifolds.get_mut(key).expect("manifold exists").points[pi]
-                        .normal_impulse = j_accumulated;
+                    if let Some(m) = self.manifolds.get_mut(key) {
+                        m.points[pi].normal_impulse = j_accumulated;
+                    }
 
                     let impulse_n = [j_applied * n[0], j_applied * n[1]];
 
@@ -1040,6 +1060,9 @@ impl PhysicsState2d {
                 + ra_cross_t * ra_cross_t * inv_inertia_a
                 + rb_cross_t * rb_cross_t * inv_inertia_b;
 
+            if inv_mass_sum_t < EPSILON {
+                return;
+            }
             let jt_new = -vel_along_tangent / inv_mass_sum_t;
             let jt_old = self.manifolds[key].points[pi].tangent_impulse;
 
@@ -1051,8 +1074,9 @@ impl PhysicsState2d {
             let max_friction = j_accumulated.abs() * mu;
             let jt_accumulated = (jt_old + jt_new).clamp(-max_friction, max_friction);
             let jt_applied = jt_accumulated - jt_old;
-            self.manifolds.get_mut(key).expect("manifold exists").points[pi].tangent_impulse =
-                jt_accumulated;
+            if let Some(m) = self.manifolds.get_mut(key) {
+                m.points[pi].tangent_impulse = jt_accumulated;
+            }
 
             let impulse_t = [jt_applied * tangent[0], jt_applied * tangent[1]];
 

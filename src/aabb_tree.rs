@@ -269,9 +269,10 @@ impl<K: Copy + Eq + Ord> AabbTree<K> {
             return false; // Still within fattened AABB
         }
 
-        let key = self.nodes[leaf as usize]
-            .key
-            .expect("update called on leaf");
+        let key = match self.nodes[leaf as usize].key {
+            Some(k) => k,
+            None => return false, // Not a leaf node — no-op
+        };
         self.remove(leaf);
         self.insert(key, tight_aabb);
         true
@@ -291,7 +292,10 @@ impl<K: Copy + Eq + Ord> AabbTree<K> {
         // For each leaf, query the tree for overlaps
         for &leaf in &leaves {
             let aabb = &self.nodes[leaf as usize].aabb;
-            let key_a = self.nodes[leaf as usize].key.expect("leaf has key");
+            let key_a = match self.nodes[leaf as usize].key {
+                Some(k) => k,
+                None => continue,
+            };
             self.query_overlap_recursive(self.root, aabb, key_a, leaf, &mut pairs);
         }
 

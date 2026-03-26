@@ -51,18 +51,30 @@ impl Spring {
     }
 
     /// Create a spring that's critically damped (no overshoot).
+    ///
+    /// # Panics
+    /// Panics if `stiffness` is negative.
     pub fn critically_damped(from: f64, to: f64, stiffness: f64) -> Self {
-        Self::new(from, to, stiffness, 2.0 * stiffness.sqrt())
+        debug_assert!(stiffness >= 0.0, "stiffness must be non-negative");
+        Self::new(from, to, stiffness, 2.0 * stiffness.abs().sqrt())
     }
 
     /// Create an over-damped spring (slow approach, no overshoot).
+    ///
+    /// # Panics
+    /// Panics if `stiffness` is negative.
     pub fn over_damped(from: f64, to: f64, stiffness: f64) -> Self {
-        Self::new(from, to, stiffness, 3.0 * stiffness.sqrt())
+        debug_assert!(stiffness >= 0.0, "stiffness must be non-negative");
+        Self::new(from, to, stiffness, 3.0 * stiffness.abs().sqrt())
     }
 
     /// Create an under-damped spring (bouncy overshoot).
+    ///
+    /// # Panics
+    /// Panics if `stiffness` is negative.
     pub fn under_damped(from: f64, to: f64, stiffness: f64) -> Self {
-        Self::new(from, to, stiffness, 0.5 * stiffness.sqrt())
+        debug_assert!(stiffness >= 0.0, "stiffness must be non-negative");
+        Self::new(from, to, stiffness, 0.5 * stiffness.abs().sqrt())
     }
 
     /// Step the spring by `dt` seconds (semi-implicit Euler).

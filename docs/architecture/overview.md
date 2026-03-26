@@ -14,7 +14,7 @@
 |--------|---------|
 | `body` | Rigid body types (Static, Dynamic, Kinematic), descriptors, state |
 | `collider` | Collision shapes (Ball, Box, Capsule, ConvexHull, Segment, Heightfield, TriMesh) |
-| `config` | World configuration (timestep, gravity, solver iterations) |
+| `config` | World configuration (timestep, gravity, solver iterations, broadphase, solver kind) |
 | `error` | `ImpetusError` enum |
 | `event` | Collision events (Started/Stopped), contact data |
 | `force` | Force, Impulse, Torque types |
@@ -31,16 +31,20 @@
 
 ## Simulation Pipeline (per step)
 
-1. Integrate velocities (gravity + accumulated forces)
-2. Broadphase — spatial hash finds AABB overlaps
-3. Narrowphase — shape-vs-shape contact generation
-4. Velocity constraint solving (normal + friction impulses, angular response)
-5. Joint constraint solving (positional + velocity)
-6. Positional correction (Baumgarte stabilization)
-7. Integrate positions
-8. Clear forces
-9. Generate collision events (Started/Stopped diffing)
-10. Step particles (gravity, drag, damping, collider interaction, lifetime)
+1. Integrate velocities (gravity + forces, gyroscopic torque in 3D)
+2. Broadphase — spatial hash or dynamic AABB tree finds AABB overlaps (speculative expansion by velocity)
+3. Narrowphase — one-shot manifold generation (Sutherland-Hodgman clipping for box/convex, single-contact for others)
+4. Update manifold cache (point matching, contact reduction to 4 points max)
+5. Wake sleeping bodies on contact with moving bodies
+6. Warm start — apply cached impulses from previous frame
+7. Velocity constraint solving — shock propagation ordering, block solver (2-point), per-point solver, friction + rolling friction
+8. Joint constraint solving (positional + velocity, motors, breaking)
+9. Positional correction (split impulse pseudo-velocities, soft constraints via ERP/CFM or Baumgarte fallback)
+10. Integrate positions
+11. Simulation islands + sleep check (union-find grouping, island-level atomic sleep)
+12. Clear forces
+13. Generate collision events (Started/Stopped/Ongoing diffing)
+14. Step particles (gravity, drag, damping, collider interaction, lifetime, sub-emitters)
 
 ## Consumers
 

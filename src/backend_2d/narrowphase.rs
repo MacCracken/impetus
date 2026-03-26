@@ -247,9 +247,28 @@ fn convex_hull_circle(
     let dist = best_dist_sq.sqrt();
 
     let (normal, depth) = if dist < EPSILON {
-        // Circle center is on the hull edge; use edge normal
-        // Find the edge that gave the closest point and compute its outward normal
-        ([0.0, 1.0], radius)
+        // Circle center is on the hull edge — find the closest edge and use its outward normal
+        let mut best_edge_normal = [0.0, 1.0];
+        let mut best_edge_dist_sq = f64::INFINITY;
+        for i in 0..n {
+            let a = world_pts[i];
+            let b = world_pts[(i + 1) % n];
+            let (cp, _) = closest_point_on_segment(a, b, circle_pos);
+            let ex = cp[0] - circle_pos[0];
+            let ey = cp[1] - circle_pos[1];
+            let d2 = ex * ex + ey * ey;
+            if d2 < best_edge_dist_sq {
+                best_edge_dist_sq = d2;
+                // Edge outward normal (assuming CCW winding)
+                let edge_dx = b[0] - a[0];
+                let edge_dy = b[1] - a[1];
+                let edge_len = (edge_dx * edge_dx + edge_dy * edge_dy).sqrt();
+                if edge_len > EPSILON {
+                    best_edge_normal = [edge_dy / edge_len, -edge_dx / edge_len];
+                }
+            }
+        }
+        (best_edge_normal, radius)
     } else {
         ([dx / dist, dy / dist], radius - dist)
     };
@@ -717,6 +736,377 @@ fn support_point_poly(points: &[[f64; 2]], dir: [f64; 2]) -> [f64; 2] {
 }
 
 // ---------------------------------------------------------------------------
+// One-shot manifold generation — Sutherland-Hodgman clipping
+// ---------------------------------------------------------------------------
+
+/// Generate multiple contact points for box-box / convex-convex via edge clipping.
+/// Returns up to 4 contact points (normal, depth, point) with a shared normal.
+pub(super) fn generate_contacts_multi(
+    shape_a: &ColliderShape,
+    pos_a: [f64; 2],
+    rot_a: f64,
+    shape_b: &ColliderShape,
+    pos_b: [f64; 2],
+    rot_b: f64,
+) -> Vec<([f64; 2], f64, [f64; 2])> {
+    match (shape_a, shape_b) {
+        // OBB vs OBB — use clipping for multi-point manifold
+        (ColliderShape::Box { half_extents: he_a }, ColliderShape::Box { half_extents: he_b }) => {
+            clip_obb_obb(
+                pos_a,
+                rot_a,
+                [he_a[0], he_a[1]],
+                pos_b,
+                rot_b,
+                [he_b[0], he_b[1]],
+            )
+        }
+        // ConvexHull vs ConvexHull — use clipping
+        (
+            ColliderShape::ConvexHull { points: pts_a },
+            ColliderShape::ConvexHull { points: pts_b },
+        ) => clip_convex_convex(pts_a, pos_a, rot_a, pts_b, pos_b, rot_b),
+        // ConvexHull vs Box
+        (ColliderShape::ConvexHull { points }, ColliderShape::Box { half_extents }) => {
+            let box_pts = box_to_convex_points(*half_extents);
+            clip_convex_convex(points, pos_a, rot_a, &box_pts, pos_b, rot_b)
+        }
+        (ColliderShape::Box { half_extents }, ColliderShape::ConvexHull { points }) => {
+            let box_pts = box_to_convex_points(*half_extents);
+            clip_convex_convex(&box_pts, pos_a, rot_a, points, pos_b, rot_b)
+        }
+        // All other shapes: delegate to single-contact generation
+        _ => {
+            if let Some(c) = generate_contact(shape_a, pos_a, rot_a, shape_b, pos_b, rot_b) {
+                vec![c]
+            } else {
+                vec![]
+            }
+        }
+    }
+}
+
+/// Clip OBB-OBB to produce multi-point manifold via Sutherland-Hodgman.
+#[allow(clippy::too_many_arguments)]
+fn clip_obb_obb(
+    pos_a: [f64; 2],
+    rot_a: f64,
+    he_a: [f64; 2],
+    pos_b: [f64; 2],
+    rot_b: f64,
+    he_b: [f64; 2],
+) -> Vec<([f64; 2], f64, [f64; 2])> {
+    let verts_a = obb_vertices(pos_a, rot_a, he_a);
+    let verts_b = obb_vertices(pos_b, rot_b, he_b);
+    clip_polygons_to_contacts(&verts_a, &verts_b, pos_a, pos_b)
+}
+
+/// Clip convex-convex to produce multi-point manifold.
+fn clip_convex_convex(
+    points_a: &[[f64; 3]],
+    pos_a: [f64; 2],
+    rot_a: f64,
+    points_b: &[[f64; 3]],
+    pos_b: [f64; 2],
+    rot_b: f64,
+) -> Vec<([f64; 2], f64, [f64; 2])> {
+    let verts_a = transform_hull(points_a, pos_a, rot_a);
+    let verts_b = transform_hull(points_b, pos_b, rot_b);
+    if verts_a.len() < 2 || verts_b.len() < 2 {
+        return vec![];
+    }
+    clip_polygons_to_contacts(&verts_a, &verts_b, pos_a, pos_b)
+}
+
+/// Get the 4 vertices of an OBB in world space (CCW order).
+fn obb_vertices(pos: [f64; 2], rot: f64, he: [f64; 2]) -> Vec<[f64; 2]> {
+    let (sin, cos) = rot.sin_cos();
+    let local = [
+        [-he[0], -he[1]],
+        [he[0], -he[1]],
+        [he[0], he[1]],
+        [-he[0], he[1]],
+    ];
+    local
+        .iter()
+        .map(|p| {
+            [
+                pos[0] + cos * p[0] - sin * p[1],
+                pos[1] + sin * p[0] + cos * p[1],
+            ]
+        })
+        .collect()
+}
+
+/// Core clipping: find reference/incident edge, clip, produce contact points.
+fn clip_polygons_to_contacts(
+    verts_a: &[[f64; 2]],
+    verts_b: &[[f64; 2]],
+    center_a: [f64; 2],
+    center_b: [f64; 2],
+) -> Vec<([f64; 2], f64, [f64; 2])> {
+    // SAT to find minimum penetration axis and reference face
+    let center_d = [center_b[0] - center_a[0], center_b[1] - center_a[1]];
+
+    struct FaceQuery {
+        depth: f64,
+        normal: [f64; 2],
+        index: usize,
+    }
+
+    fn find_min_sep(poly: &[[f64; 2]], other: &[[f64; 2]], flip_normal: bool) -> Option<FaceQuery> {
+        let n = poly.len();
+        let mut best: Option<FaceQuery> = None;
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let edge = [poly[j][0] - poly[i][0], poly[j][1] - poly[i][1]];
+            let len = (edge[0] * edge[0] + edge[1] * edge[1]).sqrt();
+            if len < EPSILON {
+                continue;
+            }
+            let mut normal = [-edge[1] / len, edge[0] / len];
+            if flip_normal {
+                normal = [-normal[0], -normal[1]];
+            }
+
+            // Find minimum projection of other polygon's vertices onto this normal
+            // relative to the face
+            let face_d = poly[i][0] * normal[0] + poly[i][1] * normal[1];
+            let mut min_sep = f64::INFINITY;
+            for v in other {
+                let d = v[0] * normal[0] + v[1] * normal[1] - face_d;
+                min_sep = min_sep.min(d);
+            }
+
+            // min_sep < 0 means overlap; we want the axis with the least overlap (most negative)
+            if min_sep > EPSILON {
+                return None; // Separating axis found — no collision
+            }
+
+            let depth = -min_sep;
+            if best.is_none() || depth < best.as_ref().unwrap().depth {
+                best = Some(FaceQuery {
+                    depth,
+                    normal,
+                    index: i,
+                });
+            }
+        }
+        best
+    }
+
+    let query_a = match find_min_sep(verts_a, verts_b, false) {
+        Some(q) => q,
+        None => return vec![],
+    };
+    let query_b = match find_min_sep(verts_b, verts_a, false) {
+        Some(q) => q,
+        None => return vec![],
+    };
+
+    // Choose reference face (the one with less penetration for stability)
+    let (ref_verts, inc_verts, ref_idx, mut normal, _flip) = if query_a.depth <= query_b.depth {
+        (verts_a, verts_b, query_a.index, query_a.normal, false)
+    } else {
+        (verts_b, verts_a, query_b.index, query_b.normal, true)
+    };
+
+    // Ensure normal points from A to B
+    let dot = center_d[0] * normal[0] + center_d[1] * normal[1];
+    if dot < 0.0 {
+        normal = [-normal[0], -normal[1]];
+    }
+
+    // Reference edge
+    let ref_n = ref_verts.len();
+    let v1 = ref_verts[ref_idx];
+    let v2 = ref_verts[(ref_idx + 1) % ref_n];
+
+    // Tangent along reference edge
+    let ref_edge = [v2[0] - v1[0], v2[1] - v1[1]];
+    let ref_len = (ref_edge[0] * ref_edge[0] + ref_edge[1] * ref_edge[1]).sqrt();
+    if ref_len < EPSILON {
+        return vec![];
+    }
+    let tangent = [ref_edge[0] / ref_len, ref_edge[1] / ref_len];
+
+    // Find incident edge on incident polygon (the edge most anti-normal)
+    let inc_n = inc_verts.len();
+    let mut min_dot = f64::INFINITY;
+    let mut inc_idx = 0;
+    for i in 0..inc_n {
+        let j = (i + 1) % inc_n;
+        let edge = [
+            inc_verts[j][0] - inc_verts[i][0],
+            inc_verts[j][1] - inc_verts[i][1],
+        ];
+        let edge_len = (edge[0] * edge[0] + edge[1] * edge[1]).sqrt();
+        if edge_len < EPSILON {
+            continue;
+        }
+        let edge_normal = [-edge[1] / edge_len, edge[0] / edge_len];
+        let d = edge_normal[0] * normal[0] + edge_normal[1] * normal[1];
+        if d < min_dot {
+            min_dot = d;
+            inc_idx = i;
+        }
+    }
+
+    // Clip incident edge against reference face side planes
+    let mut clip_pts = vec![inc_verts[inc_idx], inc_verts[(inc_idx + 1) % inc_n]];
+
+    // Side plane 1: tangent direction, offset at v1
+    let offset1 = tangent[0] * v1[0] + tangent[1] * v1[1];
+    clip_pts = clip_segment_to_line(&clip_pts, tangent, offset1);
+    if clip_pts.is_empty() {
+        return vec![];
+    }
+
+    // Side plane 2: negative tangent direction, offset at v2
+    let neg_tangent = [-tangent[0], -tangent[1]];
+    let offset2 = neg_tangent[0] * v2[0] + neg_tangent[1] * v2[1];
+    clip_pts = clip_segment_to_line(&clip_pts, neg_tangent, offset2);
+    if clip_pts.is_empty() {
+        return vec![];
+    }
+
+    // Keep only points behind the reference face (penetrating)
+    let ref_offset = normal[0] * v1[0] + normal[1] * v1[1];
+    let mut contacts = Vec::new();
+    for pt in &clip_pts {
+        let sep = normal[0] * pt[0] + normal[1] * pt[1] - ref_offset;
+        if sep <= EPSILON {
+            contacts.push((normal, -sep, *pt));
+        }
+    }
+
+    // Reduce to MAX_MANIFOLD_POINTS if needed
+    if contacts.len() > super::types::MAX_MANIFOLD_POINTS {
+        contacts = reduce_contacts(contacts);
+    }
+
+    contacts
+}
+
+/// Sutherland-Hodgman: clip a polygon against a half-plane defined by
+/// normal·p >= offset.
+fn clip_segment_to_line(points: &[[f64; 2]], normal: [f64; 2], offset: f64) -> Vec<[f64; 2]> {
+    let mut output = Vec::with_capacity(points.len() + 1);
+    let n = points.len();
+    for i in 0..n {
+        let a = points[i];
+        let b = points[(i + 1) % n];
+        let da = normal[0] * a[0] + normal[1] * a[1] - offset;
+        let db = normal[0] * b[0] + normal[1] * b[1] - offset;
+
+        if da >= 0.0 {
+            output.push(a);
+        }
+        if (da >= 0.0) != (db >= 0.0) {
+            // Edge crosses the plane — compute intersection
+            let t = da / (da - db);
+            output.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
+        }
+    }
+    output
+}
+
+/// Reduce contacts to MAX_MANIFOLD_POINTS (4) via area maximization.
+/// Selects the subset of points that maximizes the contact area.
+fn reduce_contacts(contacts: Vec<([f64; 2], f64, [f64; 2])>) -> Vec<([f64; 2], f64, [f64; 2])> {
+    let max_pts = super::types::MAX_MANIFOLD_POINTS;
+    if contacts.len() <= max_pts {
+        return contacts;
+    }
+
+    let mut selected = Vec::with_capacity(max_pts);
+
+    // 1. Start with deepest penetration point
+    let deepest = contacts
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    selected.push(deepest);
+
+    // 2. Pick the point farthest from the first
+    let p0 = contacts[deepest].2;
+    let farthest = contacts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !selected.contains(i))
+        .max_by(|(_, a), (_, b)| {
+            let da = dist_sq_2d(a.2, p0);
+            let db = dist_sq_2d(b.2, p0);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    selected.push(farthest);
+
+    // 3. Pick point that maximizes triangle area with first two
+    if contacts.len() > 2 && max_pts > 2 {
+        let p1 = contacts[farthest].2;
+        let third = contacts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !selected.contains(i))
+            .max_by(|(_, a), (_, b)| {
+                let area_a = triangle_area_2x(p0, p1, a.2).abs();
+                let area_b = triangle_area_2x(p0, p1, b.2).abs();
+                area_a
+                    .partial_cmp(&area_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        selected.push(third);
+    }
+
+    // 4. Pick point that maximizes quadrilateral area
+    if contacts.len() > 3 && max_pts > 3 {
+        let p1 = contacts[selected[1]].2;
+        let p2 = contacts[selected[2]].2;
+        let fourth = contacts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !selected.contains(i))
+            .max_by(|(_, a), (_, b)| {
+                let area_a = quad_area(p0, p1, p2, a.2);
+                let area_b = quad_area(p0, p1, p2, b.2);
+                area_a
+                    .partial_cmp(&area_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        selected.push(fourth);
+    }
+
+    selected.into_iter().map(|i| contacts[i]).collect()
+}
+
+#[inline]
+fn dist_sq_2d(a: [f64; 2], b: [f64; 2]) -> f64 {
+    (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)
+}
+
+/// 2x signed triangle area (cross product of two edges).
+#[inline]
+fn triangle_area_2x(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
+    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+}
+
+/// Area metric for selecting the 4th point: sum of triangle areas from the
+/// candidate to each edge of the existing triangle.
+#[inline]
+fn quad_area(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> f64 {
+    // Use the area of the quadrilateral ABDC (sum of two triangles)
+    triangle_area_2x(a, b, d).abs() + triangle_area_2x(b, c, d).abs()
+}
+
+// ---------------------------------------------------------------------------
 // Segment narrowphase contacts
 // ---------------------------------------------------------------------------
 
@@ -821,5 +1211,111 @@ fn segment_box(
     } else {
         // Not overlapping
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oneshot_aabb_aabb_generates_contacts() {
+        let shape_a = ColliderShape::Box {
+            half_extents: [1.0, 1.0, 0.0],
+        };
+        let shape_b = ColliderShape::Box {
+            half_extents: [1.0, 1.0, 0.0],
+        };
+        // Two overlapping axis-aligned boxes
+        let contacts =
+            generate_contacts_multi(&shape_a, [0.0, 0.0], 0.0, &shape_b, [1.5, 0.0], 0.0);
+        assert!(!contacts.is_empty(), "should generate at least one contact");
+        for (normal, depth, _point) in &contacts {
+            assert!(depth > &0.0, "depth should be positive");
+            let len = (normal[0] * normal[0] + normal[1] * normal[1]).sqrt();
+            assert!((len - 1.0).abs() < 0.01, "normal should be unit length");
+        }
+    }
+
+    #[test]
+    fn oneshot_obb_obb_multi_point() {
+        let shape = ColliderShape::Box {
+            half_extents: [1.0, 1.0, 0.0],
+        };
+        // Rotated box overlap should produce multiple contacts via clipping
+        let contacts = generate_contacts_multi(
+            &shape,
+            [0.0, 0.0],
+            0.0,
+            &shape,
+            [1.5, 0.0],
+            0.3, // rotated ~17 degrees
+        );
+        assert!(
+            !contacts.is_empty(),
+            "should generate contacts for overlapping rotated boxes"
+        );
+    }
+
+    #[test]
+    fn oneshot_no_overlap() {
+        let shape = ColliderShape::Box {
+            half_extents: [1.0, 1.0, 0.0],
+        };
+        let contacts = generate_contacts_multi(&shape, [0.0, 0.0], 0.0, &shape, [5.0, 0.0], 0.0);
+        assert!(
+            contacts.is_empty(),
+            "separated boxes should produce no contacts"
+        );
+    }
+
+    #[test]
+    fn oneshot_ball_ball_single_contact() {
+        let shape_a = ColliderShape::Ball { radius: 1.0 };
+        let shape_b = ColliderShape::Ball { radius: 1.0 };
+        let contacts =
+            generate_contacts_multi(&shape_a, [0.0, 0.0], 0.0, &shape_b, [1.5, 0.0], 0.0);
+        assert_eq!(
+            contacts.len(),
+            1,
+            "ball-ball should produce exactly one contact"
+        );
+    }
+
+    #[test]
+    fn contact_reduction_preserves_deepest() {
+        // Create 6 contacts, verify reduction picks the deepest
+        let contacts = vec![
+            ([1.0, 0.0], 0.1, [0.0, 0.0]),
+            ([1.0, 0.0], 0.5, [1.0, 0.0]), // deepest
+            ([1.0, 0.0], 0.2, [0.0, 1.0]),
+            ([1.0, 0.0], 0.3, [1.0, 1.0]),
+            ([1.0, 0.0], 0.15, [0.5, 0.5]),
+            ([1.0, 0.0], 0.05, [0.5, 0.0]),
+        ];
+        let reduced = reduce_contacts(contacts);
+        assert!(reduced.len() <= super::super::types::MAX_MANIFOLD_POINTS);
+        // The deepest point (depth=0.5) should be in the result
+        assert!(
+            reduced.iter().any(|(_, d, _)| (*d - 0.5).abs() < 1e-10),
+            "deepest point should be preserved"
+        );
+    }
+
+    #[test]
+    fn convex_hull_circle_degenerate_normal() {
+        // Test that circle center on hull edge gets proper edge normal, not [0,1]
+        let hull = vec![
+            [0.0, -1.0, 0.0],
+            [2.0, -1.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        // Circle centered exactly on the left edge of the hull
+        let result = convex_hull_circle(&hull, [1.0, 0.0], 0.0, [0.0, 0.0], 0.5);
+        if let Some((normal, _depth, _point)) = result {
+            let len = (normal[0] * normal[0] + normal[1] * normal[1]).sqrt();
+            assert!((len - 1.0).abs() < 0.01, "normal should be unit length");
+        }
     }
 }

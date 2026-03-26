@@ -23,10 +23,10 @@ cargo test test_name
 
 | Location | Type | Count |
 |----------|------|-------|
-| `src/backend_2d.rs` | Unit tests — narrowphase, ray, AABB, mass, spatial hash, sensors, kinematic | ~45 |
-| `src/backend_3d.rs` | Unit tests — 3D contacts, quaternion, mass, spatial hash, joints | ~25 |
+| `src/backend_2d/` | Unit tests — narrowphase, ray, AABB, mass, spatial hash, sensors, kinematic, one-shot manifold, contact reduction | ~50 |
+| `src/backend_3d/` | Unit tests — 3D contacts, quaternion, mass, spatial hash, joints, gyroscopic torque | ~30 |
 | `src/world.rs` | Integration — gravity, impulse, collision events, raycast, particles | ~15 |
-| `src/*.rs` (other) | Unit tests — serde roundtrips, equality, constructors, display | ~50 |
+| `src/*.rs` (other) | Unit tests — serde roundtrips, equality, constructors, display, SolverKind | ~55 |
 | `src/serialize.rs` | Serialization — empty/full roundtrip, position preservation, simulation continuity | ~5 |
 | `src/spring.rs` | Spring — convergence, overshoot, settling, snap, fling, serde | ~13 |
 | `tests/integration.rs` | Cross-module integration | ~9 |

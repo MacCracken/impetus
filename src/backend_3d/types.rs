@@ -100,7 +100,13 @@ impl RigidBody3d {
         self.linear_velocity += self.force_accumulator * (self.inv_mass * dt);
 
         if !self.fixed_rotation {
-            self.angular_velocity += self.inv_inertia * self.torque_accumulator * dt;
+            // Gyroscopic torque: ω × (I·ω) — precession term for spinning bodies
+            // (tops, wheels, projectiles, any fast-rotating body)
+            let gyro_torque = self
+                .angular_velocity
+                .cross(self.inertia * self.angular_velocity);
+            self.angular_velocity +=
+                self.inv_inertia * (self.torque_accumulator - gyro_torque) * dt;
         }
 
         let damp = 1.0 / (1.0 + dt * self.linear_damping);

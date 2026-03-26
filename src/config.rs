@@ -12,6 +12,18 @@ pub enum BroadphaseKind {
     AabbTree,
 }
 
+/// Constraint solver algorithm selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum SolverKind {
+    /// Sequential impulse solver (default). Classic velocity-based constraint solver
+    /// with warm starting and accumulated impulses.
+    SequentialImpulse,
+    /// Extended Position-Based Dynamics (XPBD). Position-based solver with compliant
+    /// constraints. More stable for stiff stacks and ragdolls.
+    Xpbd,
+}
+
 /// Physics world configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorldConfig {
@@ -52,6 +64,9 @@ pub struct WorldConfig {
     /// Broadphase algorithm (default: SpatialHash).
     #[serde(default = "default_broadphase")]
     pub broadphase: BroadphaseKind,
+    /// Constraint solver algorithm (default: SequentialImpulse).
+    #[serde(default = "default_solver")]
+    pub solver: SolverKind,
 }
 
 fn default_slop() -> f64 {
@@ -82,6 +97,10 @@ fn default_broadphase() -> BroadphaseKind {
     BroadphaseKind::SpatialHash
 }
 
+fn default_solver() -> SolverKind {
+    SolverKind::SequentialImpulse
+}
+
 impl Default for WorldConfig {
     fn default() -> Self {
         Self {
@@ -98,6 +117,7 @@ impl Default for WorldConfig {
             constraint_frequency: default_constraint_frequency(),
             constraint_damping_ratio: default_constraint_damping_ratio(),
             broadphase: default_broadphase(),
+            solver: default_solver(),
         }
     }
 }
@@ -141,10 +161,29 @@ mod tests {
             constraint_frequency: 30.0,
             constraint_damping_ratio: 1.0,
             broadphase: BroadphaseKind::SpatialHash,
+            solver: SolverKind::SequentialImpulse,
         };
         let json = serde_json::to_string(&config).unwrap();
         let back: WorldConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config, back);
+    }
+
+    #[test]
+    fn solver_kind_serde() {
+        let config = WorldConfig {
+            solver: SolverKind::Xpbd,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: WorldConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.solver, back.solver);
+        assert_eq!(back.solver, SolverKind::Xpbd);
+    }
+
+    #[test]
+    fn solver_kind_default_is_sequential_impulse() {
+        let config = WorldConfig::default();
+        assert_eq!(config.solver, SolverKind::SequentialImpulse);
     }
 
     #[test]

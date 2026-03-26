@@ -46,7 +46,7 @@ pub use body::{BodyDesc, BodyHandle, BodyState, BodyType};
 pub use collider::{ColliderDesc, ColliderHandle, ColliderShape};
 
 // Config
-pub use config::{BroadphaseKind, WorldConfig};
+pub use config::{BroadphaseKind, SolverKind, WorldConfig};
 
 // Events
 pub use event::{CollisionEvent, ContactData, ContactPoint};

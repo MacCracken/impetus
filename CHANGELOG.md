@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Added
+
+- **narrowphase** — one-shot manifold generation via Sutherland-Hodgman edge clipping for OBB-OBB and ConvexHull-ConvexHull; produces full contact manifold in a single pass instead of accumulating over frames
+- **narrowphase** — contact point reduction via area maximization; reduces large manifolds to 4 optimal points for solver efficiency
+- **3D solver** — gyroscopic torque (`ω × (I·ω)`) precession term in 3D velocity integration; required for realistic tops, wheels, projectiles, and fast-spinning bodies
+- **config** — `SolverKind` enum (`SequentialImpulse`, `Xpbd`) with `#[non_exhaustive]`; `WorldConfig::solver` field for future XPBD solver selection (default: `SequentialImpulse`)
+- **manifold** — `MAX_MANIFOLD_POINTS` increased from 2 to 4 in 2D for edge-clipping contact quality
+
+### Fixed
+
+- **solver** — division-by-zero guards added to single-point normal impulse, block solver re-solve cases, and friction effective mass computation
+- **solver** — replaced `expect()` panics with defensive `if let` checks in manifold impulse accumulation and friction solver
+- **narrowphase** — convex hull circle contact now computes actual edge outward normal when circle center coincides with hull edge, instead of using arbitrary `[0, 1]` fallback
+- **aabb_tree** — replaced `expect()` panics with graceful fallbacks in `update()` and `query_pairs()`
+- **narrowphase** — manifold point replacement uses `unwrap_or` for NaN-safe comparison
+
+### Changed
+
+- **spring** — `critically_damped()`, `over_damped()`, `under_damped()` factory functions use `stiffness.abs().sqrt()` with `debug_assert!` on negative stiffness to prevent NaN
+- **particle** — `Particle::with_radius()` clamps to non-negative with `debug_assert!` validation
+- **world** — added `#[must_use]` to `raycast()`, `raycast_filtered()`, `overlap_sphere()`, `overlap_aabb()` query methods
+
 ## [1.0.0] — 2026-03-25
 
 v1.0 release — solver quality, broadphase, collision, and inertia overhaul.

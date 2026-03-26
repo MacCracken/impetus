@@ -59,7 +59,7 @@ dependencies = [
  "arrayvec",
  "bitcode_derive",
  "bytemuck",
- "glam",
+ "glam 0.32.1",
  "serde",
 ]
 
@@ -295,6 +295,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glam"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f70749695b063ecbf6b62949ccccde2e733ec3ecbbd71d467dca4e5c6c97cca0"
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -332,7 +338,7 @@ version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fccb4f2fec90170ee6835d1a57ceda45fc4a978603e937f78a405d95e6318d89"
 dependencies = [
- "glam",
+ "glam 0.29.3",
  "serde",
  "thiserror",
  "tracing",
@@ -346,7 +352,7 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 
 [[package]]
 name = "impetus"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bitcode",
  "criterion",

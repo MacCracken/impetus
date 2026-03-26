@@ -946,3 +946,75 @@ fn closest_points_crossing_segments() {
     assert!((p1 - DVec3::new(0.0, 0.0, 0.0)).length() < EPS);
     assert!((p2 - DVec3::new(0.0, 0.0, 1.0)).length() < EPS);
 }
+
+#[test]
+fn gyroscopic_torque_precession() {
+    // A spinning body with asymmetric inertia should exhibit precession
+    // due to the gyroscopic torque term ω × (I·ω).
+    use hisab::DMat3;
+
+    let mut rb = RigidBody3d::from_desc(
+        BodyHandle(100),
+        &BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, 0.0, 0.0],
+            ..Default::default()
+        },
+    );
+    // Asymmetric inertia: Ix=1, Iy=2, Iz=3
+    rb.mass = 1.0;
+    rb.inv_mass = 1.0;
+    rb.inertia = DMat3::from_diagonal(DVec3::new(1.0, 2.0, 3.0));
+    rb.inv_inertia = DMat3::from_diagonal(DVec3::new(1.0, 0.5, 1.0 / 3.0));
+    // Spin around X at 10 rad/s — gyroscopic torque should induce cross-axis rotation
+    rb.angular_velocity = DVec3::new(10.0, 0.0, 0.0);
+
+    // Test with a spin that has components on multiple axes for gyroscopic coupling:
+    rb.angular_velocity = DVec3::new(10.0, 5.0, 0.0);
+    let before_z = rb.angular_velocity.z;
+    rb.integrate_velocities(DVec3::ZERO, 1.0 / 60.0, 100.0);
+
+    // With asymmetric inertia and multi-axis spin, gyroscopic torque
+    // should produce a non-zero z-component change
+    // ω × (I·ω) = (10,5,0) × (10,10,0) = (0,0,100-50) = (0,0,50)
+    // Effect: Δω_z = inv_Iz * (-50) * dt = (1/3) * (-50) * (1/60) ≈ -0.278
+    assert!(
+        (rb.angular_velocity.z - before_z).abs() > 0.01,
+        "gyroscopic torque should cause cross-axis angular velocity change, got dz={}",
+        rb.angular_velocity.z - before_z
+    );
+}
+
+#[test]
+fn gyroscopic_torque_symmetric_no_precession() {
+    // A symmetric body (uniform sphere) spinning around one axis should have
+    // zero gyroscopic torque: ω × (I·ω) = 0 when I is scalar multiple of identity.
+    use hisab::DMat3;
+
+    let mut rb = RigidBody3d::from_desc(
+        BodyHandle(101),
+        &BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, 0.0, 0.0],
+            ..Default::default()
+        },
+    );
+    rb.mass = 1.0;
+    rb.inv_mass = 1.0;
+    rb.inertia = DMat3::from_diagonal(DVec3::splat(2.0));
+    rb.inv_inertia = DMat3::from_diagonal(DVec3::splat(0.5));
+    rb.angular_velocity = DVec3::new(10.0, 0.0, 0.0);
+
+    let before = rb.angular_velocity;
+    rb.integrate_velocities(DVec3::ZERO, 1.0 / 60.0, 100.0);
+
+    // Symmetric body: gyroscopic torque = ω × (I·ω) = 10x × 20x = 0
+    // Only damping should apply
+    let diff = (rb.angular_velocity - before).length();
+    // Should be very small (only damping, which is 0 by default)
+    assert!(
+        diff < 0.01,
+        "symmetric body should have negligible gyroscopic effect, got diff={}",
+        diff
+    );
+}
