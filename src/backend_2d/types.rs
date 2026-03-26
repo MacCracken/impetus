@@ -56,6 +56,9 @@ pub(crate) struct RigidBody2d {
     // Split impulse — pseudo-velocities for position correction only
     pub pseudo_velocity: [f64; 2],
     pub pseudo_angular_velocity: f64,
+    // XPBD: previous-frame positions for velocity derivation
+    pub prev_position: [f64; 2],
+    pub prev_rotation: f64,
     // Sleep state
     pub is_sleeping: bool,
     pub sleep_timer: f64,
@@ -84,6 +87,8 @@ impl RigidBody2d {
             inv_inertia: 0.0,
             pseudo_velocity: [0.0, 0.0],
             pseudo_angular_velocity: 0.0,
+            prev_position: [desc.position[0], desc.position[1]],
+            prev_rotation: desc.rotation,
             is_sleeping: false,
             sleep_timer: 0.0,
             island_id: 0,

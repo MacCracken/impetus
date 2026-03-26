@@ -11,7 +11,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - **narrowphase** — one-shot manifold generation via Sutherland-Hodgman edge clipping for OBB-OBB and ConvexHull-ConvexHull; produces full contact manifold in a single pass instead of accumulating over frames
 - **narrowphase** — contact point reduction via area maximization; reduces large manifolds to 4 optimal points for solver efficiency
 - **3D solver** — gyroscopic torque (`ω × (I·ω)`) precession term in 3D velocity integration; required for realistic tops, wheels, projectiles, and fast-spinning bodies
-- **config** — `SolverKind` enum (`SequentialImpulse`, `Xpbd`) with `#[non_exhaustive]`; `WorldConfig::solver` field for future XPBD solver selection (default: `SequentialImpulse`)
+- **config** — `SolverKind` enum (`SequentialImpulse`, `Xpbd`) with `#[non_exhaustive]`; `WorldConfig::solver` field (default: `SequentialImpulse`)
+- **solver** — XPBD (Extended Position-Based Dynamics) solver for 2D backend; position-level constraint solving with compliance (α̃ = 1/(ω²·dt²)), Lagrange multiplier accumulation, velocity-level friction and restitution, position-level joint constraints (Fixed, Revolute, Distance, Spring, Rope)
 - **manifold** — `MAX_MANIFOLD_POINTS` increased from 2 to 4 in 2D for edge-clipping contact quality
 
 ### Fixed

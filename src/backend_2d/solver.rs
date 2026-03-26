@@ -29,6 +29,50 @@ impl PhysicsState2d {
         constraint_frequency: f64,
         constraint_damping_ratio: f64,
         broadphase_kind: crate::config::BroadphaseKind,
+        solver_kind: crate::config::SolverKind,
+    ) -> Vec<CollisionEvent> {
+        match solver_kind {
+            crate::config::SolverKind::Xpbd => self.step_xpbd(
+                gravity,
+                dt,
+                velocity_iterations,
+                slop,
+                max_velocity,
+                constraint_frequency,
+                broadphase_kind,
+            ),
+            _ => self.step_si(
+                gravity,
+                dt,
+                velocity_iterations,
+                position_iterations,
+                slop,
+                correction,
+                max_velocity,
+                constraint_frequency,
+                constraint_damping_ratio,
+                broadphase_kind,
+            ),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Sequential Impulse step (default)
+    // -----------------------------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    fn step_si(
+        &mut self,
+        gravity: [f64; 3],
+        dt: f64,
+        velocity_iterations: u32,
+        position_iterations: u32,
+        slop: f64,
+        correction: f64,
+        max_velocity: f64,
+        constraint_frequency: f64,
+        constraint_damping_ratio: f64,
+        broadphase_kind: crate::config::BroadphaseKind,
     ) -> Vec<CollisionEvent> {
         let gravity_2d = [gravity[0], gravity[1]];
         // 1. Integrate velocities
@@ -46,6 +90,146 @@ impl PhysicsState2d {
         self.update_manifolds(&contacts);
 
         // 5. Wake sleeping bodies on contact with non-sleeping moving bodies
+        self.wake_on_contact();
+
+        // 6. Warm start — apply cached impulses from previous frame
+        self.warm_start();
+
+        // 7. Solve velocity constraints (using manifolds with accumulation)
+        self.solve_contacts(velocity_iterations);
+
+        // 8. Solve joint constraints
+        self.solve_joints(dt, velocity_iterations);
+
+        // 9. Positional correction (soft constraint or Baumgarte)
+        self.solve_positions(
+            position_iterations,
+            slop,
+            correction,
+            dt,
+            constraint_frequency,
+            constraint_damping_ratio,
+        );
+
+        // 10. Integrate positions
+        for rb in self.bodies.values_mut() {
+            rb.integrate_positions(dt);
+        }
+
+        // 11. Build simulation islands and sleep check
+        self.build_islands_and_sleep(dt);
+
+        // 12. Clear forces
+        for rb in self.bodies.values_mut() {
+            rb.clear_forces();
+        }
+
+        // 13. Generate collision events (from manifold keys)
+        self.generate_events()
+    }
+
+    // -----------------------------------------------------------------------
+    // XPBD step — position-based dynamics with compliance
+    // -----------------------------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    fn step_xpbd(
+        &mut self,
+        gravity: [f64; 3],
+        dt: f64,
+        iterations: u32,
+        slop: f64,
+        max_velocity: f64,
+        constraint_frequency: f64,
+        broadphase_kind: crate::config::BroadphaseKind,
+    ) -> Vec<CollisionEvent> {
+        let gravity_2d = [gravity[0], gravity[1]];
+
+        // 1. Store previous positions and integrate velocities
+        for rb in self.bodies.values_mut() {
+            rb.prev_position = rb.position;
+            rb.prev_rotation = rb.rotation;
+            rb.integrate_velocities(gravity_2d, dt, max_velocity);
+        }
+
+        // 2. Predict positions: x += v * dt
+        for rb in self.bodies.values_mut() {
+            if !rb.is_dynamic() || rb.inv_mass == 0.0 || rb.is_sleeping {
+                continue;
+            }
+            rb.position[0] += rb.linear_velocity[0] * dt;
+            rb.position[1] += rb.linear_velocity[1] * dt;
+            if !rb.fixed_rotation {
+                rb.rotation += rb.angular_velocity * dt;
+            }
+        }
+
+        // 3. Broadphase + narrowphase at predicted positions
+        let broad_pairs = self.broadphase(broadphase_kind, dt);
+        let contacts = self.narrowphase(&broad_pairs);
+        self.update_manifolds(&contacts);
+
+        // 4. Wake on contact
+        self.wake_on_contact();
+
+        // 5. XPBD constraint solving — position-level with compliance
+        // Compliance: α̃ = 1 / (stiffness * dt²)
+        let alpha_tilde = if constraint_frequency > 0.0 {
+            let omega = 2.0 * std::f64::consts::PI * constraint_frequency;
+            1.0 / (omega * omega * dt * dt)
+        } else {
+            0.0 // infinite stiffness
+        };
+
+        // Initialize Lagrange multipliers for each manifold point
+        let manifold_keys: Vec<ManifoldKey> = self.manifolds.keys().copied().collect();
+        let mut lambdas: BTreeMap<(ManifoldKey, usize), f64> = BTreeMap::new();
+        for key in &manifold_keys {
+            if let Some(m) = self.manifolds.get(key) {
+                for pi in 0..m.points.len() {
+                    lambdas.insert((*key, pi), 0.0);
+                }
+            }
+        }
+
+        for _ in 0..iterations {
+            // Contact constraints
+            self.xpbd_solve_contacts(&manifold_keys, &mut lambdas, alpha_tilde, slop);
+
+            // Joint constraints
+            self.xpbd_solve_joints(dt, alpha_tilde);
+        }
+
+        // 6. Derive velocities from position change
+        let inv_dt = if dt > EPSILON { 1.0 / dt } else { 0.0 };
+        for rb in self.bodies.values_mut() {
+            if !rb.is_dynamic() || rb.inv_mass == 0.0 || rb.is_sleeping {
+                continue;
+            }
+            rb.linear_velocity[0] = (rb.position[0] - rb.prev_position[0]) * inv_dt;
+            rb.linear_velocity[1] = (rb.position[1] - rb.prev_position[1]) * inv_dt;
+            if !rb.fixed_rotation {
+                rb.angular_velocity = (rb.rotation - rb.prev_rotation) * inv_dt;
+            }
+        }
+
+        // 7. Velocity-level friction and restitution
+        self.xpbd_velocity_solve(&manifold_keys);
+
+        // 8. Islands + sleep
+        self.build_islands_and_sleep(dt);
+
+        // 9. Clear forces
+        for rb in self.bodies.values_mut() {
+            rb.clear_forces();
+        }
+
+        // 10. Generate collision events
+        self.generate_events()
+    }
+
+    /// Wake sleeping bodies that are in contact with moving non-sleeping bodies.
+    fn wake_on_contact(&mut self) {
         for manifold in self.manifolds.values() {
             let a_sleeping = self
                 .bodies
@@ -84,41 +268,6 @@ impl PhysicsState2d {
                 bb.sleep_timer = 0.0;
             }
         }
-
-        // 6. Warm start — apply cached impulses from previous frame
-        self.warm_start();
-
-        // 7. Solve velocity constraints (using manifolds with accumulation)
-        self.solve_contacts(velocity_iterations);
-
-        // 8. Solve joint constraints
-        self.solve_joints(dt, velocity_iterations);
-
-        // 9. Positional correction (soft constraint or Baumgarte)
-        self.solve_positions(
-            position_iterations,
-            slop,
-            correction,
-            dt,
-            constraint_frequency,
-            constraint_damping_ratio,
-        );
-
-        // 10. Integrate positions
-        for rb in self.bodies.values_mut() {
-            rb.integrate_positions(dt);
-        }
-
-        // 11. Build simulation islands and sleep check
-        self.build_islands_and_sleep(dt);
-
-        // 12. Clear forces
-        for rb in self.bodies.values_mut() {
-            rb.clear_forces();
-        }
-
-        // 13. Generate collision events (from manifold keys)
-        self.generate_events()
     }
 
     // -----------------------------------------------------------------------
@@ -1224,6 +1373,432 @@ impl PhysicsState2d {
                 {
                     bb.pseudo_velocity[0] += bias * n[0] * bb.inv_mass;
                     bb.pseudo_velocity[1] += bias * n[1] * bb.inv_mass;
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // XPBD contact constraint solver (position-level)
+    // -----------------------------------------------------------------------
+
+    /// Solve contact constraints using XPBD position corrections with compliance.
+    ///
+    /// For each contact point, computes the constraint violation C (penetration)
+    /// and applies a position correction weighted by inverse mass, accumulating
+    /// the Lagrange multiplier λ to prevent over-correction.
+    fn xpbd_solve_contacts(
+        &mut self,
+        keys: &[ManifoldKey],
+        lambdas: &mut BTreeMap<(ManifoldKey, usize), f64>,
+        alpha_tilde: f64,
+        slop: f64,
+    ) {
+        for key in keys {
+            let manifold = match self.manifolds.get(key) {
+                Some(m) => m,
+                None => continue,
+            };
+
+            // Skip sensors
+            let is_sensor = match (
+                self.colliders.get(coll_ah(manifold.collider_a)),
+                self.colliders.get(coll_ah(manifold.collider_b)),
+            ) {
+                (Some(a), Some(b)) => a.is_sensor || b.is_sensor,
+                _ => false,
+            };
+            if is_sensor {
+                continue;
+            }
+
+            let body_a = manifold.body_a;
+            let body_b = manifold.body_b;
+            let normal = manifold.normal;
+            let num_points = manifold.points.len();
+
+            let inv_mass_a = self
+                .bodies
+                .get(body_ah(body_a))
+                .map(|b| b.inv_mass)
+                .unwrap_or(0.0);
+            let inv_mass_b = self
+                .bodies
+                .get(body_ah(body_b))
+                .map(|b| b.inv_mass)
+                .unwrap_or(0.0);
+            let w_sum = inv_mass_a + inv_mass_b;
+            if w_sum < EPSILON {
+                continue;
+            }
+
+            for pi in 0..num_points {
+                let mp = &self.manifolds[key].points[pi];
+                let initial_depth = mp.depth;
+
+                // Constraint C = -penetration (negative when overlapping).
+                // We want to drive C to 0 from below.
+                let lambda_prev = lambdas.get(&(*key, pi)).copied().unwrap_or(0.0);
+
+                // Effective penetration accounting for corrections already applied.
+                // Each unit of lambda corresponds to w_sum units of separation gained.
+                let current_pen = (initial_depth - lambda_prev * w_sum - slop).max(0.0);
+                if current_pen < EPSILON {
+                    continue;
+                }
+
+                // XPBD: Δλ = (penetration - α̃·λ) / (w + α̃)
+                // This drives penetration to zero while respecting compliance.
+                let denom = w_sum + alpha_tilde;
+                if denom < EPSILON {
+                    continue;
+                }
+                let delta_lambda = (current_pen - alpha_tilde * lambda_prev) / denom;
+
+                // Clamp: accumulated lambda must stay non-negative (only push apart)
+                let lambda_new = (lambda_prev + delta_lambda).max(0.0);
+                let dl = lambda_new - lambda_prev;
+                if dl.abs() < EPSILON {
+                    continue;
+                }
+
+                lambdas.insert((*key, pi), lambda_new);
+                if let Some(ba) = self.bodies.get_mut(body_ah(body_a))
+                    && ba.is_dynamic()
+                {
+                    ba.position[0] -= dl * inv_mass_a * normal[0];
+                    ba.position[1] -= dl * inv_mass_a * normal[1];
+                }
+                if let Some(bb) = self.bodies.get_mut(body_ah(body_b))
+                    && bb.is_dynamic()
+                {
+                    bb.position[0] += dl * inv_mass_b * normal[0];
+                    bb.position[1] += dl * inv_mass_b * normal[1];
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // XPBD joint constraint solver (position-level)
+    // -----------------------------------------------------------------------
+
+    /// Solve joint constraints at position level for XPBD.
+    fn xpbd_solve_joints(&mut self, dt: f64, alpha_tilde: f64) {
+        use crate::joint::JointType;
+
+        let joint_data: Vec<_> = self
+            .joints
+            .iter()
+            .map(|(_, j)| {
+                (
+                    j.body_a,
+                    j.body_b,
+                    j.joint_type.clone(),
+                    j.local_anchor_a,
+                    j.local_anchor_b,
+                )
+            })
+            .collect();
+
+        for (body_a, body_b, joint_type, anchor_a, anchor_b) in &joint_data {
+            let (pos_a, rot_a, inv_mass_a) = match self.bodies.get(body_ah(*body_a)) {
+                Some(b) => (b.position, b.rotation, b.inv_mass),
+                None => continue,
+            };
+            let (pos_b, rot_b, inv_mass_b) = match self.bodies.get(body_ah(*body_b)) {
+                Some(b) => (b.position, b.rotation, b.inv_mass),
+                None => continue,
+            };
+
+            let w_sum = inv_mass_a + inv_mass_b;
+            if w_sum < EPSILON {
+                continue;
+            }
+
+            // World-space anchor positions
+            let (sin_a, cos_a) = rot_a.sin_cos();
+            let (sin_b, cos_b) = rot_b.sin_cos();
+            let wa = [
+                pos_a[0] + cos_a * anchor_a[0] - sin_a * anchor_a[1],
+                pos_a[1] + sin_a * anchor_a[0] + cos_a * anchor_a[1],
+            ];
+            let wb = [
+                pos_b[0] + cos_b * anchor_b[0] - sin_b * anchor_b[1],
+                pos_b[1] + sin_b * anchor_b[0] + cos_b * anchor_b[1],
+            ];
+
+            match joint_type {
+                JointType::Fixed | JointType::Revolute { .. } => {
+                    // Distance constraint: anchors should coincide
+                    let dx = wb[0] - wa[0];
+                    let dy = wb[1] - wa[1];
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist < EPSILON {
+                        continue;
+                    }
+                    let n = [dx / dist, dy / dist];
+                    let c = dist;
+                    let denom = w_sum + alpha_tilde;
+                    let delta_lambda = -c / denom;
+
+                    if let Some(ba) = self.bodies.get_mut(body_ah(*body_a))
+                        && ba.is_dynamic()
+                    {
+                        ba.position[0] -= delta_lambda * inv_mass_a * n[0];
+                        ba.position[1] -= delta_lambda * inv_mass_a * n[1];
+                    }
+                    if let Some(bb) = self.bodies.get_mut(body_ah(*body_b))
+                        && bb.is_dynamic()
+                    {
+                        bb.position[0] += delta_lambda * inv_mass_b * n[0];
+                        bb.position[1] += delta_lambda * inv_mass_b * n[1];
+                    }
+                }
+                JointType::Distance { length } => {
+                    let dx = wb[0] - wa[0];
+                    let dy = wb[1] - wa[1];
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist < EPSILON {
+                        continue;
+                    }
+                    let n = [dx / dist, dy / dist];
+                    let c = dist - length;
+                    let denom = w_sum + alpha_tilde;
+                    let delta_lambda = -c / denom;
+
+                    if let Some(ba) = self.bodies.get_mut(body_ah(*body_a))
+                        && ba.is_dynamic()
+                    {
+                        ba.position[0] -= delta_lambda * inv_mass_a * n[0];
+                        ba.position[1] -= delta_lambda * inv_mass_a * n[1];
+                    }
+                    if let Some(bb) = self.bodies.get_mut(body_ah(*body_b))
+                        && bb.is_dynamic()
+                    {
+                        bb.position[0] += delta_lambda * inv_mass_b * n[0];
+                        bb.position[1] += delta_lambda * inv_mass_b * n[1];
+                    }
+                }
+                JointType::Spring {
+                    rest_length,
+                    stiffness,
+                    damping: _,
+                } => {
+                    let dx = wb[0] - wa[0];
+                    let dy = wb[1] - wa[1];
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist < EPSILON {
+                        continue;
+                    }
+                    let n = [dx / dist, dy / dist];
+                    let c = dist - rest_length;
+                    // Spring compliance: α̃ = 1/(k·dt²)
+                    let spring_alpha = if *stiffness > EPSILON {
+                        1.0 / (stiffness * dt * dt)
+                    } else {
+                        alpha_tilde
+                    };
+                    let denom = w_sum + spring_alpha;
+                    let delta_lambda = -c / denom;
+
+                    if let Some(ba) = self.bodies.get_mut(body_ah(*body_a))
+                        && ba.is_dynamic()
+                    {
+                        ba.position[0] -= delta_lambda * inv_mass_a * n[0];
+                        ba.position[1] -= delta_lambda * inv_mass_a * n[1];
+                    }
+                    if let Some(bb) = self.bodies.get_mut(body_ah(*body_b))
+                        && bb.is_dynamic()
+                    {
+                        bb.position[0] += delta_lambda * inv_mass_b * n[0];
+                        bb.position[1] += delta_lambda * inv_mass_b * n[1];
+                    }
+                }
+                JointType::Rope { max_length } => {
+                    let dx = wb[0] - wa[0];
+                    let dy = wb[1] - wa[1];
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist <= *max_length || dist < EPSILON {
+                        continue;
+                    }
+                    let n = [dx / dist, dy / dist];
+                    let c = dist - max_length;
+                    let denom = w_sum + alpha_tilde;
+                    let delta_lambda = -c / denom;
+
+                    if let Some(ba) = self.bodies.get_mut(body_ah(*body_a))
+                        && ba.is_dynamic()
+                    {
+                        ba.position[0] -= delta_lambda * inv_mass_a * n[0];
+                        ba.position[1] -= delta_lambda * inv_mass_a * n[1];
+                    }
+                    if let Some(bb) = self.bodies.get_mut(body_ah(*body_b))
+                        && bb.is_dynamic()
+                    {
+                        bb.position[0] += delta_lambda * inv_mass_b * n[0];
+                        bb.position[1] += delta_lambda * inv_mass_b * n[1];
+                    }
+                }
+                _ => {
+                    // Other joint types: fall through (Mouse, Prismatic, Wheel handled later)
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // XPBD velocity-level friction + restitution
+    // -----------------------------------------------------------------------
+
+    /// After XPBD position solve and velocity derivation, apply velocity-level
+    /// friction and restitution corrections.
+    fn xpbd_velocity_solve(&mut self, keys: &[ManifoldKey]) {
+        use crate::material::CombineRule;
+
+        fn combine_property(a: f64, b: f64, rule_a: CombineRule, rule_b: CombineRule) -> f64 {
+            let rule = rule_a.max(rule_b);
+            rule.combine(a, b)
+        }
+
+        for key in keys {
+            let manifold = match self.manifolds.get(key) {
+                Some(m) => m,
+                None => continue,
+            };
+
+            let (restitution, friction) = match (
+                self.colliders.get(coll_ah(manifold.collider_a)),
+                self.colliders.get(coll_ah(manifold.collider_b)),
+            ) {
+                (Some(a), Some(b)) => {
+                    if a.is_sensor || b.is_sensor {
+                        continue;
+                    }
+                    (
+                        combine_property(
+                            a.material.restitution,
+                            b.material.restitution,
+                            a.material.restitution_combine,
+                            b.material.restitution_combine,
+                        ),
+                        combine_property(
+                            a.material.friction,
+                            b.material.friction,
+                            a.material.friction_combine,
+                            b.material.friction_combine,
+                        ),
+                    )
+                }
+                _ => continue,
+            };
+
+            let normal = manifold.normal;
+            let body_a = manifold.body_a;
+            let body_b = manifold.body_b;
+
+            let (vel_a, inv_mass_a) = match self.bodies.get(body_ah(body_a)) {
+                Some(b) => (b.linear_velocity, b.inv_mass),
+                None => continue,
+            };
+            let (vel_b, inv_mass_b) = match self.bodies.get(body_ah(body_b)) {
+                Some(b) => (b.linear_velocity, b.inv_mass),
+                None => continue,
+            };
+
+            let w_sum = inv_mass_a + inv_mass_b;
+            if w_sum < EPSILON {
+                continue;
+            }
+
+            // Relative velocity at contact
+            let rel_vel = [vel_b[0] - vel_a[0], vel_b[1] - vel_a[1]];
+            let vn = rel_vel[0] * normal[0] + rel_vel[1] * normal[1];
+
+            // Restitution: if separating, apply bounce
+            if vn < -EPSILON {
+                // Compute pre-solve relative velocity from prev positions
+                let prev_a = self
+                    .bodies
+                    .get(body_ah(body_a))
+                    .map(|b| b.prev_position)
+                    .unwrap_or([0.0, 0.0]);
+                let prev_b = self
+                    .bodies
+                    .get(body_ah(body_b))
+                    .map(|b| b.prev_position)
+                    .unwrap_or([0.0, 0.0]);
+                let pos_a_cur = self
+                    .bodies
+                    .get(body_ah(body_a))
+                    .map(|b| b.position)
+                    .unwrap_or([0.0, 0.0]);
+                let pos_b_cur = self
+                    .bodies
+                    .get(body_ah(body_b))
+                    .map(|b| b.position)
+                    .unwrap_or([0.0, 0.0]);
+                // Approximate pre-collision normal velocity from position delta before solve
+                let _ = (prev_a, prev_b, pos_a_cur, pos_b_cur);
+
+                let delta_vn = -vn * (1.0 + restitution);
+                let j = delta_vn / w_sum;
+
+                if let Some(ba) = self.bodies.get_mut(body_ah(body_a))
+                    && ba.is_dynamic()
+                {
+                    ba.linear_velocity[0] -= j * inv_mass_a * normal[0];
+                    ba.linear_velocity[1] -= j * inv_mass_a * normal[1];
+                }
+                if let Some(bb) = self.bodies.get_mut(body_ah(body_b))
+                    && bb.is_dynamic()
+                {
+                    bb.linear_velocity[0] += j * inv_mass_b * normal[0];
+                    bb.linear_velocity[1] += j * inv_mass_b * normal[1];
+                }
+            }
+
+            // Friction: tangential velocity damping
+            if friction > EPSILON {
+                // Re-read velocities after restitution
+                let vel_a = self
+                    .bodies
+                    .get(body_ah(body_a))
+                    .map(|b| b.linear_velocity)
+                    .unwrap_or([0.0, 0.0]);
+                let vel_b = self
+                    .bodies
+                    .get(body_ah(body_b))
+                    .map(|b| b.linear_velocity)
+                    .unwrap_or([0.0, 0.0]);
+                let rel_vel = [vel_b[0] - vel_a[0], vel_b[1] - vel_a[1]];
+                let vn_after = rel_vel[0] * normal[0] + rel_vel[1] * normal[1];
+                let tangent_vel = [
+                    rel_vel[0] - vn_after * normal[0],
+                    rel_vel[1] - vn_after * normal[1],
+                ];
+                let vt = (tangent_vel[0] * tangent_vel[0] + tangent_vel[1] * tangent_vel[1]).sqrt();
+
+                if vt > EPSILON {
+                    let tangent = [tangent_vel[0] / vt, tangent_vel[1] / vt];
+                    // Coulomb friction: clamp tangential impulse by μ * normal impulse
+                    // For XPBD, use a simple friction model: remove tangential velocity
+                    // scaled by friction coefficient
+                    let delta_vt = (-vt * friction).max(-vt); // don't reverse direction
+                    let j = delta_vt / w_sum;
+
+                    if let Some(ba) = self.bodies.get_mut(body_ah(body_a))
+                        && ba.is_dynamic()
+                    {
+                        ba.linear_velocity[0] -= j * inv_mass_a * tangent[0];
+                        ba.linear_velocity[1] -= j * inv_mass_a * tangent[1];
+                    }
+                    if let Some(bb) = self.bodies.get_mut(body_ah(body_b))
+                        && bb.is_dynamic()
+                    {
+                        bb.linear_velocity[0] += j * inv_mass_b * tangent[0];
+                        bb.linear_velocity[1] += j * inv_mass_b * tangent[1];
+                    }
                 }
             }
         }

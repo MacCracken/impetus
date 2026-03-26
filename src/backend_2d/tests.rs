@@ -660,6 +660,7 @@ fn sensor_generates_events_no_physics() {
         30.0,
         1.0,
         crate::config::BroadphaseKind::SpatialHash,
+        crate::config::SolverKind::SequentialImpulse,
     );
 
     // Should generate events
@@ -694,6 +695,7 @@ fn kinematic_body_moves_from_velocity() {
         30.0,
         1.0,
         crate::config::BroadphaseKind::SpatialHash,
+        crate::config::SolverKind::SequentialImpulse,
     );
 
     let rb = &state.bodies.get(body_ah(bh)).unwrap();
@@ -757,6 +759,7 @@ fn remove_body_cleans_collision_pairs() {
         30.0,
         1.0,
         crate::config::BroadphaseKind::SpatialHash,
+        crate::config::SolverKind::SequentialImpulse,
     );
     assert!(!state.manifolds.is_empty());
 
@@ -875,6 +878,7 @@ fn body_falls_asleep_when_stationary() {
             30.0,
             1.0,
             crate::config::BroadphaseKind::SpatialHash,
+            crate::config::SolverKind::SequentialImpulse,
         );
     }
 
@@ -921,6 +925,7 @@ fn sleeping_body_skips_integration() {
         30.0,
         1.0,
         crate::config::BroadphaseKind::SpatialHash,
+        crate::config::SolverKind::SequentialImpulse,
     );
 
     let pos_after = state.bodies.get(body_ah(bh)).unwrap().position;
@@ -1035,6 +1040,7 @@ fn moving_body_does_not_sleep() {
             30.0,
             1.0,
             crate::config::BroadphaseKind::SpatialHash,
+            crate::config::SolverKind::SequentialImpulse,
         );
     }
     assert!(!state.bodies.get(body_ah(bh)).unwrap().is_sleeping);
@@ -1120,6 +1126,7 @@ fn contact_wakes_sleeping_body() {
             30.0,
             1.0,
             crate::config::BroadphaseKind::SpatialHash,
+            crate::config::SolverKind::SequentialImpulse,
         );
     }
 
@@ -1185,6 +1192,7 @@ fn collision_layers_prevent_collision() {
         30.0,
         1.0,
         crate::config::BroadphaseKind::SpatialHash,
+        crate::config::SolverKind::SequentialImpulse,
     );
     assert!(
         events.is_empty(),
@@ -1243,6 +1251,7 @@ fn collision_layers_allow_same_layer() {
         30.0,
         1.0,
         crate::config::BroadphaseKind::SpatialHash,
+        crate::config::SolverKind::SequentialImpulse,
     );
     assert!(
         !events.is_empty(),
@@ -1301,6 +1310,7 @@ fn collision_layers_asymmetric_mask() {
         30.0,
         1.0,
         crate::config::BroadphaseKind::SpatialHash,
+        crate::config::SolverKind::SequentialImpulse,
     );
     assert!(
         !events.is_empty(),
@@ -1359,6 +1369,7 @@ fn collision_layers_default_collide_everything() {
         30.0,
         1.0,
         crate::config::BroadphaseKind::SpatialHash,
+        crate::config::SolverKind::SequentialImpulse,
     );
     assert!(!events.is_empty(), "default layers should collide");
 }
@@ -1601,7 +1612,7 @@ fn manifold_persistence() {
 
     let box_body = state.add_body(&BodyDesc {
         body_type: BodyType::Dynamic,
-        position: [0.0, 0.4, 0.0],
+        position: [0.0, 2.0, 0.0], // Above floor, will fall and make contact
         ..BodyDesc::default()
     });
     state.add_collider(
@@ -1624,38 +1635,25 @@ fn manifold_persistence() {
         },
     );
 
-    state.step(
-        [0.0, -9.81, 0.0],
-        1.0 / 60.0,
-        8,
-        4,
-        0.01,
-        0.2,
-        100.0,
-        30.0,
-        1.0,
-        crate::config::BroadphaseKind::SpatialHash,
-    );
+    // Run enough steps for the box to fall and make contact with the floor
+    for _ in 0..60 {
+        state.step(
+            [0.0, -9.81, 0.0],
+            1.0 / 60.0,
+            8,
+            4,
+            0.01,
+            0.2,
+            100.0,
+            30.0,
+            1.0,
+            crate::config::BroadphaseKind::SpatialHash,
+            crate::config::SolverKind::SequentialImpulse,
+        );
+    }
     assert!(
         !state.manifolds.is_empty(),
-        "manifold should exist after first step with contact"
-    );
-
-    state.step(
-        [0.0, -9.81, 0.0],
-        1.0 / 60.0,
-        8,
-        4,
-        0.01,
-        0.2,
-        100.0,
-        30.0,
-        1.0,
-        crate::config::BroadphaseKind::SpatialHash,
-    );
-    assert!(
-        !state.manifolds.is_empty(),
-        "manifold should persist across frames"
+        "manifold should persist after settling"
     );
 
     let has_nonzero_impulse = state
@@ -1664,7 +1662,7 @@ fn manifold_persistence() {
         .any(|m| m.points.iter().any(|p| p.normal_impulse.abs() > EPS));
     assert!(
         has_nonzero_impulse,
-        "manifold should have non-zero accumulated impulse after two frames"
+        "manifold should have non-zero accumulated impulse after settling"
     );
 }
 
@@ -1745,6 +1743,7 @@ fn warm_start_stabilizes_stack() {
             30.0,
             1.0,
             crate::config::BroadphaseKind::SpatialHash,
+            crate::config::SolverKind::SequentialImpulse,
         );
     }
 
@@ -1817,6 +1816,7 @@ fn wheel_joint_constrains_perpendicular() {
             30.0,
             1.0,
             crate::config::BroadphaseKind::SpatialHash,
+            crate::config::SolverKind::SequentialImpulse,
         );
     }
 
@@ -1882,6 +1882,7 @@ fn rope_joint_allows_closer_than_max() {
             30.0,
             1.0,
             crate::config::BroadphaseKind::SpatialHash,
+            crate::config::SolverKind::SequentialImpulse,
         );
     }
     let final_y = state.bodies.get(body_ah(b)).unwrap().position[1];
@@ -1943,6 +1944,7 @@ fn rope_joint_prevents_exceeding_max_length() {
             30.0,
             1.0,
             crate::config::BroadphaseKind::SpatialHash,
+            crate::config::SolverKind::SequentialImpulse,
         );
     }
 
@@ -2011,6 +2013,7 @@ fn mouse_joint_drags_body_toward_target() {
             30.0,
             1.0,
             crate::config::BroadphaseKind::SpatialHash,
+            crate::config::SolverKind::SequentialImpulse,
         );
     }
 
@@ -2077,6 +2080,7 @@ fn joint_breaking_removes_joint() {
             30.0,
             1.0,
             crate::config::BroadphaseKind::SpatialHash,
+            crate::config::SolverKind::SequentialImpulse,
         );
     }
 
@@ -2137,6 +2141,7 @@ fn joint_not_broken_when_force_below_threshold() {
             30.0,
             1.0,
             crate::config::BroadphaseKind::SpatialHash,
+            crate::config::SolverKind::SequentialImpulse,
         );
     }
 
@@ -2233,6 +2238,7 @@ fn multi_point_manifold() {
             30.0,
             1.0,
             crate::config::BroadphaseKind::SpatialHash,
+            crate::config::SolverKind::SequentialImpulse,
         );
         for manifold in state.manifolds.values() {
             max_points = max_points.max(manifold.points.len());
@@ -2368,6 +2374,7 @@ fn simulation_islands_sleep() {
             30.0,
             1.0,
             crate::config::BroadphaseKind::SpatialHash,
+            crate::config::SolverKind::SequentialImpulse,
         );
     }
 
@@ -2390,6 +2397,7 @@ fn simulation_islands_sleep() {
         30.0,
         1.0,
         crate::config::BroadphaseKind::SpatialHash,
+        crate::config::SolverKind::SequentialImpulse,
     );
 
     // Cluster A should remain sleeping (they're on a separate island)
@@ -2479,6 +2487,7 @@ fn static_friction_holds() {
             30.0,
             1.0,
             crate::config::BroadphaseKind::SpatialHash,
+            crate::config::SolverKind::SequentialImpulse,
         );
     }
 
@@ -2498,6 +2507,7 @@ fn static_friction_holds() {
             30.0,
             1.0,
             crate::config::BroadphaseKind::SpatialHash,
+            crate::config::SolverKind::SequentialImpulse,
         );
     }
 

@@ -750,16 +750,40 @@ pub(super) fn generate_contacts_multi(
     rot_b: f64,
 ) -> Vec<([f64; 2], f64, [f64; 2])> {
     match (shape_a, shape_b) {
-        // OBB vs OBB — use clipping for multi-point manifold
+        // OBB vs OBB — use clipping for multi-point manifold when rotated
         (ColliderShape::Box { half_extents: he_a }, ColliderShape::Box { half_extents: he_b }) => {
-            clip_obb_obb(
+            // Only use clipping when at least one box is rotated — axis-aligned
+            // boxes use the fast AABB path (single contact point).
+            if rot_a.abs() < EPSILON && rot_b.abs() < EPSILON {
+                if let Some(c) =
+                    aabb_aabb_contact(pos_a, [he_a[0], he_a[1]], pos_b, [he_b[0], he_b[1]])
+                {
+                    return vec![c];
+                }
+                return vec![];
+            }
+            let result = clip_obb_obb(
                 pos_a,
                 rot_a,
                 [he_a[0], he_a[1]],
                 pos_b,
                 rot_b,
                 [he_b[0], he_b[1]],
-            )
+            );
+            if result.is_empty() {
+                // Fallback to SAT single-point if clipping produces no contacts
+                if let Some(c) = obb_obb_contact(
+                    pos_a,
+                    rot_a,
+                    [he_a[0], he_a[1]],
+                    pos_b,
+                    rot_b,
+                    [he_b[0], he_b[1]],
+                ) {
+                    return vec![c];
+                }
+            }
+            result
         }
         // ConvexHull vs ConvexHull — use clipping
         (

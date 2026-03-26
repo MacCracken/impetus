@@ -8,11 +8,11 @@
 | 0.11–0.20 | Production hardening, arena storage, determinism, joints, manifolds, islands |
 | 0.21–0.23 | Multi-point manifolds, static/dynamic friction, sub-stepping, particles |
 | 1.0 | Split impulse, block solver, shock propagation, soft constraints, GJK+EPA, speculative contacts, dynamic AABB tree, full 3x3 inertia tensor |
-| 1.1 | One-shot manifold generation (Sutherland-Hodgman clipping), contact point reduction (area maximization), gyroscopic torque (3D), SolverKind config scaffold, audit fixes (div-by-zero guards, panic removal) |
+| 1.1 | XPBD solver (2D), one-shot manifold generation (Sutherland-Hodgman clipping), contact point reduction (area maximization), gyroscopic torque (3D), SolverKind config, audit fixes (div-by-zero guards, panic removal) |
 
-## 1.1.0 — Solver Precision (remaining)
+## 1.1.0 — Solver Precision (complete)
 
-- [ ] **XPBD solver** — position-based dynamics with compliant constraints; more stable than sequential impulse for stiff stacks and ragdolls; configurable per-world alongside existing SI solver (`SolverKind` enum and config scaffolded, solver logic TBD)
+All items delivered. XPBD solver logic implemented for 2D backend.
 
 ## 1.2.0 — Collision Completeness
 

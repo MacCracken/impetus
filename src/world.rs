@@ -80,6 +80,7 @@ impl PhysicsWorld {
                     self.config.constraint_frequency,
                     self.config.constraint_damping_ratio,
                     self.config.broadphase,
+                    self.config.solver,
                 );
             }
         }
@@ -1772,5 +1773,236 @@ mod tests {
 
         world.clear_particles();
         assert_eq!(world.particle_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // XPBD solver tests
+    // -----------------------------------------------------------------------
+
+    #[cfg(all(feature = "2d", not(feature = "3d")))]
+    #[test]
+    fn xpbd_gravity_moves_body() {
+        let mut world = PhysicsWorld::new(WorldConfig {
+            solver: crate::config::SolverKind::Xpbd,
+            ..Default::default()
+        });
+        let body = world.add_body(BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, 10.0, 0.0],
+            ..Default::default()
+        });
+        world.add_collider(
+            body,
+            ColliderDesc {
+                shape: ColliderShape::Ball { radius: 0.5 },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
+            },
+        );
+
+        for _ in 0..60 {
+            world.step();
+        }
+
+        let state = world.get_body_state(body).unwrap();
+        assert!(
+            state.position[1] < 10.0,
+            "XPBD: body should have fallen, got y={}",
+            state.position[1]
+        );
+    }
+
+    #[cfg(all(feature = "2d", not(feature = "3d")))]
+    #[test]
+    fn xpbd_collision_prevents_fallthrough() {
+        let mut world = PhysicsWorld::new(WorldConfig {
+            solver: crate::config::SolverKind::Xpbd,
+            velocity_iterations: 20,
+            constraint_frequency: 0.0, // infinite stiffness for contacts
+            sub_steps: 4,
+            ..Default::default()
+        });
+        // Static floor
+        let floor = world.add_body(BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, -1.0, 0.0],
+            ..Default::default()
+        });
+        world.add_collider(
+            floor,
+            ColliderDesc {
+                shape: ColliderShape::Box {
+                    half_extents: [50.0, 1.0, 0.0],
+                },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
+            },
+        );
+        // Falling ball
+        let ball = world.add_body(BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, 2.0, 0.0],
+            ..Default::default()
+        });
+        world.add_collider(
+            ball,
+            ColliderDesc {
+                shape: ColliderShape::Ball { radius: 0.5 },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
+            },
+        );
+
+        for _ in 0..300 {
+            world.step();
+        }
+
+        let state = world.get_body_state(ball).unwrap();
+        // Ball should rest on the floor (y ≈ 0.5, since floor top is at y=0 and ball radius=0.5)
+        // But at minimum it should not have fallen through (y > -1)
+        assert!(
+            state.position[1] > -1.0,
+            "XPBD: ball should not fall through floor, got y={}",
+            state.position[1]
+        );
+    }
+
+    #[cfg(all(feature = "2d", not(feature = "3d")))]
+    #[test]
+    fn xpbd_collision_generates_events() {
+        let mut world = PhysicsWorld::new(WorldConfig {
+            solver: crate::config::SolverKind::Xpbd,
+            ..Default::default()
+        });
+        let floor = world.add_body(BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, -1.0, 0.0],
+            ..Default::default()
+        });
+        world.add_collider(
+            floor,
+            ColliderDesc {
+                shape: ColliderShape::Box {
+                    half_extents: [50.0, 1.0, 0.0],
+                },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
+            },
+        );
+        let ball = world.add_body(BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [0.0, 1.0, 0.0],
+            ..Default::default()
+        });
+        world.add_collider(
+            ball,
+            ColliderDesc {
+                shape: ColliderShape::Ball { radius: 0.5 },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0xFFFF_FFFF,
+                collision_mask: 0xFFFF_FFFF,
+            },
+        );
+
+        let mut had_collision = false;
+        for _ in 0..120 {
+            world.step();
+            if !world.collision_events().is_empty() {
+                had_collision = true;
+            }
+        }
+        assert!(
+            had_collision,
+            "XPBD: should have generated collision events"
+        );
+    }
+
+    #[cfg(all(feature = "2d", not(feature = "3d")))]
+    #[test]
+    fn xpbd_joint_distance() {
+        use crate::joint::{JointDesc, JointType};
+
+        let mut world = PhysicsWorld::new(WorldConfig {
+            solver: crate::config::SolverKind::Xpbd,
+            gravity: [0.0, 0.0, 0.0],
+            velocity_iterations: 8,
+            ..Default::default()
+        });
+        let a = world.add_body(BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 0.0, 0.0],
+            ..Default::default()
+        });
+        world.add_collider(
+            a,
+            ColliderDesc {
+                shape: ColliderShape::Ball { radius: 0.1 },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0,
+                collision_mask: 0,
+            },
+        );
+        let b = world.add_body(BodyDesc {
+            body_type: BodyType::Dynamic,
+            position: [5.0, 0.0, 0.0], // start 5 units away
+            ..Default::default()
+        });
+        world.add_collider(
+            b,
+            ColliderDesc {
+                shape: ColliderShape::Ball { radius: 0.1 },
+                offset: [0.0, 0.0, 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+                collision_layer: 0,
+                collision_mask: 0,
+            },
+        );
+        world.add_joint(JointDesc {
+            body_a: a,
+            body_b: b,
+            joint_type: JointType::Distance { length: 3.0 },
+            local_anchor_a: [0.0, 0.0],
+            local_anchor_b: [0.0, 0.0],
+            motor: None,
+            damping: 0.0,
+            break_force: None,
+        });
+
+        for _ in 0..120 {
+            world.step();
+        }
+
+        let state = world.get_body_state(b).unwrap();
+        let dist =
+            (state.position[0] * state.position[0] + state.position[1] * state.position[1]).sqrt();
+        assert!(
+            (dist - 3.0).abs() < 0.5,
+            "XPBD distance joint should pull body toward length=3, got dist={}",
+            dist
+        );
     }
 }
