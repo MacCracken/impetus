@@ -114,6 +114,75 @@ pub fn body_mass_to_limb_force(mass_kg: f64, limb_count: u32) -> f64 {
     mass_kg * 9.81 / limb_count as f64
 }
 
+/// Convert muscle force (N) and moment arm (m) to joint torque (Nm).
+///
+/// τ = F × r. Inverse of joint_torque_to_force.
+#[must_use]
+#[inline]
+pub fn muscle_force_to_joint_torque(force_n: f64, moment_arm_m: f64) -> f64 {
+    force_n * moment_arm_m
+}
+
+/// Convert bone segment to cylinder inertia tensor diagonal [Ixx, Iyy, Izz] (kg·m²).
+///
+/// Models a bone as a solid cylinder along Y-axis:
+/// Ixx = Izz = m/12 × (3r² + h²), Iyy = m/2 × r²
+#[must_use]
+pub fn segment_to_cylinder_inertia(mass_kg: f64, length_m: f64, radius_m: f64) -> [f64; 3] {
+    let r2 = radius_m * radius_m;
+    let h2 = length_m * length_m;
+    let ixx = mass_kg / 12.0 * (3.0 * r2 + h2);
+    let iyy = mass_kg / 2.0 * r2;
+    [ixx, iyy, ixx]
+}
+
+/// Convert gait ground reaction force (N) to a downward force vector [0, -F, 0].
+///
+/// GRF acts at the foot contact point, directed into the ground.
+/// Returns the reaction force (upward) that the ground exerts on the body.
+#[must_use]
+#[inline]
+pub fn gait_grf_to_force_vector(grf_n: f64) -> [f64; 3] {
+    [0.0, grf_n.abs(), 0.0]
+}
+
+/// Convert body center of mass position and total mass to gravity force
+/// applied at the CoM point.
+///
+/// Returns (force_vector, application_point).
+#[must_use]
+pub fn body_com_gravity(
+    com_position: [f64; 3],
+    mass_kg: f64,
+    gravity: f64,
+) -> ([f64; 3], [f64; 3]) {
+    ([0.0, -mass_kg * gravity, 0.0], com_position)
+}
+
+/// Convert joint stiffness (0-1 normalized) and angular displacement (rad)
+/// to restoring torque (Nm).
+///
+/// Uses a linear spring model: τ = -k_max × stiffness × θ
+/// where k_max is a reference stiffness (100 Nm/rad).
+#[must_use]
+#[inline]
+pub fn joint_stiffness_to_torque(stiffness_normalized: f64, angle_rad: f64) -> f64 {
+    let k_max = 100.0; // Nm/rad reference stiffness
+    -k_max * stiffness_normalized.clamp(0.0, 1.0) * angle_rad
+}
+
+/// Convert joint damping (0-1 normalized) and angular velocity (rad/s)
+/// to damping torque (Nm).
+///
+/// τ = -c_max × damping × ω
+/// where c_max is a reference damping coefficient (10 Nm·s/rad).
+#[must_use]
+#[inline]
+pub fn joint_damping_to_torque(damping_normalized: f64, angular_vel_rads: f64) -> f64 {
+    let c_max = 10.0; // Nm·s/rad reference damping
+    -c_max * damping_normalized.clamp(0.0, 1.0) * angular_vel_rads
+}
+
 // ── Ushma bridges (thermodynamics) ─────────────────────────────────────────
 
 /// Convert friction coefficient, normal force (N), and sliding velocity (m/s)
@@ -267,5 +336,87 @@ mod tests {
         // Steel α ≈ 12e-6 /K, ΔT = 100K → ε = 0.0012
         let e = thermal_strain(12e-6, 100.0);
         assert!((e - 0.0012).abs() < 1e-6);
+    }
+
+    // ── New sharira bridges ────────────────────────────────────────────
+
+    #[test]
+    fn muscle_force_to_torque_basic() {
+        // 100N force at 0.05m moment arm → 5 Nm
+        let t = muscle_force_to_joint_torque(100.0, 0.05);
+        assert!((t - 5.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn muscle_force_to_torque_inverse() {
+        // Round-trip: force → torque → force
+        let force = 200.0;
+        let arm = 0.04;
+        let torque = muscle_force_to_joint_torque(force, arm);
+        let recovered = joint_torque_to_force(torque, arm);
+        assert!((recovered - force).abs() < 0.001);
+    }
+
+    #[test]
+    fn cylinder_inertia_basic() {
+        // 2kg cylinder, length 0.3m, radius 0.02m
+        let i = segment_to_cylinder_inertia(2.0, 0.3, 0.02);
+        let r2 = 0.02_f64 * 0.02;
+        let h2 = 0.3_f64 * 0.3;
+        let expected_ixx = 2.0 / 12.0 * (3.0 * r2 + h2);
+        let expected_iyy = 2.0 / 2.0 * r2;
+        assert!((i[0] - expected_ixx).abs() < 1e-10);
+        assert!((i[1] - expected_iyy).abs() < 1e-10);
+        assert!((i[2] - expected_ixx).abs() < 1e-10); // Izz == Ixx
+    }
+
+    #[test]
+    fn gait_grf_positive() {
+        let v = gait_grf_to_force_vector(700.0);
+        assert_eq!(v, [0.0, 700.0, 0.0]);
+    }
+
+    #[test]
+    fn gait_grf_negative_input() {
+        // Negative input should produce positive upward force
+        let v = gait_grf_to_force_vector(-700.0);
+        assert_eq!(v, [0.0, 700.0, 0.0]);
+    }
+
+    #[test]
+    fn body_com_gravity_basic() {
+        let (force, point) = body_com_gravity([1.0, 2.0, 3.0], 70.0, 9.81);
+        assert!((force[1] - (-70.0 * 9.81)).abs() < 0.001);
+        assert_eq!(force[0], 0.0);
+        assert_eq!(force[2], 0.0);
+        assert_eq!(point, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn joint_stiffness_basic() {
+        // Half stiffness, 0.1 rad displacement → τ = -100 * 0.5 * 0.1 = -5 Nm
+        let t = joint_stiffness_to_torque(0.5, 0.1);
+        assert!((t - (-5.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn joint_stiffness_clamps() {
+        // Stiffness > 1 should clamp to 1
+        let t = joint_stiffness_to_torque(2.0, 0.1);
+        assert!((t - (-10.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn joint_damping_basic() {
+        // Full damping, 1 rad/s → τ = -10 * 1.0 * 1.0 = -10 Nm
+        let t = joint_damping_to_torque(1.0, 1.0);
+        assert!((t - (-10.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn joint_damping_clamps() {
+        // Damping < 0 should clamp to 0
+        let t = joint_damping_to_torque(-0.5, 1.0);
+        assert!((t - 0.0).abs() < 0.001);
     }
 }

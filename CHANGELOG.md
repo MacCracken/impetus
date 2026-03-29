@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [1.3.0]
+
+### Added
+- **bridge** — sharira: muscle force to joint torque, cylinder inertia for bone segments, gait GRF to force vector, body CoM gravity force, joint stiffness/damping to restoring torque
+
 ## [1.2.0]
 
 ### Added
