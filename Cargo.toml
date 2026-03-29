@@ -23,7 +23,7 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 
 # Physics backend — native, built on hisab math
-hisab = { version = "1.1", optional = true }
+hisab = { version = "1", optional = true }
 
 # Serialization (optional)
 bitcode = { version = "0.6", features = ["serde"], optional = true }
