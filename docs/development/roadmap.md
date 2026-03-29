@@ -65,6 +65,15 @@ Make impetus the obvious choice for anyone writing a game or sim in Rust.
 - [ ] **Migration guide** — rapier-to-impetus, nphysics-to-impetus API mapping docs
 - [ ] **Cookbook examples** — platformer, top-down, billiards, ragdoll, stacking, breakable, vehicle, chain
 
+## Cross-Crate Bridges
+
+- [ ] `bridge.rs` module — primitive-value conversions for cross-crate physics (no deps on sibling crates)
+- [ ] **dravya bridge**: impact force (N), contact area (m²) → stress at collision point; deformation velocity → strain rate
+- [ ] **sharira bridge**: joint torques (Nm), angular velocities (rad/s) → locomotion forces; body mass (kg) → inertia tensor
+- [ ] **ushma bridge**: friction coefficient, sliding velocity → heat generation rate (W); collision energy → temperature delta
+
+---
+
 ## Out of Scope (separate AGNOS crates)
 
 - Fluid simulation (SPH, Navier-Stokes) → fluidity crate

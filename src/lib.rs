@@ -12,6 +12,8 @@
 //! - **Simulation workloads** — headless agent training environments
 
 pub mod body;
+/// Cross-crate bridges — primitive-value conversions from other AGNOS science crates.
+pub mod bridge;
 pub mod collider;
 pub mod config;
 pub mod event;

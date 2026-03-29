@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [1.2.0]
+
+### Added
+- **bridge** — cross-crate primitive-value bridges for dravya (impact stress, strain rate, bulk modulus, damage volume), sharira (joint torque to force, angular to tangential velocity, segment inertia, limb force), ushma (friction heat rate, collision temperature rise, thermal strain)
+
+### Updated
+- hisab 1.1.0 -> 1.3.0, zerocopy 0.8.47 -> 0.8.48
+
+## [Unreleased-pre-1.2]
+
 ### Added
 
 - **narrowphase** — one-shot manifold generation via Sutherland-Hodgman edge clipping for OBB-OBB and ConvexHull-ConvexHull; produces full contact manifold in a single pass instead of accumulating over frames
