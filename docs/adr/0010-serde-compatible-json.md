@@ -91,6 +91,10 @@ codecs:
     f64 (`1e20` written `100000000000000000000`).
   - **S4:** any duplicate key refuses the document, including one serde ignores: a repeated unknown
     field, or a duplicate inside an ignored value. A duplicate known field is refused by both.
+
+  Both are filed in bayan's queue (2026-11-09). S4 is a request for an opt-in, not a defect: bayan's
+  refusal is a deliberate security choice (1.11.1). If bayan declines it, impetus can accept the
+  stricter behaviour by ADR instead of waiting.
 - **The writers can abort on out-of-memory.** They use `str_builder`'s back-compat calls, which exit
   the process when a grow fails (the `_a` variants return -1). A malformed document never reaches
   that path; only a failed allocation does. Moving the writers to the `_a` calls, with an error

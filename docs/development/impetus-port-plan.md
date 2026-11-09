@@ -524,12 +524,16 @@ tanmatra filed its findings.
   M1b** (`src/fmtf.cyr`, ADR 0010), with Burger & Dybvig's free-format digits on a 40-limb bignum,
   pinned by 37,576 golden rows. The stdlib still lacks it; `fmtf.cyr` can seed an upstream printer
   (not filed yet).
-- **S3. bayan: JSON integers above `i64::MAX`** (not filed yet). The tree parser refuses any integer that
+- **S3. bayan: JSON integers above `i64::MAX`** — **filed 2026-11-09**:
+  `bayan/docs/development/issues/2026-11-09-json-integer-above-i64-max-refuses-the-document.md`, with a
+  self-proving repro and serde_json's output beside bayan's. The tree parser refuses any integer that
   doesn't fit an i64 ("integer is out of range"). serde_json reads u64 up to 2^64 − 1, and an integer
   beyond u64 as an f64. impetus's handles are u64: one at generation ≥ 2^31 is written by serde_json
   and can't be read back by the port. 3 golden rows pending (ADR 0010 findings). Ask: keep an
   out-of-i64 integer as a u64 (a flag or tag) or as its f64, as serde_json does, instead of failing.
-- **S4. bayan: a duplicate-key policy** (not filed yet). Every bayan parser refuses a document with any
+- **S4. bayan: a duplicate-key policy** — **filed 2026-11-09** as a request (the strict default is deliberate and
+  stays): `bayan/docs/development/issues/2026-11-09-json-duplicate-key-has-no-opt-in-for-ignored-members.md`, with a
+  repro. Every bayan parser refuses a document with any
   duplicate key (1.11.1, deliberate). serde refuses only a duplicate *known* field and ignores repeats of
   unknown fields and anything inside an ignored value. 3 golden rows pending. Ask: an option for
   last-wins (or keep-all) objects, so a caller with its own field checks can match serde.

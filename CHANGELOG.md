@@ -76,6 +76,9 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     (100/100).
   - 6 benches against the Rust numbers (4.8–31×, `docs/benchmarks-rust-v-cyrius.md`).
 - S1 filed upstream: `cyrius/docs/development/issues/2026-11-09-no-scoped-allocator-for-alloc.md`.
+- S3 and S4 filed in bayan's queue, each with a self-proving repro:
+  `2026-11-09-json-integer-above-i64-max-refuses-the-document.md` (u64 integers) and
+  `2026-11-09-json-duplicate-key-has-no-opt-in-for-ignored-members.md` (an opt-in, not a defect).
 - **Cyrius port, M1b part 1** ([ADR 0010](docs/adr/0010-serde-compatible-json.md);
   `docs/development/port-parity.md` §6): serde-compatible JSON, replacing the plan's
   "serde not carried over".

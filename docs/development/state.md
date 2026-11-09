@@ -83,5 +83,5 @@ dependency; the bridge partners dravya, sharira and ushma have no local repo.
 
 ## Next
 
-M2, 2D collision: the AABB tree, the spatial hash, and 2D narrowphase and raycasts. Open from M1b: filing S3 and S4
-against bayan (port plan §8).
+M2, 2D collision: the AABB tree, the spatial hash, and 2D narrowphase and raycasts. Waiting on bayan from M1b: S3 and
+S4, filed 2026-11-09 (port plan §8); their 6 golden rows stay pending.
