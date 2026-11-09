@@ -28,9 +28,10 @@ root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 MODULES = [
     "error", "config", "material", "units", "force",
     "body", "collider", "joint", "event", "query", "arena", "contact_tracker", "spring",
+    "aabb_tree", "spatial_hash",
 ]
 PENDING_MODULES = {
-    "aabb_tree": "M2", "spatial_hash": "M2", "backend_2d/types": "M2",
+    "backend_2d/types": "M2",
     "backend_2d/narrowphase": "M2", "backend_2d/raycast": "M2",
     "backend_2d/solver": "M3", "backend_2d/joints": "M3", "backend_2d/state": "M3",
     "backend_2d/tests": "M3", "particle": "M3", "world": "M3",

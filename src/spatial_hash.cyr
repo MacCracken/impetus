@@ -1,0 +1,274 @@
+# spatial_hash.cyr — the spatial hash grid for broadphase candidate pairs (port of
+# rust-old/src/spatial_hash.rs).
+#
+# Each box is rasterised into the cells it covers, (i32, i32, i32) keys, z = 0 in 2D. A box that is
+# non-finite, inverted, past the i32 cell range or more than 4,096 cells is kept in an oversized list
+# and paired with every other entry instead, so one bad box can't stall the broadphase.
+# `query_pairs` reports every pair that shares a cell, plus every pair with an oversized entry,
+# ordered by key as unsigned words (Rust's u64 handles), sorted and unique as Rust's BTreeSet.
+#
+# Rust keeps a BTreeMap of cells; the port keeps (cell, key) records and sorts them by cell, which
+# groups each cell's keys together. The pair set doesn't depend on the order the cells are visited
+# in, so any total order on cells serves. Storage is freelist buffers the grid owns and reuses (`clear`).
+
+# Records are three words: the cell as two words (x; y in the high half and z in the low half of
+# the second, an injective packing), then the key.
+struct ImSpatialHashGrid {
+    inv_cell_size: f64;
+    recs: ImWordList;
+    over: ImWordList;
+    all: ImWordList;
+    tmp: ImWordList;
+    ptmp: ImPairList;
+}
+
+# A grid of `cell_size` (its magnitude; 1 when it isn't finite or is below 1e-10). Mirrors
+# `SpatialHashGrid::new`.
+#must_use
+fn ImSpatialHashGrid_new(cell_size: f64): ImSpatialHashGrid {
+    var g: ImSpatialHashGrid;
+    var safe: f64 = 1.0;
+    var ac: f64 = f64_abs(cell_size);
+    if (_im_is_finite(cell_size) == 1 && ac >= 0.0000000001) { safe = ac; }
+    var inv: f64 = 1.0 / safe;
+    g.inv_cell_size = inv;
+    g.recs = ImWordList_new();
+    g.over = ImWordList_new();
+    g.all = ImWordList_new();
+    g.tmp = ImWordList_new();
+    g.ptmp = ImPairList_new();
+    return g;
+}
+
+# The cell size for boxes of the `n` maximum dimensions at `dims` (f64 words): twice the mean of the
+# finite, non-negative ones, at least 0.1; 1 when there are none. Mirrors
+# `SpatialHashGrid::auto_cell_size`.
+#must_use
+fn ImSpatialHashGrid_auto_cell_size(dims, n): f64 {
+    var total: f64 = 0.0;
+    var count = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var d: f64 = load64(dims + i * 8);
+        if (_im_is_finite(d) == 1 && d >= 0.0) {
+            total = total + d;
+            count = count + 1;
+        }
+    }
+    if (count == 0) { return 1.0; }
+    var cf: f64 = f64_from(count);
+    var mean: f64 = total / cf * 2.0;
+    var r: f64 = _im_max(mean, 0.1);
+    return r;
+}
+
+# Sorts the n three-word records at data by their first two words (signed), with tmp of the same
+# size: a bottom-up merge sort.
+fn _im_sort_rec3(data, n, tmp) {
+    var src = data;
+    var dst = tmp;
+    var width = 1;
+    while (width < n) {
+        var lo = 0;
+        while (lo < n) {
+            var mid = lo + width;
+            if (mid > n) { mid = n; }
+            var hi = lo + 2 * width;
+            if (hi > n) { hi = n; }
+            var i = lo;
+            var j = mid;
+            var k = lo;
+            while (k < hi) {
+                var take_i = 0;
+                if (i < mid) {
+                    if (j >= hi) {
+                        take_i = 1;
+                    } else {
+                        var a0 = load64(src + i * 24);
+                        var b0 = load64(src + j * 24);
+                        if (a0 < b0 || (a0 == b0 && load64(src + i * 24 + 8) <= load64(src + j * 24 + 8))) {
+                            take_i = 1;
+                        }
+                    }
+                }
+                var from = src + j * 24;
+                if (take_i == 1) {
+                    from = src + i * 24;
+                    i = i + 1;
+                } else {
+                    j = j + 1;
+                }
+                memcpy(dst + k * 24, from, 24);
+                k = k + 1;
+            }
+            lo = hi;
+        }
+        var t = src;
+        src = dst;
+        dst = t;
+        width = width * 2;
+    }
+    if (src != data) { memcpy(data, src, n * 24); }
+    return 0;
+}
+
+impl ImSpatialHashGrid {
+    # The inclusive cell range of [min, max] on one axis into *out (lo, hi): 1, or 0 when it is
+    # non-finite, inverted or outside the i32 cell range. Mirrors `axis_range`.
+    fn _axis(self, min: f64, max: f64, out): i64 {
+        var inv: f64 = self.inv_cell_size;
+        var a: f64 = min * inv;
+        var b: f64 = max * inv;
+        var lo: f64 = f64_floor(a);
+        var hi: f64 = f64_floor(b);
+        if (!(lo <= hi)) { return 0; }
+        if (!(lo >= -2147483648.0 && lo <= 2147483647.0)) { return 0; }
+        if (!(hi >= -2147483648.0 && hi <= 2147483647.0)) { return 0; }
+        store64(out, f64_to(lo));
+        store64(out + 8, f64_to(hi));
+        return 1;
+    }
+
+    # Inserts `key` for the box [min, max]: into every cell it covers, or the oversized list.
+    # 1, or 0 when there is no memory. Mirrors `insert`.
+    fn _insert(self, key, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64): i64 {
+        if (self.all.push(key) == 0) { return 0; }
+        var r[48];
+        var ok = self._axis(x0, x1, &r);
+        if (ok == 1) { ok = self._axis(y0, y1, &r + 16); }
+        if (ok == 1) { ok = self._axis(z0, z1, &r + 32); }
+        if (ok == 1) {
+            var count: f64 = 1.0;
+            for (var k = 0; k < 3; k = k + 1) {
+                var lof: f64 = f64_from(load64(&r + k * 16));
+                var hif: f64 = f64_from(load64(&r + k * 16 + 8));
+                var span: f64 = hif - lof + 1.0;
+                count = count * span;
+            }
+            if (!(count <= 4096.0)) { ok = 0; }
+        }
+        if (ok == 0) { return self.over.push(key); }
+        var cx = load64(&r);
+        while (cx <= load64(&r + 8)) {
+            var cy = load64(&r + 16);
+            while (cy <= load64(&r + 24)) {
+                var cz = load64(&r + 32);
+                while (cz <= load64(&r + 40)) {
+                    if (self.recs.push(cx) == 0) { return 0; }
+                    if (self.recs.push((cy << 32) | (cz & 4294967295)) == 0) { return 0; }
+                    if (self.recs.push(key) == 0) { return 0; }
+                    cz = cz + 1;
+                }
+                cy = cy + 1;
+            }
+            cx = cx + 1;
+        }
+        return 1;
+    }
+
+    # Inserts `key` for a 2D box (z = 0): 1, or 0 when there is no memory. Mirrors `insert_2d`.
+    fn insert_2d(self, key, min: ImVec2, max: ImVec2): i64 {
+        var x0: f64 = min.x;
+        var y0: f64 = min.y;
+        var x1: f64 = max.x;
+        var y1: f64 = max.y;
+        return self._insert(key, x0, y0, 0.0, x1, y1, 0.0);
+    }
+
+    # Inserts `key` for a 3D box: 1, or 0 when there is no memory. Mirrors `insert_3d`.
+    fn insert_3d(self, key, min: ImVec3, max: ImVec3): i64 {
+        var x0: f64 = min.x;
+        var y0: f64 = min.y;
+        var z0: f64 = min.z;
+        var x1: f64 = max.x;
+        var y1: f64 = max.y;
+        var z1: f64 = max.z;
+        return self._insert(key, x0, y0, z0, x1, y1, z1);
+    }
+
+    # Every pair of distinct keys that share a cell, and every pair with an oversized entry, into
+    # `out` (cleared first): each ordered (smaller first, unsigned), the list sorted and unique as
+    # Rust's BTreeSet. 1, or 0 when there is no memory. Mirrors `query_pairs`.
+    fn query_pairs(self, out: *ImPairList): i64 {
+        out.clear();
+        var n = self.recs.len / 3;
+        if (n > 1) {
+            if (self.tmp.reserve(n * 3) == 0) { return 0; }
+            _im_sort_rec3(self.recs.data, n, self.tmp.data);
+        }
+        var start = 0;
+        while (start < n) {
+            var end = start + 1;
+            var c0 = self.recs.at(start * 3);
+            var c1 = self.recs.at(start * 3 + 1);
+            while (end < n && self.recs.at(end * 3) == c0 && self.recs.at(end * 3 + 1) == c1) {
+                end = end + 1;
+            }
+            for (var i = start; i < end; i = i + 1) {
+                var ki = self.recs.at(i * 3 + 2);
+                for (var j = i + 1; j < end; j = j + 1) {
+                    var kj = self.recs.at(j * 3 + 2);
+                    if (ki != kj) {
+                        var lo, hi = _im_pair_key(ki, kj);
+                        if (out.push(lo, hi) == 0) { return 0; }
+                    }
+                }
+            }
+            start = end;
+        }
+        for (var o = 0; o < self.over.len; o = o + 1) {
+            var ko = self.over.at(o);
+            for (var a = 0; a < self.all.len; a = a + 1) {
+                var ka = self.all.at(a);
+                if (ka != ko) {
+                    var lo2, hi2 = _im_pair_key(ko, ka);
+                    if (out.push(lo2, hi2) == 0) { return 0; }
+                }
+            }
+        }
+        if (out.is_sorted() == 0) {
+            if (self.ptmp.reserve(out.len) == 0) { return 0; }
+            _im_pairs_sort(out.data, out.len, self.ptmp.data);
+        }
+        out.dedup();
+        return 1;
+    }
+
+    # The number of distinct cells in use (Rust's `cells.len()`, which its tests read). Sorts the
+    # records, as query_pairs does.
+    fn cell_count(self): i64 {
+        var n = self.recs.len / 3;
+        if (n == 0) { return 0; }
+        if (n > 1) {
+            if (self.tmp.reserve(n * 3) == 0) { return 0 - 1; }
+            _im_sort_rec3(self.recs.data, n, self.tmp.data);
+        }
+        var cells = 1;
+        for (var i = 1; i < n; i = i + 1) {
+            if (self.recs.at(i * 3) != self.recs.at(i * 3 - 3) || self.recs.at(i * 3 + 1) != self.recs.at(i * 3 - 2)) {
+                cells = cells + 1;
+            }
+        }
+        return cells;
+    }
+
+    # Empties the grid and sets a new cell size, keeping its storage, for the next step's rebuild.
+    fn reset(self, cell_size: f64) {
+        var fresh: ImSpatialHashGrid = ImSpatialHashGrid_new(cell_size);
+        var inv: f64 = fresh.inv_cell_size;
+        self.inv_cell_size = inv;
+        self.recs.len = 0;
+        self.over.len = 0;
+        self.all.len = 0;
+        return 0;
+    }
+
+    # Releases the grid's storage.
+    fn free(self) {
+        self.recs.free();
+        self.over.free();
+        self.all.free();
+        self.tmp.free();
+        self.ptmp.free();
+        return 0;
+    }
+}

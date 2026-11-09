@@ -140,9 +140,22 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     99.7 % of calls. Results are unchanged (same digests, same probes); its measured worst error is
     2^-66 against a 2^-62 bound. The tables are generated and checked against MPFR.
 
+- **Cyrius port, M2 part 1: the broadphase** (`docs/development/port-parity.md` §9):
+  - `src/aabb_tree.cyr`, the dynamic AABB tree: SAH insertion, Box2D's AVL balance, 0.1 fattening.
+  - `src/spatial_hash.cyr`, the spatial hash: cells as sorted (cell, key) records rather than a map, and
+    an oversize list past 4,096 cells or for non-finite boxes.
+  - Both are 2D and 3D, keep their storage across rebuilds, and order keys as unsigned words.
+  - Golden `broadphase.tsv`: 76 rows of pair sets and cell sizes, all exact on three targets.
+    `validate.py` recomputes every row by brute force.
+  - The 18 Rust tests are ported, and surface parity is 275/275. The harness takes rows of up to
+    8,192 tokens.
+
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
   sin_cos from 3.3 µs to 187 ns (the polyfills: 48–64 and 75–83 ns).
+- **Broadphase, first numbers** (Cyrius only; `docs/benchmarks-rust-v-cyrius.md`): rebuilding and
+  querying 1,000 boxes takes 4.7 ms (tree) and 1.95 ms (hash). Rust's whole world step on that layout
+  takes 0.51 ms, so this is a finding to profile before M3.
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

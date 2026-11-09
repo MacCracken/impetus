@@ -31,6 +31,7 @@ mod cyr;
 mod flat;
 mod glibc;
 mod grids;
+mod m_broadphase;
 mod m_config;
 mod m_constants;
 mod m_fmtf;
@@ -66,6 +67,7 @@ fn golden_modules() -> Vec<tsv::Module> {
         vec![]
     } else {
         vec![
+            m_broadphase::emit(),
             m_config::emit(),
             m_constants::emit(),
             m_fmtf::emit(),

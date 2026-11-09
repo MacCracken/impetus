@@ -309,6 +309,35 @@ fails when either drifts from `cyrius.cyml`.
 - **Result, every target:** 10 modules, 0 failing; **64,455 ok, 0 failed, 0 measured, 7 pending (S3 3, S4 3, the
   M6 constant), 103 accepted (ADR 0008 #6 92, ADR 0009 1, ADR 0011 10)**.
 
+## 9. M2a: the broadphase (2026-11-09)
+
+- **The modules:**
+  - `src/aabb_tree.cyr`, the dynamic AABB tree: SAH insertion, Box2D's AVL balance, LIFO node reuse,
+    0.1 fattening;
+  - `src/spatial_hash.cyr`, the spatial hash: cell rasterisation, and the oversize list past 4,096 cells or
+    for non-finite or out-of-range boxes.
+
+  Both keep their storage across rebuilds (`clear` / `reset`), and both order keys as unsigned words.
+- **The grid's cells are sorted records, not a map.** Rust's BTreeMap of cells becomes a list of (cell, key)
+  records sorted by an injective two-word packing of the cell. The pair set is a set, so the order cells are
+  visited in can't show.
+- **`broadphase.tsv`**, 76 rows through the oracle's pair hooks; the 2D build emits the 3D rows too, since the
+  structures are shared:
+  - `aabb_tree_pairs_2d` (25 rows) and `_3d` (8): the Rust tests' layouts, the fattening edge (boxes 0.2 apart,
+    ± 1 ulp), NaN, infinite, inverted, empty and huge boxes, random sets of 5 to 1,000, and sorted rows of 1,000;
+  - `spatial_hash_pairs_2d` (24) and `_3d` (6):
+    - cell sizes 0, negative, 1e-11, 1e-10, NaN and ±∞;
+    - the oversize cut (64×64 against 64×65 cells; 16×16×16 against 16×16×17);
+    - exact cell boundaries and the edges of the i32 cell range;
+    - random sets, and 1,000 boxes at the automatic cell size;
+  - `spatial_hash_auto_cell_size` (13, class B).
+
+  **All exact** on x86_64 ELF, x86_64 PE and aarch64. `validate.py` recomputes every row independently (the
+  tree's pairs by brute force on the fattened boxes, the hash's by its own rasterisation), and they agree.
+- **The harness** now takes 8,192 tokens per list (kimiya's core took 1,024): a 1,000-box row carries 4,001
+  input tokens.
+- **Result, every target:** 11 modules, 0 failing; **64,531 ok, 0 failed, 0 measured, 7 pending, 103 accepted**.
+
 ## How to reproduce
 
 ```sh

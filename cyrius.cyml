@@ -60,5 +60,7 @@ modules = [
     "src/arena.cyr",
     "src/contact_tracker.cyr",
     "src/spring.cyr",
+    "src/aabb_tree.cyr",
+    "src/spatial_hash.cyr",
     "src/json.cyr",
 ]

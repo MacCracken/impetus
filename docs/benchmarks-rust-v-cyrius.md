@@ -97,3 +97,22 @@ std calls glibc, about 5 ns. The polyfills they replaced are given for scale (sc
 - **Steady spring state is unaffected.** The spring caches its transition, so `spring_1d_step` and `spring_2d_step`
   don't change.
 - **A fresh spring** pays one transition: 1.86 µs to settle, against 1.80 µs on the polyfills.
+
+## M2 part 1: the broadphase (2026-11-09)
+
+Cyrius-only rows. Rust's only broadphase bench, `broadphase/aabb_tree_1000_row`, times a whole world step
+(505.76 µs), so its comparison waits for M3. The layout is the same: 1,000 unit boxes 1.5 apart, rebuilt and
+queried with the storage kept, as a step does. 100 iterations, two runs.
+
+| Bench | Body | Cyrius |
+|---|---|---|
+| `broadphase/aabb_tree_1000_row` | clear, 1,000 inserts, query the pairs | 4.70 ms |
+| `broadphase/spatial_hash_1000_row` | the automatic cell size, reset, 1,000 inserts, query the pairs | 1.95 ms |
+
+**Reading it.** The tree's broadphase alone takes about 9× Rust's whole step, so this is a finding to profile before
+M3.
+- Each insert walks about 10 levels. At every level it merges three boxes, which is six Rust-semantics min/max calls
+  per box, and every node field is a load or store through a method call.
+- The query does the same per leaf.
+- The hash is 2.4× faster than the tree on this layout, which is what the structures predict for uniform boxes.
+

@@ -3,7 +3,8 @@
 # Copied from kimiya's tests/parity_core.cyr (its working copy with the corrected oracle, kimiya ADR
 # 0006), itself tanmatra's (same format, same outcomes). The changes: an error code is named through
 # the harness's `_par_error_name` hook rather than a project function; the corrected oracle is
-# impetus's ADR 0011; and kimiya's transitional rule is off (_PAR_CR_TRANSITIONAL). tests/parity_2d.tcyr (and
+# impetus's ADR 0011; kimiya's transitional rule is off (_PAR_CR_TRANSITIONAL); and a row may carry
+# 8,192 tokens per list. tests/parity_2d.tcyr (and
 # tests/parity_3d.tcyr from M4) include the src modules they need, then this file, and define:
 # - `_par_error_name(code)`: the Rust variant name of an `IM_ERR_*` code, as a C string;
 # - `_par_dispatch(mp, ml, fp, fl)`: fill the got list for one row (1 handled, 0 pending, -1 unusable);
@@ -28,7 +29,8 @@
 # Three token lists of up to _PAR_MAX tokens: the row's inputs, its wanted outputs, and what the port returned.
 # Each slot is a kind byte ('f' 'i' 'e' 's' 'n' 'E' 'v'), a value word (f64 bits, an
 # integer, or a pointer to text) and a text length.
-var _PAR_MAX = 1024;
+# impetus raises kimiya's 1,024: a broadphase row carries 1,000 boxes (4,001 input tokens).
+var _PAR_MAX = 8192;
 var _par_in_k = 0;
 var _par_in_v = 0;
 var _par_in_l = 0;

@@ -1,0 +1,139 @@
+# spatial_hash.tcyr — the ported Rust tests of rust-old/src/spatial_hash.rs (M2a), plus Cyrius-only tests
+# of reset-and-reuse, the 4,096-cell cut and the unsigned key order.
+
+include "tests/lib_2d.cyr"
+
+# Inserts the 2D box [x0, x1] × [y0, y1] as `key`.
+fn ins2(g: *ImSpatialHashGrid, key, x0: f64, y0: f64, x1: f64, y1: f64) {
+    g.insert_2d(key, ImVec2_new(x0, y0), ImVec2_new(x1, y1));
+    return 0;
+}
+
+# Inserts the 3D box [x0, x1] × [y0, y1] × [z0, z1] as `key`.
+fn ins3(g: *ImSpatialHashGrid, key, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64) {
+    g.insert_3d(key, ImVec3_new(x0, y0, z0), ImVec3_new(x1, y1, z1));
+    return 0;
+}
+
+# The automatic cell size of the n f64 values given as words.
+fn auto(w, n): f64 {
+    var r: f64 = ImSpatialHashGrid_auto_cell_size(w, n);
+    return r;
+}
+
+# Runs the ported spatial hash tests.
+fn main() {
+    alloc_init();
+    var pairs: ImPairList = ImPairList_new();
+    var zero: f64 = 0.0;
+    var nan: f64 = zero / zero;
+    var inf: f64 = 1.0 / zero;
+
+    test_group("insert_2d_and_query");
+    var g: ImSpatialHashGrid = ImSpatialHashGrid_new(1.0);
+    ins2(&g, 0, 0.0, 0.0, 0.5, 0.5);
+    ins2(&g, 1, 0.2, 0.2, 0.8, 0.8);
+    g.query_pairs(&pairs);
+    assert_eq(pairs.contains(0, 1), 1, "(0, 1)");
+    g.free();
+
+    test_group("insert_2d_no_overlap");
+    g = ImSpatialHashGrid_new(1.0);
+    ins2(&g, 0, 0.0, 0.0, 0.5, 0.5);
+    ins2(&g, 1, 10.0, 10.0, 10.5, 10.5);
+    g.query_pairs(&pairs);
+    assert_eq(pairs.len, 0, "no pairs");
+    g.free();
+
+    test_group("insert_3d_and_query");
+    g = ImSpatialHashGrid_new(2.0);
+    ins3(&g, 0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0);
+    ins3(&g, 1, 0.5, 0.5, 0.5, 1.5, 1.5, 1.5);
+    g.query_pairs(&pairs);
+    assert_eq(pairs.contains(0, 1), 1, "(0, 1)");
+    g.free();
+
+    test_group("insert_3d_no_overlap");
+    g = ImSpatialHashGrid_new(1.0);
+    ins3(&g, 0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5);
+    ins3(&g, 1, 10.0, 10.0, 10.0, 10.5, 10.5, 10.5);
+    g.query_pairs(&pairs);
+    assert_eq(pairs.len, 0, "no pairs");
+    g.free();
+
+    var w = fl_alloc(64);
+    test_group("auto_cell_size_empty");
+    var s: f64 = auto(w, 0);
+    assert(s == 1.0, "1.0");
+
+    test_group("auto_cell_size_values");
+    var d1: f64 = 1.0;
+    var d2: f64 = 2.0;
+    store64(w, d1);
+    store64(w + 8, d2);
+    s = auto(w, 2);
+    assert(s == 3.0, "(1 + 2)/2 · 2 = 3");
+
+    test_group("non_finite_and_huge_aabbs_do_not_rasterise");
+    g = ImSpatialHashGrid_new(0.1);
+    ins2(&g, 0, nan, 0.0, nan, 1.0);
+    ins2(&g, 1, -1000000000000.0, -1000000000000.0, 1000000000000.0, 1000000000000.0);
+    ins2(&g, 2, -inf, 0.0, inf, 1.0);
+    ins2(&g, 3, 0.0, 0.0, 0.05, 0.05);
+    assert(g.cell_count() <= 1, "at most one cell");
+    g.query_pairs(&pairs);
+    assert_eq(pairs.contains(1, 3) + pairs.contains(0, 3), 2, "oversized entries pair with everything");
+    g.free();
+
+    test_group("auto_cell_size_ignores_non_finite");
+    var d3: f64 = 3.0;
+    var ni: f64 = -inf;
+    store64(w, d1);
+    store64(w + 8, nan);
+    store64(w + 16, ni);
+    store64(w + 24, d3);
+    s = auto(w, 4);
+    assert(s == 4.0, "(1 + 3)/2 · 2 = 4");
+
+    # Cyrius-only from here.
+    test_group("the_4096_cell_cut");
+    g = ImSpatialHashGrid_new(1.0);
+    ins2(&g, 0, 0.0, 0.0, 63.5, 63.5);
+    ins2(&g, 1, 0.0, 0.0, 63.5, 64.5);
+    ins2(&g, 2, 200.0, 200.0, 200.5, 200.5);
+    assert_eq(g.cell_count(), 4097, "64 x 64 rasterises; 64 x 65 is oversized; one more cell");
+    g.query_pairs(&pairs);
+    assert_eq(pairs.contains(0, 1) + pairs.contains(1, 2), 2, "the oversized box pairs with both");
+    assert_eq(pairs.contains(0, 2), 0, "the rasterised ones don't meet");
+    g.free();
+
+    test_group("reset_and_reuse");
+    g = ImSpatialHashGrid_new(1.0);
+    for (var i = 0; i < 40; i = i + 1) { ins2(&g, i, 0.0, 0.0, 0.5, 0.5); }
+    var cap = g.recs.cap;
+    g.reset(2.0);
+    ins2(&g, 7, 0.0, 0.0, 0.5, 0.5);
+    ins2(&g, 8, 1.5, 1.5, 1.9, 1.9);
+    assert_eq(g.recs.cap, cap, "the storage is kept");
+    g.query_pairs(&pairs);
+    assert_eq(pairs.len, 1, "cell size 2 puts both in one cell");
+    g.free();
+
+    test_group("unsigned_key_order");
+    g = ImSpatialHashGrid_new(1.0);
+    var hb = _im_arena_handle(0, 2147483648);
+    ins2(&g, hb, 0.0, 0.0, 0.5, 0.5);
+    ins2(&g, 5, 0.1, 0.1, 0.6, 0.6);
+    g.query_pairs(&pairs);
+    assert_eq(pairs.first(0), 5, "5 first");
+    assert_eq(pairs.second(0), hb, "the high-generation handle second");
+    g.free();
+
+    fl_free(w);
+    pairs.free();
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

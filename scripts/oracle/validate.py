@@ -704,6 +704,108 @@ def check_tables(root):
         print(f"crmath_data: current; π and ln 2 to {n} bits, and every table's hi, equal MPFR {MPFR.VERSION}'s")
 
 
+def _pairs_tokens(pairs):
+    out = [f"v:{len(pairs)}"]
+    for a, b in pairs:
+        out += [f"i:{a}", f"i:{b}"]
+    return out
+
+
+def _boxes(tokens, dims):
+    """The boxes of a broadphase row: v:N then 2·dims floats each, as (min, max) lists."""
+    n = int(tokens[0][2:])
+    vals = [tok_f(t) for t in tokens[1:1 + 2 * dims * n]]
+    return [(vals[k * 2 * dims:k * 2 * dims + dims], vals[k * 2 * dims + dims:(k + 1) * 2 * dims]) for k in range(n)]
+
+
+def _tree_pairs(boxes):
+    """Brute force: every pair whose boxes, fattened by 0.1 a side, overlap (NaN overlaps nothing)."""
+    fat = [([x - 0.1 for x in mn] + [-0.1] * (3 - len(mn)), [x + 0.1 for x in mx] + [0.1] * (3 - len(mx)))
+           for mn, mx in boxes]
+    out = []
+    for i in range(len(fat)):
+        for j in range(i + 1, len(fat)):
+            a, b = fat[i], fat[j]
+            if all(a[0][k] <= b[1][k] and a[1][k] >= b[0][k] for k in range(3)):
+                out.append((i, j))
+    return out
+
+
+def _axis(lo_v, hi_v, inv):
+    a, b = lo_v * inv, hi_v * inv
+    if not (math.isfinite(a) and math.isfinite(b)):
+        return None
+    lo, hi = float(math.floor(a)), float(math.floor(b))
+    if not (lo <= hi) or not (-2147483648.0 <= lo <= 2147483647.0) or not (-2147483648.0 <= hi <= 2147483647.0):
+        return None
+    return int(lo), int(hi)
+
+
+def _hash_pairs(cell, boxes):
+    """Python's rasterisation: cells shared, plus every pair with an oversized entry."""
+    safe = abs(cell) if math.isfinite(cell) and abs(cell) >= 1e-10 else 1.0
+    inv = 1.0 / safe
+    cells, over = {}, []
+    for k, (mn, mx) in enumerate(boxes):
+        mn3, mx3 = list(mn) + [0.0] * (3 - len(mn)), list(mx) + [0.0] * (3 - len(mx))
+        rs = [_axis(mn3[d], mx3[d], inv) for d in range(3)]
+        count = 1.0
+        if all(r is not None for r in rs):
+            for lo, hi in rs:
+                count = count * (float(hi) - float(lo) + 1.0)
+        if any(r is None for r in rs) or not (count <= 4096.0):
+            over.append(k)
+            continue
+        for cx in range(rs[0][0], rs[0][1] + 1):
+            for cy in range(rs[1][0], rs[1][1] + 1):
+                for cz in range(rs[2][0], rs[2][1] + 1):
+                    cells.setdefault((cx, cy, cz), []).append(k)
+    pairs = set()
+    for ks in cells.values():
+        for i in range(len(ks)):
+            for j in range(i + 1, len(ks)):
+                if ks[i] != ks[j]:
+                    pairs.add((min(ks[i], ks[j]), max(ks[i], ks[j])))
+    for o in over:
+        for k in range(len(boxes)):
+            if k != o:
+                pairs.add((min(o, k), max(o, k)))
+    return sorted(pairs)
+
+
+def check_broadphase(rows):
+    """Recomputes every broadphase row: the tree's pairs by brute force on the fattened boxes, the
+    hash's by an independent rasterisation, the automatic cell size."""
+    counted = 0
+    for fn, cls, ins, outs, note in rows:
+        if fn.startswith("aabb_tree_pairs_"):
+            want = _pairs_tokens(_tree_pairs(_boxes(ins, 3 if fn.endswith("3d") else 2)))
+        elif fn.startswith("spatial_hash_pairs_"):
+            want = _pairs_tokens(_hash_pairs(tok_f(ins[0]), _boxes(ins[1:], 3 if fn.endswith("3d") else 2)))
+        elif fn == "spatial_hash_auto_cell_size":
+            dims = [tok_f(t) for t in ins[1:]]
+            ok = [d for d in dims if math.isfinite(d) and d >= 0.0]
+            if not ok:
+                r = 1.0
+            else:
+                total = 0.0
+                for d in ok:
+                    total += d
+                q = total / float(len(ok)) * 2.0
+                r = 0.1 if (math.isnan(q) or q < 0.1) else q    # Rust's f64::max(q, 0.1)
+            if not same(tok_f(outs[0]), r):
+                fail(f"broadphase: {note}: Python computes {r!r}")
+            counted += 1
+            continue
+        else:
+            fail(f"broadphase: unknown function {fn}")
+            continue
+        if outs != want:
+            fail(f"broadphase: {fn}: the oracle's pair set differs from the independent recomputation")
+        counted += 1
+    return counted
+
+
 def main():
     root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
     check_tables(root)
@@ -729,6 +831,8 @@ def main():
                   f"{ties} Display rows differ only by Rust's round-half-up on an exact tie")
         elif name == "json":
             print(f"json: {check_json(rows)} documents checked against Python's json")
+        elif name == "broadphase":
+            print(f"broadphase: {check_broadphase(rows)} rows recomputed (brute force, rasterisation)")
         elif name == "spring":
             print(f"spring: {check_spring(rows)} rows recomputed (step on Python's libm)")
         elif name in ("config", "material", "units", "force"):

@@ -977,6 +977,74 @@ fn _par_spring(fp, fl): i64 {
     return 0;
 }
 
+# ── M2a: the broadphase ─────────────────────────────────────────────────────────────
+# A row's boxes are inserted in order with their input index as the key; the output is the sorted
+# pair set (`v:P`, then each pair's two indices).
+
+# Appends the pair list as `v:P` and its pairs.
+fn _par_got_pairs(pl: *ImPairList) {
+    _par_got_seq(pl.len);
+    for (var j = 0; j < pl.len; j = j + 1) {
+        _par_got_i(pl.first(j));
+        _par_got_i(pl.second(j));
+    }
+    return 0;
+}
+
+fn _par_broadphase(fp, fl): i64 {
+    var out: ImPairList = ImPairList_new();
+    if (_par_eq(fp, fl, "aabb_tree_pairs_2d") == 1 || _par_eq(fp, fl, "aabb_tree_pairs_3d") == 1) {
+        var d3 = _par_eq(fp, fl, "aabb_tree_pairs_3d");
+        var per = 4;
+        if (d3 == 1) { per = 6; }
+        var n = _par_in(0);
+        var tree: ImAabbTree = ImAabbTree_new();
+        for (var i = 0; i < n; i = i + 1) {
+            var k = 1 + i * per;
+            if (d3 == 1) {
+                tree.insert(i, ImTreeAabb_from_3d(_par_in_v3(k), _par_in_v3(k + 3)));
+            } else {
+                tree.insert(i, ImTreeAabb_from_2d(_par_in_v2(k), _par_in_v2(k + 2)));
+            }
+        }
+        if (tree.query_pairs(&out) == 0) { return 0 - 1; }
+        _par_got_pairs(&out);
+        tree.free();
+        out.free();
+        return 1;
+    }
+    if (_par_eq(fp, fl, "spatial_hash_pairs_2d") == 1 || _par_eq(fp, fl, "spatial_hash_pairs_3d") == 1) {
+        var h3 = _par_eq(fp, fl, "spatial_hash_pairs_3d");
+        var per2 = 4;
+        if (h3 == 1) { per2 = 6; }
+        var cell: f64 = _par_in(0);
+        var n2 = _par_in(1);
+        var grid: ImSpatialHashGrid = ImSpatialHashGrid_new(cell);
+        for (var i2 = 0; i2 < n2; i2 = i2 + 1) {
+            var k2 = 2 + i2 * per2;
+            if (h3 == 1) {
+                grid.insert_3d(i2, _par_in_v3(k2), _par_in_v3(k2 + 3));
+            } else {
+                grid.insert_2d(i2, _par_in_v2(k2), _par_in_v2(k2 + 2));
+            }
+        }
+        if (grid.query_pairs(&out) == 0) { return 0 - 1; }
+        _par_got_pairs(&out);
+        grid.free();
+        out.free();
+        return 1;
+    }
+    if (_par_eq(fp, fl, "spatial_hash_auto_cell_size") == 1) {
+        var n3 = _par_in(0);
+        var dims = _par_in_words(1, n3);
+        var r: f64 = ImSpatialHashGrid_auto_cell_size(dims, n3);
+        if (dims != 0) { fl_free(dims); }
+        _par_got_f(r);
+        return 1;
+    }
+    return 0;
+}
+
 # `f64::fmt_display` and `serde_json::f64` rows: src/fmtf.cyr's two layouts (ADR 0010).
 fn _par_fmtf(fp, fl): i64 {
     var x: f64 = _par_in(0);
@@ -1340,6 +1408,7 @@ fn _par_json(fp, fl): i64 {
 fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_got_n = 0;
     _par_mapped = 0;
+    if (_par_eq(mp, ml, "broadphase") == 1) { return _par_broadphase(fp, fl); }
     if (_par_eq(mp, ml, "config") == 1) { return _par_config(fp, fl); }
     if (_par_eq(mp, ml, "fmtf") == 1) { return _par_fmtf(fp, fl); }
     if (_par_eq(mp, ml, "constants") == 1) { return _par_constants(fp, fl); }

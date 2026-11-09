@@ -257,6 +257,59 @@ fn bench_sin_cos_cr() {
     return 0;
 }
 
+# broadphase/aabb_tree_1000_row: rebuild the tree over 1,000 unit boxes 1.5 apart (Rust's
+# aabb_tree_1000_row bench layout) and query its pairs, reusing the storage, as a world step does.
+# No Rust row: Rust times the whole step (M3).
+fn bench_aabb_tree_row() {
+    var b = bench_new("broadphase/aabb_tree_1000_row");
+    var t: ImAabbTree = ImAabbTree_new();
+    var out: ImPairList = ImPairList_new();
+    var reps = 100;
+    bench_batch_start(b);
+    for (var r = 0; r < reps; r = r + 1) {
+        t.clear();
+        for (var i = 0; i < 1000; i = i + 1) {
+            var x: f64 = f64_from(i) * 1.5;
+            t.insert(i, ImTreeAabb_from_2d(ImVec2_new(x - 0.5, -0.5), ImVec2_new(x + 0.5, 0.5)));
+        }
+        t.query_pairs(&out);
+        g_sink = out.len;
+    }
+    bench_batch_stop(b, reps);
+    bench_report(b);
+    t.free();
+    out.free();
+    return 0;
+}
+
+# broadphase/spatial_hash_1000_row: the same row through the spatial hash at its automatic cell size.
+fn bench_spatial_hash_row() {
+    var b = bench_new("broadphase/spatial_hash_1000_row");
+    var dims = fl_alloc(8000);
+    var one: f64 = 1.0;
+    for (var i = 0; i < 1000; i = i + 1) { store64(dims + i * 8, one); }
+    var g: ImSpatialHashGrid = ImSpatialHashGrid_new(1.0);
+    var out: ImPairList = ImPairList_new();
+    var reps = 100;
+    bench_batch_start(b);
+    for (var r = 0; r < reps; r = r + 1) {
+        var cell: f64 = ImSpatialHashGrid_auto_cell_size(dims, 1000);
+        g.reset(cell);
+        for (var i = 0; i < 1000; i = i + 1) {
+            var x: f64 = f64_from(i) * 1.5;
+            g.insert_2d(i, ImVec2_new(x - 0.5, -0.5), ImVec2_new(x + 0.5, 0.5));
+        }
+        g.query_pairs(&out);
+        g_sink = out.len;
+    }
+    bench_batch_stop(b, reps);
+    bench_report(b);
+    g.free();
+    out.free();
+    fl_free(dims);
+    return 0;
+}
+
 # Runs every bench.
 fn main(): i64 {
     alloc_init();
@@ -276,6 +329,8 @@ fn main(): i64 {
     bench_spring_settle_frames();
     bench_exp_cr();
     bench_sin_cos_cr();
+    bench_aabb_tree_row();
+    bench_spatial_hash_row();
     return 0;
 }
 

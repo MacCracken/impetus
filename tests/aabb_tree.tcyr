@@ -1,0 +1,191 @@
+# aabb_tree.tcyr — the ported Rust tests of rust-old/src/aabb_tree.rs (M2a), plus Cyrius-only tests of
+# storage reuse, node-slot reuse and the unsigned key order (Rust's keys are u64 handles).
+
+include "tests/lib_2d.cyr"
+
+# A 2D box [x0, x1] × [y0, y1].
+fn box2(x0: f64, y0: f64, x1: f64, y1: f64): ImTreeAabb {
+    return ImTreeAabb_from_2d(ImVec2_new(x0, y0), ImVec2_new(x1, y1));
+}
+
+# 1 when the pair list holds (a, b).
+fn has(pl: *ImPairList, a, b): i64 {
+    return pl.contains(a, b);
+}
+
+# A deterministic pseudo-random number in [0, 1), the Rust test's LCG.
+var _s = 12345;
+fn rnd(): f64 {
+    _s = _s * 6364136223846793005 + 1442695040888963407;
+    var u = (_s >> 11) & 9007199254740991;
+    var uf: f64 = f64_from(u);
+    var r: f64 = uf * 0.00000000000000011102230246251565404236316680908203125;
+    return r;
+}
+
+# Runs the ported AABB tree tests.
+fn main() {
+    alloc_init();
+    var pairs: ImPairList = ImPairList_new();
+
+    test_group("insert_and_query_2d");
+    var t: ImAabbTree = ImAabbTree_new();
+    t.insert(0, box2(0.0, 0.0, 1.0, 1.0));
+    t.insert(1, box2(0.5, 0.5, 1.5, 1.5));
+    t.insert(2, box2(10.0, 10.0, 11.0, 11.0));
+    t.query_pairs(&pairs);
+    assert_eq(has(&pairs, 0, 1), 1, "(0, 1)");
+    assert_eq(has(&pairs, 0, 2), 0, "not (0, 2)");
+    assert_eq(has(&pairs, 1, 2), 0, "not (1, 2)");
+    t.free();
+
+    test_group("insert_and_query_3d");
+    t = ImAabbTree_new();
+    t.insert(0, ImTreeAabb_from_3d(ImVec3_zero(), ImVec3_new(1.0, 1.0, 1.0)));
+    t.insert(1, ImTreeAabb_from_3d(ImVec3_new(0.5, 0.5, 0.5), ImVec3_new(1.5, 1.5, 1.5)));
+    t.query_pairs(&pairs);
+    assert_eq(has(&pairs, 0, 1), 1, "(0, 1)");
+    t.free();
+
+    test_group("no_overlap");
+    t = ImAabbTree_new();
+    t.insert(0, box2(0.0, 0.0, 1.0, 1.0));
+    t.insert(1, box2(5.0, 5.0, 6.0, 6.0));
+    t.query_pairs(&pairs);
+    assert_eq(pairs.len, 0, "no pairs");
+    t.free();
+
+    test_group("remove_and_query");
+    t = ImAabbTree_new();
+    var a = t.insert(0, box2(0.0, 0.0, 1.0, 1.0));
+    t.insert(1, box2(0.5, 0.5, 1.5, 1.5));
+    t.query_pairs(&pairs);
+    assert(pairs.len > 0, "a pair before removal");
+    t.remove(a);
+    t.query_pairs(&pairs);
+    assert_eq(pairs.len, 0, "none after");
+    t.free();
+
+    test_group("update_no_reinsert");
+    t = ImAabbTree_new();
+    a = t.insert(0, box2(0.0, 0.0, 1.0, 1.0));
+    assert_eq(t.update(a, box2(0.01, 0.01, 1.01, 1.01)), 0, "a small move stays in the fattened box");
+    t.free();
+
+    test_group("empty_tree");
+    t = ImAabbTree_new();
+    t.query_pairs(&pairs);
+    assert_eq(pairs.len, 0, "no pairs");
+    assert_eq(t.height(), 0 - 1, "height -1");
+    t.free();
+
+    test_group("single_node");
+    t = ImAabbTree_new();
+    t.insert(0, box2(0.0, 0.0, 1.0, 1.0));
+    t.query_pairs(&pairs);
+    assert_eq(pairs.len, 0, "no pairs");
+    assert_eq(t.height(), 0, "height 0");
+    t.free();
+
+    test_group("many_overlapping");
+    t = ImAabbTree_new();
+    for (var i = 0; i < 10; i = i + 1) { t.insert(i, box2(0.0, 0.0, 1.0, 1.0)); }
+    t.query_pairs(&pairs);
+    assert_eq(pairs.len, 45, "C(10, 2) = 45 pairs");
+    t.free();
+
+    test_group("sorted_inserts_stay_balanced");
+    t = ImAabbTree_new();
+    for (var i = 0; i < 1000; i = i + 1) {
+        var x: f64 = f64_from(i);
+        t.insert(i, box2(x, 0.0, x + 1.0, 1.0));
+    }
+    assert(t.height() < 30, "height below 30");
+    t.query_pairs(&pairs);
+    assert_eq(has(&pairs, 0, 1) + has(&pairs, 998, 999), 2, "neighbours overlap");
+    assert_eq(has(&pairs, 0, 5), 0, "distant ones don't");
+    t.free();
+
+    test_group("pairs_match_brute_force");
+    t = ImAabbTree_new();
+    var bx = fl_alloc(200 * 48);
+    for (var i = 0; i < 200; i = i + 1) {
+        var x: f64 = rnd() * 50.0;
+        var y: f64 = rnd() * 50.0;
+        var w: f64 = 0.5 + rnd() * 3.0;
+        var aabb: ImTreeAabb = box2(x, y, x + w, y + w);
+        t.insert(i, aabb);
+        _im_box_fat(bx + i * 48, aabb);
+    }
+    var want: ImPairList = ImPairList_new();
+    for (var i = 0; i < 200; i = i + 1) {
+        for (var j = i + 1; j < 200; j = j + 1) {
+            if (_im_box_overlaps(bx + i * 48, bx + j * 48) == 1) { want.push(i, j); }
+        }
+    }
+    t.query_pairs(&pairs);
+    var same = 0;
+    if (pairs.len == want.len) {
+        same = 1;
+        for (var k = 0; k < pairs.len; k = k + 1) {
+            if (pairs.first(k) != want.first(k) || pairs.second(k) != want.second(k)) { same = 0; }
+        }
+    }
+    assert_eq(same, 1, "the tree's pairs are the brute-force set");
+    assert(pairs.len > 0, "and there are some");
+    fl_free(bx);
+    want.free();
+    t.free();
+
+    # Cyrius-only from here.
+    test_group("clear_and_reuse");
+    t = ImAabbTree_new();
+    for (var i = 0; i < 50; i = i + 1) { t.insert(i, box2(0.0, 0.0, 1.0, 1.0)); }
+    var cap = t.cap;
+    t.clear();
+    t.insert(7, box2(0.0, 0.0, 1.0, 1.0));
+    t.insert(8, box2(0.5, 0.0, 1.5, 1.0));
+    assert_eq(t.cap, cap, "the storage is kept");
+    t.query_pairs(&pairs);
+    assert_eq(pairs.len, 1, "one pair after the rebuild");
+    assert_eq(has(&pairs, 7, 8), 1, "(7, 8)");
+    t.free();
+
+    test_group("node_slots_reused_lifo");
+    t = ImAabbTree_new();
+    t.insert(0, box2(0.0, 0.0, 1.0, 1.0));
+    var b = t.insert(1, box2(5.0, 0.0, 6.0, 1.0));
+    t.remove(b);
+    assert_eq(t.insert(2, box2(0.5, 0.0, 1.5, 1.0)), b, "the removed leaf's slot comes back first");
+    t.query_pairs(&pairs);
+    assert_eq(has(&pairs, 0, 2), 1, "(0, 2)");
+    t.free();
+
+    test_group("update_reinserts_when_escaping");
+    t = ImAabbTree_new();
+    a = t.insert(0, box2(0.0, 0.0, 1.0, 1.0));
+    t.insert(1, box2(5.0, 0.0, 6.0, 1.0));
+    assert_eq(t.update(a, box2(4.5, 0.0, 5.5, 1.0)), 1, "moved out of its fattened box");
+    t.query_pairs(&pairs);
+    assert_eq(has(&pairs, 0, 1), 1, "now overlapping key 1");
+    t.free();
+
+    test_group("unsigned_key_order");
+    # A handle at generation >= 2^31 is a negative word but orders after the rest, as a u64.
+    t = ImAabbTree_new();
+    var hb = _im_arena_handle(0, 2147483648);
+    t.insert(hb, box2(0.0, 0.0, 1.0, 1.0));
+    t.insert(5, box2(0.5, 0.0, 1.5, 1.0));
+    t.query_pairs(&pairs);
+    assert_eq(pairs.len, 1, "one pair");
+    assert_eq(pairs.first(0), 5, "5 first");
+    assert_eq(pairs.second(0), hb, "the high-generation handle second");
+    t.free();
+
+    pairs.free();
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

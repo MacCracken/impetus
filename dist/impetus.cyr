@@ -4202,6 +4202,858 @@ impl ImSpring3d {
     }
 }
 
+# --- aabb_tree.cyr ---
+
+# aabb_tree.cyr — the dynamic AABB tree (balanced BVH) for broadphase candidate pairs (port of
+# rust-old/src/aabb_tree.rs).
+#
+# Leaves hold a key (a collider handle word) and its box fattened by 0.1 a side. Insertion picks the
+# sibling by the surface-area heuristic and rebalances on the way up with Box2D's AVL rotation, so
+# sorted inserts stay logarithmic. `query_pairs` reports every pair of leaves whose fattened boxes
+# overlap, ordered by key as unsigned words (Rust's u64 handles), sorted and unique: the pair set
+# depends only on the boxes, never on the tree's shape. Boxes are 3D; 2D ones have z = 0.
+#
+# Storage is freelist buffers the tree owns and reuses: `clear` empties it for the next step's
+# rebuild without freeing, so a steady state allocates nothing (port-parity.md §4.1).
+
+struct ImTreeAabb { min: ImVec3; max: ImVec3; }
+
+# A box from 2D bounds (z = 0). Mirrors `TreeAabb::from_2d`.
+#must_use
+fn ImTreeAabb_from_2d(min: ImVec2, max: ImVec2): ImTreeAabb {
+    var a: ImTreeAabb;
+    var x0: f64 = min.x;
+    var y0: f64 = min.y;
+    var x1: f64 = max.x;
+    var y1: f64 = max.y;
+    a.min = ImVec3_new(x0, y0, 0.0);
+    a.max = ImVec3_new(x1, y1, 0.0);
+    return a;
+}
+
+# A box from 3D bounds. Mirrors `TreeAabb::from_3d`.
+#must_use
+fn ImTreeAabb_from_3d(min: ImVec3, max: ImVec3): ImTreeAabb {
+    var a: ImTreeAabb;
+    a.min = min;
+    a.max = max;
+    return a;
+}
+
+# A growable list of words on freelist storage.
+struct ImWordList { data; len; cap; }
+
+# An empty word list.
+#must_use
+fn ImWordList_new(): ImWordList {
+    var l: ImWordList;
+    l.data = 0;
+    l.len = 0;
+    l.cap = 0;
+    return l;
+}
+
+impl ImWordList {
+    # Room for at least `need` words: 1, or 0 when there is no memory (the list is unchanged).
+    fn reserve(self, need): i64 {
+        if (need <= self.cap) { return 1; }
+        var cap = self.cap * 2;
+        if (cap < 16) { cap = 16; }
+        while (cap < need) { cap = cap * 2; }
+        var d = fl_alloc(cap * 8);
+        if (d == 0) { return 0; }
+        if (self.len > 0) { memcpy(d, self.data, self.len * 8); }
+        if (self.data != 0) { fl_free(self.data); }
+        self.data = d;
+        self.cap = cap;
+        return 1;
+    }
+
+    # Appends w: 1, or 0 when there is no memory.
+    fn push(self, w): i64 {
+        if (self.len == self.cap) {
+            if (self.reserve(self.len + 1) == 0) { return 0; }
+        }
+        store64(self.data + self.len * 8, w);
+        self.len = self.len + 1;
+        return 1;
+    }
+
+    # Removes and returns the last word (the list must not be empty).
+    fn pop(self): i64 {
+        self.len = self.len - 1;
+        return load64(self.data + self.len * 8);
+    }
+
+    # Word i.
+    #must_use
+    fn at(self, i): i64 {
+        return load64(self.data + i * 8);
+    }
+
+    # Releases the buffer.
+    fn free(self) {
+        if (self.data != 0) { fl_free(self.data); }
+        self.data = 0;
+        self.len = 0;
+        self.cap = 0;
+        return 0;
+    }
+}
+
+# A node is 12 words: the box (min x, y, z, max x, y, z as f64 words), parent, left, right (−1 for
+# none), whether it holds a key, the key, and its height (0 for a leaf).
+const _IM_TN = 96;
+
+# The tree. `nodes` holds `count` node slots (`cap` allocated); `free` the slots to reuse (LIFO, as
+# Rust's free_list.pop()); `walk`, `leaves` and `tmp` are query scratch.
+struct ImAabbTree {
+    nodes;
+    count;
+    cap;
+    root;
+    free: ImWordList;
+    walk: ImWordList;
+    leaves: ImWordList;
+    tmp: ImPairList;
+}
+
+# An empty tree. Mirrors `AabbTree::new`.
+#must_use
+fn ImAabbTree_new(): ImAabbTree {
+    var t: ImAabbTree;
+    t.nodes = 0;
+    t.count = 0;
+    t.cap = 0;
+    t.root = 0 - 1;
+    t.free = ImWordList_new();
+    t.walk = ImWordList_new();
+    t.leaves = ImWordList_new();
+    t.tmp = ImPairList_new();
+    return t;
+}
+
+# The surface area of the box at b (six f64 words): 2·(dx·dy + dy·dz + dz·dx).
+#must_use
+fn _im_box_area(b): f64 {
+    var x0: f64 = load64(b);
+    var y0: f64 = load64(b + 8);
+    var z0: f64 = load64(b + 16);
+    var x1: f64 = load64(b + 24);
+    var y1: f64 = load64(b + 32);
+    var z1: f64 = load64(b + 40);
+    var dx: f64 = x1 - x0;
+    var dy: f64 = y1 - y0;
+    var dz: f64 = z1 - z0;
+    var s: f64 = 2.0 * (dx * dy + dy * dz + dz * dx);
+    return s;
+}
+
+# d = the union of boxes a and b (Rust's NaN-ignoring min / max, a first). d may be a or b.
+fn _im_box_merge(d, a, b) {
+    for (var k = 0; k < 3; k = k + 1) {
+        var amin: f64 = load64(a + k * 8);
+        var bmin: f64 = load64(b + k * 8);
+        var amax: f64 = load64(a + 24 + k * 8);
+        var bmax: f64 = load64(b + 24 + k * 8);
+        var mn: f64 = _im_min(amin, bmin);
+        var mx: f64 = _im_max(amax, bmax);
+        store64(d + k * 8, _im_bits(mn));
+        store64(d + 24 + k * 8, _im_bits(mx));
+    }
+    return 0;
+}
+
+# 1 when boxes a and b overlap (closed intervals; a NaN bound overlaps nothing).
+#must_use
+fn _im_box_overlaps(a, b): i64 {
+    for (var k = 0; k < 3; k = k + 1) {
+        var amin: f64 = load64(a + k * 8);
+        var amax: f64 = load64(a + 24 + k * 8);
+        var bmin: f64 = load64(b + k * 8);
+        var bmax: f64 = load64(b + 24 + k * 8);
+        if (!(amin <= bmax && amax >= bmin)) { return 0; }
+    }
+    return 1;
+}
+
+# 1 when box a contains box b.
+#must_use
+fn _im_box_contains(a, b): i64 {
+    for (var k = 0; k < 3; k = k + 1) {
+        var amin: f64 = load64(a + k * 8);
+        var amax: f64 = load64(a + 24 + k * 8);
+        var bmin: f64 = load64(b + k * 8);
+        var bmax: f64 = load64(b + 24 + k * 8);
+        if (!(amin <= bmin && amax >= bmax)) { return 0; }
+    }
+    return 1;
+}
+
+# Writes aabb, fattened by 0.1 a side (Rust's AABB_MARGIN), into the six words at d.
+fn _im_box_fat(d, aabb: ImTreeAabb) {
+    var x0: f64 = aabb.min.x;
+    var y0: f64 = aabb.min.y;
+    var z0: f64 = aabb.min.z;
+    var x1: f64 = aabb.max.x;
+    var y1: f64 = aabb.max.y;
+    var z1: f64 = aabb.max.z;
+    var a0: f64 = x0 - 0.1;
+    var a1: f64 = y0 - 0.1;
+    var a2: f64 = z0 - 0.1;
+    var b0: f64 = x1 + 0.1;
+    var b1: f64 = y1 + 0.1;
+    var b2: f64 = z1 + 0.1;
+    store64(d, _im_bits(a0));
+    store64(d + 8, _im_bits(a1));
+    store64(d + 16, _im_bits(a2));
+    store64(d + 24, _im_bits(b0));
+    store64(d + 32, _im_bits(b1));
+    store64(d + 40, _im_bits(b2));
+    return 0;
+}
+
+# Writes aabb (unfattened) into the six words at d.
+fn _im_box_tight(d, aabb: ImTreeAabb) {
+    var x0: f64 = aabb.min.x;
+    var y0: f64 = aabb.min.y;
+    var z0: f64 = aabb.min.z;
+    var x1: f64 = aabb.max.x;
+    var y1: f64 = aabb.max.y;
+    var z1: f64 = aabb.max.z;
+    store64(d, _im_bits(x0));
+    store64(d + 8, _im_bits(y0));
+    store64(d + 16, _im_bits(z0));
+    store64(d + 24, _im_bits(x1));
+    store64(d + 32, _im_bits(y1));
+    store64(d + 40, _im_bits(z1));
+    return 0;
+}
+
+impl ImAabbTree {
+    # The address of node i.
+    #must_use
+    fn _n(self, i): i64 {
+        return self.nodes + i * _IM_TN;
+    }
+
+    #must_use
+    fn _parent(self, i): i64 { return load64(self.nodes + i * _IM_TN + 48); }
+    #must_use
+    fn _left(self, i): i64 { return load64(self.nodes + i * _IM_TN + 56); }
+    #must_use
+    fn _right(self, i): i64 { return load64(self.nodes + i * _IM_TN + 64); }
+    #must_use
+    fn _height(self, i): i64 { return load64(self.nodes + i * _IM_TN + 88); }
+    fn _set_parent(self, i, v) { store64(self.nodes + i * _IM_TN + 48, v); return 0; }
+    fn _set_left(self, i, v) { store64(self.nodes + i * _IM_TN + 56, v); return 0; }
+    fn _set_right(self, i, v) { store64(self.nodes + i * _IM_TN + 64, v); return 0; }
+    fn _set_height(self, i, v) { store64(self.nodes + i * _IM_TN + 88, v); return 0; }
+
+    # 1 when node i is a leaf (no left child).
+    #must_use
+    fn _is_leaf(self, i): i64 {
+        if (load64(self.nodes + i * _IM_TN + 56) == 0 - 1) { return 1; }
+        return 0;
+    }
+
+    # A node slot, reused from the free list (last freed first) or appended; -1 when there is no
+    # memory. Its words are left for the caller to set. Mirrors `alloc_node`.
+    fn _alloc(self): i64 {
+        if (self.free.len > 0) { return self.free.pop(); }
+        if (self.count == self.cap) {
+            var cap = self.cap * 2;
+            if (cap < 16) { cap = 16; }
+            var d = fl_alloc(cap * _IM_TN);
+            if (d == 0) { return 0 - 1; }
+            if (self.count > 0) { memcpy(d, self.nodes, self.count * _IM_TN); }
+            if (self.nodes != 0) { fl_free(self.nodes); }
+            self.nodes = d;
+            self.cap = cap;
+        }
+        var i = self.count;
+        self.count = self.count + 1;
+        return i;
+    }
+
+    # Inserts a leaf for `key` with the tight box `aabb`: its node index, or -1 when there is no
+    # memory. Mirrors `AabbTree::insert`.
+    fn insert(self, key, aabb: ImTreeAabb): i64 {
+        var fat[48];
+        _im_box_fat(&fat, aabb);
+        var leaf = self._alloc();
+        if (leaf < 0) { return 0 - 1; }
+        var ln = self._n(leaf);
+        memcpy(ln, &fat, 48);
+        store64(ln + 48, 0 - 1);
+        store64(ln + 56, 0 - 1);
+        store64(ln + 64, 0 - 1);
+        store64(ln + 72, 1);
+        store64(ln + 80, key);
+        store64(ln + 88, 0);
+        if (self.root == 0 - 1) {
+            self.root = leaf;
+            return leaf;
+        }
+        # The best sibling by the surface-area heuristic.
+        var best = self.root;
+        var comb[48];
+        var m1[48];
+        while (self._is_leaf(best) == 0) {
+            var left = self._left(best);
+            var right = self._right(best);
+            _im_box_merge(&comb, self._n(best), &fat);
+            var csa: f64 = _im_box_area(&comb);
+            var cost: f64 = 2.0 * csa;
+            var nsa: f64 = _im_box_area(self._n(best));
+            var inherit: f64 = 2.0 * (csa - nsa);
+            _im_box_merge(&m1, self._n(left), &fat);
+            var cl: f64 = _im_box_area(&m1);
+            if (self._is_leaf(left) == 1) {
+                cl = cl + inherit;
+            } else {
+                var lsa: f64 = _im_box_area(self._n(left));
+                cl = cl - lsa + inherit;
+            }
+            _im_box_merge(&m1, self._n(right), &fat);
+            var cr: f64 = _im_box_area(&m1);
+            if (self._is_leaf(right) == 1) {
+                cr = cr + inherit;
+            } else {
+                var rsa: f64 = _im_box_area(self._n(right));
+                cr = cr - rsa + inherit;
+            }
+            if (cost < cl && cost < cr) { break; }
+            if (cl < cr) { best = left; } else { best = right; }
+        }
+        # A new internal node: parent of the sibling and the new leaf.
+        var old_parent = self._parent(best);
+        var np = self._alloc();
+        if (np < 0) { return 0 - 1; }
+        var pn = self._n(np);
+        _im_box_merge(pn, self._n(best), &fat);
+        store64(pn + 48, old_parent);
+        store64(pn + 56, best);
+        store64(pn + 64, leaf);
+        store64(pn + 72, 0);
+        store64(pn + 80, 0);
+        store64(pn + 88, self._height(best) + 1);
+        self._set_parent(best, np);
+        self._set_parent(leaf, np);
+        if (old_parent == 0 - 1) {
+            self.root = np;
+        } elif (self._left(old_parent) == best) {
+            self._set_left(old_parent, np);
+        } else {
+            self._set_right(old_parent, np);
+        }
+        self._fix_upwards(np);
+        return leaf;
+    }
+
+    # Removes leaf `leaf`. Mirrors `AabbTree::remove`.
+    fn remove(self, leaf) {
+        if (leaf == self.root) {
+            self.root = 0 - 1;
+            self.free.push(leaf);
+            return 0;
+        }
+        var parent = self._parent(leaf);
+        var grand = self._parent(parent);
+        var sibling = self._left(parent);
+        if (sibling == leaf) { sibling = self._right(parent); }
+        if (grand == 0 - 1) {
+            self.root = sibling;
+            self._set_parent(sibling, 0 - 1);
+        } else {
+            if (self._left(grand) == parent) {
+                self._set_left(grand, sibling);
+            } else {
+                self._set_right(grand, sibling);
+            }
+            self._set_parent(sibling, grand);
+            self._fix_upwards(grand);
+        }
+        self.free.push(parent);
+        self.free.push(leaf);
+        return 0;
+    }
+
+    # Moves leaf `leaf` to the tight box `aabb`, reinserting only when it escapes its fattened box:
+    # 1 when reinserted. A non-leaf is left alone (0). Mirrors `AabbTree::update`.
+    fn update(self, leaf, aabb: ImTreeAabb): i64 {
+        var tight[48];
+        _im_box_tight(&tight, aabb);
+        if (_im_box_contains(self._n(leaf), &tight) == 1) { return 0; }
+        if (load64(self._n(leaf) + 72) == 0) { return 0; }
+        var key = load64(self._n(leaf) + 80);
+        self.remove(leaf);
+        self.insert(key, aabb);
+        return 1;
+    }
+
+    # The leaves, depth first (right child popped first, as Rust's stack), into self.leaves.
+    fn _collect_leaves(self) {
+        self.leaves.len = 0;
+        if (self.root == 0 - 1) { return 0; }
+        self.walk.len = 0;
+        self.walk.push(self.root);
+        while (self.walk.len > 0) {
+            var node = self.walk.pop();
+            if (self._is_leaf(node) == 1) {
+                self.leaves.push(node);
+            } else {
+                self.walk.push(self._left(node));
+                self.walk.push(self._right(node));
+            }
+        }
+        return 0;
+    }
+
+    # Every pair of keys whose fattened boxes overlap, into `out` (cleared first): each ordered
+    # (smaller first, unsigned), the list sorted and unique as Rust's BTreeSet. 1, or 0 when there
+    # is no memory. Mirrors `AabbTree::query_pairs`.
+    fn query_pairs(self, out: *ImPairList): i64 {
+        out.clear();
+        if (self.root == 0 - 1) { return 1; }
+        self._collect_leaves();
+        for (var li = 0; li < self.leaves.len; li = li + 1) {
+            var leaf = self.leaves.at(li);
+            var lnode = self._n(leaf);
+            if (load64(lnode + 72) == 1) {
+                var key_a = load64(lnode + 80);
+                self.walk.len = 0;
+                self.walk.push(self.root);
+                while (self.walk.len > 0) {
+                    var node = self.walk.pop();
+                    if (_im_box_overlaps(self._n(node), lnode) == 1) {
+                        if (self._is_leaf(node) == 1) {
+                            # Each pair once, from its lower-indexed leaf.
+                            if (node > leaf && load64(self._n(node) + 72) == 1) {
+                                var lo, hi = _im_pair_key(key_a, load64(self._n(node) + 80));
+                                if (out.push(lo, hi) == 0) { return 0; }
+                            }
+                        } else {
+                            self.walk.push(self._left(node));
+                            self.walk.push(self._right(node));
+                        }
+                    }
+                }
+            }
+        }
+        if (out.is_sorted() == 0) {
+            if (self.tmp.reserve(out.len) == 0) { return 0; }
+            _im_pairs_sort(out.data, out.len, self.tmp.data);
+        }
+        out.dedup();
+        return 1;
+    }
+
+    # The tree's height: 0 for one leaf, −1 when empty. (Rust's is test-only.)
+    #must_use
+    fn height(self): i64 {
+        if (self.root == 0 - 1) { return 0 - 1; }
+        return self._height(self.root);
+    }
+
+    # Walks from `node` to the root, rebalancing and refitting heights and boxes. Mirrors
+    # `fix_upwards`.
+    fn _fix_upwards(self, node0) {
+        var node = node0;
+        while (node != 0 - 1) {
+            node = self._balance(node);
+            var left = self._left(node);
+            var right = self._right(node);
+            if (left != 0 - 1 && right != 0 - 1) {
+                var hl = self._height(left);
+                var hr = self._height(right);
+                if (hr > hl) { hl = hr; }
+                self._set_height(node, 1 + hl);
+                _im_box_merge(self._n(node), self._n(left), self._n(right));
+            }
+            node = self._parent(node);
+        }
+        return 0;
+    }
+
+    # Puts `new` in `old`'s place under `parent` (or as the root). Mirrors `replace_child`.
+    fn _replace_child(self, parent, old, new) {
+        if (parent == 0 - 1) {
+            self.root = new;
+        } elif (self._left(parent) == old) {
+            self._set_left(parent, new);
+        } else {
+            self._set_right(parent, new);
+        }
+        return 0;
+    }
+
+    # Box2D's AVL rotation: when a's children differ in height by more than one, promote the taller.
+    # The node now at a's place. Mirrors `balance`.
+    fn _balance(self, a): i64 {
+        if (self._is_leaf(a) == 1 || self._height(a) < 2) { return a; }
+        var b = self._left(a);
+        var c = self._right(a);
+        var bal = self._height(c) - self._height(b);
+        if (bal > 1) {
+            # Promote C.
+            var f = self._left(c);
+            var g = self._right(c);
+            var ap = self._parent(a);
+            self._set_left(c, a);
+            self._set_parent(c, ap);
+            self._set_parent(a, c);
+            self._replace_child(ap, a, c);
+            var keep = g;
+            var give = f;
+            if (self._height(f) > self._height(g)) {
+                keep = f;
+                give = g;
+            }
+            self._set_right(c, keep);
+            self._set_right(a, give);
+            self._set_parent(give, a);
+            _im_box_merge(self._n(a), self._n(b), self._n(give));
+            _im_box_merge(self._n(c), self._n(a), self._n(keep));
+            var h1 = self._height(b);
+            if (self._height(give) > h1) { h1 = self._height(give); }
+            self._set_height(a, 1 + h1);
+            var h2 = self._height(a);
+            if (self._height(keep) > h2) { h2 = self._height(keep); }
+            self._set_height(c, 1 + h2);
+            return c;
+        }
+        if (bal < 0 - 1) {
+            # Promote B.
+            var d = self._left(b);
+            var e = self._right(b);
+            var ap2 = self._parent(a);
+            self._set_left(b, a);
+            self._set_parent(b, ap2);
+            self._set_parent(a, b);
+            self._replace_child(ap2, a, b);
+            var keep2 = e;
+            var give2 = d;
+            if (self._height(d) > self._height(e)) {
+                keep2 = d;
+                give2 = e;
+            }
+            self._set_right(b, keep2);
+            self._set_left(a, give2);
+            self._set_parent(give2, a);
+            _im_box_merge(self._n(a), self._n(c), self._n(give2));
+            _im_box_merge(self._n(b), self._n(a), self._n(keep2));
+            var h3 = self._height(c);
+            if (self._height(give2) > h3) { h3 = self._height(give2); }
+            self._set_height(a, 1 + h3);
+            var h4 = self._height(a);
+            if (self._height(keep2) > h4) { h4 = self._height(keep2); }
+            self._set_height(b, 1 + h4);
+            return b;
+        }
+        return a;
+    }
+
+    # Empties the tree, keeping its storage, for the next step's rebuild.
+    fn clear(self) {
+        self.count = 0;
+        self.root = 0 - 1;
+        self.free.len = 0;
+        return 0;
+    }
+
+    # Releases the tree's storage.
+    fn free(self) {
+        if (self.nodes != 0) { fl_free(self.nodes); }
+        self.nodes = 0;
+        self.count = 0;
+        self.cap = 0;
+        self.root = 0 - 1;
+        self.free.free();
+        self.walk.free();
+        self.leaves.free();
+        self.tmp.free();
+        return 0;
+    }
+}
+
+# --- spatial_hash.cyr ---
+
+# spatial_hash.cyr — the spatial hash grid for broadphase candidate pairs (port of
+# rust-old/src/spatial_hash.rs).
+#
+# Each box is rasterised into the cells it covers, (i32, i32, i32) keys, z = 0 in 2D. A box that is
+# non-finite, inverted, past the i32 cell range or more than 4,096 cells is kept in an oversized list
+# and paired with every other entry instead, so one bad box can't stall the broadphase.
+# `query_pairs` reports every pair that shares a cell, plus every pair with an oversized entry,
+# ordered by key as unsigned words (Rust's u64 handles), sorted and unique as Rust's BTreeSet.
+#
+# Rust keeps a BTreeMap of cells; the port keeps (cell, key) records and sorts them by cell, which
+# groups each cell's keys together. The pair set doesn't depend on the order the cells are visited
+# in, so any total order on cells serves. Storage is freelist buffers the grid owns and reuses (`clear`).
+
+# Records are three words: the cell as two words (x; y in the high half and z in the low half of
+# the second, an injective packing), then the key.
+struct ImSpatialHashGrid {
+    inv_cell_size: f64;
+    recs: ImWordList;
+    over: ImWordList;
+    all: ImWordList;
+    tmp: ImWordList;
+    ptmp: ImPairList;
+}
+
+# A grid of `cell_size` (its magnitude; 1 when it isn't finite or is below 1e-10). Mirrors
+# `SpatialHashGrid::new`.
+#must_use
+fn ImSpatialHashGrid_new(cell_size: f64): ImSpatialHashGrid {
+    var g: ImSpatialHashGrid;
+    var safe: f64 = 1.0;
+    var ac: f64 = f64_abs(cell_size);
+    if (_im_is_finite(cell_size) == 1 && ac >= 0.0000000001) { safe = ac; }
+    var inv: f64 = 1.0 / safe;
+    g.inv_cell_size = inv;
+    g.recs = ImWordList_new();
+    g.over = ImWordList_new();
+    g.all = ImWordList_new();
+    g.tmp = ImWordList_new();
+    g.ptmp = ImPairList_new();
+    return g;
+}
+
+# The cell size for boxes of the `n` maximum dimensions at `dims` (f64 words): twice the mean of the
+# finite, non-negative ones, at least 0.1; 1 when there are none. Mirrors
+# `SpatialHashGrid::auto_cell_size`.
+#must_use
+fn ImSpatialHashGrid_auto_cell_size(dims, n): f64 {
+    var total: f64 = 0.0;
+    var count = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var d: f64 = load64(dims + i * 8);
+        if (_im_is_finite(d) == 1 && d >= 0.0) {
+            total = total + d;
+            count = count + 1;
+        }
+    }
+    if (count == 0) { return 1.0; }
+    var cf: f64 = f64_from(count);
+    var mean: f64 = total / cf * 2.0;
+    var r: f64 = _im_max(mean, 0.1);
+    return r;
+}
+
+# Sorts the n three-word records at data by their first two words (signed), with tmp of the same
+# size: a bottom-up merge sort.
+fn _im_sort_rec3(data, n, tmp) {
+    var src = data;
+    var dst = tmp;
+    var width = 1;
+    while (width < n) {
+        var lo = 0;
+        while (lo < n) {
+            var mid = lo + width;
+            if (mid > n) { mid = n; }
+            var hi = lo + 2 * width;
+            if (hi > n) { hi = n; }
+            var i = lo;
+            var j = mid;
+            var k = lo;
+            while (k < hi) {
+                var take_i = 0;
+                if (i < mid) {
+                    if (j >= hi) {
+                        take_i = 1;
+                    } else {
+                        var a0 = load64(src + i * 24);
+                        var b0 = load64(src + j * 24);
+                        if (a0 < b0 || (a0 == b0 && load64(src + i * 24 + 8) <= load64(src + j * 24 + 8))) {
+                            take_i = 1;
+                        }
+                    }
+                }
+                var from = src + j * 24;
+                if (take_i == 1) {
+                    from = src + i * 24;
+                    i = i + 1;
+                } else {
+                    j = j + 1;
+                }
+                memcpy(dst + k * 24, from, 24);
+                k = k + 1;
+            }
+            lo = hi;
+        }
+        var t = src;
+        src = dst;
+        dst = t;
+        width = width * 2;
+    }
+    if (src != data) { memcpy(data, src, n * 24); }
+    return 0;
+}
+
+impl ImSpatialHashGrid {
+    # The inclusive cell range of [min, max] on one axis into *out (lo, hi): 1, or 0 when it is
+    # non-finite, inverted or outside the i32 cell range. Mirrors `axis_range`.
+    fn _axis(self, min: f64, max: f64, out): i64 {
+        var inv: f64 = self.inv_cell_size;
+        var a: f64 = min * inv;
+        var b: f64 = max * inv;
+        var lo: f64 = f64_floor(a);
+        var hi: f64 = f64_floor(b);
+        if (!(lo <= hi)) { return 0; }
+        if (!(lo >= -2147483648.0 && lo <= 2147483647.0)) { return 0; }
+        if (!(hi >= -2147483648.0 && hi <= 2147483647.0)) { return 0; }
+        store64(out, f64_to(lo));
+        store64(out + 8, f64_to(hi));
+        return 1;
+    }
+
+    # Inserts `key` for the box [min, max]: into every cell it covers, or the oversized list.
+    # 1, or 0 when there is no memory. Mirrors `insert`.
+    fn _insert(self, key, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64): i64 {
+        if (self.all.push(key) == 0) { return 0; }
+        var r[48];
+        var ok = self._axis(x0, x1, &r);
+        if (ok == 1) { ok = self._axis(y0, y1, &r + 16); }
+        if (ok == 1) { ok = self._axis(z0, z1, &r + 32); }
+        if (ok == 1) {
+            var count: f64 = 1.0;
+            for (var k = 0; k < 3; k = k + 1) {
+                var lof: f64 = f64_from(load64(&r + k * 16));
+                var hif: f64 = f64_from(load64(&r + k * 16 + 8));
+                var span: f64 = hif - lof + 1.0;
+                count = count * span;
+            }
+            if (!(count <= 4096.0)) { ok = 0; }
+        }
+        if (ok == 0) { return self.over.push(key); }
+        var cx = load64(&r);
+        while (cx <= load64(&r + 8)) {
+            var cy = load64(&r + 16);
+            while (cy <= load64(&r + 24)) {
+                var cz = load64(&r + 32);
+                while (cz <= load64(&r + 40)) {
+                    if (self.recs.push(cx) == 0) { return 0; }
+                    if (self.recs.push((cy << 32) | (cz & 4294967295)) == 0) { return 0; }
+                    if (self.recs.push(key) == 0) { return 0; }
+                    cz = cz + 1;
+                }
+                cy = cy + 1;
+            }
+            cx = cx + 1;
+        }
+        return 1;
+    }
+
+    # Inserts `key` for a 2D box (z = 0): 1, or 0 when there is no memory. Mirrors `insert_2d`.
+    fn insert_2d(self, key, min: ImVec2, max: ImVec2): i64 {
+        var x0: f64 = min.x;
+        var y0: f64 = min.y;
+        var x1: f64 = max.x;
+        var y1: f64 = max.y;
+        return self._insert(key, x0, y0, 0.0, x1, y1, 0.0);
+    }
+
+    # Inserts `key` for a 3D box: 1, or 0 when there is no memory. Mirrors `insert_3d`.
+    fn insert_3d(self, key, min: ImVec3, max: ImVec3): i64 {
+        var x0: f64 = min.x;
+        var y0: f64 = min.y;
+        var z0: f64 = min.z;
+        var x1: f64 = max.x;
+        var y1: f64 = max.y;
+        var z1: f64 = max.z;
+        return self._insert(key, x0, y0, z0, x1, y1, z1);
+    }
+
+    # Every pair of distinct keys that share a cell, and every pair with an oversized entry, into
+    # `out` (cleared first): each ordered (smaller first, unsigned), the list sorted and unique as
+    # Rust's BTreeSet. 1, or 0 when there is no memory. Mirrors `query_pairs`.
+    fn query_pairs(self, out: *ImPairList): i64 {
+        out.clear();
+        var n = self.recs.len / 3;
+        if (n > 1) {
+            if (self.tmp.reserve(n * 3) == 0) { return 0; }
+            _im_sort_rec3(self.recs.data, n, self.tmp.data);
+        }
+        var start = 0;
+        while (start < n) {
+            var end = start + 1;
+            var c0 = self.recs.at(start * 3);
+            var c1 = self.recs.at(start * 3 + 1);
+            while (end < n && self.recs.at(end * 3) == c0 && self.recs.at(end * 3 + 1) == c1) {
+                end = end + 1;
+            }
+            for (var i = start; i < end; i = i + 1) {
+                var ki = self.recs.at(i * 3 + 2);
+                for (var j = i + 1; j < end; j = j + 1) {
+                    var kj = self.recs.at(j * 3 + 2);
+                    if (ki != kj) {
+                        var lo, hi = _im_pair_key(ki, kj);
+                        if (out.push(lo, hi) == 0) { return 0; }
+                    }
+                }
+            }
+            start = end;
+        }
+        for (var o = 0; o < self.over.len; o = o + 1) {
+            var ko = self.over.at(o);
+            for (var a = 0; a < self.all.len; a = a + 1) {
+                var ka = self.all.at(a);
+                if (ka != ko) {
+                    var lo2, hi2 = _im_pair_key(ko, ka);
+                    if (out.push(lo2, hi2) == 0) { return 0; }
+                }
+            }
+        }
+        if (out.is_sorted() == 0) {
+            if (self.ptmp.reserve(out.len) == 0) { return 0; }
+            _im_pairs_sort(out.data, out.len, self.ptmp.data);
+        }
+        out.dedup();
+        return 1;
+    }
+
+    # The number of distinct cells in use (Rust's `cells.len()`, which its tests read). Sorts the
+    # records, as query_pairs does.
+    fn cell_count(self): i64 {
+        var n = self.recs.len / 3;
+        if (n == 0) { return 0; }
+        if (n > 1) {
+            if (self.tmp.reserve(n * 3) == 0) { return 0 - 1; }
+            _im_sort_rec3(self.recs.data, n, self.tmp.data);
+        }
+        var cells = 1;
+        for (var i = 1; i < n; i = i + 1) {
+            if (self.recs.at(i * 3) != self.recs.at(i * 3 - 3) || self.recs.at(i * 3 + 1) != self.recs.at(i * 3 - 2)) {
+                cells = cells + 1;
+            }
+        }
+        return cells;
+    }
+
+    # Empties the grid and sets a new cell size, keeping its storage, for the next step's rebuild.
+    fn reset(self, cell_size: f64) {
+        var fresh: ImSpatialHashGrid = ImSpatialHashGrid_new(cell_size);
+        var inv: f64 = fresh.inv_cell_size;
+        self.inv_cell_size = inv;
+        self.recs.len = 0;
+        self.over.len = 0;
+        self.all.len = 0;
+        return 0;
+    }
+
+    # Releases the grid's storage.
+    fn free(self) {
+        self.recs.free();
+        self.over.free();
+        self.all.free();
+        self.tmp.free();
+        self.ptmp.free();
+        return 0;
+    }
+}
+
 # --- json.cyr ---
 
 # json.cyr — serde-compatible JSON (ADR 0010): the same documents the Rust crate's serde_json writes

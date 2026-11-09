@@ -72,6 +72,9 @@ impetus specifics:
 - A handle is `i:` of its word: two's complement above `i64::MAX`, the port's own representation.
   A payload enum (`ColliderShape`, `JointType`, `CollisionEvent`) is `e:<Enum>.<Variant>` then the
   variant's fields; a `Vec` is `v:<len>` then its elements (`flat.rs`).
+- Broadphase rows (`broadphase.tsv`) give the boxes in insertion order (`v:N`, then min and max per box; the hash
+  rows start with the cell size) and the sorted candidate pair set (`v:P`, then the two input indices per pair).
+  The structures are shared by both backends, so the 2D build emits the 3D rows too.
 - `Spring::step` rows (`spring.tsv`) carry a note `[<regime> S=<n>]`: the regime the transition took
   and its **sensitivity**, the most the two outputs move, in ulps, when one exp, sin or cos result
   on the path moves by one ulp. `m_spring.rs` computes it from a transcription of `transition` and
@@ -127,6 +130,8 @@ Standard-library Python, run with `-I`. It never calls the oracle:
 - every `spring` row is recomputed: the constructors, `is_settled`, and `step` through a Python
   transcription. Python's `math` calls the same glibc `exp`, `sin` and `cos` as Rust's f64 methods,
   so the step rows match bit for bit;
+- every `broadphase` row is recomputed: the tree's pairs by brute force on the fattened boxes, the hash's by an
+  independent rasterisation, the automatic cell size;
 - the corrected oracle and `src/crmath_data.cyr` are current (above).
 
 A tampered row makes it exit 1.
