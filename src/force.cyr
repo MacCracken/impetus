@@ -1,0 +1,91 @@
+# force.cyr — forces, impulses and torques (port of rust-old/src/force.rs).
+#
+# Rust's `point: Option<[f64; 3]>` is a presence flag plus the point (as material.cyr's Option
+# fields). Magnitudes keep Rust's operation order: (x² + y²) + z², then the square root.
+
+struct ImForce { vector: ImVec3; has_point; point: ImVec3; }
+struct ImImpulse { vector: ImVec3; has_point; point: ImVec3; }
+struct ImTorque { value: f64; }
+
+# √((x² + y²) + z²), as Rust's `(x.powi(2) + y.powi(2) + z.powi(2)).sqrt()`.
+#must_use
+fn _im_magnitude3(v: ImVec3): f64 {
+    var x: f64 = v.x;
+    var y: f64 = v.y;
+    var z: f64 = v.z;
+    var s: f64 = x * x + y * y + z * z;
+    var r: f64 = f64_sqrt(s);
+    return r;
+}
+
+# A force (x, y, z) in newtons at the centre of mass. Mirrors `Force::new`.
+#must_use
+fn ImForce_new(x: f64, y: f64, z: f64): ImForce {
+    var f: ImForce;
+    f.vector = ImVec3_new(x, y, z);
+    f.has_point = 0;
+    f.point = ImVec3_zero();
+    return f;
+}
+
+# A force (x, y, z) applied at (px, py, pz) relative to the body centre. Mirrors `Force::at_point`.
+#must_use
+fn ImForce_at_point(x: f64, y: f64, z: f64, px: f64, py: f64, pz: f64): ImForce {
+    var f: ImForce;
+    f.vector = ImVec3_new(x, y, z);
+    f.has_point = 1;
+    f.point = ImVec3_new(px, py, pz);
+    return f;
+}
+
+# The weight of `mass` under gravity `g`: (0, −mass·g, 0). Mirrors `Force::gravity`.
+#must_use
+fn ImForce_gravity(mass: f64, g: f64): ImForce {
+    var w: f64 = -mass * g;
+    return ImForce_new(0.0, w, 0.0);
+}
+
+impl ImForce {
+    # The force's magnitude. Mirrors `Force::magnitude`.
+    #must_use
+    fn magnitude(self): f64 {
+        return _im_magnitude3(self.vector);
+    }
+}
+
+# An impulse (x, y, z) in newton-seconds at the centre of mass. Mirrors `Impulse::new`.
+#must_use
+fn ImImpulse_new(x: f64, y: f64, z: f64): ImImpulse {
+    var i: ImImpulse;
+    i.vector = ImVec3_new(x, y, z);
+    i.has_point = 0;
+    i.point = ImVec3_zero();
+    return i;
+}
+
+# An impulse (x, y, z) applied at (px, py, pz) relative to the body centre.
+# Mirrors `Impulse::at_point`.
+#must_use
+fn ImImpulse_at_point(x: f64, y: f64, z: f64, px: f64, py: f64, pz: f64): ImImpulse {
+    var i: ImImpulse;
+    i.vector = ImVec3_new(x, y, z);
+    i.has_point = 1;
+    i.point = ImVec3_new(px, py, pz);
+    return i;
+}
+
+impl ImImpulse {
+    # The impulse's magnitude. Mirrors `Impulse::magnitude`.
+    #must_use
+    fn magnitude(self): f64 {
+        return _im_magnitude3(self.vector);
+    }
+}
+
+# A torque in newton-meters (positive is counter-clockwise). Mirrors `Torque::new`.
+#must_use
+fn ImTorque_new(value: f64): ImTorque {
+    var t: ImTorque;
+    t.value = value;
+    return t;
+}

@@ -22,13 +22,18 @@
 //!
 //! Adapted from kimiya's and tanmatra's `scripts/oracle/` (same format, same rules). Modules are
 //! added at the start of their milestone, with the golden grid from the port plan §6:
-//! `constants` and `math` (M0); …
+//! `constants` and `math` (M0); `config`, `material`, `units` and `force` (M1a); …
 
 mod cyr;
+mod flat;
 mod glibc;
 mod grids;
+mod m_config;
 mod m_constants;
+mod m_force;
+mod m_material;
 mod m_math;
+mod m_units;
 mod t_constants;
 mod tsv;
 
@@ -53,7 +58,14 @@ fn golden_modules() -> Vec<tsv::Module> {
     if cfg!(feature = "b3") {
         vec![]
     } else {
-        vec![m_constants::emit(), m_math::emit()]
+        vec![
+            m_config::emit(),
+            m_constants::emit(),
+            m_force::emit(),
+            m_material::emit(),
+            m_math::emit(),
+            m_units::emit(),
+        ]
     }
 }
 

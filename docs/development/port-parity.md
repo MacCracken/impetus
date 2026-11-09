@@ -159,6 +159,28 @@ empty; `tests/lib_2d.cyr` and `tests/lib_3d.cyr` include their profile's module 
 `[lib.3d]` order, and every test file includes one of them. A check (M1, with surface parity)
 fails when either drifts from `cyrius.cyml`.
 
+## 5. M1a: the math helpers, config, material, units, force (2026-11-09)
+
+- **The math helpers** (`src/mathx.cyr`) close the 4,045 pending `math` rows: `_im_min` / `_im_max` /
+  `_im_clamp` (Rust's NaN-ignoring semantics, the second operand when equal), `_im_is_nan`,
+  `_im_is_finite`, `_im_to_radians` (one multiply by the folded π/180), `_im_powi2` / `_im_powi3`,
+  `_im_exp` (the polyfill), `_im_atan2` (ganita's on `_f64_atan_polyfill`), `_im_hypot`,
+  `_im_sin_cos`. Every one is **0 ulp** on its class-A/B rows.
+- **The value modules**, every row 0 ulp on x86_64 ELF, x86_64 PE and aarch64:
+
+| Module | Rows | Result |
+|---|---|---|
+| `config` | 293 | `default` exact; `validate` 200 ok, **92 accepted (ADR 0008 #6)**: XPBD configs the oracle accepts and the port refuses |
+| `material` | 2,046 | combine rules (min/max exact, mean/product 0 ulp), presets exact, `effective_static_friction` 0 ulp |
+| `units` | 2,236 | constructors exact, `to_radians` 0 ulp ((value·π)/180, not `f64::to_radians`' value·(π/180)); `Quantity::fmt` 280 rows **pending** on S2 |
+| `force` | 1,308 | constructors exact, magnitudes and `gravity` 0 ulp |
+
+- `validate.py` recomputes 5,230 of these rows independently (every `validate` verdict, combine
+  rule, `to_radians`, magnitude and gravity vector).
+- **Result, every target:** 6 modules, 0 failing; **24,431 ok, 0 failed, 0 measured, 281 pending
+  (S2's 280 and the M6 constant), 93 accepted** (ADR 0008 #6 92, ADR 0009 1). The dispatched math
+  digests are unchanged and equal on all three targets.
+
 ## How to reproduce
 
 ```sh

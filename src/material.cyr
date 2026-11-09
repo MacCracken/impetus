@@ -1,0 +1,113 @@
+# material.cyr — physics materials (port of rust-old/src/material.rs).
+#
+# `ImCombineRule` keeps the Rust variant order, which is also the priority order the solver uses
+# when two materials disagree (Max > Multiply > Average > Min). `ImPhysicsMaterial` holds the Rust
+# fields in declaration order; Rust's `static_friction: Option<f64>` is a presence flag plus the
+# value (as kimiya's Option<f64> fields).
+
+enum ImCombineRule {
+    IM_COMBINE_MIN = 0;
+    IM_COMBINE_AVERAGE = 1;
+    IM_COMBINE_MULTIPLY = 2;
+    IM_COMBINE_MAX = 3;
+}
+
+struct ImPhysicsMaterial {
+    friction: f64;
+    restitution: f64;
+    density: f64;
+    has_static_friction;
+    static_friction: f64;
+    rolling_friction: f64;
+    friction_combine;
+    restitution_combine;
+}
+
+# The Rust variant name of a combine rule (`"Average"`), or "Unknown".
+#must_use
+fn combine_rule_name(rule): i64 {
+    if (rule == IM_COMBINE_MIN) { return "Min"; }
+    if (rule == IM_COMBINE_AVERAGE) { return "Average"; }
+    if (rule == IM_COMBINE_MULTIPLY) { return "Multiply"; }
+    if (rule == IM_COMBINE_MAX) { return "Max"; }
+    return "Unknown";
+}
+
+# Combine two values by `rule`: the mean (a + b)·0.5, the smaller, the product, or the larger
+# (min and max ignore a NaN operand, as Rust's). NaN for a value that is no rule.
+# Mirrors `CombineRule::combine`.
+#must_use
+fn combine_rule_combine(rule, a: f64, b: f64): f64 {
+    if (rule == IM_COMBINE_AVERAGE) { var r: f64 = (a + b) * 0.5; return r; }
+    if (rule == IM_COMBINE_MIN) { var r: f64 = _im_min(a, b); return r; }
+    if (rule == IM_COMBINE_MAX) { var r: f64 = _im_max(a, b); return r; }
+    if (rule == IM_COMBINE_MULTIPLY) { var r: f64 = a * b; return r; }
+    var nan: f64 = 0.0 / 0.0;
+    return nan;
+}
+
+# A material with the given friction, restitution and density and every other field at its
+# default: no static friction override, no rolling friction, Average friction, Min restitution.
+#must_use
+fn _im_material(friction: f64, restitution: f64, density: f64): ImPhysicsMaterial {
+    var m: ImPhysicsMaterial;
+    m.friction = friction;
+    m.restitution = restitution;
+    m.density = density;
+    m.has_static_friction = 0;
+    m.static_friction = 0.0;
+    m.rolling_friction = 0.0;
+    m.friction_combine = IM_COMBINE_AVERAGE;
+    m.restitution_combine = IM_COMBINE_MIN;
+    return m;
+}
+
+# Friction 0.5, restitution 0, density 1. Mirrors `PhysicsMaterial::default`.
+#must_use
+fn ImPhysicsMaterial_default(): ImPhysicsMaterial {
+    return _im_material(0.5, 0.0, 1.0);
+}
+
+# Low friction, low bounce (ice rink). Mirrors `PhysicsMaterial::ice`.
+#must_use
+fn ImPhysicsMaterial_ice(): ImPhysicsMaterial {
+    return _im_material(0.05, 0.1, 0.9);
+}
+
+# High friction, bouncy (rubber). Mirrors `PhysicsMaterial::rubber`.
+#must_use
+fn ImPhysicsMaterial_rubber(): ImPhysicsMaterial {
+    return _im_material(1.0, 0.8, 1.1);
+}
+
+# Moderate friction, low density (wood). Mirrors `PhysicsMaterial::wood`.
+#must_use
+fn ImPhysicsMaterial_wood(): ImPhysicsMaterial {
+    return _im_material(0.4, 0.2, 0.6);
+}
+
+# Moderate friction, high density (steel). Mirrors `PhysicsMaterial::steel`.
+#must_use
+fn ImPhysicsMaterial_steel(): ImPhysicsMaterial {
+    return _im_material(0.6, 0.3, 7.8);
+}
+
+# Low friction, maximum bounce (super ball). Mirrors `PhysicsMaterial::bouncy`.
+#must_use
+fn ImPhysicsMaterial_bouncy(): ImPhysicsMaterial {
+    return _im_material(0.3, 1.0, 1.0);
+}
+
+impl ImPhysicsMaterial {
+    # The static friction coefficient: the override when set, else friction × 1.5.
+    # Mirrors `PhysicsMaterial::effective_static_friction`.
+    #must_use
+    fn effective_static_friction(self): f64 {
+        if (self.has_static_friction == 1) {
+            var s: f64 = self.static_friction;
+            return s;
+        }
+        var r: f64 = self.friction * 1.5;
+        return r;
+    }
+}

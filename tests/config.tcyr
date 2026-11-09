@@ -1,0 +1,99 @@
+# config.tcyr — the ported Rust tests of rust-old/src/config.rs (M1a), plus ADR 0008 #6.
+#
+# Not carried over: config_serde_roundtrip, custom_config_serde, solver_kind_serde (serde).
+
+include "tests/ulp.cyr"
+include "tests/lib_2d.cyr"
+
+# 1 when validate() returns Err(code).
+fn rejects(c: ImWorldConfig, code): i64 {
+    var t, v = c.validate();
+    if (is_err_result(t) == 1 && v == code) { return 1; }
+    return 0;
+}
+
+# 1 when validate() returns Ok.
+fn accepts(c: ImWorldConfig): i64 {
+    var t, v = c.validate();
+    if (is_err_result(t) == 0) { return 1; }
+    return 0;
+}
+
+# Runs the ported config tests.
+fn main() {
+    alloc_init();
+    test_group("validate_accepts_default_and_rejects_bad_values");
+    assert(accepts(ImWorldConfig_default()) == 1, "default is valid");
+    var nan: f64 = 0.0 / 0.0;
+    var inf: f64 = 1.0 / 0.0;
+    var c: ImWorldConfig = ImWorldConfig_default();
+    c.timestep = -1.0;
+    assert(rejects(c, IM_ERR_INVALID_CONFIG) == 1, "negative timestep");
+    c = ImWorldConfig_default();
+    c.timestep = nan;
+    assert(rejects(c, IM_ERR_INVALID_CONFIG) == 1, "NaN timestep");
+    c = ImWorldConfig_default();
+    c.gravity = ImVec3_new(0.0, nan, 0.0);
+    assert(rejects(c, IM_ERR_INVALID_CONFIG) == 1, "NaN gravity");
+    c = ImWorldConfig_default();
+    c.sub_steps = 4294967295;
+    assert(rejects(c, IM_ERR_INVALID_CONFIG) == 1, "sub_steps u32::MAX");
+    c = ImWorldConfig_default();
+    c.position_correction = 2.0;
+    assert(rejects(c, IM_ERR_INVALID_CONFIG) == 1, "correction 2");
+    c = ImWorldConfig_default();
+    c.max_velocity = 0.0;
+    assert(rejects(c, IM_ERR_INVALID_CONFIG) == 1, "max_velocity 0");
+    c = ImWorldConfig_default();
+    c.constraint_frequency = -1.0;
+    assert(rejects(c, IM_ERR_INVALID_CONFIG) == 1, "negative frequency");
+    c = ImWorldConfig_default();
+    c.max_velocity = inf;
+    assert(accepts(c) == 1, "infinite max_velocity disables the clamp");
+
+    test_group("default_config");
+    var d: ImWorldConfig = ImWorldConfig_default();
+    var ts: f64 = d.timestep;
+    var sixtieth: f64 = 1.0 / 60.0;
+    assert(ts == sixtieth, "timestep 1/60");
+    var gx: f64 = d.gravity.x;
+    var gy: f64 = d.gravity.y;
+    var gz: f64 = d.gravity.z;
+    assert(gx == 0.0 && gy == -9.81 && gz == 0.0, "gravity (0, -9.81, 0)");
+    assert(d.deterministic == 1, "deterministic");
+    assert_eq(d.velocity_iterations, 4, "4 velocity iterations");
+    assert_eq(d.position_iterations, 1, "1 position iteration");
+    assert_eq(d.step, 0, "step 0");
+
+    test_group("solver_kind_default_is_sequential_impulse");
+    assert_eq(d.solver, IM_SOLVER_SEQUENTIAL_IMPULSE, "sequential impulse");
+
+    test_group("zero_gravity_config");
+    var z: ImWorldConfig = ImWorldConfig_default();
+    z.gravity = ImVec3_zero();
+    var zy: f64 = z.gravity.y;
+    assert(zy == 0.0, "gravity zero");
+    assert(accepts(z) == 1, "zero gravity is valid");
+
+    # ADR 0008 #6 (Cyrius-only): XPBD is refused; a value that is no variant too.
+    test_group("adr_0008_xpbd_refused");
+    var x: ImWorldConfig = ImWorldConfig_default();
+    x.solver = IM_SOLVER_XPBD;
+    assert(rejects(x, IM_ERR_UNSUPPORTED) == 1, "XPBD -> Unsupported");
+    x.timestep = -1.0;
+    assert(rejects(x, IM_ERR_INVALID_CONFIG) == 1, "a Rust check fails first");
+    var y: ImWorldConfig = ImWorldConfig_default();
+    y.solver = 7;
+    assert(rejects(y, IM_ERR_INVALID_CONFIG) == 1, "solver value that is no variant");
+    y = ImWorldConfig_default();
+    y.broadphase = 0 - 1;
+    assert(rejects(y, IM_ERR_INVALID_CONFIG) == 1, "broadphase value that is no variant");
+    y = ImWorldConfig_default();
+    y.velocity_iterations = 0 - 1;
+    assert(rejects(y, IM_ERR_INVALID_CONFIG) == 1, "a count no u32 holds");
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

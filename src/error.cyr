@@ -1,0 +1,55 @@
+# error.cyr — impetus's error codes (port of rust-old/src/error.rs).
+#
+# A fallible impetus function returns a value-form Result whose Err payload is one of these codes:
+# `var t, v = f(..); if (is_err_result(t) == 1) { .. v is the code .. }`. The golden token
+# `E:InvalidConfig` is IM_ERR_INVALID_CONFIG: IM_ERR_ + snake(variant). The values follow the Rust
+# variant order and are append-only (the Cyrius form of #[non_exhaustive]). Every Rust variant
+# carries a String that restates the caller's input (a handle, a field and its value), so no detail
+# travels with the code (as tanmatra and kimiya); im_error_message(code) gives the fixed text.
+#
+# IM_ERR_UNSUPPORTED is Cyrius-only (ADR 0008 #5, #6): what the Rust crate accepted and ignored.
+
+enum ImError {
+    IM_ERR_NONE = 0;
+    IM_ERR_BODY_NOT_FOUND = 1;
+    IM_ERR_COLLIDER_NOT_FOUND = 2;
+    IM_ERR_JOINT_NOT_FOUND = 3;
+    IM_ERR_INVALID_CONFIG = 4;
+    IM_ERR_SERIALIZE = 5;
+    IM_ERR_DESERIALIZE = 6;
+    IM_ERR_PHYSICS = 7;
+    IM_ERR_UNSUPPORTED = 8;
+}
+
+# The Rust variant name of an error code (`"InvalidConfig"`), "None" for IM_ERR_NONE, "Unsupported"
+# for the Cyrius-only code, or "Unknown" for a value that is no code.
+#must_use
+fn im_error_name(code): i64 {
+    if (code == IM_ERR_NONE) { return "None"; }
+    if (code == IM_ERR_BODY_NOT_FOUND) { return "BodyNotFound"; }
+    if (code == IM_ERR_COLLIDER_NOT_FOUND) { return "ColliderNotFound"; }
+    if (code == IM_ERR_JOINT_NOT_FOUND) { return "JointNotFound"; }
+    if (code == IM_ERR_INVALID_CONFIG) { return "InvalidConfig"; }
+    if (code == IM_ERR_SERIALIZE) { return "Serialize"; }
+    if (code == IM_ERR_DESERIALIZE) { return "Deserialize"; }
+    if (code == IM_ERR_PHYSICS) { return "Physics"; }
+    if (code == IM_ERR_UNSUPPORTED) { return "Unsupported"; }
+    return "Unknown";
+}
+
+# The Rust error's Display text without its payload: thiserror's message up to the `: {0}`
+# (`"invalid configuration"` for `invalid configuration: timestep = -1.0`). "no error" for
+# IM_ERR_NONE and "unknown error" for a value that is no code.
+#must_use
+fn im_error_message(code): i64 {
+    if (code == IM_ERR_NONE) { return "no error"; }
+    if (code == IM_ERR_BODY_NOT_FOUND) { return "body not found"; }
+    if (code == IM_ERR_COLLIDER_NOT_FOUND) { return "collider not found"; }
+    if (code == IM_ERR_JOINT_NOT_FOUND) { return "joint not found"; }
+    if (code == IM_ERR_INVALID_CONFIG) { return "invalid configuration"; }
+    if (code == IM_ERR_SERIALIZE) { return "serialization error"; }
+    if (code == IM_ERR_DESERIALIZE) { return "deserialization error"; }
+    if (code == IM_ERR_PHYSICS) { return "physics error"; }
+    if (code == IM_ERR_UNSUPPORTED) { return "unsupported"; }
+    return "unknown error";
+}

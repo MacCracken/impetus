@@ -1,0 +1,14 @@
+# lib_2d.cyr — the 2D profile's module list, in cyrius.cyml [lib] order, for test compiles.
+#
+# `cyrius test` never prepends [lib] (it is read only by `cyrius distlib`), and `[test] modules`
+# can't differ by profile (port-parity.md §4.4), so every 2D test file includes this one. Keep it
+# in step with [lib]; tests/lib_3d.cyr mirrors [lib.3d] from M4.
+
+include "src/error.cyr"
+include "src/constants.cyr"
+include "src/mathx.cyr"
+include "src/vec.cyr"
+include "src/config.cyr"
+include "src/material.cyr"
+include "src/units.cyr"
+include "src/force.cyr"

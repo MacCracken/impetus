@@ -1,23 +1,106 @@
-# impetus benchmarks
-# Stdlib auto-included via cyrius.cyml
+# impetus benchmarks — the Cyrius twin of each Rust benchmark in rust-old/benches/simulation.rs, as
+# its module ports. Numbers are recorded against the Rust ones in docs/benchmarks-rust-v-cyrius.md.
 #
 # Pattern: bench_new -> bench_batch_start -> tight loop -> bench_batch_stop -> bench_report.
-# For sub-1us ops use batch_size >= 1000 to amortize clock_gettime overhead
-# (~240 ns per start/stop pair on x86_64 Linux). See lib/bench.cyr header for
-# the full overhead-vs-batching guidance.
+# For sub-1us ops use batch_size >= 1000 to amortize clock_gettime overhead (lib/bench.cyr).
+#
+# M1a: forces/force_magnitude, forces/gravity_force, materials/preset_steel, preset_rubber,
+# degrees_to_radians, quantity_new. materials/quantity_display waits for S2 (port plan §8).
 
-# The empty body, timed as the harness floor.
-fn bench_noop(): i64 { return 0; }
+include "tests/lib_2d.cyr"
 
-# Runs the benches. Each module adds its Rust-mirrored benches (port plan §6 gates).
+var N = 1000000;
+var g_sink = 0;
+
+# forces/force_magnitude: |(3, 4, 0)|.
+fn bench_force_magnitude() {
+    var f: ImForce = ImForce_new(3.0, 4.0, 0.0);
+    var b = bench_new("forces/force_magnitude");
+    bench_batch_start(b);
+    for (var i = 0; i < N; i = i + 1) {
+        var m: f64 = f.magnitude();
+        g_sink = _im_bits(m);
+    }
+    bench_batch_stop(b, N);
+    bench_report(b);
+    return 0;
+}
+
+# forces/gravity_force: the weight of 10 kg under 9.81 m/s².
+fn bench_gravity_force() {
+    var b = bench_new("forces/gravity_force");
+    bench_batch_start(b);
+    for (var i = 0; i < N; i = i + 1) {
+        var w: ImForce = ImForce_gravity(10.0, 9.81);
+        g_sink = w.has_point;
+    }
+    bench_batch_stop(b, N);
+    bench_report(b);
+    return 0;
+}
+
+# materials/preset_steel.
+fn bench_preset_steel() {
+    var b = bench_new("materials/preset_steel");
+    bench_batch_start(b);
+    for (var i = 0; i < N; i = i + 1) {
+        var m: ImPhysicsMaterial = ImPhysicsMaterial_steel();
+        g_sink = m.friction_combine;
+    }
+    bench_batch_stop(b, N);
+    bench_report(b);
+    return 0;
+}
+
+# materials/preset_rubber.
+fn bench_preset_rubber() {
+    var b = bench_new("materials/preset_rubber");
+    bench_batch_start(b);
+    for (var i = 0; i < N; i = i + 1) {
+        var m: ImPhysicsMaterial = ImPhysicsMaterial_rubber();
+        g_sink = m.friction_combine;
+    }
+    bench_batch_stop(b, N);
+    bench_report(b);
+    return 0;
+}
+
+# materials/degrees_to_radians: 180° to radians.
+fn bench_degrees_to_radians() {
+    var q: ImQuantity = ImQuantity_degrees(180.0);
+    var b = bench_new("materials/degrees_to_radians");
+    bench_batch_start(b);
+    for (var i = 0; i < N; i = i + 1) {
+        var r: f64 = q.to_radians();
+        g_sink = _im_bits(r);
+    }
+    bench_batch_stop(b, N);
+    bench_report(b);
+    return 0;
+}
+
+# materials/quantity_new: 42 N.
+fn bench_quantity_new() {
+    var b = bench_new("materials/quantity_new");
+    bench_batch_start(b);
+    for (var i = 0; i < N; i = i + 1) {
+        var q: ImQuantity = ImQuantity_new(42.0, IM_UNIT_NEWTONS);
+        g_sink = q.unit;
+    }
+    bench_batch_stop(b, N);
+    bench_report(b);
+    return 0;
+}
+
+# Runs every bench.
 fn main(): i64 {
     alloc_init();
-    var b = bench_new("noop");
-    bench_batch_start(b);
-    var i = 0;
-    while (i < 1000000) { bench_noop(); i = i + 1; }
-    bench_batch_stop(b, 1000000);
-    bench_report(b);
+    bench_force_magnitude();
+    bench_gravity_force();
+    bench_preset_steel();
+    bench_preset_rubber();
+    bench_degrees_to_radians();
+    bench_quantity_new();
     return 0;
 }
 

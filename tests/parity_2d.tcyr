@@ -21,7 +21,7 @@
 # are never gated. The exit code is the number of modules with a failure.
 
 include "tests/ulp.cyr"
-include "src/constants.cyr"
+include "tests/lib_2d.cyr"
 
 alloc_init();
 
@@ -29,11 +29,10 @@ include "tests/parity_core.cyr"
 
 # ── hooks ───────────────────────────────────────────────────────────────────────────
 
-# The Rust variant name of an error code. src/error.cyr (M1) brings `im_error_name`; until then
-# no dispatcher returns an error.
+# The Rust variant name of an error code (src/error.cyr).
 #must_use
 fn _par_error_name(code): i64 {
-    return "Unknown";
+    return im_error_name(code);
 }
 
 # ── cross-target digests (M0 step 8) ────────────────────────────────────────────────
@@ -84,33 +83,6 @@ fn _par_dg_print(slot, name) {
     return 0;
 }
 
-# ── candidates ──────────────────────────────────────────────────────────────────────
-# ganita_f64_atan2 (lib/ganita.cyr, 1.2.15) with `_f64_atan_polyfill` in place of the `f64_atan`
-# builtin, which is x87 on x86_64 and the polyfill on aarch64. Chosen in M0 step 8
-# (port-parity.md §2): the same bits on every target. M1 moves it into src/mathx.cyr as
-# `_im_atan2`. Words in, word out, as ganita.
-fn _cand_atan2_poly(y, x): i64 {
-    var ay = y & 0x7FFFFFFFFFFFFFFF;
-    var ax = x & 0x7FFFFFFFFFFFFFFF;
-    if (ay > 0x7FF0000000000000) { return y; }
-    if (ax > 0x7FF0000000000000) { return x; }
-    var ysign = y & 0x8000000000000000;
-    var xneg = (x >> 63) & 1;
-    if (ay == 0) {
-        if (xneg == 1) { return F64_PI | ysign; }
-        return y;
-    }
-    if (ax == 0) { return F64_PI_2 | ysign; }
-    if ((ay == 0x7FF0000000000000) && (ax == 0x7FF0000000000000)) {
-        if (xneg == 1) { return _F64_3PI_4 | ysign; }
-        return F64_PI_4 | ysign;
-    }
-    var q = _f64_atan_polyfill(f64_div(y, x));
-    if (xneg == 0) { return q; }
-    if (ysign != 0) { return f64_sub(q, F64_PI); }
-    return f64_add(q, F64_PI);
-}
-
 # ── dispatch ────────────────────────────────────────────────────────────────────────
 # Each module's dispatcher fills the got list for one row. It returns 1 when it handled the
 # function, 0 when the function is pending (not ported), or -1 when the inputs are unusable (a
@@ -135,16 +107,11 @@ fn _par_constants(fp, fl): i64 {
     return 0 - 1;
 }
 
-# `f64::*` rows: the Rust std reference values (port plan §7.1). Dispatched: the counterparts the
-# port uses. exp and atan2 are the polyfill forms, which give the same bits on every target
-# (port-parity.md §2): `f64_exp` and the `f64_atan` inside ganita's atan2 are x87 on x86_64 and the
-# polyfill on aarch64. Pending until M1's src/mathx.cyr:
-# - min, max, clamp: f64_min / f64_max return the second operand when the first is NaN and NaN
-#   when the second is (probed), while Rust ignores a NaN operand either way (_im_min, _im_max,
-#   _im_clamp);
-# - is_nan, is_finite: no public stdlib predicate (_im_is_nan, _im_is_finite);
-# - to_radians, powi2, powi3: impetus's own one-line helpers in Rust's operation order.
-# sin_cos is the pair (f64_sin, f64_cos): there is no stdlib sin_cos.
+# `f64::*` rows: the Rust std reference values (port plan §7.1), through the counterparts the port
+# uses: the builtins where they match Rust, and src/mathx.cyr's `_im_` helpers where they don't.
+# exp and atan2 are the polyfill forms, which give the same bits on every target (port-parity.md
+# §2): `f64_exp` and the `f64_atan` inside ganita's atan2 are x87 on x86_64 and the polyfill on
+# aarch64.
 fn _par_math(fp, fl): i64 {
     var x: f64 = _par_in(0);
     if (_par_eq(fp, fl, "f64::sqrt") == 1) { var r: f64 = f64_sqrt(x); _par_got_f(r); return 1; }
@@ -152,28 +119,337 @@ fn _par_math(fp, fl): i64 {
     if (_par_eq(fp, fl, "f64::floor") == 1) { var r: f64 = f64_floor(x); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::ceil") == 1) { var r: f64 = f64_ceil(x); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::sin_cos") == 1) {
-        var s: f64 = f64_sin(x);
-        var c: f64 = f64_cos(x);
+        var sv, cv = _im_sin_cos(x);
+        var s: f64 = sv;
+        var c: f64 = cv;
         _par_got_f(s);
         _par_got_f(c);
         return 1;
     }
     if (_par_eq(fp, fl, "f64::sin") == 1) { var r: f64 = f64_sin(x); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::cos") == 1) { var r: f64 = f64_cos(x); _par_got_f(r); return 1; }
-    if (_par_eq(fp, fl, "f64::exp") == 1) { var r: f64 = _f64_exp_polyfill(x); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::exp") == 1) { var r: f64 = _im_exp(x); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::is_nan") == 1) { _par_got_i(_im_is_nan(x)); return 1; }
+    if (_par_eq(fp, fl, "f64::is_finite") == 1) { _par_got_i(_im_is_finite(x)); return 1; }
+    if (_par_eq(fp, fl, "f64::to_radians") == 1) { var r: f64 = _im_to_radians(x); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::powi2") == 1) { var r: f64 = _im_powi2(x); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::powi3") == 1) { var r: f64 = _im_powi3(x); _par_got_f(r); return 1; }
     if (_par_in_n < 2) { return 0; }
     var y: f64 = _par_in(1);
     # Rust's y.atan2(x) is the golden f64::atan2(y, x): inputs in C order.
-    if (_par_eq(fp, fl, "f64::atan2") == 1) { _par_got_f(_cand_atan2_poly(_par_in(0), _par_in(1))); return 1; }
-    if (_par_eq(fp, fl, "f64::hypot") == 1) { var r: f64 = ganita_f64_hypot(x, y); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::atan2") == 1) { _par_got_f(_im_atan2(_par_in(0), _par_in(1))); return 1; }
+    if (_par_eq(fp, fl, "f64::hypot") == 1) { var r: f64 = _im_hypot(x, y); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::powf") == 1) { var r: f64 = ganita_f64_pow(x, y); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::max") == 1) { var r: f64 = _im_max(x, y); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::min") == 1) { var r: f64 = _im_min(x, y); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::clamp") == 1) {
+        var hi: f64 = _par_in(2);
+        var r: f64 = _im_clamp(x, y, hi);
+        _par_got_f(r);
+        return 1;
+    }
+    return 0;
+}
+
+# ── M1a: config, material, units, force ─────────────────────────────────────────────
+# Inputs and outputs are the structs flattened field by field (scripts/oracle/src/flat.rs).
+
+# ADR 0008 #6: a `validate` row the port refuses as XPBD while the oracle accepts it. Set by the
+# config dispatcher, cleared for every row by _par_dispatch.
+var _par_mapped = 0;
+var _par_map_xpbd = 0;
+
+# 1 if input token k is `n:` (Option::None).
+#must_use
+fn _par_in_is_none(k): i64 {
+    if (load64(_par_in_k + k * 8) == 110) { return 1; }
+    return 0;
+}
+
+# 1 if input token k's text, after its `prefix` ("PhysicsUnit."), equals `name`.
+#must_use
+fn _par_in_enum_is(k, prefix, name): i64 {
+    var p = load64(_par_in_v + k * 8);
+    var l = load64(_par_in_l + k * 8);
+    var pl = strlen(prefix);
+    if (l <= pl) { return 0; }
+    if (_par_eq(p, pl, prefix) != 1) { return 0; }
+    return _par_eq(p + pl, l - pl, name);
+}
+
+# Input token k as an enum value: the first v in [0, n) whose name (`name_fn(v)`) matches, or -1.
+#must_use
+fn _par_in_enum(k, prefix, name_fn, n): i64 {
+    for (var v = 0; v < n; v = v + 1) {
+        if (_par_in_enum_is(k, prefix, fncall1(name_fn, v)) == 1) { return v; }
+    }
+    return 0 - 1;
+}
+
+# Appends an enum output, `prefix` + `name` ("CombineRule." + "Average"), to the got list.
+fn _par_got_enum(prefix, name) {
+    var pl = strlen(prefix);
+    var nl = strlen(name);
+    var t = alloc(pl + nl + 1);
+    memcpy(t, prefix, pl);
+    memcpy(t + pl, name, nl);
+    store8(t + pl + nl, 0);
+    _par_got_e(t);
+    return 0;
+}
+
+fn _par_in_config(k): ImWorldConfig {
+    var c: ImWorldConfig = ImWorldConfig_default();
+    var ts: f64 = _par_in(k);
+    var gx: f64 = _par_in(k + 1);
+    var gy: f64 = _par_in(k + 2);
+    var gz: f64 = _par_in(k + 3);
+    var slop: f64 = _par_in(k + 8);
+    var corr: f64 = _par_in(k + 9);
+    var mv: f64 = _par_in(k + 10);
+    var fq: f64 = _par_in(k + 12);
+    var dr: f64 = _par_in(k + 13);
+    c.timestep = ts;
+    c.gravity = ImVec3_new(gx, gy, gz);
+    c.velocity_iterations = _par_in(k + 4);
+    c.position_iterations = _par_in(k + 5);
+    c.deterministic = _par_in(k + 6);
+    c.step = _par_in(k + 7);
+    c.position_slop = slop;
+    c.position_correction = corr;
+    c.max_velocity = mv;
+    c.sub_steps = _par_in(k + 11);
+    c.constraint_frequency = fq;
+    c.constraint_damping_ratio = dr;
+    c.broadphase = _par_in_enum(k + 14, "BroadphaseKind.", &broadphase_kind_name, 2);
+    c.solver = _par_in_enum(k + 15, "SolverKind.", &solver_kind_name, 2);
+    return c;
+}
+
+fn _par_got_config(c: ImWorldConfig) {
+    var ts: f64 = c.timestep;
+    var gx: f64 = c.gravity.x;
+    var gy: f64 = c.gravity.y;
+    var gz: f64 = c.gravity.z;
+    var slop: f64 = c.position_slop;
+    var corr: f64 = c.position_correction;
+    var mv: f64 = c.max_velocity;
+    var fq: f64 = c.constraint_frequency;
+    var dr: f64 = c.constraint_damping_ratio;
+    _par_got_f(ts);
+    _par_got_f(gx);
+    _par_got_f(gy);
+    _par_got_f(gz);
+    _par_got_i(c.velocity_iterations);
+    _par_got_i(c.position_iterations);
+    _par_got_i(c.deterministic);
+    _par_got_i(c.step);
+    _par_got_f(slop);
+    _par_got_f(corr);
+    _par_got_f(mv);
+    _par_got_i(c.sub_steps);
+    _par_got_f(fq);
+    _par_got_f(dr);
+    _par_got_enum("BroadphaseKind.", broadphase_kind_name(c.broadphase));
+    _par_got_enum("SolverKind.", solver_kind_name(c.solver));
+    return 0;
+}
+
+fn _par_config(fp, fl): i64 {
+    if (_par_eq(fp, fl, "WorldConfig::default") == 1) {
+        _par_got_config(ImWorldConfig_default());
+        return 1;
+    }
+    if (_par_eq(fp, fl, "WorldConfig::validate") == 1) {
+        if (_par_in_n != 16) { return 0 - 1; }
+        var c: ImWorldConfig = _par_in_config(0);
+        var t, v = c.validate();
+        if (is_err_result(t) == 1) {
+            if (v == IM_ERR_UNSUPPORTED && c.solver == IM_SOLVER_XPBD) {
+                _par_mapped = 8;
+                _par_map_xpbd = _par_map_xpbd + 1;
+            }
+            _par_got_err(v);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+fn _par_in_material(k): ImPhysicsMaterial {
+    var m: ImPhysicsMaterial = ImPhysicsMaterial_default();
+    var fr: f64 = _par_in(k);
+    var re: f64 = _par_in(k + 1);
+    var de: f64 = _par_in(k + 2);
+    var sf: f64 = _par_in(k + 3);
+    var ro: f64 = _par_in(k + 4);
+    m.friction = fr;
+    m.restitution = re;
+    m.density = de;
+    m.has_static_friction = 1 - _par_in_is_none(k + 3);
+    m.static_friction = 0.0;
+    if (m.has_static_friction == 1) { m.static_friction = sf; }
+    m.rolling_friction = ro;
+    m.friction_combine = _par_in_enum(k + 5, "CombineRule.", &combine_rule_name, 4);
+    m.restitution_combine = _par_in_enum(k + 6, "CombineRule.", &combine_rule_name, 4);
+    return m;
+}
+
+fn _par_got_material(m: ImPhysicsMaterial) {
+    var fr: f64 = m.friction;
+    var re: f64 = m.restitution;
+    var de: f64 = m.density;
+    var sf: f64 = m.static_friction;
+    var ro: f64 = m.rolling_friction;
+    _par_got_f(fr);
+    _par_got_f(re);
+    _par_got_f(de);
+    if (m.has_static_friction == 1) { _par_got_f(sf); } else { _par_got_none(); }
+    _par_got_f(ro);
+    _par_got_enum("CombineRule.", combine_rule_name(m.friction_combine));
+    _par_got_enum("CombineRule.", combine_rule_name(m.restitution_combine));
+    return 0;
+}
+
+fn _par_material(fp, fl): i64 {
+    if (_par_eq(fp, fl, "CombineRule::combine") == 1) {
+        var rule = _par_in_enum(0, "CombineRule.", &combine_rule_name, 4);
+        var a: f64 = _par_in(1);
+        var b: f64 = _par_in(2);
+        var r: f64 = combine_rule_combine(rule, a, b);
+        _par_got_f(r);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "PhysicsMaterial::default") == 1) { _par_got_material(ImPhysicsMaterial_default()); return 1; }
+    if (_par_eq(fp, fl, "PhysicsMaterial::ice") == 1) { _par_got_material(ImPhysicsMaterial_ice()); return 1; }
+    if (_par_eq(fp, fl, "PhysicsMaterial::rubber") == 1) { _par_got_material(ImPhysicsMaterial_rubber()); return 1; }
+    if (_par_eq(fp, fl, "PhysicsMaterial::wood") == 1) { _par_got_material(ImPhysicsMaterial_wood()); return 1; }
+    if (_par_eq(fp, fl, "PhysicsMaterial::steel") == 1) { _par_got_material(ImPhysicsMaterial_steel()); return 1; }
+    if (_par_eq(fp, fl, "PhysicsMaterial::bouncy") == 1) { _par_got_material(ImPhysicsMaterial_bouncy()); return 1; }
+    if (_par_eq(fp, fl, "PhysicsMaterial::effective_static_friction") == 1) {
+        var m: ImPhysicsMaterial = _par_in_material(0);
+        var r: f64 = m.effective_static_friction();
+        _par_got_f(r);
+        return 1;
+    }
+    return 0;
+}
+
+fn _par_got_quantity(q: ImQuantity) {
+    var v: f64 = q.value;
+    _par_got_f(v);
+    _par_got_enum("PhysicsUnit.", physics_unit_name(q.unit));
+    return 0;
+}
+
+fn _par_units(fp, fl): i64 {
+    var v: f64 = _par_in(0);
+    if (_par_eq(fp, fl, "Quantity::new") == 1) {
+        var u = _par_in_enum(1, "PhysicsUnit.", &physics_unit_name, 14);
+        _par_got_quantity(ImQuantity_new(v, u));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "Quantity::meters") == 1) { _par_got_quantity(ImQuantity_meters(v)); return 1; }
+    if (_par_eq(fp, fl, "Quantity::kilograms") == 1) { _par_got_quantity(ImQuantity_kilograms(v)); return 1; }
+    if (_par_eq(fp, fl, "Quantity::seconds") == 1) { _par_got_quantity(ImQuantity_seconds(v)); return 1; }
+    if (_par_eq(fp, fl, "Quantity::newtons") == 1) { _par_got_quantity(ImQuantity_newtons(v)); return 1; }
+    if (_par_eq(fp, fl, "Quantity::joules") == 1) { _par_got_quantity(ImQuantity_joules(v)); return 1; }
+    if (_par_eq(fp, fl, "Quantity::radians") == 1) { _par_got_quantity(ImQuantity_radians(v)); return 1; }
+    if (_par_eq(fp, fl, "Quantity::degrees") == 1) { _par_got_quantity(ImQuantity_degrees(v)); return 1; }
+    if (_par_eq(fp, fl, "Quantity::meters_per_second") == 1) {
+        _par_got_quantity(ImQuantity_meters_per_second(v));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "Quantity::pascals") == 1) { _par_got_quantity(ImQuantity_pascals(v)); return 1; }
+    if (_par_eq(fp, fl, "Quantity::to_radians") == 1) {
+        var u2 = _par_in_enum(1, "PhysicsUnit.", &physics_unit_name, 14);
+        var q: ImQuantity = ImQuantity_new(v, u2);
+        var r: f64 = q.to_radians();
+        _par_got_f(r);
+        return 1;
+    }
+    # Quantity::fmt: pending until the stdlib has a shortest round-trip f64 printer (S2).
+    return 0;
+}
+
+# Appends a force or impulse: the vector, then `n:` or the point.
+fn _par_got_vector_point(v: ImVec3, has, p: ImVec3) {
+    var vx: f64 = v.x;
+    var vy: f64 = v.y;
+    var vz: f64 = v.z;
+    _par_got_f(vx);
+    _par_got_f(vy);
+    _par_got_f(vz);
+    if (has == 1) {
+        var px: f64 = p.x;
+        var py: f64 = p.y;
+        var pz: f64 = p.z;
+        _par_got_f(px);
+        _par_got_f(py);
+        _par_got_f(pz);
+    } else {
+        _par_got_none();
+    }
+    return 0;
+}
+
+fn _par_force(fp, fl): i64 {
+    var x: f64 = _par_in(0);
+    var y: f64 = _par_in(1);
+    if (_par_eq(fp, fl, "Torque::new") == 1) {
+        var t: ImTorque = ImTorque_new(x);
+        var tv: f64 = t.value;
+        _par_got_f(tv);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "Force::gravity") == 1) {
+        var g: ImForce = ImForce_gravity(x, y);
+        _par_got_vector_point(g.vector, g.has_point, g.point);
+        return 1;
+    }
+    var z: f64 = _par_in(2);
+    if (_par_eq(fp, fl, "Force::new") == 1) {
+        var f: ImForce = ImForce_new(x, y, z);
+        _par_got_vector_point(f.vector, f.has_point, f.point);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "Impulse::new") == 1) {
+        var i: ImImpulse = ImImpulse_new(x, y, z);
+        _par_got_vector_point(i.vector, i.has_point, i.point);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "Force::magnitude") == 1 || _par_eq(fp, fl, "Impulse::magnitude") == 1) {
+        # The point doesn't enter the magnitude; build the force from the vector alone.
+        var fm: ImForce = ImForce_new(x, y, z);
+        var r: f64 = fm.magnitude();
+        _par_got_f(r);
+        return 1;
+    }
+    var px: f64 = _par_in(3);
+    var py: f64 = _par_in(4);
+    var pz: f64 = _par_in(5);
+    if (_par_eq(fp, fl, "Force::at_point") == 1) {
+        var fa: ImForce = ImForce_at_point(x, y, z, px, py, pz);
+        _par_got_vector_point(fa.vector, fa.has_point, fa.point);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "Impulse::at_point") == 1) {
+        var ia: ImImpulse = ImImpulse_at_point(x, y, z, px, py, pz);
+        _par_got_vector_point(ia.vector, ia.has_point, ia.point);
+        return 1;
+    }
     return 0;
 }
 
 fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_got_n = 0;
+    _par_mapped = 0;
+    if (_par_eq(mp, ml, "config") == 1) { return _par_config(fp, fl); }
     if (_par_eq(mp, ml, "constants") == 1) { return _par_constants(fp, fl); }
+    if (_par_eq(mp, ml, "force") == 1) { return _par_force(fp, fl); }
+    if (_par_eq(mp, ml, "material") == 1) { return _par_material(fp, fl); }
     if (_par_eq(mp, ml, "math") == 1) { return _par_math(fp, fl); }
+    if (_par_eq(mp, ml, "units") == 1) { return _par_units(fp, fl); }
     return 0;
 }
 
@@ -261,6 +537,8 @@ fn _par_c_bound(fp, fl): i64 {
 # arrive with M4, the ADR 0008 mappings with their modules.
 #must_use
 fn _par_accepted(fp, fl, ip, il): i64 {
+    # ADR 0008 #6: a `validate` row the port refuses as XPBD (mapped by the config dispatcher).
+    if (_par_mapped == 8) { return 8; }
     # ADR 0009: ganita pow(-1, DBL_MAX) gives +inf instead of 1 (tanmatra ADR 0007, kimiya ADR 0004).
     if (_par_eq(fp, fl, "f64::powf") == 1 && _par_eq(ip, il, "f:bff0000000000000 f:7fefffffffffffff") == 1) {
         return 9;
@@ -268,14 +546,24 @@ fn _par_accepted(fp, fl, ip, il): i64 {
     return 0;
 }
 
-# 1 for an ADR whose accepted rows are counted but not printed row by row. None yet.
+# 1 for an ADR whose accepted rows are counted but not printed row by row: ADR 0008's XPBD mapping
+# (summarised by _par_module_done).
 #must_use
 fn _par_accepted_quiet(adr): i64 {
+    if (adr == 8) { return 1; }
     return 0;
 }
 
-# After the math module: the cross-target digests.
+# After the config module: the ADR 0008 #6 mapping summary. After the math module: the cross-target
+# digests.
 fn _par_module_done(mp, ml) {
+    if (_par_eq(mp, ml, "config") == 1) {
+        print("  ADR 0008 #6 XPBD: ", 20);
+        fmt_int(_par_map_xpbd);
+        print(" validate rows the oracle accepts and the port refuses", 54);
+        println(" (Err(Unsupported)), accepted (ADR 8)");
+        return 0;
+    }
     if (_par_eq(mp, ml, "math") != 1) { return 0; }
     _par_dg_print(0, "f64::sin_cos");
     _par_dg_print(1, "f64::sin");

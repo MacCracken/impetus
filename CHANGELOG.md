@@ -62,6 +62,20 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - Hot loops compute on `f64` locals; struct values work but cost 2.5×.
   - Both solvers' shock-propagation sorts rely on stability, so the port sorts on
     (level, index).
+- **Cyrius port, M1a** (port plan §6; `docs/development/port-parity.md` §5):
+  - `src/mathx.cyr`, Rust std semantics on the Cyrius builtins: NaN-ignoring min/max/clamp,
+    the predicates, to_radians, the literal powi, exp and atan2 on the polyfills, hypot and
+    sin_cos. It closes the 4,045 pending math rows.
+  - `src/error.cyr`, `vec.cyr`, `config.cyr`, `material.cyr`, `units.cyr` and `force.cyr`.
+    `validate` refuses XPBD, accepted by ADR 0008 #6 (92 mapped rows). `Quantity`'s Display
+    number waits for a stdlib shortest-printer (S2).
+  - Golden config, material, units and force rows; `validate.py` recomputes 5,230 of them.
+  - Result: **24,431 ok, 0 failed, 281 pending, 93 accepted**, every row 0 ulp, on x86_64
+    ELF, x86_64 PE and aarch64.
+  - 33 Rust tests ported, `[lib]` + `dist/impetus.cyr`, and `scripts/surface_parity.py`
+    (100/100).
+  - 6 benches against the Rust numbers (4.8–31×, `docs/benchmarks-rust-v-cyrius.md`).
+- S1 filed upstream: `cyrius/docs/development/issues/2026-11-09-no-scoped-allocator-for-alloc.md`.
 
 ### Removed
 - Committed fuzz build output (`fuzz/target/`, 208 files). It is now ignored under

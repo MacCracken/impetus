@@ -487,7 +487,8 @@ Each one gets an issue in the owning repo with the probe or benchmark that shows
 tanmatra filed its findings.
 
 **Cyrius stdlib (blocking)**
-- **S1. A scoped allocator for `alloc`.** `alloc` is a bump allocator with no free and no hook, so a
+- **S1. A scoped allocator for `alloc`** — **filed 2026-11-09**:
+  `cyrius/docs/development/issues/2026-11-09-no-scoped-allocator-for-alloc.md`, with a self-proving repro. `alloc` is a bump allocator with no free and no hook, so a
   library can't contain what the libraries it calls allocate. An allocation scope (`alloc_push(arena)` /
   `alloc_pop()`, or an allocator the global `alloc` dispatches through) lets impetus run each step's hisab
   calls in its step arena and reset it, with no change to hisab's 574 allocation sites. Measured cost of
@@ -519,6 +520,11 @@ tanmatra filed its findings.
 - (H9 is listed first, above.)
 
 **Cyrius stdlib / ganita / compiler**
+- **S2. Shortest round-trip f64 printing** (Rust's `Display`, JavaScript's `Number#toString`):
+  `fmt_float` prints a fixed number of decimals. `Quantity`'s `Display` needs the shortest digits that
+  round-trip, written positionally (Rust prints 2.2250738585072014e-308 as a 308-digit decimal). Its
+  280 golden rows are pending (`port-parity.md` §5). bayan's Grisu2 printer round-trips but is not
+  always shortest and uses exponents.
 - **Stdlib math:**
   - public `f64_is_nan` / `f64_is_finite`, `f64_copysign`, `f64_sin_cos`;
   - `F64_EPSILON` / `F64_INFINITY` / `F64_NAN` as typed constants;
@@ -571,7 +577,8 @@ tanmatra filed its findings.
 | Milestone | Status | Golden rows | Reference tests | Benches | Notes |
 |---|---|---|---|---|---|
 | M0 Initialize | ✅ done 2026-11-09 | constants 3 + math 18,919: **14,875 ok, 0 failed, 0 measured, 4,046 pending (M1 helpers), 1 accepted (ADR 0009)**, identical bits on x86_64 ELF, x86_64 PE and aarch64 | — | 1 probe bench | oracle hooks; scaffold and repairs; `cyrius.cyml` with hisab 3.4.1; generator, `validate.py`, `src/constants.cyr`, parity harness; exp and atan2 on the polyfills (cross-target bits), K = 2; ADRs 0008, 0009 and the 0007 amendment (hisab off the step path until S1/H9); six probes ([`port-parity.md`](port-parity.md) §4). Next: M1 |
-| M1 Foundation | ☐ | | | | |
+| M1a Foundation: math helpers, error, config, material, units, force | ✅ done 2026-11-09 | config 293 + material 2,046 + units 2,236 + force 1,308 + math (0 pending now): **24,431 ok, 0 failed, 281 pending (S2 280, M6 1), 93 accepted** on x86_64 ELF, x86_64 PE and aarch64; every row 0 ulp | 33 of 44 Rust tests ported (2 partial: the Display symbols), 11 serde n/a; 97 assertions | 6 (4.8–31× Rust; [benchmarks](../benchmarks-rust-v-cyrius.md)) | `src/error.cyr`, `mathx.cyr`, `vec.cyr`, `config.cyr`, `material.cyr`, `units.cyr`, `force.cyr`; `[lib]` + `dist/impetus.cyr`; `tests/lib_2d.cyr`; surface parity 100/100 (`scripts/surface_parity.py`); ADR 0008 #6 mapped |
+| M1b Foundation: types, arena, contact tracker, spring | ☐ | | | | body, collider, joint, event, query descriptors; the generational arena; the contact tracker; the exact spring |
 | M2 2D collision | ☐ | | | | |
 | M3 2D dynamics | ☐ | | | | |
 | M4 3D collision | ☐ | | | | |

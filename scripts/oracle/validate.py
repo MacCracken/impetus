@@ -265,6 +265,90 @@ def check_math(rows):
     return counted, pairs
 
 
+# ── M1a: config, material, units, force ─────────────────────────────────────────────
+
+
+def tok_any(t):
+    if t.startswith("f:"):
+        return tok_f(t)
+    if t.startswith("i:"):
+        return tok_i(t)
+    if t == "n:":
+        return None
+    return t
+
+
+def rust_validate(c):
+    """WorldConfig::validate's verdict for the 16 config tokens, in Rust's order."""
+    ts, gx, gy, gz, vi, pi_, _det, _step, slop, corr, mv, sub, fq, dr = c[:14]
+    fin = math.isfinite
+    if not (fin(ts) and ts > 0.0):
+        return "E:InvalidConfig"
+    if not all(fin(g) for g in (gx, gy, gz)):
+        return "E:InvalidConfig"
+    if sub > 4096 or vi > 10_000 or pi_ > 10_000:
+        return "E:InvalidConfig"
+    if not (fin(slop) and slop >= 0.0):
+        return "E:InvalidConfig"
+    if not (0.0 <= corr <= 1.0):
+        return "E:InvalidConfig"
+    if math.isnan(mv) or mv <= 0.0:
+        return "E:InvalidConfig"
+    if not (fin(fq) and fq >= 0.0) or not (fin(dr) and dr >= 0.0):
+        return "E:InvalidConfig"
+    return None
+
+
+def combine(rule, a, b):
+    return {
+        "e:CombineRule.Average": lambda: (a + b) * 0.5,
+        "e:CombineRule.Min": lambda: rust_min(a, b),
+        "e:CombineRule.Max": lambda: rust_max(a, b),
+        "e:CombineRule.Multiply": lambda: a * b,
+    }[rule]()
+
+
+def check_m1a(name, rows):
+    """Recomputes every row of the M1a modules that Python can. Returns the count."""
+    counted = 0
+    for fn, cls, ins, outs, note in rows:
+        v = [tok_any(t) for t in ins]
+        want = outs
+        if fn == "WorldConfig::validate":
+            verdict = rust_validate(v)
+            if (verdict is None and want) or (verdict is not None and want != [verdict]):
+                fail(f"{name}: {note}: Python says {verdict or 'Ok'}")
+            counted += 1
+        elif fn == "CombineRule::combine":
+            got = combine(ins[0], v[1], v[2])
+            if not same(got, tok_f(want[0])):
+                fail(f"{name}: {note}: Python says {got!r}")
+            counted += 1
+        elif fn == "PhysicsMaterial::effective_static_friction":
+            got = v[3] if v[3] is not None else v[0] * 1.5
+            if not same(got, tok_f(want[0])):
+                fail(f"{name}: {note}: Python says {got!r}")
+            counted += 1
+        elif fn == "Quantity::to_radians":
+            got = v[0] * math.pi / 180.0 if ins[1] == "e:PhysicsUnit.Degrees" else v[0]
+            if not same(got, tok_f(want[0])):
+                fail(f"{name}: {note}: Python says {got!r}")
+            counted += 1
+        elif fn in ("Force::magnitude", "Impulse::magnitude"):
+            x, y, z = v[0], v[1], v[2]
+            got = rust_sqrt(x * x + y * y + z * z)
+            if not same(got, tok_f(want[0])):
+                fail(f"{name}: {note}: Python says {got!r}")
+            counted += 1
+        elif fn == "Force::gravity":
+            m, g = v
+            got = [0.0, (-m) * g, 0.0]
+            if not all(same(a, tok_f(b)) for a, b in zip(got, want[:3])) or want[3] != "n:":
+                fail(f"{name}: {note}: Python says {got!r}")
+            counted += 1
+    return counted
+
+
 def main():
     root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
     golden = root / "tests/golden"
@@ -281,6 +365,8 @@ def main():
         if name == "constants":
             check_constants(root, rows)
             print(f"constants: {len(rows)} rows checked against rust-old/src")
+        elif name in ("config", "material", "units", "force"):
+            print(f"{name}: {check_m1a(name, rows)} rows recomputed")
         elif name == "math":
             counted, pairs = check_math(rows)
             print(

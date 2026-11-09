@@ -1,0 +1,131 @@
+# units.cyr — unit-tagged quantities (port of rust-old/src/units.rs).
+#
+# A value plus a unit tag; no unit arithmetic or conversion beyond degrees → radians.
+# `ImPhysicsUnit` keeps the Rust variant order. Rust's `Display` prints the value in its shortest
+# round-trip decimal form, which the Cyrius stdlib has no printer for yet (port plan §8, S2): the
+# unit symbols are ported (`physics_unit_symbol`), and the formatted quantity waits for S2. Its
+# golden rows are pending until then.
+
+enum ImPhysicsUnit {
+    IM_UNIT_METERS = 0;
+    IM_UNIT_KILOGRAMS = 1;
+    IM_UNIT_SECONDS = 2;
+    IM_UNIT_METERS_PER_SECOND = 3;
+    IM_UNIT_METERS_PER_SECOND_SQUARED = 4;
+    IM_UNIT_NEWTONS = 5;
+    IM_UNIT_NEWTON_METERS = 6;
+    IM_UNIT_JOULES = 7;
+    IM_UNIT_RADIANS = 8;
+    IM_UNIT_DEGREES = 9;
+    IM_UNIT_RADIANS_PER_SECOND = 10;
+    IM_UNIT_KG_PER_CUBIC_METER = 11;
+    IM_UNIT_KG_PER_SQUARE_METER = 12;
+    IM_UNIT_PASCALS = 13;
+}
+
+struct ImQuantity { value: f64; unit; }
+
+# π as Rust's `consts::PI`: the double nearest.
+var _IM_PI: f64 = 3.141592653589793;
+
+# The Rust variant name of a unit (`"MetersPerSecond"`), or "Unknown".
+#must_use
+fn physics_unit_name(u): i64 {
+    if (u == IM_UNIT_METERS) { return "Meters"; }
+    if (u == IM_UNIT_KILOGRAMS) { return "Kilograms"; }
+    if (u == IM_UNIT_SECONDS) { return "Seconds"; }
+    if (u == IM_UNIT_METERS_PER_SECOND) { return "MetersPerSecond"; }
+    if (u == IM_UNIT_METERS_PER_SECOND_SQUARED) { return "MetersPerSecondSquared"; }
+    if (u == IM_UNIT_NEWTONS) { return "Newtons"; }
+    if (u == IM_UNIT_NEWTON_METERS) { return "NewtonMeters"; }
+    if (u == IM_UNIT_JOULES) { return "Joules"; }
+    if (u == IM_UNIT_RADIANS) { return "Radians"; }
+    if (u == IM_UNIT_DEGREES) { return "Degrees"; }
+    if (u == IM_UNIT_RADIANS_PER_SECOND) { return "RadiansPerSecond"; }
+    if (u == IM_UNIT_KG_PER_CUBIC_METER) { return "KgPerCubicMeter"; }
+    if (u == IM_UNIT_KG_PER_SQUARE_METER) { return "KgPerSquareMeter"; }
+    if (u == IM_UNIT_PASCALS) { return "Pascals"; }
+    return "Unknown";
+}
+
+# The unit's symbol as Rust's `Display` writes it (UTF-8: "m/s²", "N·m", "°"), or "" for a value
+# that is no unit.
+#must_use
+fn physics_unit_symbol(u): i64 {
+    if (u == IM_UNIT_METERS) { return "m"; }
+    if (u == IM_UNIT_KILOGRAMS) { return "kg"; }
+    if (u == IM_UNIT_SECONDS) { return "s"; }
+    if (u == IM_UNIT_METERS_PER_SECOND) { return "m/s"; }
+    if (u == IM_UNIT_METERS_PER_SECOND_SQUARED) { return "m/s²"; }
+    if (u == IM_UNIT_NEWTONS) { return "N"; }
+    if (u == IM_UNIT_NEWTON_METERS) { return "N·m"; }
+    if (u == IM_UNIT_JOULES) { return "J"; }
+    if (u == IM_UNIT_RADIANS) { return "rad"; }
+    if (u == IM_UNIT_DEGREES) { return "°"; }
+    if (u == IM_UNIT_RADIANS_PER_SECOND) { return "rad/s"; }
+    if (u == IM_UNIT_KG_PER_CUBIC_METER) { return "kg/m³"; }
+    if (u == IM_UNIT_KG_PER_SQUARE_METER) { return "kg/m²"; }
+    if (u == IM_UNIT_PASCALS) { return "Pa"; }
+    return "";
+}
+
+# A quantity with the given value and unit. Mirrors `Quantity::new`.
+#must_use
+fn ImQuantity_new(value: f64, unit): ImQuantity {
+    var q: ImQuantity;
+    q.value = value;
+    q.unit = unit;
+    return q;
+}
+
+# A distance in meters. Mirrors `Quantity::meters`.
+#must_use
+fn ImQuantity_meters(value: f64): ImQuantity { return ImQuantity_new(value, IM_UNIT_METERS); }
+
+# A mass in kilograms. Mirrors `Quantity::kilograms`.
+#must_use
+fn ImQuantity_kilograms(value: f64): ImQuantity { return ImQuantity_new(value, IM_UNIT_KILOGRAMS); }
+
+# A time in seconds. Mirrors `Quantity::seconds`.
+#must_use
+fn ImQuantity_seconds(value: f64): ImQuantity { return ImQuantity_new(value, IM_UNIT_SECONDS); }
+
+# A force in newtons. Mirrors `Quantity::newtons`.
+#must_use
+fn ImQuantity_newtons(value: f64): ImQuantity { return ImQuantity_new(value, IM_UNIT_NEWTONS); }
+
+# An energy in joules. Mirrors `Quantity::joules`.
+#must_use
+fn ImQuantity_joules(value: f64): ImQuantity { return ImQuantity_new(value, IM_UNIT_JOULES); }
+
+# An angle in radians. Mirrors `Quantity::radians`.
+#must_use
+fn ImQuantity_radians(value: f64): ImQuantity { return ImQuantity_new(value, IM_UNIT_RADIANS); }
+
+# An angle in degrees. Mirrors `Quantity::degrees`.
+#must_use
+fn ImQuantity_degrees(value: f64): ImQuantity { return ImQuantity_new(value, IM_UNIT_DEGREES); }
+
+# A velocity in meters per second. Mirrors `Quantity::meters_per_second`.
+#must_use
+fn ImQuantity_meters_per_second(value: f64): ImQuantity {
+    return ImQuantity_new(value, IM_UNIT_METERS_PER_SECOND);
+}
+
+# A pressure in pascals. Mirrors `Quantity::pascals`.
+#must_use
+fn ImQuantity_pascals(value: f64): ImQuantity { return ImQuantity_new(value, IM_UNIT_PASCALS); }
+
+impl ImQuantity {
+    # The value in radians for an angle (degrees converted as Rust writes it, (value·π) / 180);
+    # any other quantity's raw value. Mirrors `Quantity::to_radians`.
+    #must_use
+    fn to_radians(self): f64 {
+        if (self.unit == IM_UNIT_DEGREES) {
+            var r: f64 = self.value * _IM_PI / 180.0;
+            return r;
+        }
+        var v: f64 = self.value;
+        return v;
+    }
+}

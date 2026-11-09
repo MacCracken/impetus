@@ -1,0 +1,69 @@
+# units.tcyr — the ported Rust tests of rust-old/src/units.rs (M1a).
+#
+# quantity_display and quantity_display_all_units are ported for the unit symbols only: the numeric
+# part of Rust's Display waits for a shortest round-trip printer (port plan §8, S2).
+# Not carried over: quantity_serde (serde).
+
+include "tests/ulp.cyr"
+include "tests/lib_2d.cyr"
+
+# 1 when |got − want| < 1e-10.
+fn close(got: f64, want: f64): i64 {
+    var d: f64 = f64_abs(got - want);
+    if (d < 0.0000000001) { return 1; }
+    return 0;
+}
+
+# Runs the ported units tests.
+fn main() {
+    alloc_init();
+    test_group("quantity_display (symbols)");
+    assert(streq(physics_unit_symbol(IM_UNIT_NEWTONS), "N") == 1, "N");
+    assert(streq(physics_unit_symbol(IM_UNIT_METERS), "m") == 1, "m");
+    assert(streq(physics_unit_symbol(IM_UNIT_DEGREES), "°") == 1, "degree sign");
+
+    test_group("quantity_display_all_units (symbols)");
+    assert(streq(physics_unit_symbol(IM_UNIT_KILOGRAMS), "kg") == 1, "kg");
+    assert(streq(physics_unit_symbol(IM_UNIT_SECONDS), "s") == 1, "s");
+    assert(streq(physics_unit_symbol(IM_UNIT_METERS_PER_SECOND), "m/s") == 1, "m/s");
+    assert(streq(physics_unit_symbol(IM_UNIT_METERS_PER_SECOND_SQUARED), "m/s²") == 1, "m/s²");
+    assert(streq(physics_unit_symbol(IM_UNIT_NEWTON_METERS), "N·m") == 1, "N·m");
+    assert(streq(physics_unit_symbol(IM_UNIT_JOULES), "J") == 1, "J");
+    assert(streq(physics_unit_symbol(IM_UNIT_RADIANS), "rad") == 1, "rad");
+    assert(streq(physics_unit_symbol(IM_UNIT_RADIANS_PER_SECOND), "rad/s") == 1, "rad/s");
+    assert(streq(physics_unit_symbol(IM_UNIT_KG_PER_CUBIC_METER), "kg/m³") == 1, "kg/m³");
+    assert(streq(physics_unit_symbol(IM_UNIT_KG_PER_SQUARE_METER), "kg/m²") == 1, "kg/m²");
+    assert(streq(physics_unit_symbol(IM_UNIT_PASCALS), "Pa") == 1, "Pa");
+
+    test_group("degrees_to_radians");
+    var q: ImQuantity = ImQuantity_degrees(180.0);
+    assert(close(q.to_radians(), 3.141592653589793) == 1, "180 degrees is pi");
+
+    test_group("degrees_to_radians_90");
+    var q90: ImQuantity = ImQuantity_degrees(90.0);
+    assert(close(q90.to_radians(), 1.5707963267948966) == 1, "90 degrees is pi/2");
+
+    test_group("degrees_to_radians_zero");
+    var q0: ImQuantity = ImQuantity_degrees(0.0);
+    var r0: f64 = q0.to_radians();
+    assert(r0 == 0.0, "0 degrees is 0");
+
+    test_group("radians_passthrough");
+    var qr: ImQuantity = ImQuantity_radians(1.0);
+    var rr: f64 = qr.to_radians();
+    assert(rr == 1.0, "radians unchanged");
+
+    test_group("non_angle_to_radians_passthrough");
+    var qm: ImQuantity = ImQuantity_meters(5.0);
+    var rm: f64 = qm.to_radians();
+    assert(rm == 5.0, "meters unchanged");
+
+    test_group("physics_unit_equality");
+    assert(IM_UNIT_METERS == IM_UNIT_METERS, "meters == meters");
+    assert(IM_UNIT_METERS != IM_UNIT_SECONDS, "meters != seconds");
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

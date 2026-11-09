@@ -37,7 +37,7 @@ impl Class {
 }
 
 /// One typed value.
-#[allow(dead_code)] // E, None, Err and V arrive with the first modules that return them (M1)
+#[allow(dead_code)] // V arrives with the first module that returns a sequence (M1b)
 #[derive(Clone, Debug)]
 pub enum Tok {
     /// `f:<16 hex digits>` — the IEEE-754 bit pattern, lowercase.
@@ -64,7 +64,6 @@ pub fn i(x: impl Into<i64>) -> Tok {
     Tok::I(x.into())
 }
 
-#[allow(dead_code)] // first used by M1's predicates
 pub fn b(x: bool) -> Tok {
     Tok::I(i64::from(x))
 }
@@ -74,14 +73,12 @@ pub fn s(x: impl Into<String>) -> Tok {
 }
 
 /// `e:<Enum>.<Variant>`, the variant named by its `Debug` text.
-#[allow(dead_code)] // first used by M1's enums
 pub fn e(name: &'static str, v: impl std::fmt::Debug) -> Tok {
     Tok::E(name, format!("{v:?}"))
 }
 
 /// `E:<Variant>` for an `ImpetusError`: its `Debug` text up to the payload, so
 /// `InvalidConfig("sub_steps must be ≥ 1")` is `E:InvalidConfig`.
-#[allow(dead_code)] // first used by M1's config validation
 pub fn err(x: &impetus::ImpetusError) -> Tok {
     let text = format!("{x:?}");
     Tok::Err(
@@ -164,7 +161,7 @@ impl Module {
     /// As [`Module::row`], with `extra` appended to the note in brackets: how the expected value
     /// was obtained (an ADR 0008 mapping, say). For review and `validate.py` only; the harness
     /// ignores the note.
-    #[allow(dead_code)] // first used by the ADR 0008 mapped rows (M1)
+    #[allow(dead_code)] // first used by a row whose expected value is derived (an ADR mapping)
     pub fn row_noted(&mut self, func: &str, class: Class, ins: &[Tok], outs: &[Tok], extra: &str) {
         let note = format!(
             "{func}({}) -> {} [{extra}]",

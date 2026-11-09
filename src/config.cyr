@@ -1,0 +1,128 @@
+# config.cyr — world configuration (port of rust-old/src/config.rs).
+#
+# `ImWorldConfig` holds the Rust `WorldConfig` fields in declaration order. Rust's `u32` counts and
+# `u64` step are i64 words here; a value no `u32` could hold is refused by `validate` (as kimiya
+# refuses out-of-type inputs). `validate` checks the fields in Rust's order and returns the same
+# verdict for every config Rust can hold, with two Cyrius-only refusals after them (ADR 0008):
+# `IM_SOLVER_XPBD` (#6, Err(IM_ERR_UNSUPPORTED)) and an enum value that is no variant
+# (Err(IM_ERR_INVALID_CONFIG)).
+
+enum ImBroadphaseKind {
+    IM_BROADPHASE_SPATIAL_HASH = 0;
+    IM_BROADPHASE_AABB_TREE = 1;
+}
+
+enum ImSolverKind {
+    IM_SOLVER_SEQUENTIAL_IMPULSE = 0;
+    IM_SOLVER_XPBD = 1;
+}
+
+struct ImWorldConfig {
+    timestep: f64;
+    gravity: ImVec3;
+    velocity_iterations;
+    position_iterations;
+    deterministic;
+    step;
+    position_slop: f64;
+    position_correction: f64;
+    max_velocity: f64;
+    sub_steps;
+    constraint_frequency: f64;
+    constraint_damping_ratio: f64;
+    broadphase;
+    solver;
+}
+
+# The Rust variant name of a broadphase kind (`"SpatialHash"`), or "Unknown".
+#must_use
+fn broadphase_kind_name(k): i64 {
+    if (k == IM_BROADPHASE_SPATIAL_HASH) { return "SpatialHash"; }
+    if (k == IM_BROADPHASE_AABB_TREE) { return "AabbTree"; }
+    return "Unknown";
+}
+
+# The Rust variant name of a solver kind (`"SequentialImpulse"`), or "Unknown".
+#must_use
+fn solver_kind_name(k): i64 {
+    if (k == IM_SOLVER_SEQUENTIAL_IMPULSE) { return "SequentialImpulse"; }
+    if (k == IM_SOLVER_XPBD) { return "Xpbd"; }
+    return "Unknown";
+}
+
+# The default configuration: 1/60 s, gravity (0, −9.81, 0), 4 velocity and 1 position iteration,
+# slop 0.01, correction 0.2, max velocity 100, 1 sub-step, 30 Hz critically damped soft
+# constraints, the spatial hash and the sequential-impulse solver. Mirrors `WorldConfig::default`.
+#must_use
+fn ImWorldConfig_default(): ImWorldConfig {
+    var c: ImWorldConfig;
+    c.timestep = 1.0 / 60.0;
+    c.gravity = ImVec3_new(0.0, -9.81, 0.0);
+    c.velocity_iterations = 4;
+    c.position_iterations = 1;
+    c.deterministic = 1;
+    c.step = 0;
+    c.position_slop = 0.01;
+    c.position_correction = 0.2;
+    c.max_velocity = 100.0;
+    c.sub_steps = 1;
+    c.constraint_frequency = 30.0;
+    c.constraint_damping_ratio = 1.0;
+    c.broadphase = IM_BROADPHASE_SPATIAL_HASH;
+    c.solver = IM_SOLVER_SEQUENTIAL_IMPULSE;
+    return c;
+}
+
+# 1 when n is a count a Rust `u32` could hold and at most `max`.
+#must_use
+fn _im_count_ok(n, max): i64 {
+    if (n < 0 || n > max) { return 0; }
+    return 1;
+}
+
+# 1 when x is finite and at least 0.
+#must_use
+fn _im_finite_non_negative(x: f64): i64 {
+    if (_im_is_finite(x) == 0) { return 0; }
+    if (x >= 0.0) { return 1; }
+    return 0;
+}
+
+impl ImWorldConfig {
+    # Ok(0) when every setting is usable; else Err(IM_ERR_INVALID_CONFIG) for the first offending
+    # field in Rust's order: a finite positive timestep, finite gravity, sub_steps ≤
+    # IM_MAX_SUB_STEPS, iteration counts ≤ IM_MAX_ITERATIONS, finite slop ≥ 0, correction in
+    # [0, 1], max_velocity > 0 (∞ disables the clamp), finite frequency and damping ratio ≥ 0.
+    # Then the Cyrius-only checks: Err(IM_ERR_UNSUPPORTED) for the XPBD solver (ADR 0008 #6), and
+    # Err(IM_ERR_INVALID_CONFIG) for a broadphase or solver value that is no variant.
+    # Mirrors `WorldConfig::validate`.
+    #must_use
+    fn validate(self): Result {
+        var ts: f64 = self.timestep;
+        if (_im_is_finite(ts) == 0) { return Err(IM_ERR_INVALID_CONFIG); }
+        if (ts <= 0.0) { return Err(IM_ERR_INVALID_CONFIG); }
+        var gx: f64 = self.gravity.x;
+        var gy: f64 = self.gravity.y;
+        var gz: f64 = self.gravity.z;
+        if (_im_is_finite(gx) == 0 || _im_is_finite(gy) == 0 || _im_is_finite(gz) == 0) {
+            return Err(IM_ERR_INVALID_CONFIG);
+        }
+        if (_im_count_ok(self.sub_steps, IM_MAX_SUB_STEPS) == 0) { return Err(IM_ERR_INVALID_CONFIG); }
+        if (_im_count_ok(self.velocity_iterations, IM_MAX_ITERATIONS) == 0) { return Err(IM_ERR_INVALID_CONFIG); }
+        if (_im_count_ok(self.position_iterations, IM_MAX_ITERATIONS) == 0) { return Err(IM_ERR_INVALID_CONFIG); }
+        if (_im_finite_non_negative(self.position_slop) == 0) { return Err(IM_ERR_INVALID_CONFIG); }
+        # `(0.0..=1.0).contains(&x)`: false for NaN.
+        var corr: f64 = self.position_correction;
+        if (corr >= 0.0 && corr <= 1.0) {} else { return Err(IM_ERR_INVALID_CONFIG); }
+        var mv: f64 = self.max_velocity;
+        if (_im_is_nan(mv) == 1 || mv <= 0.0) { return Err(IM_ERR_INVALID_CONFIG); }
+        if (_im_finite_non_negative(self.constraint_frequency) == 0) { return Err(IM_ERR_INVALID_CONFIG); }
+        if (_im_finite_non_negative(self.constraint_damping_ratio) == 0) { return Err(IM_ERR_INVALID_CONFIG); }
+        if (self.broadphase != IM_BROADPHASE_SPATIAL_HASH && self.broadphase != IM_BROADPHASE_AABB_TREE) {
+            return Err(IM_ERR_INVALID_CONFIG);
+        }
+        if (self.solver == IM_SOLVER_XPBD) { return Err(IM_ERR_UNSUPPORTED); }
+        if (self.solver != IM_SOLVER_SEQUENTIAL_IMPULSE) { return Err(IM_ERR_INVALID_CONFIG); }
+        return Ok(0);
+    }
+}

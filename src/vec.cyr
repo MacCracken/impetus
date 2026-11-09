@@ -1,0 +1,38 @@
+# vec.cyr — impetus's value vectors.
+#
+# The Rust crate passes `[f64; 2]` and `[f64; 3]` arrays at its API; the port passes these structs
+# by value (16 bytes in two registers, 24 through the hidden return pointer). Hot loops read the
+# components into f64 locals instead (port-parity.md §4.2). Operations arrive with the modules that
+# use them.
+
+struct ImVec2 { x: f64; y: f64; }
+struct ImVec3 { x: f64; y: f64; z: f64; }
+
+# (x, y) as a value.
+#must_use
+fn ImVec2_new(x: f64, y: f64): ImVec2 {
+    var v: ImVec2;
+    v.x = x;
+    v.y = y;
+    return v;
+}
+
+# (x, y, z) as a value.
+#must_use
+fn ImVec3_new(x: f64, y: f64, z: f64): ImVec3 {
+    var v: ImVec3;
+    v.x = x;
+    v.y = y;
+    v.z = z;
+    return v;
+}
+
+# (0, 0, 0).
+#must_use
+fn ImVec3_zero(): ImVec3 {
+    var v: ImVec3;
+    v.x = 0.0;
+    v.y = 0.0;
+    v.z = 0.0;
+    return v;
+}

@@ -1,0 +1,32 @@
+# error.tcyr — the ported Rust tests of rust-old/src/error.rs (M1a).
+#
+# The Rust messages carry their payload (`body not found: handle-42`); the port's codes carry none
+# (src/error.cyr), so error_display checks the fixed text and the variant name.
+
+include "tests/ulp.cyr"
+include "tests/lib_2d.cyr"
+
+# Runs the ported error tests.
+fn main() {
+    alloc_init();
+    test_group("error_display");
+    assert(streq(im_error_message(IM_ERR_BODY_NOT_FOUND), "body not found") == 1, "message without payload");
+    assert(streq(im_error_name(IM_ERR_BODY_NOT_FOUND), "BodyNotFound") == 1, "variant name");
+
+    test_group("error_variants");
+    for (var c = IM_ERR_BODY_NOT_FOUND; c <= IM_ERR_PHYSICS; c = c + 1) {
+        assert(strlen(im_error_message(c)) > 0, "every variant has a message");
+        assert(streq(im_error_name(c), "Unknown") == 0, "every variant has a name");
+    }
+    assert(streq(im_error_name(IM_ERR_UNSUPPORTED), "Unsupported") == 1, "the Cyrius-only code");
+    assert(streq(im_error_name(99), "Unknown") == 1, "a value that is no code");
+
+    test_group("error_equality");
+    assert(IM_ERR_PHYSICS == IM_ERR_PHYSICS, "a code equals itself");
+    assert(IM_ERR_PHYSICS != IM_ERR_BODY_NOT_FOUND, "two variants differ");
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

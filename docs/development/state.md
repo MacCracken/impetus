@@ -17,7 +17,8 @@ Plan of record: [`impetus-port-plan.md`](impetus-port-plan.md).
 | Milestone | Status |
 |---|---|
 | M0 Initialize | ✅ **done 2026-11-09.** Steps 0–3: oracle hooks; `cyrius port` scaffold and repairs; ADRs renumbered, ADR 0008; `cyrius.cyml` with hisab 3.4.1. Steps 4–7: math probed; `scripts/oracle/` writes `tests/golden/` (constants 3 + math 18,919), deterministic, glibc-pinned, validated; `src/constants.cyr`; `tests/parity_2d.tcyr`. Step 8 ([`port-parity.md`](port-parity.md) §2): **14,875 ok, 0 failed, 0 measured, 4,046 pending, 1 accepted (ADR 0009)** with identical output bits on x86_64 ELF, x86_64 PE and aarch64; exp and atan2 on the polyfills; K = 2. Step 9 (§4): hisab leaks on the step path (ADR 0007 amendment: hisab off it until S1/H9); freelist and the step arena flat; hot loops on `f64` locals; stride arrays and struct values work; the stable-sort trap; per-profile test includes |
-| M1 Foundation | ☐ |
+| M1a Foundation | ✅ **done 2026-11-09.** `src/mathx.cyr` (the `_im_` helpers: Rust-semantics min/max/clamp, the predicates, to_radians, the literal powi, exp and atan2 on the polyfills, hypot, sin_cos) closes the 4,045 pending math rows; `src/error.cyr`, `vec.cyr`, `config.cyr` (`validate`, with ADR 0008 #6), `material.cyr`, `units.cyr` (Display's number waits for S2), `force.cyr`; golden config 293 + material 2,046 + units 2,236 + force 1,308; **24,431 ok, 0 failed, 281 pending, 93 accepted**, every row 0 ulp, on x86_64 ELF, x86_64 PE and aarch64; 33 Rust tests ported; `[lib]` + `dist/impetus.cyr`; surface parity 100/100; 6 benches |
+| M1b Foundation | ☐ next: body, collider, joint, event, query descriptors; arena; contact tracker; spring |
 | M2 2D collision | ☐ |
 | M3 2D dynamics | ☐ |
 | M4 3D collision | ☐ |
@@ -45,12 +46,17 @@ Plan of record: [`impetus-port-plan.md`](impetus-port-plan.md).
 
 ## Tests
 
-- `tests/parity_2d.tcyr` (+ `tests/parity_core.cyr`, `tests/ulp.cyr`): the golden-corpus harness for the shared
-  and 2D modules — 2 modules (constants, math), **14,875 ok, 0 failed, 0 measured, 4,046 pending (M1's `_im_`
-  math helpers), 1 accepted (ADR 0009)** on x86_64 ELF, x86_64 PE and aarch64, with identical output digests
-  on all three. Class C K = 2 ulp against glibc (max 1; hypot 2 on 3 rows).
+- `tests/parity_2d.tcyr` (+ `tests/parity_core.cyr`, `tests/ulp.cyr`, `tests/lib_2d.cyr`): the golden-corpus
+  harness for the shared and 2D modules — 6 modules (config, constants, force, material, math, units),
+  **24,431 ok, 0 failed, 0 measured, 281 pending (S2's 280 Display rows, the M6 constant), 93 accepted (ADR
+  0008 #6 92, ADR 0009 1)** on x86_64 ELF, x86_64 PE and aarch64, with identical math digests on all three.
+- `tests/error.tcyr`, `config.tcyr`, `material.tcyr`, `units.tcyr`, `force.tcyr`: 33 ported Rust tests and
+  the Cyrius-only groups, 97 assertions. 11 serde tests are not carried over.
+- `tests/impetus.bcyr`: 6 benches, recorded in `docs/benchmarks-rust-v-cyrius.md`.
+- `scripts/surface_parity.py`: 100 items ok across the five M1a modules.
 - `scripts/probes/`: `p1_memory.cyr`, `p2_vectors.bcyr` (M0 step 9, `port-parity.md` §4).
-- `tests/golden/`: `constants.tsv` (3), `math.tsv` (18,919), `modules.txt`.
+- `tests/golden/`: `config.tsv` (293), `constants.tsv` (3), `force.tsv` (1,308), `material.tsv` (2,046),
+  `math.tsv` (18,919), `units.tsv` (2,236), `modules.txt`; 3.5 MB.
 - `tests/impetus.tcyr`, `.bcyr`, `.fcyr`: scaffold stubs.
 
 ## Dependencies
@@ -68,4 +74,4 @@ dependency; the bridge partners dravya, sharira and ushma have no local repo.
 
 ## Next
 
-M1 Foundation (port plan §6): error, config, material, units, types, arena, contact_tracker, spring, and `src/mathx.cyr` (the `_im_` helpers that close the 4,045 pending math rows, `_im_atan2`).
+M1b (port plan §6): the body, collider, joint, event and query descriptors (payload enums as a kind plus a struct), the generational arena on a typed stride buffer, the contact tracker on sorted arrays, and the exact spring.

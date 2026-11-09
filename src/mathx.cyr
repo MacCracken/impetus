@@ -1,0 +1,136 @@
+# mathx.cyr — impetus's math helpers: Rust std semantics on top of the Cyrius builtins.
+#
+# Port plan §7.1; port-parity.md §1–§2. Each helper mirrors one std f64 method as rustc 1.99.1
+# compiles it, and is pinned by tests/golden/math.tsv:
+# - min / max / clamp ignore a NaN operand as Rust does (the stdlib f64_min / f64_max return the
+#   second operand when the first is NaN, and NaN when the second is);
+# - the predicates have no public stdlib counterpart;
+# - to_radians and the literal-exponent powi are Rust's exact operation order;
+# - exp and atan2 are the polyfill forms, the same bits on every target (the native f64_exp and
+#   f64_atan are x87 on x86_64); hypot is ganita's; sin_cos is the builtin pair.
+# Class-C results are within K = 2 ulp of glibc on every target (port-parity.md §2).
+
+# π/180 as Rust folds `consts::PI / 180.0`: the double nearest, pinned by the to_radians rows.
+var _IM_RADS_PER_DEG: f64 = 0.017453292519943295;
+
+# The bits of an f64 as an integer word: an untyped parameter, an i64 return.
+#must_use
+fn _im_bits(x): i64 {
+    return x;
+}
+
+# 1 when x is NaN. Mirrors `f64::is_nan`.
+#must_use
+fn _im_is_nan(x: f64): i64 {
+    if (x != x) { return 1; }
+    return 0;
+}
+
+# 1 when x is neither infinite nor NaN (x − x is 0 only then). Mirrors `f64::is_finite`.
+#must_use
+fn _im_is_finite(x: f64): i64 {
+    var d: f64 = x - x;
+    if (d == 0.0) { return 1; }
+    return 0;
+}
+
+# The smaller of x and y, ignoring a NaN operand (NaN only when both are). Equal operands, +0 and
+# −0 included, give y, as rustc 1.99.1's `x.min(y)` does (minsd). Mirrors `f64::min`.
+#must_use
+fn _im_min(x: f64, y: f64): f64 {
+    if (x != x) { return y; }
+    if (y != y) { return x; }
+    if (x < y) { return x; }
+    return y;
+}
+
+# The larger of x and y, ignoring a NaN operand (NaN only when both are). Equal operands give y
+# (maxsd). Mirrors `f64::max`.
+#must_use
+fn _im_max(x: f64, y: f64): f64 {
+    if (x != x) { return y; }
+    if (y != y) { return x; }
+    if (x > y) { return x; }
+    return y;
+}
+
+# x restricted to [lo, hi]: lo when x < lo, hi when x > hi, else x (a NaN x stays NaN). Rust
+# panics on lo > hi or a NaN bound; every caller passes valid bounds. Mirrors `f64::clamp`.
+#must_use
+fn _im_clamp(x: f64, lo: f64, hi: f64): f64 {
+    var r: f64 = x;
+    if (r < lo) { r = lo; }
+    if (r > hi) { r = hi; }
+    return r;
+}
+
+# Degrees to radians: one multiply by the folded π/180. Mirrors `f64::to_radians`.
+#must_use
+fn _im_to_radians(x: f64): f64 {
+    var r: f64 = x * _IM_RADS_PER_DEG;
+    return r;
+}
+
+# x², as LLVM expands a literal `x.powi(2)`.
+#must_use
+fn _im_powi2(x: f64): f64 {
+    var r: f64 = x * x;
+    return r;
+}
+
+# x³, as LLVM expands a literal `x.powi(3)`: (x·x)·x.
+#must_use
+fn _im_powi3(x: f64): f64 {
+    var sq: f64 = x * x;
+    var r: f64 = sq * x;
+    return r;
+}
+
+# e^x through the exp polyfill: the same bits on every target. Stands for `f64::exp`.
+#must_use
+fn _im_exp(x: f64): f64 {
+    var r: f64 = _f64_exp_polyfill(x);
+    return r;
+}
+
+# √(x² + y²) without undue overflow or underflow (ganita). Stands for `f64::hypot`.
+#must_use
+fn _im_hypot(x: f64, y: f64): f64 {
+    var r: f64 = ganita_f64_hypot(x, y);
+    return r;
+}
+
+# (sin x, cos x): the builtin pair, which is the polyfill on every target. Stands for
+# `f64::sin_cos`. Read as `var s, c = _im_sin_cos(x);` and bind each to an f64 local.
+#must_use
+fn _im_sin_cos(x: f64) {
+    var s: f64 = f64_sin(x);
+    var c: f64 = f64_cos(x);
+    return (s, c);
+}
+
+# The angle of (x, y) in [−π, π]: ganita_f64_atan2 (1.2.15) with `_f64_atan_polyfill` in place of
+# the `f64_atan` builtin, so the same bits on every target (port-parity.md §2). The whole C99
+# Annex F table, signs of zero included, as ganita. Words in, word out. Stands for `y.atan2(x)`.
+#must_use
+fn _im_atan2(y, x): i64 {
+    var ay = y & 0x7FFFFFFFFFFFFFFF;
+    var ax = x & 0x7FFFFFFFFFFFFFFF;
+    if (ay > 0x7FF0000000000000) { return y; }
+    if (ax > 0x7FF0000000000000) { return x; }
+    var ysign = y & 0x8000000000000000;
+    var xneg = (x >> 63) & 1;
+    if (ay == 0) {
+        if (xneg == 1) { return F64_PI | ysign; }
+        return y;
+    }
+    if (ax == 0) { return F64_PI_2 | ysign; }
+    if ((ay == 0x7FF0000000000000) && (ax == 0x7FF0000000000000)) {
+        if (xneg == 1) { return _F64_3PI_4 | ysign; }
+        return F64_PI_4 | ysign;
+    }
+    var q = _f64_atan_polyfill(f64_div(y, x));
+    if (xneg == 0) { return q; }
+    if (ysign != 0) { return f64_sub(q, F64_PI); }
+    return f64_add(q, F64_PI);
+}

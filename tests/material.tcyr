@@ -1,0 +1,99 @@
+# material.tcyr — the ported Rust tests of rust-old/src/material.rs (M1a).
+#
+# Not carried over: material_serde, rolling_friction_serde, combine_rule_serde,
+# serde_defaults_for_new_fields (serde).
+
+include "tests/ulp.cyr"
+include "tests/lib_2d.cyr"
+
+# 1 when two materials have equal fields (Rust's derived PartialEq).
+fn same(a: ImPhysicsMaterial, b: ImPhysicsMaterial): i64 {
+    var af: f64 = a.friction;
+    var bf: f64 = b.friction;
+    var ar: f64 = a.restitution;
+    var br: f64 = b.restitution;
+    var ad: f64 = a.density;
+    var bd: f64 = b.density;
+    var ao: f64 = a.rolling_friction;
+    var bo: f64 = b.rolling_friction;
+    if (af != bf || ar != br || ad != bd || ao != bo) { return 0; }
+    if (a.has_static_friction != b.has_static_friction) { return 0; }
+    if (a.friction_combine != b.friction_combine || a.restitution_combine != b.restitution_combine) { return 0; }
+    return 1;
+}
+
+# 1 when |got − want| < 1e-10.
+fn close(got: f64, want: f64): i64 {
+    var d: f64 = f64_abs(got - want);
+    if (d < 0.0000000001) { return 1; }
+    return 0;
+}
+
+# Runs the ported material tests.
+fn main() {
+    alloc_init();
+    test_group("default_material");
+    var m: ImPhysicsMaterial = ImPhysicsMaterial_default();
+    var mf: f64 = m.friction;
+    var mr: f64 = m.restitution;
+    var md: f64 = m.density;
+    assert(mf == 0.5 && mr == 0.0 && md == 1.0, "0.5 / 0 / 1");
+
+    test_group("presets");
+    var ice: ImPhysicsMaterial = ImPhysicsMaterial_ice();
+    var rubber: ImPhysicsMaterial = ImPhysicsMaterial_rubber();
+    var bouncy: ImPhysicsMaterial = ImPhysicsMaterial_bouncy();
+    var steel: ImPhysicsMaterial = ImPhysicsMaterial_steel();
+    var wood: ImPhysicsMaterial = ImPhysicsMaterial_wood();
+    var icef: f64 = ice.friction;
+    var rubf: f64 = rubber.friction;
+    var bor: f64 = bouncy.restitution;
+    var str: f64 = steel.restitution;
+    var std: f64 = steel.density;
+    var wod: f64 = wood.density;
+    assert(icef < rubf, "ice slips more than rubber");
+    assert(bor > str, "bouncy bounces more than steel");
+    assert(std > wod, "steel is denser than wood");
+
+    test_group("preset_values");
+    var icer: f64 = ice.restitution;
+    var iced: f64 = ice.density;
+    var rubr: f64 = rubber.restitution;
+    assert(icef == 0.05 && icer == 0.1 && iced == 0.9, "ice 0.05 / 0.1 / 0.9");
+    assert(rubf == 1.0 && rubr == 0.8, "rubber 1 / 0.8");
+
+    test_group("material_equality");
+    assert(same(ImPhysicsMaterial_steel(), ImPhysicsMaterial_steel()) == 1, "steel == steel");
+    assert(same(ice, rubber) == 0, "ice != rubber");
+
+    test_group("default_combine_rules");
+    assert_eq(m.friction_combine, IM_COMBINE_AVERAGE, "friction: Average");
+    assert_eq(m.restitution_combine, IM_COMBINE_MIN, "restitution: Min");
+    var mo: f64 = m.rolling_friction;
+    assert(mo == 0.0, "no rolling friction");
+
+    test_group("combine_rules");
+    assert(close(combine_rule_combine(IM_COMBINE_AVERAGE, 0.4, 0.6), 0.5) == 1, "average");
+    assert(close(combine_rule_combine(IM_COMBINE_MIN, 0.3, 0.7), 0.3) == 1, "min");
+    assert(close(combine_rule_combine(IM_COMBINE_MAX, 0.3, 0.7), 0.7) == 1, "max");
+    assert(close(combine_rule_combine(IM_COMBINE_MULTIPLY, 0.5, 0.4), 0.2) == 1, "multiply");
+
+    test_group("combine_rule_ordering");
+    assert(IM_COMBINE_MAX > IM_COMBINE_MULTIPLY, "Max > Multiply");
+    assert(IM_COMBINE_MULTIPLY > IM_COMBINE_AVERAGE, "Multiply > Average");
+    assert(IM_COMBINE_AVERAGE > IM_COMBINE_MIN, "Average > Min");
+
+    # Cyrius-only: the static friction override and its fallback.
+    test_group("effective_static_friction");
+    var fallback: f64 = m.effective_static_friction();
+    assert(fallback == 0.75, "friction x 1.5 without an override");
+    m.has_static_friction = 1;
+    m.static_friction = 0.9;
+    var over: f64 = m.effective_static_friction();
+    assert(over == 0.9, "the override when set");
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);
