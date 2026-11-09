@@ -1,0 +1,257 @@
+# Probes 2–4 (port plan §4 step 9): the vector representation for the solver's inner loop,
+# typed stride arrays of structs, and struct values with operator overloading.
+#
+# One contact-solve kernel, written four ways, run over 1,000 contacts × 100 passes:
+#   relative velocity v = (vb + wb × rb) − (va + wa × ra); vn = v · n; λ = −vn · m_eff;
+#   va −= n · (λ · ima); vb += n · (λ · imb).
+# (a) hisab HVec3 handles, every operation returning a new HVec3 (allocates);
+# (b) hisab HVec3 handles, read with the accessors and written in place with the setters;
+# (c) struct values: `ImV3 { x: f64; y: f64; z: f64; }` with operator overloads, contacts in a
+#     typed stride array of `ImContact` (probe 3) built from nested struct fields (probe 4);
+# (d) plain scalars: one f64 stride per contact.
+# All four must give the same final velocities, bit for bit.
+#
+#   cyrius bench scripts/probes/p2_vectors.bcyr
+
+struct ImV3 { x: f64; y: f64; z: f64; }
+struct ImContact { va: ImV3; wa: ImV3; ra: ImV3; vb: ImV3; wb: ImV3; rb: ImV3; n: ImV3; meff: f64; ima: f64; imb: f64; }
+
+fn ImV3_add(a: ImV3, b: ImV3): ImV3 { var r: ImV3; r.x = a.x + b.x; r.y = a.y + b.y; r.z = a.z + b.z; return r; }
+fn ImV3_sub(a: ImV3, b: ImV3): ImV3 { var r: ImV3; r.x = a.x - b.x; r.y = a.y - b.y; r.z = a.z - b.z; return r; }
+fn v3_scale(a: ImV3, s: f64): ImV3 { var r: ImV3; r.x = a.x * s; r.y = a.y * s; r.z = a.z * s; return r; }
+fn v3_dot(a: ImV3, b: ImV3): f64 { var d: f64 = a.x * b.x + a.y * b.y + a.z * b.z; return d; }
+fn v3_cross(a: ImV3, b: ImV3): ImV3 {
+    var r: ImV3;
+    r.x = a.y * b.z - a.z * b.y;
+    r.y = a.z * b.x - a.x * b.z;
+    r.z = a.x * b.y - a.y * b.x;
+    return r;
+}
+
+# Typed views of the untyped heap words fl_alloc returns (a direct `var p: *T = word;` warns).
+fn as_f64s(p): *f64 { return p; }
+fn as_contacts(p): *ImContact { return p; }
+# An f64's bits as an integer word: an untyped parameter, an i64 return.
+fn bits(x): i64 { return x; }
+
+var N = 1000;
+var PASSES = 100;
+# (d) scalars: 24 f64 per contact: va 0, wa 3, ra 6, vb 9, wb 12, rb 15, n 18, meff 21, ima 22, imb 23.
+var g_s = 0;
+# (a)/(b) hisab: 10 words per contact: va, wa, ra, vb, wb, rb, n handles, then meff, ima, imb bits.
+var g_h = 0;
+# (c) structs.
+var g_c = 0;
+
+# Deterministic inputs: a value per (contact, slot).
+fn val(i, k): f64 {
+    var a: f64 = f64_from((i * 7 + k * 13) % 17);
+    var r: f64 = a * 0.125 - 1.0;
+    return r;
+}
+
+fn setup() {
+    g_s = fl_alloc(N * 24 * 8);
+    g_h = fl_alloc(N * 10 * 8);
+    g_c = fl_alloc(N * sizeof(ImContact));
+    var cbase: *ImContact = as_contacts(g_c);
+    for (var i = 0; i < N; i = i + 1) {
+        var s: *f64 = as_f64s(g_s);
+        s = s + i * 24;
+        for (var k = 0; k < 21; k = k + 1) { s[k] = val(i, k); }
+        s[21] = 0.5;
+        s[22] = 1.0;
+        s[23] = 0.25;
+        for (var v = 0; v < 7; v = v + 1) {
+            store64(g_h + (i * 10 + v) * 8, hvec3_new(s[v * 3], s[v * 3 + 1], s[v * 3 + 2]));
+        }
+        store64(g_h + (i * 10 + 7) * 8, s[21]);
+        store64(g_h + (i * 10 + 8) * 8, s[22]);
+        store64(g_h + (i * 10 + 9) * 8, s[23]);
+        var c: *ImContact = cbase + i;
+        c.va.x = s[0]; c.va.y = s[1]; c.va.z = s[2];
+        c.wa.x = s[3]; c.wa.y = s[4]; c.wa.z = s[5];
+        c.ra.x = s[6]; c.ra.y = s[7]; c.ra.z = s[8];
+        c.vb.x = s[9]; c.vb.y = s[10]; c.vb.z = s[11];
+        c.wb.x = s[12]; c.wb.y = s[13]; c.wb.z = s[14];
+        c.rb.x = s[15]; c.rb.y = s[16]; c.rb.z = s[17];
+        c.n.x = s[18]; c.n.y = s[19]; c.n.z = s[20];
+        c.meff = s[21];
+        c.ima = s[22];
+        c.imb = s[23];
+    }
+    return 0;
+}
+
+# (d) scalars.
+fn kernel_scalar(i) {
+    var s: *f64 = as_f64s(g_s);
+    s = s + i * 24;
+    var rvx: f64 = s[9] + (s[13] * s[17] - s[14] * s[16]) - s[0] - (s[4] * s[8] - s[5] * s[7]);
+    var rvy: f64 = s[10] + (s[14] * s[15] - s[12] * s[17]) - s[1] - (s[5] * s[6] - s[3] * s[8]);
+    var rvz: f64 = s[11] + (s[12] * s[16] - s[13] * s[15]) - s[2] - (s[3] * s[7] - s[4] * s[6]);
+    var vn: f64 = rvx * s[18] + rvy * s[19] + rvz * s[20];
+    var lam: f64 = -vn * s[21];
+    var la: f64 = lam * s[22];
+    var lb: f64 = lam * s[23];
+    s[0] = s[0] - s[18] * la; s[1] = s[1] - s[19] * la; s[2] = s[2] - s[20] * la;
+    s[9] = s[9] + s[18] * lb; s[10] = s[10] + s[19] * lb; s[11] = s[11] + s[20] * lb;
+    return 0;
+}
+
+# (c) struct values on a typed stride array.
+fn kernel_struct(i) {
+    var cbase: *ImContact = as_contacts(g_c);
+    var c: *ImContact = cbase + i;
+    var rel: ImV3 = c.vb + v3_cross(c.wb, c.rb) - c.va - v3_cross(c.wa, c.ra);
+    var vn: f64 = v3_dot(rel, c.n);
+    var lam: f64 = -vn * c.meff;
+    c.va = c.va - v3_scale(c.n, lam * c.ima);
+    c.vb = c.vb + v3_scale(c.n, lam * c.imb);
+    return 0;
+}
+
+# (a) hisab, allocating.
+fn kernel_hisab(i) {
+    var h = g_h + i * 80;
+    var va = load64(h);
+    var vb = load64(h + 24);
+    var nn = load64(h + 48);
+    var rel = hvec3_sub(hvec3_sub(hvec3_add(vb, hvec3_cross(load64(h + 32), load64(h + 40))), va), hvec3_cross(load64(h + 8), load64(h + 16)));
+    var vn: f64 = hvec3_dot(rel, nn);
+    var meff: f64 = load64(h + 56);
+    var ima: f64 = load64(h + 64);
+    var imb: f64 = load64(h + 72);
+    var lam: f64 = -vn * meff;
+    store64(h, hvec3_sub(va, hvec3_scale(nn, lam * ima)));
+    store64(h + 24, hvec3_add(vb, hvec3_scale(nn, lam * imb)));
+    return 0;
+}
+
+# (b) hisab handles, in place.
+fn kernel_inplace(i) {
+    var h = g_h + i * 80;
+    var va = load64(h);
+    var wa = load64(h + 8);
+    var ra = load64(h + 16);
+    var vb = load64(h + 24);
+    var wb = load64(h + 32);
+    var rb = load64(h + 40);
+    var nn = load64(h + 48);
+    var vax: f64 = HVec3_x(va); var vay: f64 = HVec3_y(va); var vaz: f64 = HVec3_z(va);
+    var wax: f64 = HVec3_x(wa); var way: f64 = HVec3_y(wa); var waz: f64 = HVec3_z(wa);
+    var rax: f64 = HVec3_x(ra); var ray: f64 = HVec3_y(ra); var raz: f64 = HVec3_z(ra);
+    var vbx: f64 = HVec3_x(vb); var vby: f64 = HVec3_y(vb); var vbz: f64 = HVec3_z(vb);
+    var wbx: f64 = HVec3_x(wb); var wby: f64 = HVec3_y(wb); var wbz: f64 = HVec3_z(wb);
+    var rbx: f64 = HVec3_x(rb); var rby: f64 = HVec3_y(rb); var rbz: f64 = HVec3_z(rb);
+    var nx: f64 = HVec3_x(nn); var ny: f64 = HVec3_y(nn); var nz: f64 = HVec3_z(nn);
+    var rvx: f64 = vbx + (wby * rbz - wbz * rby) - vax - (way * raz - waz * ray);
+    var rvy: f64 = vby + (wbz * rbx - wbx * rbz) - vay - (waz * rax - wax * raz);
+    var rvz: f64 = vbz + (wbx * rby - wby * rbx) - vaz - (wax * ray - way * rax);
+    var vn: f64 = rvx * nx + rvy * ny + rvz * nz;
+    var meff: f64 = load64(h + 56);
+    var ima: f64 = load64(h + 64);
+    var imb: f64 = load64(h + 72);
+    var lam: f64 = -vn * meff;
+    var la: f64 = lam * ima;
+    var lb: f64 = lam * imb;
+    HVec3_set_x(va, vax - nx * la); HVec3_set_y(va, vay - ny * la); HVec3_set_z(va, vaz - nz * la);
+    HVec3_set_x(vb, vbx + nx * lb); HVec3_set_y(vb, vby + ny * lb); HVec3_set_z(vb, vbz + nz * lb);
+    return 0;
+}
+
+# FNV-1a over contact 0..N's va and vb words, per representation.
+fn digest_scalar(): i64 {
+    var h = 0xcbf29ce484222325;
+    for (var i = 0; i < N; i = i + 1) {
+        for (var k = 0; k < 12; k = k + 1) {
+            var slot = k;
+            if (k >= 3) { slot = k + 6; }
+            if (k >= 6) { slot = 99; }
+            if (slot != 99) { h = (h ^ load64(g_s + (i * 24 + slot) * 8)) * 0x100000001b3; }
+        }
+    }
+    return h;
+}
+
+fn digest_struct(): i64 {
+    var h = 0xcbf29ce484222325;
+    var cbase: *ImContact = as_contacts(g_c);
+    for (var i = 0; i < N; i = i + 1) {
+        var c: *ImContact = cbase + i;
+        var ax: f64 = c.va.x; var ay: f64 = c.va.y; var az: f64 = c.va.z;
+        var bx: f64 = c.vb.x; var by: f64 = c.vb.y; var bz: f64 = c.vb.z;
+        h = (h ^ bits(ax)) * 0x100000001b3;
+        h = (h ^ bits(ay)) * 0x100000001b3;
+        h = (h ^ bits(az)) * 0x100000001b3;
+        h = (h ^ bits(bx)) * 0x100000001b3;
+        h = (h ^ bits(by)) * 0x100000001b3;
+        h = (h ^ bits(bz)) * 0x100000001b3;
+    }
+    return h;
+}
+
+fn digest_hisab(): i64 {
+    var h = 0xcbf29ce484222325;
+    for (var i = 0; i < N; i = i + 1) {
+        var va = load64(g_h + i * 80);
+        var vb = load64(g_h + i * 80 + 24);
+        h = (h ^ load64(va)) * 0x100000001b3;
+        h = (h ^ load64(va + 8)) * 0x100000001b3;
+        h = (h ^ load64(va + 16)) * 0x100000001b3;
+        h = (h ^ load64(vb)) * 0x100000001b3;
+        h = (h ^ load64(vb + 8)) * 0x100000001b3;
+        h = (h ^ load64(vb + 16)) * 0x100000001b3;
+    }
+    return h;
+}
+
+fn show(name, d) {
+    print(name, strlen(name));
+    print(" digest 0x", 10);
+    fmt_hex(d);
+    println("");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    setup();
+    var b = bench_new("d_scalars");
+    bench_batch_start(b);
+    for (var p = 0; p < PASSES; p = p + 1) { for (var i = 0; i < N; i = i + 1) { kernel_scalar(i); } }
+    bench_batch_stop(b, N * PASSES);
+    bench_report(b);
+    show("  scalars", digest_scalar());
+
+    b = bench_new("c_struct_values");
+    bench_batch_start(b);
+    for (var p = 0; p < PASSES; p = p + 1) { for (var i = 0; i < N; i = i + 1) { kernel_struct(i); } }
+    bench_batch_stop(b, N * PASSES);
+    bench_report(b);
+    show("  structs", digest_struct());
+
+    b = bench_new("b_hisab_in_place");
+    bench_batch_start(b);
+    for (var p = 0; p < PASSES; p = p + 1) { for (var i = 0; i < N; i = i + 1) { kernel_inplace(i); } }
+    bench_batch_stop(b, N * PASSES);
+    bench_report(b);
+    show("  hisab in place", digest_hisab());
+
+    # (a) starts from fresh copies of the inputs, so its digest compares with the others.
+    setup();
+    var before = alloc_used();
+    b = bench_new("a_hisab_allocating");
+    bench_batch_start(b);
+    for (var p = 0; p < PASSES; p = p + 1) { for (var i = 0; i < N; i = i + 1) { kernel_hisab(i); } }
+    bench_batch_stop(b, N * PASSES);
+    bench_report(b);
+    show("  hisab allocating", digest_hisab());
+    print("  hisab allocating: global heap per kernel call ", 48);
+    fmt_int((alloc_used() - before) / (N * PASSES));
+    println(" bytes");
+    return 0;
+}
+
+var r = main();
+sys_exit_group(r);

@@ -36,6 +36,81 @@ fn _par_error_name(code): i64 {
     return "Unknown";
 }
 
+# ── cross-target digests (M0 step 8) ────────────────────────────────────────────────
+# A 64-bit FNV-1a fold of every output word the port returns for a math function, in row order.
+# Run on x86_64 ELF, x86_64 PE and aarch64: equal digests mean bit-identical results on every
+# row, which is what ADR 0008 #7 promises for impetus-owned arithmetic. Histograms alone can't
+# show that. Slots 0–6 are the dispatched class-C functions, 7 the class-A/B rows together, 8–9
+# the native shadows (which differ on aarch64 by design).
+var _PAR_DG_N = 10;
+var _par_dg[80];
+
+fn _par_dg_init() {
+    for (var k = 0; k < _PAR_DG_N; k = k + 1) { store64(&_par_dg + k * 8, 0xcbf29ce484222325); }
+    return 0;
+}
+
+# The digest slot of a math function, or -1.
+#must_use
+fn _par_dg_slot(fp, fl): i64 {
+    if (_par_eq(fp, fl, "f64::sin_cos") == 1) { return 0; }
+    if (_par_eq(fp, fl, "f64::sin") == 1) { return 1; }
+    if (_par_eq(fp, fl, "f64::cos") == 1) { return 2; }
+    if (_par_eq(fp, fl, "f64::atan2") == 1) { return 3; }
+    if (_par_eq(fp, fl, "f64::hypot") == 1) { return 4; }
+    if (_par_eq(fp, fl, "f64::exp") == 1) { return 5; }
+    if (_par_eq(fp, fl, "f64::powf") == 1) { return 6; }
+    return 7;
+}
+
+# Folds the got list into digest `slot`.
+fn _par_dg_fold(slot) {
+    var at = &_par_dg + slot * 8;
+    var h = load64(at);
+    for (var k = 0; k < _par_got_n; k = k + 1) {
+        h = (h ^ load64(_par_got_v + k * 8)) * 0x100000001b3;
+    }
+    store64(at, h);
+    return 0;
+}
+
+# Prints digest `slot` under `name`.
+fn _par_dg_print(slot, name) {
+    print("  digest ", 9);
+    _par_print_pad(name, strlen(name), 34);
+    print(" 0x", 3);
+    fmt_hex(load64(&_par_dg + slot * 8));
+    println("");
+    return 0;
+}
+
+# ── candidates ──────────────────────────────────────────────────────────────────────
+# ganita_f64_atan2 (lib/ganita.cyr, 1.2.15) with `_f64_atan_polyfill` in place of the `f64_atan`
+# builtin, which is x87 on x86_64 and the polyfill on aarch64. Chosen in M0 step 8
+# (port-parity.md §2): the same bits on every target. M1 moves it into src/mathx.cyr as
+# `_im_atan2`. Words in, word out, as ganita.
+fn _cand_atan2_poly(y, x): i64 {
+    var ay = y & 0x7FFFFFFFFFFFFFFF;
+    var ax = x & 0x7FFFFFFFFFFFFFFF;
+    if (ay > 0x7FF0000000000000) { return y; }
+    if (ax > 0x7FF0000000000000) { return x; }
+    var ysign = y & 0x8000000000000000;
+    var xneg = (x >> 63) & 1;
+    if (ay == 0) {
+        if (xneg == 1) { return F64_PI | ysign; }
+        return y;
+    }
+    if (ax == 0) { return F64_PI_2 | ysign; }
+    if ((ay == 0x7FF0000000000000) && (ax == 0x7FF0000000000000)) {
+        if (xneg == 1) { return _F64_3PI_4 | ysign; }
+        return F64_PI_4 | ysign;
+    }
+    var q = _f64_atan_polyfill(f64_div(y, x));
+    if (xneg == 0) { return q; }
+    if (ysign != 0) { return f64_sub(q, F64_PI); }
+    return f64_add(q, F64_PI);
+}
+
 # ── dispatch ────────────────────────────────────────────────────────────────────────
 # Each module's dispatcher fills the got list for one row. It returns 1 when it handled the
 # function, 0 when the function is pending (not ported), or -1 when the inputs are unusable (a
@@ -60,8 +135,10 @@ fn _par_constants(fp, fl): i64 {
     return 0 - 1;
 }
 
-# `f64::*` rows: the Rust std reference values (port plan §7.1). Dispatched now: the functions
-# with a direct Cyrius counterpart. Pending until M1's src/mathx.cyr:
+# `f64::*` rows: the Rust std reference values (port plan §7.1). Dispatched: the counterparts the
+# port uses. exp and atan2 are the polyfill forms, which give the same bits on every target
+# (port-parity.md §2): `f64_exp` and the `f64_atan` inside ganita's atan2 are x87 on x86_64 and the
+# polyfill on aarch64. Pending until M1's src/mathx.cyr:
 # - min, max, clamp: f64_min / f64_max return the second operand when the first is NaN and NaN
 #   when the second is (probed), while Rust ignores a NaN operand either way (_im_min, _im_max,
 #   _im_clamp);
@@ -83,11 +160,11 @@ fn _par_math(fp, fl): i64 {
     }
     if (_par_eq(fp, fl, "f64::sin") == 1) { var r: f64 = f64_sin(x); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::cos") == 1) { var r: f64 = f64_cos(x); _par_got_f(r); return 1; }
-    if (_par_eq(fp, fl, "f64::exp") == 1) { var r: f64 = f64_exp(x); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::exp") == 1) { var r: f64 = _f64_exp_polyfill(x); _par_got_f(r); return 1; }
     if (_par_in_n < 2) { return 0; }
     var y: f64 = _par_in(1);
     # Rust's y.atan2(x) is the golden f64::atan2(y, x): inputs in C order.
-    if (_par_eq(fp, fl, "f64::atan2") == 1) { var r: f64 = ganita_f64_atan2(x, y); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::atan2") == 1) { _par_got_f(_cand_atan2_poly(_par_in(0), _par_in(1))); return 1; }
     if (_par_eq(fp, fl, "f64::hypot") == 1) { var r: f64 = ganita_f64_hypot(x, y); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::powf") == 1) { var r: f64 = ganita_f64_pow(x, y); _par_got_f(r); return 1; }
     return 0;
@@ -101,18 +178,21 @@ fn _par_dispatch(mp, ml, fp, fl): i64 {
 }
 
 # Shadow comparisons, never gated: the same golden rows through another Cyrius candidate.
-# - the exp polyfill, which gives the same bits on every target (the builtin is x87 on x86_64):
-#   the cross-target choice the port plan §7.1 makes for the spring;
+# - the native exp and ganita's atan2 (on the native atan): x87 on x86_64, so their bits differ
+#   between targets; the polyfill forms are dispatched instead (port-parity.md §2);
 # - the sin / cos polyfills, which the builtins are on every target (probed: same bits on x86_64);
 # - the stdlib min / max, to show where their NaN semantics differ from Rust's.
 fn _par_shadows(mp, ml, fp, fl, cls) {
     if (_par_eq(mp, ml, "math") != 1) { return 0; }
+    # The port's own outputs first (a pending row has none), before a shadow replaces them.
+    if (_par_got_n > 0) { _par_dg_fold(_par_dg_slot(fp, fl)); }
     var x: f64 = _par_in(0);
     if (_par_eq(fp, fl, "f64::exp") == 1) {
         _par_got_n = 0;
-        var r: f64 = _f64_exp_polyfill(x);
+        var r: f64 = f64_exp(x);
         _par_got_f(r);
-        _par_shadow_record("f64::exp ~ _f64_exp_polyfill", cls);
+        _par_shadow_record("f64::exp ~ f64_exp (native)", cls);
+        _par_dg_fold(8);
         return 0;
     }
     if (_par_eq(fp, fl, "f64::sin") == 1) {
@@ -131,6 +211,14 @@ fn _par_shadows(mp, ml, fp, fl, cls) {
     }
     if (_par_in_n < 2) { return 0; }
     var y: f64 = _par_in(1);
+    if (_par_eq(fp, fl, "f64::atan2") == 1) {
+        _par_got_n = 0;
+        var r: f64 = ganita_f64_atan2(x, y);
+        _par_got_f(r);
+        _par_shadow_record("f64::atan2 ~ ganita_f64_atan2", cls);
+        _par_dg_fold(9);
+        return 0;
+    }
     if (_par_eq(fp, fl, "f64::max") == 1) {
         _par_got_n = 0;
         var r: f64 = f64_max(x, y);
@@ -150,17 +238,33 @@ fn _par_shadows(mp, ml, fp, fl, cls) {
 
 # The class-C bound for a function, in ulps; -1 when none is set yet (the rows are measured).
 # Bounds are derived in M0 step 8 (docs/development/port-parity.md) per target against glibc,
-# BEFORE the function's first gated comparison, and never raised to make a row pass. None is set
-# yet: every class-C row is measured.
+# BEFORE the function's first gated comparison, and never raised to make a row pass.
+#
+# The math primitives get 2 ulp: glibc and each Cyrius counterpart (the polyfills, ganita) document
+# about 1 ulp, so two implementations can differ by up to 2. Measured 2026-11-09 on x86_64 ELF,
+# x86_64 PE and aarch64: max 1 ulp, except hypot's 3 rows at 2 (port-parity.md §2). impetus's own
+# class-C functions get K_F = 2·S·c + 2 at their milestones (port-parity.md, the rule).
 #must_use
 fn _par_c_bound(fp, fl): i64 {
+    if (_par_eq(fp, fl, "f64::sin_cos") == 1) { return 2; }
+    if (_par_eq(fp, fl, "f64::sin") == 1) { return 2; }
+    if (_par_eq(fp, fl, "f64::cos") == 1) { return 2; }
+    if (_par_eq(fp, fl, "f64::atan2") == 1) { return 2; }
+    if (_par_eq(fp, fl, "f64::hypot") == 1) { return 2; }
+    if (_par_eq(fp, fl, "f64::exp") == 1) { return 2; }
+    if (_par_eq(fp, fl, "f64::powf") == 1) { return 2; }
     return 0 - 1;
 }
 
-# The ADR accepting a divergent row (function and raw input field), or 0. None yet: the ADR 0007
-# hisab paths arrive with M4, the ADR 0008 mappings with their modules.
+# The ADR accepting a divergent row (function and raw input field), or 0. Each entry names its ADR;
+# an accepted row is reported on every run and doesn't fail its module. The ADR 0007 hisab paths
+# arrive with M4, the ADR 0008 mappings with their modules.
 #must_use
 fn _par_accepted(fp, fl, ip, il): i64 {
+    # ADR 0009: ganita pow(-1, DBL_MAX) gives +inf instead of 1 (tanmatra ADR 0007, kimiya ADR 0004).
+    if (_par_eq(fp, fl, "f64::powf") == 1 && _par_eq(ip, il, "f:bff0000000000000 f:7fefffffffffffff") == 1) {
+        return 9;
+    }
     return 0;
 }
 
@@ -170,8 +274,19 @@ fn _par_accepted_quiet(adr): i64 {
     return 0;
 }
 
-# Module-specific summary lines after a module's report. None yet.
+# After the math module: the cross-target digests.
 fn _par_module_done(mp, ml) {
+    if (_par_eq(mp, ml, "math") != 1) { return 0; }
+    _par_dg_print(0, "f64::sin_cos");
+    _par_dg_print(1, "f64::sin");
+    _par_dg_print(2, "f64::cos");
+    _par_dg_print(3, "f64::atan2");
+    _par_dg_print(4, "f64::hypot");
+    _par_dg_print(5, "f64::exp");
+    _par_dg_print(6, "f64::powf");
+    _par_dg_print(7, "class A/B rows");
+    _par_dg_print(8, "exp ~ f64_exp (native)");
+    _par_dg_print(9, "atan2 ~ ganita_f64_atan2");
     return 0;
 }
 
@@ -182,5 +297,6 @@ fn _par_skip(mp, ml): i64 {
     return 0;
 }
 
+_par_dg_init();
 var exit_code = _par_main();
 sys_exit_group(exit_code);

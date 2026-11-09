@@ -81,3 +81,32 @@ The scope, milestones, probes and upstream gap list are in
   without a fixed reference, a translation error and a deliberate change look the same.
 - **Wait until kiran or soorat need impetus in Cyrius.** Rejected: the port is part of how the
   ecosystem gets ready for them, and its benchmarks and issues are inputs to that work.
+
+## Amendment — M0 step 9 (2026-11-09): hisab stays off the step path until allocation can be scoped
+
+**Context.** Probe 1 (`docs/development/port-parity.md` §4.1) measured what a hisab call costs a
+running world:
+- The global `alloc` is a bump allocator with no free and no redirection hook. hisab calls it
+  directly, and a library can't `alloc_reset` without wiping its consumer's heap.
+- Every hisab function that returns a value therefore leaks for the life of the process: 24 bytes
+  per vector operation, 105,920 bytes per `gjk_epa_3d` on two spheres, 10,936 per `detect_islands`
+  over 100 bodies, 20,792 per `bvh_build` of 100 boxes.
+- A 3D scene with 100 touching pairs would leak about 10 MB per step.
+
+**Decision.** hisab-first stands as the direction. Until hisab's allocations can be scoped, the port
+calls hisab **only off the step path**: at setup (`inertia_box` / `inertia_sphere` at `add_collider`)
+and nowhere a step or a per-frame query runs. Scoping means either a stdlib allocation scope that
+redirects `alloc` to a caller's arena (request S1, port plan §8), or allocator-taking hisab variants
+(H9).
+- The step path and the queries are impetus-owned.
+- The 2D backend (M1–M3) needs nothing from hisab on its step path, so it is unaffected.
+- The 3D narrowphase (M4) decides at its start between two options:
+  - wait for S1 or H9;
+  - port impetus's own GJK/EPA as a stopgap, under its own ADR, and switch to hisab when the
+    allocation is scoped.
+
+**Consequences.**
+- The gap list (port plan §8) leads with S1 and H9, measured.
+- Every hisab use on the step path that this ADR names (3D quaternion and matrix ops, GJK/EPA, BVH,
+  `detect_islands`) moves behind that request. Where the port plan lists them as "use", read "use
+  once S1/H9 lands".

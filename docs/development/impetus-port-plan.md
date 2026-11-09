@@ -284,11 +284,18 @@ tests only.
    - a **step comparator** with per-field classes;
    - a **divergence table** naming every ADR 0007 path, reported by name, as kimiya's ADR 0002
      mapping.
-8. **Baseline measurements** → `docs/development/port-parity.md`. The math sweep runs every
+8. ✅ **Baseline measurements. Done 2026-11-09** ([`port-parity.md`](port-parity.md) §2): the corpus on x86_64 ELF, x86_64 PE and aarch64, with a per-function digest of the port's output bits. sin, cos, hypot, pow and every class-A/B row give **identical bits on all three targets**. The native `f64_exp` and ganita's atan2 (on the native `f64_atan`) differ on aarch64, so the port uses `_f64_exp_polyfill` and ganita's atan2 on `_f64_atan_polyfill`, identical everywhere. K = 2 ulp for the primitives (max observed 1; hypot 2 on 3 rows), now gated. [ADR 0009](../adr/0009-accept-ganita-pow-minus-one-divergence.md) accepts `pow(-1, DBL_MAX)`. Result on every target: **14,875 ok, 0 failed, 0 measured, 4,046 pending, 1 accepted**. Baseline measurements → `docs/development/port-parity.md`. The math sweep runs every
    Cyrius counterpart against glibc on x86_64 ELF, x86_64 PE (wine) and aarch64 (qemu). Set the
    class-C bounds by tanmatra's rule (K_F = 2·S·calls + 2; above 64, make the primitive exact
    or write an ADR).
-9. **Probes**, each answered with a small program and numbers before M1 writes any code:
+9. ✅ **Probes. Done 2026-11-09** ([`port-parity.md`](port-parity.md) §4, programs in `scripts/probes/`):
+   (1) every hisab call that returns a value leaks from the global bump heap (24 B per vector op, 105,920 B per
+   `gjk_epa_3d`), so hisab stays off the step path until S1/H9 ([ADR 0007 amendment](../adr/0007-cyrius-port-hisab-first.md));
+   freelist and a per-step arena are flat. (2) Hot loops load components into `f64` locals (56 ns per contact kernel;
+   struct values 154 ns, a compiler finding). (3) Typed stride arrays work; `--bounds` can't check them. (4) Struct
+   values, nested fields and overloads work and are bit-exact. (5) Both solvers' shock-propagation sorts are stable
+   on a non-total key: the port sorts on (level, input index). (6) `[lib]` is never prepended to tests: per-profile
+   `tests/lib_2d.cyr` / `tests/lib_3d.cyr`. The probes, each answered with a small program and numbers before M1 writes any code:
    1. **Memory model.** Can world-lifetime storage (freelist or a world-owned arena) and a
       per-step scratch arena coexist with hisab's allocations? Can hisab be pointed at the
       scratch arena (`alloc_via`), or must it keep using the global bump heap? Gate: a soak
@@ -447,6 +454,7 @@ Every std f64 method in `src/` outside tests, 1.4.0:
 | `Result<T, ImpetusError>` | value-form `Result` + `IM_ERR_*` code, with `?` (as tanmatra). No `Result` through `callptr` |
 | `Option<BodyState>` and similar | out-pointer + 1/0, or the value-form `Option` for one word |
 | closures in `sort_by` / iterator chains | loops; a comparator through `fncall2` with `f64_lt` for f64 keys |
+| stable `sort_by_key` on a non-total key (the solvers' shock-propagation order) | sort on (key, index in the input order): total, and the stable sort's exact order (`vec_sort_by` is introsort) |
 | `#[non_exhaustive]` / `#[must_use]` | append-only enum values / `#must_use` |
 
 ### 7.4 Names
@@ -462,7 +470,7 @@ Every std f64 method in `src/` outside tests, 1.4.0:
 
 ### 7.5 Memory
 
-Settled by probe 1; the starting design:
+Settled by probe 1 (`port-parity.md` §4.1; freelist and the step arena measured flat):
 - **World lifetime**: arenas, broadphase nodes, manifolds and particles live in storage the world
   owns (freelist or a growable world arena), freed by `ImPhysicsWorld_free`.
 - **Step lifetime**: pair lists, contact scratch, island lists and joint prep live in a step
@@ -478,7 +486,18 @@ Settled by probe 1; the starting design:
 Each one gets an issue in the owning repo with the probe or benchmark that shows it, as
 tanmatra filed its findings.
 
+**Cyrius stdlib (blocking)**
+- **S1. A scoped allocator for `alloc`.** `alloc` is a bump allocator with no free and no hook, so a
+  library can't contain what the libraries it calls allocate. An allocation scope (`alloc_push(arena)` /
+  `alloc_pop()`, or an allocator the global `alloc` dispatches through) lets impetus run each step's hisab
+  calls in its step arena and reset it, with no change to hisab's 574 allocation sites. Measured cost of
+  its absence: `port-parity.md` §4.1. **It blocks hisab on the step path** (ADR 0007 amendment), and it
+  helps every library built on hisab or the stdlib containers.
+
 **hisab**
+- **H9 (blocking unless S1 lands). Allocator-scoped calls**: hisab's alternative to S1, allocator-taking
+  variants of the functions a step calls (vector, quaternion and matrix ops; `gjk_epa_3d`; `bvh_build`;
+  `detect_islands`). Measured per-call leaks are in `port-parity.md` §4.1.
 - **H1. Allocation-free vector math** in hot loops: in-place `_into(out, a, b)` variants, or
   value-type vectors. Today every returned vector, quaternion or matrix allocates. hisab's
   benchmark doc lists stack structs and arenas as "not planned unless a consumer asks"; this is
@@ -497,8 +516,7 @@ tanmatra filed its findings.
 - **H7. Broadphase support**: a BVH self-pair query, incremental insert/remove/refit, and an
   AABB-cell spatial hash with pair enumeration.
 - **H8. 2D ray tests**, or document that z = 0 embedding is supported.
-- **H9. Allocator-scoped calls**: route hisab's allocations through a caller-chosen allocator,
-  so a step arena can hold them.
+- (H9 is listed first, above.)
 
 **Cyrius stdlib / ganita / compiler**
 - **Stdlib math:**
@@ -508,13 +526,16 @@ tanmatra filed its findings.
   - a deterministic atan2 (on the polyfill), and an exp polyfill exposed as the
     cross-target choice.
 - **Collections:**
-  - a stable sort;
+  - a stable sort (both solvers' shock-propagation sorts rely on stability, `port-parity.md` §4.3;
+    the port works around it with a total key);
   - `vec_reserve` / `vec_free`;
   - a documented way to seed `hashmap` deterministically;
   - an ordered map, if more than impetus needs one.
 - **Compiler:**
   - f64 values live in integer registers and every op moves through xmm0/xmm1, with no xmm
     register allocation;
+  - a struct-value vector kernel costs 2.5× the same kernel on `f64` locals (154 vs 56–63 ns,
+    `port-parity.md` §4.2): the 24-byte return through the hidden pointer and the field copies;
   - `#inline` takes at most two parameters;
   - `memcpy` / `memset` are byte loops (open issue `2026-11-02`);
   - struct fields can't be fixed arrays;
@@ -549,7 +570,7 @@ tanmatra filed its findings.
 
 | Milestone | Status | Golden rows | Reference tests | Benches | Notes |
 |---|---|---|---|---|---|
-| M0 Initialize | ◐ steps 0–7 done 2026-11-09 | constants 3 + math 18,919: 3,154 ok, 0 failed, 11,722 measured, 4,046 pending (x86_64 ELF) | — | — | oracle hooks and `2d` without hisab (unreleased port tooling on 1.4.0); scaffold, repairs, `cyrius.cyml` with hisab 3.4.1, ADR 0008; generator, `validate.py`, `src/constants.cyr`, parity harness; all gates clean. Next: step 8 (baselines on x86_64 PE and aarch64, class-C bounds, the pow ADR), step 9 (probes) |
+| M0 Initialize | ✅ done 2026-11-09 | constants 3 + math 18,919: **14,875 ok, 0 failed, 0 measured, 4,046 pending (M1 helpers), 1 accepted (ADR 0009)**, identical bits on x86_64 ELF, x86_64 PE and aarch64 | — | 1 probe bench | oracle hooks; scaffold and repairs; `cyrius.cyml` with hisab 3.4.1; generator, `validate.py`, `src/constants.cyr`, parity harness; exp and atan2 on the polyfills (cross-target bits), K = 2; ADRs 0008, 0009 and the 0007 amendment (hisab off the step path until S1/H9); six probes ([`port-parity.md`](port-parity.md) §4). Next: M1 |
 | M1 Foundation | ☐ | | | | |
 | M2 2D collision | ☐ | | | | |
 | M3 2D dynamics | ☐ | | | | |

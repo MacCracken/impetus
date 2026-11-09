@@ -48,6 +48,20 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - `validate.py` recomputes the 7,197 class-A/B math rows and the constants independently.
   - `tests/parity_2d.tcyr` replays the corpus: 3,154 ok, 0 failed, 11,722 measured (class C,
     bounds come with the step-8 baselines), 4,046 pending (M1's Rust-semantics math helpers).
+- **Cyrius port, M0 steps 8–9** (`docs/development/port-parity.md`):
+  - Baselines on x86_64 ELF, x86_64 PE and aarch64. A per-function digest shows bit-identical
+    output on all three for sin, cos, hypot, pow and every exact row. exp and atan2 use the
+    polyfill forms, the only primitives whose native bits differ by target. Class-C bound
+    K = 2 ulp, now gated: **14,875 ok, 0 failed, 0 measured, 4,046 pending, 1 accepted**.
+  - [ADR 0009](docs/adr/0009-accept-ganita-pow-minus-one-divergence.md) accepts ganita's
+    `pow(-1, DBL_MAX)`.
+  - Six probes (`scripts/probes/`). Every hisab call that returns a value leaks from the
+    global bump heap (24 B per vector op, 105,920 B per `gjk_epa_3d`), so hisab stays off
+    the step path until allocation can be scoped (ADR 0007 amendment). Freelist and a
+    per-step arena stay flat.
+  - Hot loops compute on `f64` locals; struct values work but cost 2.5×.
+  - Both solvers' shock-propagation sorts rely on stability, so the port sorts on
+    (level, index).
 
 ### Removed
 - Committed fuzz build output (`fuzz/target/`, 208 files). It is now ignored under

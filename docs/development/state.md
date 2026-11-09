@@ -16,7 +16,7 @@ Plan of record: [`impetus-port-plan.md`](impetus-port-plan.md).
 
 | Milestone | Status |
 |---|---|
-| M0 Initialize | ◐ **in progress.** Step 0 ✅ (oracle hooks). Steps 1–3 ✅: `cyrius port` scaffold; CLAUDE.md merged; roadmap restored; Rust CI, scripts, architecture overview and testing guide moved under `rust-old/`; `rust-old/README.md` restored for the doctest include; ADRs renumbered, ADR 0008; `cyrius.cyml` with hisab 3.4.1. Steps 4–7 ✅ 2026-11-09: math counterparts probed; `scripts/oracle/` writes `tests/golden/` (constants 3 + math 18,919 rows, 2.2 MB), deterministic, glibc-pinned, `--check`ed for both builds, independently validated (`validate.py`); `src/constants.cyr` generated; `tests/parity_2d.tcyr` replays it: **3,154 ok, 0 failed, 11,722 measured, 4,046 pending** on x86_64 ELF. Next: step 8 (baselines on x86_64 PE and aarch64, class-C bounds), step 9 (probes) |
+| M0 Initialize | ✅ **done 2026-11-09.** Steps 0–3: oracle hooks; `cyrius port` scaffold and repairs; ADRs renumbered, ADR 0008; `cyrius.cyml` with hisab 3.4.1. Steps 4–7: math probed; `scripts/oracle/` writes `tests/golden/` (constants 3 + math 18,919), deterministic, glibc-pinned, validated; `src/constants.cyr`; `tests/parity_2d.tcyr`. Step 8 ([`port-parity.md`](port-parity.md) §2): **14,875 ok, 0 failed, 0 measured, 4,046 pending, 1 accepted (ADR 0009)** with identical output bits on x86_64 ELF, x86_64 PE and aarch64; exp and atan2 on the polyfills; K = 2. Step 9 (§4): hisab leaks on the step path (ADR 0007 amendment: hisab off it until S1/H9); freelist and the step arena flat; hot loops on `f64` locals; stride arrays and struct values work; the stable-sort trap; per-profile test includes |
 | M1 Foundation | ☐ |
 | M2 2D collision | ☐ |
 | M3 2D dynamics | ☐ |
@@ -46,9 +46,10 @@ Plan of record: [`impetus-port-plan.md`](impetus-port-plan.md).
 ## Tests
 
 - `tests/parity_2d.tcyr` (+ `tests/parity_core.cyr`, `tests/ulp.cyr`): the golden-corpus harness for the shared
-  and 2D modules — 2 modules (constants, math), 3,154 ok, 0 failed, 11,722 measured (class C, no bound until
-  step 8), 4,046 pending (M1's `_im_` math helpers), on x86_64 ELF. Against glibc: sin, cos, atan2, exp, powf
-  ≤ 1 ulp, hypot ≤ 2; the one outlier is ganita's `pow(-1, DBL_MAX)`.
+  and 2D modules — 2 modules (constants, math), **14,875 ok, 0 failed, 0 measured, 4,046 pending (M1's `_im_`
+  math helpers), 1 accepted (ADR 0009)** on x86_64 ELF, x86_64 PE and aarch64, with identical output digests
+  on all three. Class C K = 2 ulp against glibc (max 1; hypot 2 on 3 rows).
+- `scripts/probes/`: `p1_memory.cyr`, `p2_vectors.bcyr` (M0 step 9, `port-parity.md` §4).
 - `tests/golden/`: `constants.tsv` (3), `math.tsv` (18,919), `modules.txt`.
 - `tests/impetus.tcyr`, `.bcyr`, `.fcyr`: scaffold stubs.
 
@@ -67,4 +68,4 @@ dependency; the bridge partners dravya, sharira and ushma have no local repo.
 
 ## Next
 
-M0 steps 8–9 (port plan §4): cross-target baselines and class-C bounds, then the probes.
+M1 Foundation (port plan §6): error, config, material, units, types, arena, contact_tracker, spring, and `src/mathx.cyr` (the `_im_` helpers that close the 4,045 pending math rows, `_im_atan2`).
