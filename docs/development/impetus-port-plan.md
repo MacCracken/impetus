@@ -1,0 +1,543 @@
+# impetus Rust → Cyrius port plan
+
+> **Plan of record** for porting impetus to Cyrius. Rust **1.4.0** is the final Rust feature
+> release and the **reference implementation** (the oracle); the Cyrius port ships as **2.0.0**.
+> The method is tanmatra's ([its ADR 0006](../../../tanmatra/docs/adr/0006-cyrius-port-with-rust-oracle.md),
+> [its port plan](../../../tanmatra/docs/development/tanmatra-port-plan.md)), as adapted by kimiya
+> ([its port plan](../../../kimiya/docs/development/kimiya-port-plan.md)). Where this plan says
+> "as tanmatra" or "as kimiya", follow that document. §2 lists what is different here and why.
+>
+> ▶ **Start on Cyrius 6.7.18 with hisab 3.4.1**, after 1.4.0 is committed and tagged (M0 step 0).
+
+| Thing | Value | Source |
+|---|---|---|
+| Rust source (oracle) | impetus **1.4.0**: 10,399 code lines in `src/` (no tests, no comments), 36 files, two exclusive backends (`2d` default, `3d`) | `Cargo.toml`, `VERSION` |
+| Rust health, 2026-11-09 on rustc 1.99.1 | ✅ fmt, clippy `-D warnings` on 5 feature sets, rustdoc `-D warnings` on both backends, `cargo audit`, `cargo deny`. Tests: 298 unit (2D) / 274 (3D), 30 regression (2 `#[ignore]`d for the 2.0 snapshot format), 9 integration, 2 doc | local run |
+| Correctness baseline | The 1.4 audit-and-repair sweep: every fix is pinned by a test in `tests/regressions.rs` | `CHANGELOG.md` 1.4.0 |
+| Cyrius toolchain | **6.7.18** (installed) | `~/.cyrius/current` |
+| hisab | **3.4.1**, Cyrius, tag `3.4.1`, bundle `dist/hisab.cyr` | `/home/macro/Repos/hisab` |
+| ganita | **1.2.15**, bundled in the 6.7.18 stdlib | `~/.cyrius/versions/6.7.18/lib/ganita.cyr` |
+| Oracle's math | Rust **std** → host **glibc 2.44** for `sin_cos` (15 calls), `sin`/`cos`, `atan2` (2), `hypot` (15), `exp` (4), `powf` (1). glam 0.34.3 (re-exported by Rust hisab 1.4.0) for `DVec3` / `DQuat` / `DMat3`, 3D only | `grep` of `src/`, `Cargo.lock` |
+| Cyrius consumers | **None yet.** kiran and joshua have no local repo; aethersafha is Cyrius (0.18.2) but declares no impetus dependency; the bridge partners dravya, sharira and ushma have no local repo | `~/Repos` |
+| Target | impetus **2.0.0**, Cyrius | this document |
+
+## 0. Decisions already made
+
+- **hisab-first** (2026-11-09). The port uses as much of Cyrius hisab as it can: vector,
+  quaternion and matrix types, ray tests, GJK/EPA/MPR, BVH, island detection, inertia tensors.
+  It does not keep private copies of glam or of impetus algorithms that hisab already provides.
+  Where hisab lacks something, the port **files the gap upstream** (§8) rather than transcribing
+  around it. The ports are how the ecosystem finds where hisab, ganita, the stdlib and the
+  compiler need work.
+- **Performance is measured, not gated.** Every Rust benchmark gets a Cyrius twin and both
+  columns are recorded per milestone (`docs/benchmarks-rust-v-cyrius.md`, as tanmatra). The
+  ratios are first numbers on an 8-month-old language with no speed work yet, and hisab's own
+  history shows its speed has been flat since September (median 0 % over 80 benchmarks, 6.6.4 →
+  6.7.18). A slow row is a finding to file, with its numbers, not a reason to change the port.
+- **The oracle is frozen.** Rust 1.4.0 moves to `rust-old/` and is never edited. A generator
+  crate in `scripts/oracle/` drives it by path (as tanmatra). A wrong oracle value is fixed in
+  Rust as 1.4.x and regenerated.
+- **No Rust 2.0** (as kimiya). The roadmap's "2.0 — Breaking Cleanup" items that are API shape
+  changes land in the Cyrius API only (§3.3), accepted by ADR. New physics stays out of the port.
+
+## 1. Porting models and references
+
+- **tanmatra 2.0.1** (`/home/macro/Repos/tanmatra`), the template. It is the source for:
+  - `scripts/oracle/` (generator crate, TSV format 1, `validate.py`, `probe_tables.py`);
+  - `tests/parity.tcyr`, `tests/parity_core.cyr` and `tests/ulp.cyr`;
+  - `docs/development/port-parity.md` and the port-parity rule for class-C bounds;
+  - the CLAUDE.md translation of the Rust principles (its plan §2 step 2);
+  - `scripts/rust_test_ledger.py` and `scripts/surface_parity.py`.
+- **kimiya** (in progress), the model for:
+  - a **hisab dependency** (`[deps.hisab]`, ADR 0003);
+  - a **glibc oracle** (std, not `libm`; ADR 0005 for correctly rounded primitives);
+  - **API divergences** accepted by ADR (its ADR 0002 and the oracle ↔ `Err` mapping).
+- **hisab 3.4.1**, the dependency. Read `CLAUDE.md`, `docs/guides/migration-3.4.md` (the Result
+  convention) and the doc comment of every function impetus calls. Several 3.x functions are
+  stricter than glam (§7.2).
+- **Language and toolchain** (`/home/macro/Repos/cyrius`): `docs/guides/cyrius-guide.md`,
+  `docs/stdlib-reference.md`, `docs/development/ecosystem-migration.md` (6.7.x entries),
+  `cyrius help manifest`, `BENCHMARKS.md`.
+
+---
+
+## 2. What is different from tanmatra and kimiya
+
+tanmatra and kimiya are libraries of pure functions: values in, values out, one golden row per
+call. impetus is a **stateful simulation**, so five things change.
+
+1. **A step is not a function call.** A world step runs broadphase, narrowphase, warm start,
+   iterations, position correction, integration and sleep over shared state. A 1-ulp difference in
+   a stacked pile grows every frame, so long trajectories can't be compared bit for bit. Parity
+   therefore has three layers (§5):
+   - **function rows** for everything that is a function (springs, mass properties, contact
+     generation, ray tests, broadphase pair sets, materials, config validation);
+   - **single-step rows**: load the oracle's full state at frame k, step once, and compare the
+     full state at k + 1;
+   - **scenario reference tests**: physical outcomes such as resting height, bounce speed,
+     swing, settling and sleep. `tests/regressions.rs` is already this, one test per 1.4 fix.
+2. **hisab replaces impetus code.** hisab's results differ from glam's and from impetus's own
+   algorithms, on purpose:
+   - `hquat_rotate_vec3` rotates by q/|q|;
+   - `m3_inverse_checked` decides singularity exactly;
+   - hisab's GJK is a more robust algorithm than impetus's.
+
+   Those paths are compared within a class-D tolerance and by the reference tests, never by
+   bits. ADR 007 accepts each divergence by name (§5).
+3. **Memory per frame is a design problem.** The stdlib `alloc` is a bump allocator with no free.
+   hisab allocates every vector, quaternion and matrix it returns. `alloc_reset` would wipe the
+   consumer's heap as well as impetus's. A world that steps 60 times a second for hours must
+   reach a flat heap after warm-up. This is M0's first probe (§4 step 9).
+4. **Two backends behind one API.** Rust's `2d` and `3d` features are exclusive and give the
+   same public names. In Cyrius:
+   - `[lib]` (the 2D default) and `[lib.3d]` are bundle profiles with disjoint backend modules;
+   - each defines the same `ImPhysicsWorld` API, and a consumer includes exactly one bundle;
+   - `[features]` only selects optional dependencies and defines nothing, and `#define` is
+     capped at 16 names, so profiles are the clean split;
+   - tests include their backend's module list explicitly, as tanmatra's split parity harness
+     does.
+5. **Snapshots can't be carried.** bitcode has no Cyrius implementation, and the 1.4 snapshot is
+   incomplete anyway (roadmap 2.0). The port designs the complete format from the start (M6). It
+   has no oracle, so it is checked by round trip and by step-equivalence: a restored world steps
+   to the same bits as the original.
+
+---
+
+## 3. Scope
+
+### 3.1 In scope for 2.0.0
+
+| Milestone | Rust module | Code lines | Cyrius module(s) | hisab use |
+|---|---|---|---|---|
+| M1 | `error.rs` | 19 | `src/error.cyr` | — |
+| M1 | `config.rs` | 124 | `src/config.cyr` | — |
+| M1 | `material.rs` | 108 | `src/material.cyr` | — |
+| M1 | `units.rs` | 106 | `src/units.cyr` | — |
+| M1 | `force.rs`, `body.rs`, `collider.rs`, `joint.rs`, `event.rs`, `query.rs` | 259 | `src/types.cyr` (descriptors, handles, events) | — |
+| M1 | `arena.rs` | 198 | `src/arena.cyr` | — |
+| M1 | `contact_tracker.rs` | 107 | `src/contact_tracker.cyr` | — |
+| M1 | `spring.rs` | 268 | `src/spring.cyr` | — |
+| M2 | `backend_2d/types.rs` | 550 | `src/b2_types.cyr` | `HVec2` at the API edge |
+| M2 | `backend_2d/narrowphase.rs` | 830 | `src/b2_narrowphase.cyr` | `convex_hull_2d` (hull input) |
+| M2 | `backend_2d/raycast.rs` | 448 | `src/b2_raycast.cyr` | `geo_ray_*` with z = 0 where the probe allows |
+| M2 | `aabb_tree.rs`, `spatial_hash.rs` | 480 | `src/broadphase.cyr` | `bvh_*` per-frame rebuild, if the probe wins (§7.2) |
+| M3 | `backend_2d/solver.rs`, `joints.rs`, `state.rs` | 2,172 | `src/b2_solver.cyr`, `src/b2_joints.cyr`, `src/b2_state.cyr` | `detect_islands` |
+| M3 | `world.rs` (2D paths, particles) | 1,078 | `src/world.cyr`, `src/particle.cyr` | — |
+| M4 | `backend_3d/types.rs` | 446 | `src/b3_types.cyr` | `HVec3`, `HQuat`, `m3_*`, `inertia_box` / `inertia_sphere` |
+| M4 | `backend_3d/narrowphase.rs` | 1,109 | `src/b3_narrowphase.cyr` | `gjk_intersect_3d`, `gjk_epa_3d`, `mpr_*` |
+| M4 | `backend_3d/raycast.rs` | 200 | `src/b3_raycast.cyr` | `geo_ray_sphere`, `geo_ray_obb_face`, `geo_ray_capsule_branch` |
+| M5 | `backend_3d/solver.rs`, `joints.rs`, `state.rs` | 1,473 | `src/b3_solver.cyr`, `src/b3_joints.cyr`, `src/b3_state.cyr` | `m3_*`, `hquat_*` |
+| M6 | `serialize.rs` and `world.rs` snapshot code | 48 + ~150 | `src/snapshot.cyr` | — |
+
+`particle.rs` (153 lines) goes with `world.rs` in M3. The surface parity check (§4 gates) covers
+every `pub fn` and every `pub` method on the re-exported types.
+
+### 3.2 Deferred or not carried
+
+| Rust surface | Decision | Why |
+|---|---|---|
+| `bridge.rs` (17 fns, 27 tests): dravya, sharira, ushma | **deferred** until a Cyrius consumer exists | the same rule as tanmatra's bridges. Each is a thin primitive-value wrapper, so it ports later as a small parity-tested file |
+| `SolverKind::Xpbd` (2D-only, experimental) | **not carried**. `config_validate` returns `Err(IM_ERR_UNSUPPORTED)` | it has known gaps (roadmap: XPBD parity) and no consumer. Demand-gated, as a Cyrius 2.x item |
+| serde derives on every public type | **not carried** | as tanmatra: JSON only for types a Cyrius consumer exchanges, via `#derive(Serialize)` once the derive key-scan issue is fixed |
+| `Send + Sync` assertions, `#[inline]` | **not carried** | Rust-only mechanics |
+| Heightfield and TriMesh colliders | **carried as in Rust**: accepted, generating no contacts | parity; contacts for them are a roadmap item |
+
+### 3.3 API changes in the Cyrius version (accepted divergences, ADR 008)
+
+These come from the roadmap's "2.0 — Breaking Cleanup". Each row says how the harness still
+compares it, so no function leaves parity entirely.
+
+| # | Rust 1.4.0 | Cyrius 2.0.0 | Golden comparison |
+|---|---|---|---|
+| 1 | `add_collider` / `add_joint` store an orphan for a missing body | return `Result`: `Err(IM_ERR_BODY_NOT_FOUND)` | oracle orphan ↔ `Err`; the rest class A on handles |
+| 2 | deprecated `restore` beside `try_restore` | one fallible `restore` | the snapshot is Cyrius-only (M6) |
+| 3 | incomplete bitcode snapshot | complete, versioned format | round trip and step-equivalence (§2 item 5) |
+| 4 | 3D `BodyState` keeps only rotation about Z | full quaternion and angular-velocity vector | the oracle hook (§4 step 0) exposes the full state |
+| 5 | 3D Revolute / Prismatic / motors accepted, with no effect | `add_joint` returns `Err(IM_ERR_UNSUPPORTED)` in the 3D profile | oracle accept-and-ignore ↔ `Err` |
+| 6 | `SolverKind::Xpbd` | refused by `config_validate` (§3.2) | oracle Xpbd rows ↔ `Err` |
+| 7 | results bit-identical only on the same platform | **bit-identical across targets** for impetus-owned arithmetic (§7.1) | measured on x86_64 ELF, x86_64 PE and aarch64, as tanmatra |
+
+Not in 2.0, because they are new physics with no oracle: 3D islands and island sleep, consistent
+3D joint frames, XPBD parity, 3D revolute/prismatic/motors. They start after 2.0, with reference
+tests only.
+
+---
+
+## 4. M0 — Initialize with `cyrius port`
+
+0. **Freeze a green oracle (Rust, before the move).** *Maintainer action, with two Rust changes
+   to decide first.*
+   - **Oracle hooks.** The public API can't show what step parity needs:
+     - 3D orientation and angular velocity (`BodyState` is Z-only);
+     - manifolds and warm-start impulses;
+     - joint accumulators;
+     - sleep timers and islands;
+     - contact generation for a single shape pair.
+
+     Add a non-default, `#[doc(hidden)]` `oracle` cargo feature with a read-only state dump and
+     pair-level entry points for contacts, mass properties and ray tests. It is additive and
+     doesn't change behaviour. Put it in 1.4.0 if it lands before the tag, otherwise in 1.4.1.
+   - **`2d = ["dep:hisab"]` → `2d = []`.** The 2D backend uses no hisab; only `backend_3d/` and
+     one `#[cfg(feature = "3d")]` function in `world.rs` do. The default build compiles hisab
+     and glam for nothing.
+   - Commit and tag. The release workflow requires the tag to equal `VERSION`. Re-run the P(-1)
+     check on the tagged commit; nothing in `src/` changes after this point.
+   - Record the glibc version (2.44 today). The oracle's transcendental bits depend on it.
+1. **Scaffold.** `cyrius port --dry-run .`, then `cyrius port .`.
+   - Expect these to move into `rust-old/`: `Cargo.toml`, `Cargo.lock`, `src/`, `tests/`,
+     `benches/`, `fuzz/`, `Makefile`, `deny.toml`, `codecov.yml`, `target/`.
+   - Untrack `fuzz/target/` first. 208 build files under it are committed despite `.gitignore`.
+2. **Repair what the scaffold overwrites** (as tanmatra's plan §2 step 2, filed as
+   `cyrius/docs/development/issues/2026-11-08-cyrius-port-clobbers-project-docs-and-omits-bench.md`):
+   - **CLAUDE.md**: merge, keeping the identity, process and DO NOT list. Translate the principles:
+     - `#[non_exhaustive]` → append-only enum values;
+     - `#[must_use]` → `#must_use` / `#pure`;
+     - no `unwrap`/`panic!` → no `+?`, `-?`, `*?`, `assert_fatal`, `result_unwrap` or `panic` in
+       `src/`;
+     - "Vec arena over HashMap" and "BTreeMap for determinism" → "sorted arrays and typed stride
+       arenas; never `hashmap`" (its seed is random per process, §7.3);
+     - "tracing on all operations" → sakshi spans, behind a level.
+   - **Roadmap** restored from git; **`state.md`** rewritten for 1.4.0 → 2.0.0-dev.
+   - **Workflows**: keep the scaffold's Cyrius CI and add `test --bounds`, `deps --locked`,
+     `audit`, plus a **3D profile job**. Move the Rust workflows to
+     `rust-old/.github/workflows/`. Append `/rust-old/target/` and `/build/` to `.gitignore`.
+   - **Move Rust-only material** to `rust-old/`: `scripts/bench-history.sh`,
+     `scripts/version-bump.sh`, `bench-history.csv`, `docs/guides/testing.md`,
+     `docs/architecture/overview.md`.
+   - **ADRs**: renumber `docs/adr/001`–`006` to the scaffold's four-digit form and add:
+     - 0007, the port (drafted as [ADR 007](../adr/007-cyrius-port-hisab-first.md));
+     - 0008, the §3.3 API divergences.
+   - Check that `cyrius.cyml` reads `version = "${file:VERSION}"` and that `bench` is in
+     `[test] stdlib`. Document the scaffold's stub functions so `cyrius audit` passes.
+3. **`cyrius.cyml`.** Confirm the keys with `cyrius help manifest`.
+   ```toml
+   [package]
+   name = "impetus"
+   version = "${file:VERSION}"
+   license = "GPL-3.0-only"
+   language = "cyrius"
+   cyrius = "6.7.18"
+
+   [deps]
+   stdlib = ["syscalls", "string", "alloc", "str", "fmt", "io", "vec", "math", "ganita",
+             "tagged", "result", "freelist", "fnptr", "sakshi"]
+
+   [deps.hisab]
+   git = "https://github.com/MacCracken/hisab.git"
+   tag = "3.4.1"
+   modules = ["dist/hisab.cyr"]
+
+   [test]
+   stdlib = ["assert", "bench"]
+
+   [lib]                 # 2D, the default, as Rust's default feature
+   modules = ["src/error.cyr", ...]
+
+   [lib.3d]
+   modules = ["src/error.cyr", ...]
+   ```
+   - **Shared order:** error → config → material → units → types → arena → contact_tracker →
+     spring → broadphase → snapshot. The world comes last.
+   - **2D:** b2_types → b2_narrowphase → b2_raycast → b2_joints → b2_solver → b2_state →
+     particle → world.
+   - **3D:** b3_types → … → world.
+   - `world.cyr` is shared. Where it calls a backend, it calls the same `_im_backend_*` names,
+     which each profile defines.
+   - hisab's own leaves (`dist/hisab.deps`: math, alloc, vec, ganita, result, str, fmt) are
+     listed in `[deps] stdlib`.
+4. **Toolchain and math check.** Confirm the counterpart of every Rust f64 method impetus calls
+   (§7.1). The stdlib lacks public `is_nan`, `is_finite`, `copysign`, `sin_cos`, `EPSILON`,
+   `INFINITY` and `NAN`, and Rust-semantics `min` / `max`. Write local `_im_*` helpers for them
+   (as kimiya's `mathx.cyr`) and file the gaps (§8).
+5. **Golden-value generator** in `scripts/oracle/`: copy tanmatra's crate and adapt it.
+   - **Two oracle builds.** The backends are exclusive, so the generator is one crate run
+     twice: `--features 2d,oracle` and `--features 3d,oracle`. The 3D build writes
+     `tests/golden/b3_*.tsv`.
+   - TSV format 1, f64 as bit patterns, deterministic, with a `--check` mode, as tanmatra.
+   - **glibc in the header**, as kimiya; `--check` refuses a corpus from another glibc.
+   - **Step format** (new): each row is a scenario name and a frame index. Its inputs are the
+     full state dump at frame k plus the frame's applied forces; its outputs are the dump at
+     k + 1 and the frame's events. State dumps flatten in a fixed order (bodies by handle, then
+     manifolds by pair key, then joints).
+6. **Table and constant generator.** impetus has few tables: the material presets, config
+   defaults and limits (`MAX_SUB_STEPS`, `MAX_ITERATIONS`, `MAX_SNAPSHOT_INDEX`), and solver
+   constants (`RESTITUTION_VELOCITY_THRESHOLD`, `MAX_CONDITION_NUMBER`, `JOINT_BAUMGARTE`). They
+   are extracted and proven as tanmatra does for private constants.
+7. **Parity harness.** Copy `tests/parity.tcyr`, `tests/parity_core.cyr` and `tests/ulp.cyr`, and
+   split them per profile: `tests/parity_2d.tcyr` and `tests/parity_3d.tcyr`. Add:
+   - a **state loader** that builds a world from a dump row;
+   - a **step comparator** with per-field classes;
+   - a **divergence table** naming every ADR 007 path, reported by name, as kimiya's ADR 0002
+     mapping.
+8. **Baseline measurements** → `docs/development/port-parity.md`. The math sweep runs every
+   Cyrius counterpart against glibc on x86_64 ELF, x86_64 PE (wine) and aarch64 (qemu). Set the
+   class-C bounds by tanmatra's rule (K_F = 2·S·calls + 2; above 64, make the primitive exact
+   or write an ADR).
+9. **Probes**, each answered with a small program and numbers before M1 writes any code:
+   1. **Memory model.** Can world-lifetime storage (freelist or a world-owned arena) and a
+      per-step scratch arena coexist with hisab's allocations? Can hisab be pointed at the
+      scratch arena (`alloc_via`), or must it keep using the global bump heap? Gate: a soak
+      test of 10⁵ steps of a 100-body pile reaches a flat heap high-water mark after warm-up.
+   2. **Vector representation in hot loops.** Time a contact-solve inner loop four ways:
+      - hisab `HVec3` handles;
+      - hisab with in-place setters;
+      - struct values (`struct ImV3 { x: f64; y: f64; z: f64; }` with `ImV3_add` operator
+        overloads);
+      - plain scalars.
+
+      The numbers go into hisab request H1 (§8). Until H1 lands, use the fastest form inside
+      the solver, narrowphase and integration loops, and hisab everywhere else.
+   3. **Typed stride arrays.** An arena of `ImBody` structs through a typed `*ImBody` base, with
+      `base + k` stepping by `sizeof`, under `--bounds`.
+   4. **Struct values.** Re-probe at the pin (they changed heavily in 6.7.10 – 6.7.17):
+      - returns of 16 bytes (vec2, two registers) and 24/32 bytes (vec3/quat, hidden pointer);
+      - `Result` payloads (the open small-struct bug, so use a handle or out-pointer);
+      - operator overloading on struct values.
+   5. **Deterministic sort.** `vec_sort_by` is introsort, not stable. Every sort key impetus uses
+      must be total (pair keys, handle indices), or a local stable merge sort must replace it.
+      List each Rust sort site and its key.
+   6. **Per-profile tests.** How `cyrius test` prepends `[lib]` modules. The 3D test files must
+      compile against the 3D list only.
+
+**Gate:** `cyrius build` and `cyrius bench` pass; `cyrius test` runs both harnesses (0 modules)
+with no warnings; `cyrius lint` and `fmt --check` are clean. Committed: the generators,
+`tests/ulp.cyr`, ADRs 0007 and 0008, the probe results in `port-parity.md` and the upstream issues
+(§8).
+
+---
+
+## 5. Parity policy
+
+tanmatra's classes apply (its plan §4), with two additions for the simulation:
+
+| Class | Tolerance | impetus examples |
+|---|---|---|
+| **A — exact** | bit-identical / equal integers | handles and generations, config validation verdicts, material presets, combine rules, collision layers, broadphase pair **sets**, contact counts and feature ids, event sequences, constants |
+| **B — arithmetic** | ≤ 2 ulp, expected 0 | spring step with its cached matrix (× + only), 2D contact generation (SAT, clipping), 2D mass properties, solver arithmetic on 2D paths, AABBs |
+| **C — transcendental** | ulp ≤ K by the port-parity rule | spring transition (exp, sin, cos), 2D rotation (`sin_cos`), `atan2`, `hypot` sites, joint angles |
+| **D — iterative / hisab-backed** | relative ≤ 1e-12, or a per-function bound set before its first comparison | every ADR 007 path: 3D quaternion rotation, mat3 inverse, GJK/EPA normal and depth, BVH-derived pair order (the pair *set* stays class A), `detect_islands` membership (class A on sets) |
+| **S — single step** | per field: the class of the path that produced it | one `step()` from an oracle state dump. Positions, velocities and impulses take the path's class; contact sets and events are class A, except a named near-degenerate contact flip |
+| **R — reference** | physical tolerance stated in the test | the 30 regression scenarios, the Rust unit tests that assert physics (resting height, bounce speed, swing, settling, sleep), and energy and momentum invariants over long runs |
+
+Rules:
+- **Never widen a class to make a row pass** (as tanmatra). A failure is one of three things:
+  - a port defect;
+  - a Cyrius/hisab/ganita defect, which is filed upstream;
+  - an oracle defect, which is fixed in Rust 1.4.x and regenerated.
+
+  The only exception is a divergence accepted by an ADR, which the harness still reports by name.
+- **Bit-level trajectories only where the scene is not chaotic**: free fall, a single pendulum, a
+  spring, one bouncing ball. They are compared over the whole horizon. Piles, stacks and chains
+  get class S rows at frames spread through the run, plus class R.
+- **Branch points on both sides**:
+  - the restitution threshold (1 m/s);
+  - the block solver's condition number (1000);
+  - the static/kinetic friction slip threshold;
+  - sleep onset and wake-on-contact;
+  - the speculative margin;
+  - the spatial-hash oversize cap (`MAX_CELLS_PER_ENTRY`);
+  - the spring's damping regimes (under, critical, over).
+
+---
+
+## 6. Milestones
+
+Every milestone ends with tanmatra's gates (its plan §3), run for **both profiles** from M4 on:
+- `cyrius build`; `cyrius test` and `test --bounds` **with no warnings** (the f64 type diagnostics
+  appear only there);
+- `cyrius bench`, recorded against the Rust numbers;
+- `vet`, `lint` and `fmt --check` on the milestone's files;
+- `distlib --all`, then `distlib --check`, then `deps --locked`;
+- **surface parity**: every in-scope Rust `pub fn` has a Cyrius counterpart or a written reason;
+- the soak test (§4 step 9.1) once a world steps;
+- CHANGELOG and `state.md`.
+
+| Milestone | Modules | Key work | Golden grid (minimum) |
+|---|---|---|---|
+| **M1 Foundation** | error, config, material, units, types, arena, contact_tracker, spring | `ImpetusError` → `IM_ERR_*` append-only code enum, no detail string (as tanmatra). `WorldConfig::validate` with its limits. `CombineRule` priority. Descriptors as structs; `ColliderShape`, `JointType`, `ForceField`, `CollisionEvent` as a kind enum plus a typed payload struct (a boxed payload enum allocates, and `: stack` holds one word). Generational arena over a typed stride buffer with the lazy free-list rebuild. Sorted-array contact tracker. Exact spring with the cached transition | every config field at and past its limit; every combine-rule pair; arena insert/remove/reuse sequences (seeded); tracker sub-step sequences incl. start-and-stop within a frame; springs over under/critical/over-damped × dt ∈ {1e-6, 1/60, 1, 100} |
+| **M2 2D collision** | b2_types, b2_narrowphase, b2_raycast, broadphase | Mass properties (polygon, capsule, box, circle; offset colliders). Narrowphase: reference/incident-face clipping, rounded shapes, capsule end contacts, either winding, normals A→B. Raycast: hisab `geo_ray_*` with z = 0 where probe 2 allows, impetus code for segments and polygons. Broadphase: the balanced AABB tree (or a per-frame `bvh_build`, if the probe wins), the spatial hash with an oversize list | every shape pair × both orders × seeded poses incl. touching, separated by the speculative margin, deep, rotated by 0/π/4/π/2; rays from every side and inside; pair sets vs brute force for 1,000 boxes (sorted row, random) |
+| **M3 2D dynamics** | b2_solver, b2_joints, b2_state, particle, world | Sequential impulses: warm start 0.95, the block solver with the condition check, restitution from the pre-solve speed, split impulse, soft ERP. Velocity-level joints (`Row`, `PointBlock`, soft springs, limits, motors, breaking). Islands via `detect_islands` with contacts filtered to dynamic–dynamic (static ground doesn't merge), atomic sleep, wake on contact begin. Sub-steps with forces held for the frame. Particles: R3 spread, capped spawns, fields, drag, collisions. Events | the step corpus: box stack 10, pyramid, revolute chain 20, pinned box, bouncing balls (e = 0, 0.5, 1), friction ramp, sleeping stack plus support removal, sub-steps 1/4/8, an emitter scene; class S at frames {1, 2, 10, 60, 300}; class R for all 28 2D regression tests |
+| **M4 3D collision** | b3_types, b3_narrowphase, b3_raycast | World-space inverse inertia R·I⁻¹·Rᵀ on `m3_*`. Gyroscopic step (implicit, energy-projected). Mass properties with the parallel-axis shift (`inertia_box`, `inertia_sphere`; capsule and cylinder per H5). GJK/EPA on hisab for hull and general pairs, with contact points per H3. 15-axis OBB SAT with face clipping (impetus-owned), capsule and sphere closed forms. Raycast on hisab's ray tests | every 3D shape pair × both orders × seeded poses; inertia for each shape, offset and rotated; rays incl. zero direction; hisab-path rows as class D |
+| **M5 3D dynamics** | b3_solver, b3_joints, b3_state, world (3D) | Two-tangent friction, restitution bias, Baumgarte /dt, Fixed joint as a 6×6 block (a hisab or ganita dense solve, if one fits), Distance, Rope, Spring, Wheel, Mouse joints; Revolute/Prismatic/motors refused (§3.3 #5). Per-body sleep, sleepers zeroed | the M3 corpus in 3D plus a spinning-top gyroscopic scene; class R for the 3D regression tests |
+| **M6 Snapshots** | snapshot | A complete, versioned binary format written with `store64`: header and version, config, arena slots with generations and free-list order, bodies, colliders, joints with accumulators, manifolds with warm-start impulses, sleep state, force fields, particles and emitters. Validation as `validate_snapshot` (index caps, finite values) | round trip for every scenario at several frames; restore-then-step equals step bit for bit (the 2 `#[ignore]`d Rust tests become live Cyrius tests); corrupted and truncated inputs refused (port of `fuzz_serialize`) |
+| **M7 Release 2.0.0** | all | Rust-test ledger (mela pattern): each of the 2D + 3D unit tests, 30 regression, 9 integration and 2 doc tests is ported, folded into golden rows, or marked n/a / deferred. Full surface-parity diff. `docs/benchmarks-rust-v-cyrius.md` with all 38 benchmarks in both columns. `cyrius distlib --all`. `cyrius audit`. VERSION 2.0.0 | the full corpus green for both profiles on x86_64 ELF, x86_64 PE and aarch64 |
+
+Order: M0 → M1 → M2 → M3 → M4 → M5 → M6 → M7. The 2D backend is the default, uses no hisab
+types in Rust, and gives a complete world first. 3D leans hardest on hisab, so it comes after the
+memory and vector probes have settled and the first hisab requests have had time to land.
+
+---
+
+## 7. Rust → Cyrius mapping (impetus specifics)
+
+### 7.1 Math functions
+
+Every std f64 method in `src/` outside tests, 1.4.0:
+
+| Rust (calls) | Cyrius | Parity |
+|---|---|---|
+| `sqrt` (41), `abs` (284), `floor` (2), `ceil` (2) | `f64_sqrt`, `f64_abs`, `f64_floor`, `f64_ceil` (builtins) | exact on every target |
+| `sin_cos` (15), `sin` (1), `cos` (1) | `f64_sin`, `f64_cos`, two calls (no `sin_cos`) | the polyfill on every target, so identical everywhere; class C against glibc |
+| `atan2` (2) | an atan2 on `_f64_atan_polyfill`, as the language survey recommends | `ganita_f64_atan2` calls the native x87 `f64_atan` on x86_64, so its bits differ between targets |
+| `exp` (4, spring) | `_f64_exp_polyfill` | `f64_exp` is x87 on x86_64; the polyfill keeps §3.3 #7 |
+| `hypot` (15) | `ganita_f64_hypot` (pure Cyrius) | ≤ 2 ulp from libm (tanmatra measured); class C, or exact by the rule if a site is ill-conditioned |
+| `powf` (1) | `ganita_f64_pow` | class C; mind ganita's `pow(-1, huge)` defect (tanmatra ADR 0007) |
+| `powi` (19) | explicit products in LLVM's square-and-multiply order (as tanmatra) | class B |
+| `min` (32), `max` (74), `clamp` (28) | local `_im_min` / `_im_max` / `_im_clamp` with Rust's NaN-ignoring semantics (`f64_min(NaN, 1)` is 1 but `f64_min(1, NaN)` is NaN) | exact |
+| `is_nan` (14), `is_finite` (42) | `x != x`; `x - x == 0` (as kimiya's `_km_is_finite`) | exact |
+| `to_radians` (5) | `x * (PI / 180.0)` in Rust's order | class B |
+
+**Typing traps** (as tanmatra §5, all probed on 6.7.18):
+- An operator is typed by its left operand. Bind every builtin and ganita result to a `: f64`
+  local first; `(0 - x)` is an integer subtraction, so write `-x`.
+- There is no exponent notation, so write `0.000000001`.
+- A hex pattern in a `const` is an integer.
+- `F64_*` stdlib constants are untyped `var`s; define impetus's own `const`s.
+- `#derive(accessors)` getters return untyped bits.
+
+### 7.2 glam and impetus algorithms → hisab
+
+| Rust | hisab 3.4.1 | Plan |
+|---|---|---|
+| `DVec3` new/ZERO/splat/X/Y/Z, `+ − neg`, `* f64`, `dot`, `cross`, `length(_squared)`, `min`/`max`/`abs` | `hvec3_*` | use; hot loops per probe 2 until H1 |
+| `/ f64`, `+= −= *=`, `==`, vector `is_finite`, `normalize_or`, `try_normalize`, `any_orthogonal_vector`, `any_orthonormal_pair`, `from_array`/`to_array` | none | H2; local helpers until then |
+| `DQuat` IDENTITY, `from_xyzw`, `from_rotation_z`, `q * q`, `.inverse()`, `.normalize()` | `hquat_identity`, `hquat_new`, `hquat_from_rotation_z`, `hquat_mul`, `hquat_conjugate` (bit-exact with glam's inverse), `hquat_normalize_checked` | use |
+| `q * v` (glam assumes a unit q) | `hquat_rotate_vec3` (divides by \|q\|² unless it is exactly 1) | use; class D, ADR 007. A unit-assuming variant is H2 |
+| `-q` | none (`hquat_new` on negated parts) | H2 |
+| `DMat3` ZERO, `from_cols`, `from_quat`, `M·v`, `M·M`, `+`, `* f64`, transpose, determinant | `m3_new`, `m3_from_cols`, `m3_from_quat`, `m3_mul_vec3`, `m3_mul`, `m3_add`, `m3_scale`, `m3_transpose`, `m3_determinant` | use |
+| `from_diagonal`, `M − M`, `−M` | none | H2 |
+| `.inverse()` | `m3_inverse_checked` (exact singularity) | use; class D |
+| impetus GJK / EPA (3D) | `gjk_intersect_3d`, `gjk_epa_3d` (normal and depth), `mpr_*` | use; contact points need H3 |
+| impetus 15-axis OBB SAT + face clipping, capsule and sphere closed forms | none (hisab makes no manifolds) | impetus-owned |
+| impetus 2D SAT + clipping | none (`convex_hull_2d` only) | impetus-owned |
+| impetus AABB tree (balanced, incremental) | `bvh_build`, `bvh_query_aabb` (static; no pair query) | probe a per-frame rebuild; H7 for pair query and incremental updates |
+| impetus spatial hash (AABB rasterisation, pairs, oversize list) | `spatial_hash_*` (points with radius queries) | impetus-owned unless H7 |
+| impetus island union-find | `detect_islands` (sorted, deterministic; unions every contact given) | use, with contacts filtered to dynamic–dynamic |
+| impetus box/sphere inertia | `inertia_box`, `inertia_sphere` | use; capsule, cylinder and polygon inertia are H5 |
+| 3D ray vs ball / box / capsule | `geo_ray_sphere`, `geo_ray_obb_face`, `geo_ray_capsule_branch` | use |
+| sequential impulses, joints, sleep | `sequential_impulse` is a reduced model; hisab's D039 assigns the full solver to impetus | impetus-owned |
+
+### 7.3 Types and idioms
+
+| Rust | Cyrius |
+|---|---|
+| `Arena<T>` (generational) | a typed stride buffer, `*ImBody` + k stepping by `sizeof` (probe 3), with a generation column and the free list. Its storage comes from freelist or the world arena, never `vec` (8-byte words only, and growth never frees) |
+| `BTreeMap` (11) / `BTreeSet` (2) | sorted arrays keyed by `u64` pair or handle keys, with binary search. Manifolds are rebuilt every frame (ADR 006), so a sorted array rebuilt per frame fits. **Never `hashmap`**: its seed is random per process, so iteration order changes between runs |
+| `HashMap` (1) | the same sorted array |
+| `AabbTree<K>`, `SpatialHashGrid<K>` | keys are already handle words (`i64`); no generics needed |
+| `ColliderShape`, `JointType`, `ForceField`, `CollisionEvent` (payload enums) | a kind enum (`IM_SHAPE_BALL`, …, append-only) plus one payload struct with the union of fields. Hull points sit behind a pointer and a count: struct fields can't be fixed arrays |
+| `Vec<ContactPoint>` in `ContactData` | caller buffer plus count, or a frame-scratch array the world owns |
+| `[f64; 2]` / `[f64; 3]` public arguments | struct values `ImVec2` / `ImVec3` at the API (two registers for 16 bytes); `HVec2` / `HVec3` on the hisab side |
+| `Result<T, ImpetusError>` | value-form `Result` + `IM_ERR_*` code, with `?` (as tanmatra). No `Result` through `callptr` |
+| `Option<BodyState>` and similar | out-pointer + 1/0, or the value-form `Option` for one word |
+| closures in `sort_by` / iterator chains | loops; a comparator through `fncall2` with `f64_lt` for f64 keys |
+| `#[non_exhaustive]` / `#[must_use]` | append-only enum values / `#must_use` |
+
+### 7.4 Names
+
+- **Public structs** `Im<Name>` with `impl` blocks, so methods keep their Rust names:
+  `w.add_body(desc)`, `w.step()`, `s.step(dt)`. The constructors are `ImPhysicsWorld_new`,
+  `ImSpring_critically_damped` and so on.
+- **Globals and enum members** carry `IM_`; private helpers carry `_im_`; the backend seam
+  that `world.cyr` calls is `_im_backend_*`.
+- Scan for collisions with the 6.7.18 stdlib and hisab before M1 (`vec_*`, `map_*`,
+  `Ok`/`Err`, `f64_min`/`max`/`clamp`, ganita `mat_*`, hisab's `hvec*`, `geo_*`, `gjk_*`,
+  `contact_*`, `detect_islands`). "Last definition wins" across files is only a warning.
+
+### 7.5 Memory
+
+Settled by probe 1; the starting design:
+- **World lifetime**: arenas, broadphase nodes, manifolds and particles live in storage the world
+  owns (freelist or a growable world arena), freed by `ImPhysicsWorld_free`.
+- **Step lifetime**: pair lists, contact scratch, island lists and joint prep live in a step
+  arena reset at the start of every step.
+- **hisab temporaries**: in the step arena if hisab can be pointed there (H9), otherwise kept
+  out of the per-step loops.
+- **Never `alloc_reset`.** It would wipe the consumer's heap.
+
+---
+
+## 8. Gaps to file upstream (M0, then as found)
+
+Each one gets an issue in the owning repo with the probe or benchmark that shows it, as
+tanmatra filed its findings.
+
+**hisab**
+- **H1. Allocation-free vector math** in hot loops: in-place `_into(out, a, b)` variants, or
+  value-type vectors. Today every returned vector, quaternion or matrix allocates. hisab's
+  benchmark doc lists stack structs and arenas as "not planned unless a consumer asks"; this is
+  the consumer asking, with probe 2's numbers.
+- **H2. glam conveniences:**
+  - vectors: divide by a scalar, equality, a public vector `is_finite`, `normalize_or`,
+    `any_orthogonal`, `any_orthonormal_pair`;
+  - matrices: `m3_from_diagonal`, `m3_sub`, `m3_neg`;
+  - quaternions: `hquat_neg`, a unit-assuming `hquat_rotate_vec3_unit`;
+  - 2D: `hvec2_cross` (the perp-dot).
+- **H3. Contact points from GJK/EPA** (witness points), and a GJK distance query for
+  separated pairs (speculative contacts).
+- **H4. Segment–segment closest points** (capsule pairs).
+- **H5. Inertia** for capsule, cylinder and convex polygon/hull, with the parallel-axis shift.
+- **H6. 3D convex hull** (roadmap: ConvexHull raycast needs hull faces).
+- **H7. Broadphase support**: a BVH self-pair query, incremental insert/remove/refit, and an
+  AABB-cell spatial hash with pair enumeration.
+- **H8. 2D ray tests**, or document that z = 0 embedding is supported.
+- **H9. Allocator-scoped calls**: route hisab's allocations through a caller-chosen allocator,
+  so a step arena can hold them.
+
+**Cyrius stdlib / ganita / compiler**
+- **Stdlib math:**
+  - public `f64_is_nan` / `f64_is_finite`, `f64_copysign`, `f64_sin_cos`;
+  - `F64_EPSILON` / `F64_INFINITY` / `F64_NAN` as typed constants;
+  - Rust-semantics `f64_min_num` / `f64_max_num`;
+  - a deterministic atan2 (on the polyfill), and an exp polyfill exposed as the
+    cross-target choice.
+- **Collections:**
+  - a stable sort;
+  - `vec_reserve` / `vec_free`;
+  - a documented way to seed `hashmap` deterministically;
+  - an ordered map, if more than impetus needs one.
+- **Compiler:**
+  - f64 values live in integer registers and every op moves through xmm0/xmm1, with no xmm
+    register allocation;
+  - `#inline` takes at most two parameters;
+  - `memcpy` / `memset` are byte loops (open issue `2026-11-02`);
+  - struct fields can't be fixed arrays;
+  - `#define` is capped at 16 names;
+  - small-struct `Result` payloads misread (open issue `2026-11-08`);
+  - `f64v_*` writes past `dst` when n isn't a lane multiple (open issue `2026-11-06`);
+  - no exponent literals.
+
+---
+
+## 9. After 2.0.0
+
+1. **Bridges** (`src/bridge.cyr`), ported per consumer as dravya, sharira and ushma land in
+   Cyrius. Parity comes from the Rust bridge tests in `rust-old/`.
+2. **New physics from the roadmap**, now in Cyrius:
+   - 3D islands and island sleep (on `detect_islands`);
+   - 3D revolute, prismatic and motors;
+   - consistent 3D joint frames;
+   - XPBD, if a consumer asks;
+   - CCD on hisab `time_of_impact` / `swept_aabb`;
+   - compound shapes;
+   - shape casting;
+   - heightfield contacts.
+3. **Speed work with the ecosystem.** Once kiran and soorat are in Cyrius, the benchmark
+   columns and the §8 issues are the input to compiler, ganita and hisab tuning.
+4. **Removing `rust-old/`** after the bridges are ported or dropped, the corpus and generators
+   are archived, and the test ledger is closed (as tanmatra §6).
+
+---
+
+## 10. Tracking
+
+| Milestone | Status | Golden rows | Reference tests | Benches | Notes |
+|---|---|---|---|---|---|
+| M0 Initialize | ☐ | | | | step 0 waits on the oracle-hook decision |
+| M1 Foundation | ☐ | | | | |
+| M2 2D collision | ☐ | | | | |
+| M3 2D dynamics | ☐ | | | | |
+| M4 3D collision | ☐ | | | | |
+| M5 3D dynamics | ☐ | | | | |
+| M6 Snapshots | ☐ | | | | |
+| M7 Release 2.0.0 | ☐ | | | | |

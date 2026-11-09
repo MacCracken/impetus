@@ -13,6 +13,11 @@
 | 1.3 | sharira bridge additions (muscle torque, cylinder inertia, gait GRF, CoM gravity) |
 | 1.4 | Rust 1.99 / hisab 1.4; audit and repair sweep — contact normal orientation, polygon clipping, solver (restitution, block solver, warm start, split impulse), velocity-level joints, sub-step forces/events, 3D world-space inertia, GJK/EPA/SAT fixes, mass properties, sleep/islands, balanced AABB tree, validated config and snapshot restore, exact springs |
 
+**Next: the Cyrius port (2.0.0).** Rust 1.4.0 is the final Rust feature release and the parity
+oracle; see [`impetus-port-plan.md`](impetus-port-plan.md) and
+[ADR 007](../adr/007-cyrius-port-hisab-first.md). The 2.0 breaking items below land in the Cyrius
+API; the themed sections continue in Cyrius after 2.0.
+
 Planned sections below are grouped by theme; version numbers are assigned when work is scheduled.
 
 ## Collision Completeness
