@@ -139,20 +139,44 @@ for M3; it was measured today for context: **253 ns** (criterion, 250.2–257.0)
 | `_im_b2_add_collider_mass` | 82 ns |
 | of which `mass_properties` | 46 ns |
 
-The shape copy is one 168-byte `memcpy`, and the stdlib's `memcpy` copies a byte at a time. A portable word loop is
-4–8× faster:
+The shape copy's 349 ns is mostly one `memcpy` of the 184-byte `ColliderShape` record, and the stdlib's
+`memcpy` copies a byte at a time. 8-byte chunks with a byte tail, in plain Cyrius, are 4–7× faster (the repro filed
+upstream, two runs):
 
-| Bytes | `memcpy` (byte loop) | word loop + byte tail |
-|---|---|---|
-| 24 | 43 ns | 11 ns |
-| 168 | 260 ns | 35 ns |
-| 256 | 393 ns | 50 ns |
-| 4,096 | 6.17 µs | 0.77 µs |
+| Bytes | What it is | `memcpy` (byte loop) | 8-byte chunks + byte tail |
+|---|---|---|---|
+| 24 | a spatial hash record | 42–44 ns | 11 ns |
+| 184 | a `ColliderShape` | 287–296 ns | 43–45 ns |
+| 224 | an `ImRigidBody2d` | 341–361 ns | 51–54 ns |
+| 4,096 | a page | 6.08–6.45 µs | 0.86–0.91 µs |
 
-That is upstream finding **S5** (port plan §8). The port also calls `memcpy`:
-- for every arena insert and get (M3's body records are about 250 B);
+That is upstream finding **S5** (port plan §8). It was filed as an addition to ranga's open issue, which measured the
+same ratio on 8 MB frames. The port also calls `memcpy`:
+- for every arena insert and get (M3's body records are 224 B);
 - for the spatial hash's 24-byte record moves, once per record per merge pass. How much of the M2a hash row that
   costs is to measure in the profiling before M3;
 - in every JSON reader.
 
 The port isn't changed for speed. The world AABB's 261 ns is mostly its `sin_cos` (209 ns in `math/sin_cos_cr`).
+
+## M2 part 3: the 2D narrowphase (2026-11-09)
+
+Cyrius-only rows, 100,000 calls of `generate_contacts_multi` on a touching pair, x86_64 ELF. Rust times its
+narrowphase only inside the step benches, so the comparison waits for M3.
+
+| Bench | Pair | First port | One `sin_cos` per polygon and contact |
+|---|---|---|---|
+| `b2/contacts_ball_box` | a ball on a box (one round test) | 169 ns | 132 ns |
+| `b2/contacts_box_box_rotated` | two boxes, one at 0.3 rad (clipping, two points) | 1.98 µs | 1.28 µs |
+| `b2/contacts_capsule_box_lying` | a capsule lying on a box (two end caps) | 560 ns | 506 ns |
+| `b2/contacts_hull8_hull8` | two 8-vertex hulls | 3.29 µs | 3.18 µs |
+
+**Reading it.**
+- **The correctly rounded `sin_cos` dominates the small pairs.** It costs about 200 ns (`math/sin_cos_cr`), against
+  roughly 15 ns for glibc's.
+- **The box paths called it more than they needed to.** Rust's box `polygon_vertices` calls `local_to_world` once
+  per vertex, and `box_to_world` rotates and translates separately: four and two calls of one angle. The port now
+  takes each once. The bits are the same because `sin_cos` is pure, and all 16,133 contact rows still match. That
+  is the 0.7 µs off the rotated box pair.
+- **The hull pair is arithmetic.** It runs about 2 × 8 × 8 dot products for the separations and 16 edge-normal
+  square roots per call, on the compiler's xmm0/xmm1 code (port plan §8).

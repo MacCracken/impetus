@@ -559,19 +559,26 @@ tanmatra filed its findings.
   - `vec_reserve` / `vec_free`;
   - a documented way to seed `hashmap` deterministically;
   - an ordered map, if more than impetus needs one.
-- **S5. `memcpy` copies a byte at a time** (not filed yet). `lib/string.cyr`'s `memcpy` is a `load8` / `store8`
-  loop; the `rep movsb` it replaced broke aarch64's instruction alignment. A portable word loop for the
-  8-byte-aligned bulk, with a byte tail, is 4–8× faster (x86_64 ELF, M2b): 24 B 43 → 11 ns, 168 B 260 → 35 ns,
-  256 B 393 → 50 ns, 4 KiB 6.17 → 0.77 µs. The port calls `memcpy` for every arena insert and get (a body record
-  is ~250 B), for the shape copy each collider takes (349 of a ball's 545 ns), for the broadphase sorts' 24-byte
-  record moves, and in every JSON reader. Ask: a word-at-a-time `memcpy` (and `memset`, `memeq`) in plain Cyrius,
-  so no instruction-alignment issue returns.
+- **S5. `memcpy` copies a byte at a time** — **filed 2026-11-09** as impetus's addition to ranga's open issue
+  `cyrius/docs/development/issues/2026-11-02-memcpy-memset-byte-loops-dominate-frame-copies.md`
+  (a second file would have duplicated it), with a repro of its own, `repros/2026-11-09-memcpy-small-struct-copies.bcyr`.
+  `lib/string.cyr`'s `memcpy` is a `load8` / `store8` loop; the `rep movsb` it replaced broke aarch64's instruction
+  alignment. ranga measured 8 MB frames (6.5×). impetus adds the struct-sized regime: 8-byte chunks with a byte
+  tail, in plain Cyrius, are 4–7× faster (x86_64 ELF, two runs). 24 B goes from 42–44 to 11 ns, a 184-byte
+  `ColliderShape` from 287–296 to 43–45 ns, a 224-byte rigid body from 341–361 to 51–54 ns, and 4 KiB from
+  6.08–6.45 to 0.86–0.91 µs. The port calls `memcpy` for every arena insert and get, for the shape copy each
+  collider takes (about 290 ns of the shape copy's 349, in a ball's 545 ns), for the spatial hash's 24-byte record
+  moves, and in every JSON reader. The issue's proposed fix (8-byte chunks, landing with or after `memmove`)
+  covers both regimes.
 - **Compiler:**
   - f64 values live in integer registers and every op moves through xmm0/xmm1, with no xmm
     register allocation;
   - a struct-value vector kernel costs 2.5× the same kernel on `f64` locals (154 vs 56–63 ns,
     `port-parity.md` §4.2): the 24-byte return through the hidden pointer and the field copies;
   - `#inline` takes at most two parameters;
+  - multi-return values are untyped words: an operator on one (`-x`, `x * y`) is integer arithmetic on
+    the f64's bits, with no f64 diagnostic (M2c caught one through its golden rows). Bound to an `f64`
+    local first, they are fine; four-value returns don't parse (`var a, b, c, d = f()`);
   - `memcpy` / `memset` are byte loops (open issue `2026-11-02`);
   - struct fields can't be fixed arrays;
   - `#define` is capped at 16 names;
@@ -608,7 +615,7 @@ tanmatra filed its findings.
 | M0 Initialize | ✅ done 2026-11-09 | constants 3 + math 18,919: **14,875 ok, 0 failed, 0 measured, 4,046 pending (M1 helpers), 1 accepted (ADR 0009)**, identical bits on x86_64 ELF, x86_64 PE and aarch64 | — | 1 probe bench | oracle hooks; scaffold and repairs; `cyrius.cyml` with hisab 3.4.1; generator, `validate.py`, `src/constants.cyr`, parity harness; exp and atan2 on the polyfills (cross-target bits), K = 2; ADRs 0008, 0009 and the 0007 amendment (hisab off the step path until S1/H9); six probes ([`port-parity.md`](port-parity.md) §4). Next: M1 |
 | M1a Foundation: math helpers, error, config, material, units, force | ✅ done 2026-11-09 | config 293 + material 2,046 + units 2,236 + force 1,308 + math (0 pending now): **24,431 ok, 0 failed, 281 pending (S2 280, M6 1), 93 accepted** on x86_64 ELF, x86_64 PE and aarch64; every row 0 ulp | 33 of 44 Rust tests ported (2 partial: the Display symbols), 11 serde n/a; 97 assertions | 6 (4.8–31× Rust; [benchmarks](../benchmarks-rust-v-cyrius.md)) | `src/error.cyr`, `mathx.cyr`, `vec.cyr`, `config.cyr`, `material.cyr`, `units.cyr`, `force.cyr`; `[lib]` + `dist/impetus.cyr`; `tests/lib_2d.cyr`; surface parity 100/100 (`scripts/surface_parity.py`); ADR 0008 #6 mapped |
 | M1b Foundation: types, arena, contact tracker, spring | ✅ done 2026-11-09 | fmtf 37,576 + json 937 + spring 1,000 + types 1 (+ math 19,165 with the crmath threshold rows): **64,455 ok, 0 failed, 0 measured, 7 pending (S3 3, S4 3, M6 1), 103 accepted (ADR 11: 10)** on x86_64 ELF, x86_64 PE and aarch64; every spring step row 0 ulp | all 63 Rust tests of the M1b modules ported (body 6, collider 7, joint 12, event 6, query 3, arena 10, tracker 3, spring 16), plus Cyrius-only groups and `crmath.tcyr` (23) | 3 spring + 4 serde + Display + 2 crmath ([benchmarks](../benchmarks-rust-v-cyrius.md)) | part 1: ADR 0010, `src/fmtf.cyr`, `src/json.cyr` for the M1a types. Part 2: `src/types.cyr`, `arena.cyr`, `contact_tracker.cyr`, `spring.cyr`; codecs for every M1b type in both serde struct forms; S3, S4 found; surface parity 258/258. Part 3: [ADR 0011](../adr/0011-correctly-rounded-exp-sin-cos.md), correctly rounded exp, sin and cos (`src/crmath.cyr`, generated `crmath_data.cyr`), the corrected oracle (`*.cr.tsv`, 10 rows), class C exact on them |
-| M2 2D collision | ◐ parts 1–2 done 2026-11-09 | broadphase 76 (pair sets of the tree and the hash in 2D and 3D, the automatic cell size) + b2_mass 75 (bodies' mass, inertia and inverses from world dumps): **64,606 ok, 0 failed, 0 measured, 7 pending, 103 accepted** on x86_64 ELF, x86_64 PE and aarch64; `validate.py` recomputes all 151 independently | the 18 Rust tests of `aabb_tree` (10) and `spatial_hash` (8); the 12 type tests of `backend_2d/tests.rs` (10) and `types.rs` (2); Cyrius-only groups (storage and slot reuse, the 4,096-cell cut, unsigned keys; inverse masses, floors, integration, world AABBs per shape, the shape copy, islands); 109 assertions | 5 Cyrius-only (1,000 boxes: tree 4.7 ms, hash 1.95 ms, against Rust's whole step at 0.51 ms; ball mass 545 ns against Rust's whole `add_body_with_collider` at 253 ns, 349 ns of it the shape copy's byte-loop `memcpy`, S5) | part 1: `src/aabb_tree.cyr`, `src/spatial_hash.cyr`; harness rows of up to 8,192 tokens. Part 2: `src/b2_types.cyr`; private constants generated (`src/constants_private.cyr`, `t_private.rs`); surface parity 374/374, `pub(super)` items included. Next: part 3, `backend_2d/narrowphase.rs` |
+| M2 2D collision | ◐ parts 1–3 done 2026-11-09 | broadphase 76 (pair sets of the tree and the hash in 2D and 3D, the automatic cell size) + b2_mass 75 (bodies' mass, inertia and inverses from world dumps) + b2_narrow 17,854 (every ordered pair of a 12-shape catalog at 0/π/4/π/2 and seeded poses, touching ± 10⁻⁹, non-finite poses, big hulls, 2,400 seeded pairs; contacts class C at 0 ulp against the corrected oracle, 3 rows corrected; the touch test class A): **82,457 ok, 0 failed, 0 measured, 7 pending, 106 accepted** on x86_64 ELF, x86_64 PE and aarch64; `validate.py` recomputes every row (the narrowphase through a Python transcription) | the 18 Rust tests of `aabb_tree` (10) and `spatial_hash` (8); the 12 type tests; the 32 narrowphase tests of `narrowphase.rs` (11) and `backend_2d/tests.rs` (21); Cyrius-only groups; 205 assertions | 9 Cyrius-only (1,000 boxes: tree 4.7 ms, hash 1.95 ms, against Rust's whole step at 0.51 ms; ball mass 545 ns against Rust's whole `add_body_with_collider` at 253 ns, S5; contacts: ball–box 132 ns, rotated box–box 1.28 µs, lying capsule–box 506 ns, 8-gon hulls 3.18 µs) | part 1: `src/aabb_tree.cyr`, `src/spatial_hash.cyr`. Part 2: `src/b2_types.cyr`; private constants generated (`src/constants_private.cyr`). Part 3: `src/b2_narrowphase.cyr`, one `sin_cos` per polygon and contact. Surface parity 386/386. Next: part 4, `backend_2d/raycast.rs` |
 | M3 2D dynamics | ☐ | | | | |
 | M4 3D collision | ☐ | | | | |
 | M5 3D dynamics | ☐ | | | | |

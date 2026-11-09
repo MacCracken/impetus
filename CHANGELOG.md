@@ -79,6 +79,10 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
 - S3 and S4 filed in bayan's queue, each with a self-proving repro:
   `2026-11-09-json-integer-above-i64-max-refuses-the-document.md` (u64 integers) and
   `2026-11-09-json-duplicate-key-has-no-opt-in-for-ignored-members.md` (an opt-in, not a defect).
+- S5 filed upstream as an addition to ranga's open issue
+  `cyrius/docs/development/issues/2026-11-02-memcpy-memset-byte-loops-dominate-frame-copies.md`:
+  the byte-loop `memcpy` costs 4–7× on struct-sized copies too, with a new repro
+  (`repros/2026-11-09-memcpy-small-struct-copies.bcyr`).
 - **Cyrius port, M1b part 1** ([ADR 0010](docs/adr/0010-serde-compatible-json.md);
   `docs/development/port-parity.md` §6): serde-compatible JSON, replacing the plan's
   "serde not carried over".
@@ -168,6 +172,28 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     103 accepted.**
   - The 12 Rust type tests are ported, with Cyrius-only groups (65 assertions). Surface parity is
     374/374, now counting `pub(super)` items.
+- **Cyrius port, M2 part 3: the 2D narrowphase** (`docs/development/port-parity.md` §11):
+  - `src/b2_narrowphase.cyr`:
+    - the round tests: circle, box, capsule, segment and hull against a circle, including a centre
+      inside the hull;
+    - Box2D's reference/incident-face clipping for boxes, hulls (either winding) and segments, with
+      the SAT fallback;
+    - capsule end-cap contacts against boxes, hulls and segments;
+    - `generate_contacts_multi` and `shapes_touch`.
+
+    Contacts are five-word records in a caller's two-contact buffer.
+  - Golden `b2_narrow.tsv`: 17,854 rows. They cover every ordered pair of a 12-shape catalog at
+    0/π/4/π/2 and seeded rotations, poses touching and ±10⁻⁹ apart, the Rust tests' poses, NaN and
+    infinite poses, 24- and 40-vertex hulls, and 2,400 seeded pairs.
+    - Contacts are class C, at 0 ulp against the corrected oracle; the touch test is class A.
+    - `validate.py` reproduces every row through a Python transcription. It also writes
+      `b2_narrow.cr.tsv`: the 3 rows where glibc misrounds a `sin`, which the port matches.
+    - **82,457 ok, 0 failed, 0 measured, 7 pending, 106 accepted** on three targets.
+  - The 32 Rust narrowphase tests are ported, with Cyrius-only groups (96 assertions). Surface
+    parity is 386/386.
+  - Found on the way: multi-return values are untyped words, so an operator applied to one works on
+    the integer bits, with no f64 diagnostic (port plan §8). Two golden rows caught it, and the fix
+    binds such values to `f64` locals.
 
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
@@ -180,8 +206,13 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - a 16-vertex hull's mass properties, 578 ns;
   - a rotated box's world AABB, 261 ns.
 
-  349 ns of the ball's 545 is its shape copy, a 168-byte `memcpy`. The stdlib copies a byte at a
-  time, and a word loop is 4–8× faster (S5, port plan §8, not filed yet).
+  349 ns of the ball's 545 is its shape copy, mostly one 184-byte `memcpy`. The stdlib copies a
+  byte at a time, and 8-byte chunks are 4–7× faster (S5, port plan §8).
+- **2D narrowphase, first numbers** (Cyrius only; Rust times it inside its step benches, M3):
+  ball–box 132 ns, rotated box–box 1.28 µs, a lying capsule on a box 506 ns, two 8-vertex hulls
+  3.18 µs. Taking one `sin_cos` per polygon and per contact, where Rust takes four and two of the
+  same angle, gave 169 → 132 ns, 1.98 → 1.28 µs, 560 → 506 ns and 3.29 → 3.18 µs. The bits are
+  identical, because `sin_cos` is pure.
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

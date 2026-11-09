@@ -1,0 +1,310 @@
+# b2_narrowphase.tcyr — the ported Rust tests of rust-old/src/backend_2d/narrowphase.rs (M2c): its own
+# 11 and the 21 narrowphase tests of backend_2d/tests.rs, plus Cyrius-only tests of the manifold key
+# order, the transforms, the deepest-contact pick and the touch test.
+
+include "tests/lib_2d.cyr"
+
+var EPS: f64 = 0.000001;
+var TIGHT: f64 = 0.000000001;
+
+# 1 when |got − want| < eps.
+fn near(got: f64, want: f64, eps: f64): i64 {
+    var d: f64 = f64_abs(got - want);
+    if (d < eps) { return 1; }
+    return 0;
+}
+
+# Field w (0 nx, 1 ny, 2 depth, 3 px, 4 py) of contact i at c.
+fn fld(c, i, w): f64 {
+    var r: f64 = load64(c + i * 40 + w * 8);
+    return r;
+}
+
+# The deepest contact of (a at (ax, ay), rotation ra) against b into out: the count, 0 or 1.
+fn contact(a: *ImColliderShape, ax: f64, ay: f64, ra: f64, b: *ImColliderShape, bx: f64, by: f64, rb: f64, out): i64 {
+    return _im_b2_generate_contact(a, ax, ay, ra, b, bx, by, rb, out);
+}
+
+# Every contact of the pair into out: the count.
+fn multi(a: *ImColliderShape, ax: f64, ay: f64, ra: f64, b: *ImColliderShape, bx: f64, by: f64, rb: f64, out): i64 {
+    return _im_b2_generate_contacts_multi(a, ax, ay, ra, b, bx, by, rb, out);
+}
+
+# The square hull of half side h, counter-clockwise or clockwise.
+fn square_hull(h: f64, cw): ImColliderShape {
+    var w = fl_alloc(96);
+    var z: f64 = 0.0;
+    var m: f64 = -h;
+    store64(w, m); store64(w + 8, m); store64(w + 16, z);
+    store64(w + 24, h); store64(w + 32, m); store64(w + 40, z);
+    store64(w + 48, h); store64(w + 56, h); store64(w + 64, z);
+    store64(w + 72, m); store64(w + 80, h); store64(w + 88, z);
+    if (cw == 1) {
+        for (var q = 0; q < 3; q = q + 1) {
+            var t = load64(w + 24 + q * 8);
+            store64(w + 24 + q * 8, load64(w + 72 + q * 8));
+            store64(w + 72 + q * 8, t);
+        }
+    }
+    var s: ImColliderShape = ImColliderShape_convex_hull(w, 4);
+    fl_free(w);
+    return s;
+}
+
+# A segment from (ax, ay) to (bx, by).
+fn seg(ax: f64, ay: f64, bx: f64, by: f64): ImColliderShape {
+    return ImColliderShape_segment(ImVec3_new(ax, ay, 0.0), ImVec3_new(bx, by, 0.0));
+}
+
+# Runs the ported narrowphase tests.
+fn main() {
+    alloc_init();
+    var out[80];
+    var pi2: f64 = 1.5707963267948966;
+    var b11: ImColliderShape = ImColliderShape_box(1.0, 1.0, 0.0);
+    var ball1: ImColliderShape = ImColliderShape_ball(1.0);
+    var cap: ImColliderShape = ImColliderShape_capsule(1.0, 0.5);
+    var n = 0;
+
+    # ── backend_2d/tests.rs ──
+    test_group("circle_circle_overlap");
+    assert_eq(_im_b2_circle_circle(0.0, 0.0, 1.0, 1.5, 0.0, 1.0, &out), 1, "touches");
+    assert_eq(near(fld(&out, 0, 0), 1.0, EPS) + near(fld(&out, 0, 1), 0.0, EPS), 2, "normal +x");
+    assert_eq(near(fld(&out, 0, 2), 0.5, EPS), 1, "depth 0.5");
+
+    test_group("circle_circle_no_overlap");
+    assert_eq(_im_b2_circle_circle(0.0, 0.0, 1.0, 3.0, 0.0, 1.0, &out), 0, "apart");
+
+    test_group("circle_circle_coincident");
+    assert_eq(_im_b2_circle_circle(0.0, 0.0, 1.0, 0.0, 0.0, 1.0, &out), 1, "touches");
+    assert_eq(near(fld(&out, 0, 2), 2.0, EPS), 1, "depth: the radii");
+
+    test_group("circle_aabb_overlap");
+    assert_eq(_im_b2_circle_aabb(1.8, 0.0, 0.5, 0.0, 0.0, 1.5, 1.0, &out), 1, "touches");
+    assert_eq(fld(&out, 0, 2) > 0.0, 1, "depth > 0");
+    assert_eq(near(fld(&out, 0, 0), 1.0, EPS), 1, "normal away from the box");
+
+    test_group("circle_aabb_no_overlap");
+    assert_eq(_im_b2_circle_aabb(5.0, 0.0, 0.5, 0.0, 0.0, 1.0, 1.0, &out), 0, "apart");
+
+    test_group("circle_aabb_inside");
+    assert_eq(_im_b2_circle_aabb(0.0, 0.0, 0.5, 0.0, 0.0, 2.0, 2.0, &out), 1, "inside");
+    assert_eq(fld(&out, 0, 2) > 0.0, 1, "depth > 0");
+
+    test_group("aabb_aabb_overlap");
+    assert_eq(contact(&b11, 0.0, 0.0, 0.0, &b11, 1.5, 0.0, 0.0, &out), 1, "touches");
+    assert_eq(near(fld(&out, 0, 0), 1.0, EPS), 1, "normal +x");
+    assert_eq(near(fld(&out, 0, 2), 0.5, EPS), 1, "depth 0.5");
+
+    test_group("aabb_aabb_no_overlap");
+    assert_eq(contact(&b11, 0.0, 0.0, 0.0, &b11, 5.0, 0.0, 0.0, &out), 0, "apart");
+
+    test_group("aabb_aabb_vertical_overlap");
+    assert_eq(contact(&b11, 0.0, 0.0, 0.0, &b11, 0.0, 1.5, 0.0, &out), 1, "touches");
+    assert_eq(near(fld(&out, 0, 1), 1.0, EPS), 1, "normal +y");
+
+    var ball5: ImColliderShape = ImColliderShape_ball(0.5);
+    test_group("capsule_circle_overlap");
+    assert_eq(contact(&cap, 0.0, 0.0, 0.0, &ball5, 0.8, 0.0, 0.0, &out), 1, "touches");
+    assert_eq(fld(&out, 0, 2) > 0.0, 1, "depth > 0");
+    assert_eq(near(fld(&out, 0, 0), 1.0, EPS), 1, "normal toward the circle");
+
+    test_group("capsule_circle_miss");
+    assert_eq(contact(&cap, 0.0, 0.0, 0.0, &ball5, 5.0, 0.0, 0.0, &out), 0, "apart");
+
+    test_group("capsule_circle_endpoint");
+    assert_eq(contact(&cap, 0.0, 0.0, 0.0, &ball5, 0.0, 1.3, 0.0, &out), 1, "touches the top cap");
+    assert_eq(fld(&out, 0, 2) > 0.0, 1, "depth > 0");
+    assert_eq(fld(&out, 0, 1) > 0.5, 1, "normal upward");
+
+    var b55: ImColliderShape = ImColliderShape_box(0.5, 0.5, 0.0);
+    test_group("capsule_aabb_overlap");
+    assert_eq(contact(&cap, 0.0, 0.0, 0.0, &b55, 0.8, 0.0, 0.0, &out), 1, "touches");
+    assert_eq(fld(&out, 0, 2) > 0.0, 1, "depth > 0");
+
+    test_group("capsule_aabb_miss");
+    assert_eq(contact(&cap, 0.0, 0.0, 0.0, &b55, 5.0, 0.0, 0.0, &out), 0, "apart");
+
+    test_group("capsule_capsule_overlap");
+    assert_eq(contact(&cap, 0.0, 0.0, 0.0, &cap, 0.8, 0.0, 0.0, &out), 1, "touches");
+    assert_eq(fld(&out, 0, 2) > 0.0, 1, "depth > 0");
+    assert_eq(near(fld(&out, 0, 0), 1.0, EPS), 1, "normal +x");
+
+    test_group("capsule_capsule_miss");
+    assert_eq(contact(&cap, 0.0, 0.0, 0.0, &cap, 5.0, 0.0, 0.0, &out), 0, "apart");
+
+    test_group("capsule_capsule_perpendicular");
+    assert_eq(contact(&cap, 0.0, 0.0, 0.0, &cap, 0.2, 0.0, pi2, &out), 1, "crossing");
+    assert_eq(fld(&out, 0, 2) > 0.0, 1, "depth > 0");
+
+    test_group("closest_point_on_segment_midpoint");
+    var x1, y1, t1 = _im_b2_closest_point_on_segment(0.0, 0.0, 10.0, 0.0, 5.0, 3.0);
+    var fx1: f64 = x1;
+    var fy1: f64 = y1;
+    var ft1: f64 = t1;
+    assert_eq(near(fx1, 5.0, EPS) + near(fy1, 0.0, EPS) + near(ft1, 0.5, EPS), 3, "(5, 0), t = 0.5");
+
+    test_group("closest_point_on_segment_endpoint_a");
+    var x2, y2, t2 = _im_b2_closest_point_on_segment(0.0, 0.0, 10.0, 0.0, -5.0, 0.0);
+    var fx2: f64 = x2;
+    var ft2: f64 = t2;
+    assert_eq(near(fx2, 0.0, EPS) + near(ft2, 0.0, EPS), 2, "a, t = 0");
+
+    test_group("closest_point_on_segment_endpoint_b");
+    var x3, y3, t3 = _im_b2_closest_point_on_segment(0.0, 0.0, 10.0, 0.0, 15.0, 0.0);
+    var fx3: f64 = x3;
+    var ft3: f64 = t3;
+    assert_eq(near(fx3, 10.0, EPS) + near(ft3, 1.0, EPS), 2, "b, t = 1");
+
+    test_group("closest_points_segments_perpendicular");
+    var x4, y4, t4 = _im_b2_closest_point_on_segment(0.0, -1.0, 0.0, 1.0, 1.0, 0.0);
+    var x5, y5, t5 = _im_b2_closest_point_on_segment(1.0, 0.0, 3.0, 0.0, 0.0, 0.0);
+    var fx4: f64 = x4;
+    var fy4: f64 = y4;
+    var fx5: f64 = x5;
+    var fy5: f64 = y5;
+    assert_eq(near(fx4, 0.0, EPS) + near(fy4, 0.0, EPS), 2, "the origin on the vertical");
+    assert_eq(near(fx5, 1.0, EPS) + near(fy5, 0.0, EPS), 2, "(1, 0) on the horizontal");
+
+    # ── narrowphase.rs ──
+    test_group("oneshot_aabb_aabb_generates_contacts");
+    n = multi(&b11, 0.0, 0.0, 0.0, &b11, 1.5, 0.0, 0.0, &out);
+    assert_eq(n > 0, 1, "at least one contact");
+    for (var i = 0; i < n; i = i + 1) {
+        var nx: f64 = fld(&out, i, 0);
+        var ny: f64 = fld(&out, i, 1);
+        var len: f64 = f64_sqrt(nx * nx + ny * ny);
+        assert_eq(fld(&out, i, 2) > 0.0, 1, "depth > 0");
+        assert_eq(near(len, 1.0, 0.01), 1, "unit normal");
+    }
+
+    test_group("oneshot_obb_obb_multi_point");
+    assert_eq(multi(&b11, 0.0, 0.0, 0.0, &b11, 1.5, 0.0, 0.3, &out) > 0, 1, "rotated overlap");
+
+    test_group("oneshot_no_overlap");
+    assert_eq(multi(&b11, 0.0, 0.0, 0.0, &b11, 5.0, 0.0, 0.0, &out), 0, "apart");
+
+    test_group("oneshot_ball_ball_single_contact");
+    assert_eq(multi(&ball1, 0.0, 0.0, 0.0, &ball1, 1.5, 0.0, 0.0, &out), 1, "exactly one");
+
+    test_group("box_pair_normals_point_a_to_b");
+    var floor: ImColliderShape = ImColliderShape_box(5.0, 0.5, 0.0);
+    var cap2: ImColliderShape = ImColliderShape_capsule(0.5, 0.25);
+    var sg: ImColliderShape = seg(-0.5, 0.0, 0.5, 0.0);
+    for (var k = 0; k < 3; k = k + 1) {
+        var other = &ball5;
+        var y: f64 = 0.9;
+        if (k == 1) { other = &cap2; y = 1.2; }
+        if (k == 2) { other = &sg; y = 0.45; }
+        assert_eq(contact(other, 0.0, y, 0.0, &floor, 0.0, 0.0, 0.0, &out), 1, "(X, Box) touches");
+        assert_eq(fld(&out, 0, 1) < -0.99 && fld(&out, 0, 2) > 0.0, 1, "(X, Box): normal down");
+        assert_eq(contact(&floor, 0.0, 0.0, 0.0, other, 0.0, y, 0.0, &out), 1, "(Box, X) touches");
+        assert_eq(fld(&out, 0, 1) > 0.99, 1, "(Box, X): normal up");
+    }
+
+    test_group("round_vs_rotated_box_respects_rotation");
+    var thin: ImColliderShape = ImColliderShape_box(1.0, 0.1, 0.0);
+    var ball3: ImColliderShape = ImColliderShape_ball(0.3);
+    assert_eq(contact(&ball3, 0.8, 0.0, 0.0, &thin, 0.0, 0.0, pi2, &out), 0, "past the rotated box");
+    assert_eq(contact(&ball3, 0.35, 0.5, 0.0, &thin, 0.0, 0.0, pi2, &out), 1, "on its side");
+    assert_eq(fld(&out, 0, 0) < -0.99, 1, "normal -x");
+    assert_eq(near(fld(&out, 0, 2), 0.05, TIGHT), 1, "depth 0.05");
+
+    test_group("hull_hull_two_point_manifold");
+    for (var cw = 0; cw < 2; cw = cw + 1) {
+        var h: ImColliderShape = square_hull(1.0, cw);
+        n = multi(&h, 0.0, 0.0, 0.0, &h, 0.0, 1.9, 0.0, &out);
+        assert_eq(n, 2, "two points");
+        for (var j = 0; j < n; j = j + 1) {
+            assert_eq(fld(&out, j, 1) > 0.99 && near(fld(&out, j, 2), 0.1, TIGHT) == 1, 1, "normal +y, depth 0.1");
+        }
+        h.free();
+    }
+
+    test_group("resting_boxes_two_points_under_top_box");
+    var ground: ImColliderShape = ImColliderShape_box(10.0, 0.5, 0.0);
+    for (var r = 0; r < 2; r = r + 1) {
+        var rot: f64 = 0.0;
+        if (r == 1) { rot = 0.001; }
+        n = multi(&ground, 0.0, 0.0, 0.0, &b55, 8.0, 0.99, rot, &out);
+        assert_eq(n, 2, "two points");
+        for (var q = 0; q < n; q = q + 1) {
+            var px: f64 = fld(&out, q, 3);
+            assert_eq(fld(&out, q, 1) > 0.99, 1, "normal +y");
+            assert_eq(px >= 7.4 && px <= 8.6, 1, "under the top box");
+        }
+    }
+
+    test_group("circle_inside_hull_pushes_out");
+    var sq: ImColliderShape = square_hull(1.0, 0);
+    assert_eq(_im_b2_hull_circle(sq.points, 4, 0.0, 0.0, 0.0, 0.0, 0.8, 0.5, &out), 1, "inside");
+    assert_eq(fld(&out, 0, 1) > 0.99 && near(fld(&out, 0, 2), 0.7, TIGHT) == 1, 1, "out the top, depth 0.7");
+    assert_eq(_im_b2_hull_circle(sq.points, 4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2, &out), 1, "centred");
+
+    test_group("lying_capsule_and_segment_floor_two_points");
+    var lying: ImColliderShape = ImColliderShape_capsule(1.0, 0.25);
+    assert_eq(multi(&floor, 0.0, 0.0, 0.0, &lying, 0.0, 0.74, pi2, &out), 2, "capsule on a box");
+    var long: ImColliderShape = seg(-5.0, 0.0, 5.0, 0.0);
+    n = multi(&long, 0.0, 0.0, 0.0, &b55, 1.0, 0.49, 0.0, &out);
+    assert_eq(n, 2, "box on a segment");
+    for (var s = 0; s < n; s = s + 1) { assert_eq(fld(&out, s, 1) > 0.99, 1, "normal +y"); }
+
+    test_group("convex_hull_circle_degenerate_normal");
+    var w = fl_alloc(96);
+    var z: f64 = 0.0;
+    var one: f64 = 1.0;
+    var two: f64 = 2.0;
+    store64(w, z); store64(w + 8, -one); store64(w + 16, z);
+    store64(w + 24, two); store64(w + 32, -one); store64(w + 40, z);
+    store64(w + 48, two); store64(w + 56, one); store64(w + 64, z);
+    store64(w + 72, z); store64(w + 80, one); store64(w + 88, z);
+    if (_im_b2_hull_circle(w, 4, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, &out) == 1) {
+        var dnx: f64 = fld(&out, 0, 0);
+        var dny: f64 = fld(&out, 0, 1);
+        var dlen: f64 = f64_sqrt(dnx * dnx + dny * dny);
+        assert_eq(near(dlen, 1.0, 0.01), 1, "unit edge normal");
+    }
+    fl_free(w);
+
+    # ── Cyrius-only ──
+    test_group("ordered_manifold_key");
+    var k1, k2 = _im_b2_ordered_manifold_key(5, 3);
+    assert_eq(k1 == 3 && k2 == 5, 1, "smaller first");
+    var k3, k4 = _im_b2_ordered_manifold_key(0 - 1, 2);
+    assert_eq(k3 == 2 && k4 == 0 - 1, 1, "unsigned: u64::MAX last");
+
+    test_group("transforms_round_trip");
+    var lx, ly = _im_b2_world_to_local(3.0, -1.0, 1.0, 2.0, 0.7);
+    var lxf: f64 = lx;
+    var lyf: f64 = ly;
+    var wx, wy = _im_b2_local_to_world(lxf, lyf, 1.0, 2.0, 0.7);
+    var wxf: f64 = wx;
+    var wyf: f64 = wy;
+    assert_eq(near(wxf, 3.0, TIGHT) + near(wyf, -1.0, TIGHT), 2, "back to (3, -1)");
+    var px1, py1 = _im_b2_world_pos(1.0, 2.0, 0.7, lxf, lyf);
+    var pxf: f64 = px1;
+    assert_eq(pxf == wxf, 1, "world_pos is local_to_world");
+
+    test_group("generate_contact_keeps_the_deeper");
+    n = multi(&ground, 0.0, 0.0, 0.0, &b55, 8.0, 0.99, 0.001, &out);
+    var da: f64 = fld(&out, 0, 2);
+    var db: f64 = fld(&out, 1, 2);
+    var deepest: f64 = da;
+    if (db > da) { deepest = db; }
+    assert_eq(contact(&ground, 0.0, 0.0, 0.0, &b55, 8.0, 0.99, 0.001, &out), 1, "one");
+    assert_eq(fld(&out, 0, 2) == deepest, 1, "the deeper");
+
+    test_group("shapes_touch");
+    assert_eq(_im_b2_shapes_touch(&ball1, 0.0, 0.0, 0.0, &b11, 1.9, 0.0, 0.0), 1, "ball on a box");
+    assert_eq(_im_b2_shapes_touch(&ball1, 0.0, 0.0, 0.0, &b11, 2.1, 0.0, 0.0), 0, "ball apart");
+    assert_eq(_im_b2_shapes_touch(&b11, 0.0, 0.0, 0.0, &b11, 2.0, 0.0, 0.0), 1, "boxes exactly touching");
+    var field: ImColliderShape = _im_shape(IM_SHAPE_HEIGHTFIELD);
+    assert_eq(_im_b2_shapes_touch(&field, 0.0, 0.0, 0.0, &b11, 0.0, 0.0, 0.0), 0, "a heightfield touches nothing");
+
+    sq.free();
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

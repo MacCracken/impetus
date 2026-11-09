@@ -65,5 +65,6 @@ modules = [
     "src/aabb_tree.cyr",
     "src/spatial_hash.cyr",
     "src/b2_types.cyr",
+    "src/b2_narrowphase.cyr",
     "src/json.cyr",
 ]

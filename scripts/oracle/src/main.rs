@@ -33,6 +33,8 @@ mod glibc;
 mod grids;
 #[cfg(not(feature = "b3"))]
 mod m_b2_mass;
+#[cfg(not(feature = "b3"))]
+mod m_b2_narrow;
 mod m_broadphase;
 mod m_config;
 mod m_constants;
@@ -73,6 +75,8 @@ fn golden_modules() -> Vec<tsv::Module> {
             // The 2D backend's bodies: the 3D dump's inertia is a tensor.
             #[cfg(not(feature = "b3"))]
             m_b2_mass::emit(),
+            #[cfg(not(feature = "b3"))]
+            m_b2_narrow::emit(),
             m_broadphase::emit(),
             m_config::emit(),
             m_constants::emit(),

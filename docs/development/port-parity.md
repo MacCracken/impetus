@@ -373,6 +373,44 @@ fails when either drifts from `cyrius.cyml`.
   - The integrations and the islands arrive with M3's step rows.
 - **Result, every target:** 12 modules, 0 failing; **64,606 ok, 0 failed, 0 measured, 7 pending, 103 accepted**.
 
+## 11. M2c: the 2D narrowphase (2026-11-09)
+
+- **The module:** `src/b2_narrowphase.cyr`, every expression in Rust's operation order. It covers:
+  - the round tests (circle–circle, circle–box, capsule–circle and capsule–capsule, segment–circle,
+    hull–circle with the centre-inside case);
+  - Box2D's reference/incident-face clipping for boxes, hulls and segments, with the SAT fallback;
+  - capsule end-cap contacts against boxes, hulls and segments;
+  - `generate_contacts_multi` and `shapes_touch`.
+
+  A contact is a five-word record in a caller's buffer of room for two, and functions return the count. Rust's
+  `capsule_end_contacts` closure is a box-or-hull switch. Polygon vertices live on the stack up to 16 per polygon,
+  and on freelist beyond that.
+- **One `sin_cos` per polygon and per contact.** Rust's box `polygon_vertices` calls `local_to_world` per vertex,
+  and `box_to_world` rotates and translates separately. That is four and two `sin_cos` calls of one angle. The port
+  takes one, which gives the same bits because `sin_cos` is pure. The hull path already does this, as Rust's
+  `transform_hull` does.
+- **`b2_narrow.tsv`**, 17,854 rows through the oracle's `contacts_2d` and `shapes_touch_2d`:
+  - `b2::contacts` (class C, bound 0, 16,133 rows): every ordered pair of a 12-shape catalog at five rotation
+    pairs (0, π/4, π/2, and 0.3 against −1.1), along three directions at six distances from coincident to apart.
+    The catalog: ball, box, capsule, hulls in both windings, a triangle, a segment, a two-point hull, and
+    degenerate ones (a zero ball, a flat box, a zero-length capsule, a collinear hull).
+  - Exactly touching, 10⁻⁹ apart and 10⁻⁹ overlapping poses; the Rust tests' poses; NaN and infinite poses; hulls
+    of 24 and 40 vertices; heightfields and meshes, which generate nothing; and 2,400 seeded pairs.
+  - `b2::shapes_touch` (class A, 1,721 rows).
+
+  Every box's half extents are finite and non-negative. A round shape against a box reaches Rust's
+  `f64::clamp(-h, h)`, which panics on an inverted or NaN range, so the port's behaviour there is never compared.
+- **The corrected oracle.** `validate.py` transcribes the narrowphase in Python. On glibc's `sin` and `cos` it
+  reproduces all 17,854 rows bit for bit. On MPFR's it writes `b2_narrow.cr.tsv`: 3 rows where glibc misrounds a
+  `sin`, and the port equals the corrected value on all 3. The transcription folds with explicit loops, because
+  Python 3.12's `sum()` of floats is compensated and Rust's is not.
+- **A port defect the rows caught.** Multi-return values are untyped words, so `-ax` on one negated the integer
+  bits, not the float, and the compiler gave no f64 diagnostic. That produced a non-unit SAT normal on 2 rows.
+  The fix binds the value to an `f64` local first, as the f64-hygiene rule asks. No other multi-return site applies
+  an operator to an untyped value.
+- **Result, every target:** 13 modules, 0 failing; **82,457 ok, 0 failed, 0 measured, 7 pending, 106 accepted**.
+  Every narrowphase row is 0 ulp on x86_64 ELF, x86_64 PE and aarch64, and the digests are unchanged.
+
 ## How to reproduce
 
 ```sh

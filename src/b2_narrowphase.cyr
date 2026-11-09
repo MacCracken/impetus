@@ -1,0 +1,1146 @@
+# b2_narrowphase.cyr — 2D contact generation (port of rust-old/src/backend_2d/narrowphase.rs).
+#
+# A contact is five f64 words, _IM_B2_CONTACT bytes: the normal x, y (from A to B), the depth, and
+# the world point x, y. Generators write their contacts into a caller's buffer of room for two
+# (_IM_B2_MAX_CONTACTS; a one-shot 2D manifold never has more) and return how many they wrote, so
+# an `Option<Contact2>` is a count of 0 or 1 and a `Vec<Contact2>` one of 0 to 2.
+#
+# Every expression keeps Rust's operation order and every rotation goes through `_im_sin_cos`, which
+# is correctly rounded (ADR 0011), so the rows are class C at 0 ulp against the corrected oracle.
+# Points travel as multi-return pairs (x, y). The polygon paths keep their vertices in a stack
+# buffer, or on freelist past _IM_B2_POLY_STACK vertices, freed before they return.
+
+const _IM_B2_CONTACT = 40;
+const _IM_B2_MAX_CONTACTS = 2;
+
+# ── transforms ──────────────────────────────────────────────────────────────────────
+
+# The world position of `offset` on a body at (bx, by) rotated by rot. Mirrors `world_pos`.
+#must_use
+fn _im_b2_world_pos(bx: f64, by: f64, rot: f64, ox: f64, oy: f64) {
+    var sn, cs = _im_sin_cos(rot);
+    var s: f64 = sn;
+    var c: f64 = cs;
+    var x: f64 = bx + c * ox - s * oy;
+    var y: f64 = by + s * ox + c * oy;
+    return (x, y);
+}
+
+# A world point in the frame of a body at (bx, by) rotated by rot. Mirrors `world_to_local`.
+#must_use
+fn _im_b2_world_to_local(wx: f64, wy: f64, bx: f64, by: f64, rot: f64) {
+    var dx: f64 = wx - bx;
+    var dy: f64 = wy - by;
+    var sn, cs = _im_sin_cos(rot);
+    var s: f64 = sn;
+    var c: f64 = cs;
+    var x: f64 = c * dx + s * dy;
+    var y: f64 = -s * dx + c * dy;
+    return (x, y);
+}
+
+# A body-local point in world space. Mirrors `local_to_world`.
+#must_use
+fn _im_b2_local_to_world(lx: f64, ly: f64, bx: f64, by: f64, rot: f64) {
+    var sn, cs = _im_sin_cos(rot);
+    var s: f64 = sn;
+    var c: f64 = cs;
+    var x: f64 = bx + c * lx - s * ly;
+    var y: f64 = by + s * lx + c * ly;
+    return (x, y);
+}
+
+# The vector (vx, vy) rotated by rot. Mirrors `rotate`.
+#must_use
+fn _im_b2_rotate(vx: f64, vy: f64, rot: f64) {
+    var sn, cs = _im_sin_cos(rot);
+    var s: f64 = sn;
+    var c: f64 = cs;
+    var x: f64 = c * vx - s * vy;
+    var y: f64 = s * vx + c * vy;
+    return (x, y);
+}
+
+# The collider pair (a, b) with the smaller handle first, as unsigned words. Mirrors
+# `ordered_manifold_key`.
+#must_use
+fn _im_b2_ordered_manifold_key(a, b) {
+    if (_im_ult(b, a) == 1) { return (b, a); }
+    return (a, b);
+}
+
+# ── contact records ─────────────────────────────────────────────────────────────────
+
+# Writes the contact (normal (nx, ny), depth d, point (px, py)) at c.
+fn _im_b2_put(c, nx: f64, ny: f64, d: f64, px: f64, py: f64) {
+    store64(c, nx);
+    store64(c + 8, ny);
+    store64(c + 16, d);
+    store64(c + 24, px);
+    store64(c + 32, py);
+    return 0;
+}
+
+# Negates the normal of the contact at c. Mirrors `flip_normal`.
+fn _im_b2_flip(c) {
+    var nx: f64 = load64(c);
+    var ny: f64 = load64(c + 8);
+    store64(c, -nx);
+    store64(c + 8, -ny);
+    return 0;
+}
+
+# Negates the normals of the n contacts at c.
+fn _im_b2_flip_all(c, n) {
+    for (var i = 0; i < n; i = i + 1) { _im_b2_flip(c + i * _IM_B2_CONTACT); }
+    return 0;
+}
+
+# The dot product of (ax, ay) and (bx, by). Mirrors `dot2`.
+#must_use
+fn _im_b2_dot2(ax: f64, ay: f64, bx: f64, by: f64): f64 {
+    var r: f64 = ax * bx + ay * by;
+    return r;
+}
+
+# Maps the contact at c, computed in the frame of a box at (bx, by) rotated by rot, to world space.
+# Mirrors `box_to_world`.
+fn _im_b2_box_to_world(c, bx: f64, by: f64, rot: f64) {
+    var nx: f64 = load64(c);
+    var ny: f64 = load64(c + 8);
+    var px: f64 = load64(c + 24);
+    var py: f64 = load64(c + 32);
+    # Rust's rotate and local_to_world, sharing one sin_cos (a pure function).
+    var sn, cs = _im_sin_cos(rot);
+    var s: f64 = sn;
+    var k: f64 = cs;
+    var wnx: f64 = k * nx - s * ny;
+    var wny: f64 = s * nx + k * ny;
+    var wpx: f64 = bx + k * px - s * py;
+    var wpy: f64 = by + s * px + k * py;
+    store64(c, wnx);
+    store64(c + 8, wny);
+    store64(c + 24, wpx);
+    store64(c + 32, wpy);
+    return 0;
+}
+
+# ── circles and boxes ───────────────────────────────────────────────────────────────
+
+# Circle A (centre (ax, ay), radius ra) against circle B into out: 1, or 0 when they don't touch.
+# Mirrors `circle_circle`.
+fn _im_b2_circle_circle(ax: f64, ay: f64, ra: f64, bx: f64, by: f64, rb: f64, out): i64 {
+    var dx: f64 = bx - ax;
+    var dy: f64 = by - ay;
+    var dist_sq: f64 = dx * dx + dy * dy;
+    var sum_r: f64 = ra + rb;
+    if (dist_sq >= sum_r * sum_r) { return 0; }
+    var dist: f64 = f64_sqrt(dist_sq);
+    var nx: f64 = 0.0;
+    var ny: f64 = 1.0;
+    var depth: f64 = sum_r;
+    if (!(dist < _IM_B2_EPSILON)) {
+        nx = dx / dist;
+        ny = dy / dist;
+        depth = sum_r - dist;
+    }
+    var px: f64 = ax + nx * ra;
+    var py: f64 = ay + ny * ra;
+    _im_b2_put(out, nx, ny, depth, px, py);
+    return 1;
+}
+
+# A circle (centre (cx, cy), radius r) against the axis-aligned box of half extents (hx, hy) at
+# (bx, by) into out: 1, or 0. The normal points from the box to the circle. Mirrors `circle_aabb`.
+fn _im_b2_circle_aabb(cx: f64, cy: f64, r: f64, bx: f64, by: f64, hx: f64, hy: f64, out): i64 {
+    var dx: f64 = cx - bx;
+    var dy: f64 = cy - by;
+    var closest_x: f64 = _im_clamp(dx, -hx, hx);
+    var closest_y: f64 = _im_clamp(dy, -hy, hy);
+    var diff_x: f64 = dx - closest_x;
+    var diff_y: f64 = dy - closest_y;
+    var dist_sq: f64 = diff_x * diff_x + diff_y * diff_y;
+    if (dist_sq >= r * r) { return 0; }
+    var dist: f64 = f64_sqrt(dist_sq);
+    var nx: f64 = 0.0;
+    var ny: f64 = 0.0;
+    var depth: f64 = 0.0;
+    if (dist < _IM_B2_EPSILON) {
+        var adx: f64 = f64_abs(dx);
+        var ady: f64 = f64_abs(dy);
+        var f0: f64 = hx - adx;
+        var f1: f64 = hy - ady;
+        if (f0 < f1) {
+            nx = 1.0;
+            if (!(dx >= 0.0)) { nx = -1.0; }
+            depth = f0 + r;
+        } else {
+            ny = 1.0;
+            if (!(dy >= 0.0)) { ny = -1.0; }
+            depth = f1 + r;
+        }
+    } else {
+        nx = diff_x / dist;
+        ny = diff_y / dist;
+        depth = r - dist;
+    }
+    var px: f64 = bx + closest_x;
+    var py: f64 = by + closest_y;
+    _im_b2_put(out, nx, ny, depth, px, py);
+    return 1;
+}
+
+# A circle against an oriented box (at (bx, by), rotated by brot) into out: 1, or 0. The normal
+# points from the box to the circle. Mirrors `circle_obb`.
+fn _im_b2_circle_obb(cx: f64, cy: f64, r: f64, bx: f64, by: f64, brot: f64, hx: f64, hy: f64, out): i64 {
+    var lx, ly = _im_b2_world_to_local(cx, cy, bx, by, brot);
+    if (_im_b2_circle_aabb(lx, ly, r, 0.0, 0.0, hx, hy, out) == 0) { return 0; }
+    _im_b2_box_to_world(out, bx, by, brot);
+    return 1;
+}
+
+# ── segments and capsules ───────────────────────────────────────────────────────────
+
+# A capsule's axis end points in world space into out (x0, y0, x1, y1): the axis is the body's
+# local y. Mirrors `capsule_endpoints`.
+fn _im_b2_capsule_endpoints(px: f64, py: f64, rot: f64, hh: f64, out) {
+    var sn, cs = _im_sin_cos(rot);
+    var s: f64 = sn;
+    var c: f64 = cs;
+    var dx: f64 = -s * hh;
+    var dy: f64 = c * hh;
+    var x0: f64 = px - dx;
+    var y0: f64 = py - dy;
+    var x1: f64 = px + dx;
+    var y1: f64 = py + dy;
+    store64(out, x0);
+    store64(out + 8, y0);
+    store64(out + 16, x1);
+    store64(out + 24, y1);
+    return 0;
+}
+
+# The point of segment (a, b) closest to p, and its parameter t in [0, 1]: (x, y, t). A segment
+# shorter than EPSILON gives a. Mirrors `closest_point_on_segment`.
+#must_use
+fn _im_b2_closest_point_on_segment(ax: f64, ay: f64, bx: f64, by: f64, px: f64, py: f64): i64 {
+    var abx: f64 = bx - ax;
+    var aby: f64 = by - ay;
+    var len_sq: f64 = abx * abx + aby * aby;
+    if (len_sq < _IM_B2_EPSILON_SQ) {
+        var z: f64 = 0.0;
+        return (ax, ay, z);
+    }
+    var t0: f64 = ((px - ax) * abx + (py - ay) * aby) / len_sq;
+    var t: f64 = _im_clamp(t0, 0.0, 1.0);
+    var x: f64 = ax + abx * t;
+    var y: f64 = ay + aby * t;
+    return (x, y, t);
+}
+
+# The squared distance from (px, py) to (qx, qy), as `powi(2)`: two products.
+#must_use
+fn _im_b2_dist_sq(px: f64, py: f64, qx: f64, qy: f64): f64 {
+    var x: f64 = px - qx;
+    var y: f64 = py - qy;
+    var r: f64 = x * x + y * y;
+    return r;
+}
+
+# The closest points of segments (a, b) and (c, d) into out (on ab x, y, on cd x, y). Mirrors
+# `closest_points_segments`: the four end-point projections, then the clamped analytic pair.
+fn _im_b2_closest_points_segments(ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64, dx: f64, dy: f64, out) {
+    var abx: f64 = bx - ax;
+    var aby: f64 = by - ay;
+    var cdx: f64 = dx - cx;
+    var cdy: f64 = dy - cy;
+    var d1: f64 = abx * abx + aby * aby;
+    var d2: f64 = cdx * cdx + cdy * cdy;
+    var pax, pay, ta = _im_b2_closest_point_on_segment(cx, cy, dx, dy, ax, ay);
+    var pbx, pby, tb = _im_b2_closest_point_on_segment(cx, cy, dx, dy, bx, by);
+    var pcx, pcy, tc = _im_b2_closest_point_on_segment(ax, ay, bx, by, cx, cy);
+    var pdx, pdy, td = _im_b2_closest_point_on_segment(ax, ay, bx, by, dx, dy);
+    var b1x: f64 = ax;
+    var b1y: f64 = ay;
+    var b2x: f64 = pax;
+    var b2y: f64 = pay;
+    var best: f64 = _im_b2_dist_sq(ax, ay, pax, pay);
+    var dd: f64 = _im_b2_dist_sq(bx, by, pbx, pby);
+    if (dd < best) {
+        b1x = bx; b1y = by; b2x = pbx; b2y = pby; best = dd;
+    }
+    dd = _im_b2_dist_sq(pcx, pcy, cx, cy);
+    if (dd < best) {
+        b1x = pcx; b1y = pcy; b2x = cx; b2y = cy; best = dd;
+    }
+    dd = _im_b2_dist_sq(pdx, pdy, dx, dy);
+    if (dd < best) {
+        b1x = pdx; b1y = pdy; b2x = dx; b2y = dy; best = dd;
+    }
+    if (d1 > _IM_B2_EPSILON_SQ && d2 > _IM_B2_EPSILON_SQ) {
+        var rx: f64 = ax - cx;
+        var ry: f64 = ay - cy;
+        var d3: f64 = abx * cdx + aby * cdy;
+        var d4: f64 = abx * rx + aby * ry;
+        var d5: f64 = cdx * rx + cdy * ry;
+        var denom: f64 = d1 * d2 - d3 * d3;
+        var adenom: f64 = f64_abs(denom);
+        if (adenom > _IM_B2_EPSILON_SQ) {
+            var s0: f64 = (d3 * d5 - d4 * d2) / denom;
+            var s: f64 = _im_clamp(s0, 0.0, 1.0);
+            var t0: f64 = (d3 * s + d5) / d2;
+            var t: f64 = _im_clamp(t0, 0.0, 1.0);
+            var s1: f64 = (t * d3 - d4) / d1;
+            s = _im_clamp(s1, 0.0, 1.0);
+            var t1: f64 = (d3 * s + d5) / d2;
+            t = _im_clamp(t1, 0.0, 1.0);
+            var p1x: f64 = ax + abx * s;
+            var p1y: f64 = ay + aby * s;
+            var p2x: f64 = cx + cdx * t;
+            var p2y: f64 = cy + cdy * t;
+            dd = _im_b2_dist_sq(p1x, p1y, p2x, p2y);
+            if (dd < best) {
+                b1x = p1x; b1y = p1y; b2x = p2x; b2y = p2y;
+            }
+        }
+    }
+    store64(out, b1x);
+    store64(out + 8, b1y);
+    store64(out + 16, b2x);
+    store64(out + 24, b2y);
+    return 0;
+}
+
+# A capsule (at (cx, cy), rotated by crot, half height hh, radius cr) against a ball (at (bx, by),
+# radius br) into out: 1, or 0. Mirrors `capsule_circle`.
+fn _im_b2_capsule_circle(cx: f64, cy: f64, crot: f64, hh: f64, cr: f64, bx: f64, by: f64, br: f64, out): i64 {
+    var e[32];
+    _im_b2_capsule_endpoints(cx, cy, crot, hh, &e);
+    var e0x: f64 = load64(&e);
+    var e0y: f64 = load64(&e + 8);
+    var e1x: f64 = load64(&e + 16);
+    var e1y: f64 = load64(&e + 24);
+    var qx, qy, t = _im_b2_closest_point_on_segment(e0x, e0y, e1x, e1y, bx, by);
+    return _im_b2_circle_circle(qx, qy, cr, bx, by, br, out);
+}
+
+# Capsule A against capsule B into out: 1, or 0. Mirrors `capsule_capsule`.
+fn _im_b2_capsule_capsule(ax: f64, ay: f64, ra: f64, hha: f64, cra: f64, bx: f64, by: f64, rb: f64, hhb: f64,
+  crb: f64, out): i64 {
+    var ea[32];
+    var eb[32];
+    var cp[32];
+    _im_b2_capsule_endpoints(ax, ay, ra, hha, &ea);
+    _im_b2_capsule_endpoints(bx, by, rb, hhb, &eb);
+    var a1x: f64 = load64(&ea);
+    var a1y: f64 = load64(&ea + 8);
+    var a2x: f64 = load64(&ea + 16);
+    var a2y: f64 = load64(&ea + 24);
+    var b1x: f64 = load64(&eb);
+    var b1y: f64 = load64(&eb + 8);
+    var b2x: f64 = load64(&eb + 16);
+    var b2y: f64 = load64(&eb + 24);
+    _im_b2_closest_points_segments(a1x, a1y, a2x, a2y, b1x, b1y, b2x, b2y, &cp);
+    var pax: f64 = load64(&cp);
+    var pay: f64 = load64(&cp + 8);
+    var pbx: f64 = load64(&cp + 16);
+    var pby: f64 = load64(&cp + 24);
+    return _im_b2_circle_circle(pax, pay, cra, pbx, pby, crb, out);
+}
+
+# A segment (end points (ax, ay), (bx, by) local to a body at (sx, sy) rotated by srot) against a
+# ball into out: 1, or 0. The point is on the segment. Mirrors `segment_circle`.
+fn _im_b2_segment_circle(sx: f64, sy: f64, srot: f64, ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64, cr: f64,
+  out): i64 {
+    var sn, cs = _im_sin_cos(srot);
+    var s: f64 = sn;
+    var c: f64 = cs;
+    var wax: f64 = sx + c * ax - s * ay;
+    var way: f64 = sy + s * ax + c * ay;
+    var wbx: f64 = sx + c * bx - s * by;
+    var wby: f64 = sy + s * bx + c * by;
+    var qx, qy, t = _im_b2_closest_point_on_segment(wax, way, wbx, wby, cx, cy);
+    var clx: f64 = qx;
+    var cly: f64 = qy;
+    var dx: f64 = cx - clx;
+    var dy: f64 = cy - cly;
+    var dist_sq: f64 = dx * dx + dy * dy;
+    if (dist_sq >= cr * cr) { return 0; }
+    var dist: f64 = f64_sqrt(dist_sq);
+    if (dist < _IM_B2_EPSILON) {
+        _im_b2_put(out, 0.0, 1.0, cr, clx, cly);
+        return 1;
+    }
+    var nx: f64 = dx / dist;
+    var ny: f64 = dy / dist;
+    var depth: f64 = cr - dist;
+    _im_b2_put(out, nx, ny, depth, clx, cly);
+    return 1;
+}
+
+# ── polygons: area and edge normals ─────────────────────────────────────────────────
+
+# Twice the signed area of the n points at pts, stride bytes apart (x, y first): positive for
+# counter-clockwise. A left fold from -0.0, as Rust's f64 `sum`. Mirrors `signed_area_2x`.
+#must_use
+fn _im_b2_signed_area_2x(pts, n, stride): f64 {
+    var acc: f64 = -0.0;
+    for (var i = 0; i < n; i = i + 1) {
+        var j = i + 1;
+        if (j == n) { j = 0; }
+        var ax: f64 = load64(pts + i * stride);
+        var ay: f64 = load64(pts + i * stride + 8);
+        var bx: f64 = load64(pts + j * stride);
+        var by: f64 = load64(pts + j * stride + 8);
+        var term: f64 = ax * by - bx * ay;
+        acc = acc + term;
+    }
+    return acc;
+}
+
+# The outward unit normal of edge a → b for the winding (+1 counter-clockwise, -1 clockwise):
+# (1, x, y), or (0, 0, 0) for an edge shorter than EPSILON. Mirrors `edge_normal`.
+#must_use
+fn _im_b2_edge_normal(ax: f64, ay: f64, bx: f64, by: f64, winding: f64): i64 {
+    var ex: f64 = bx - ax;
+    var ey: f64 = by - ay;
+    var len: f64 = f64_sqrt(ex * ex + ey * ey);
+    var z: f64 = 0.0;
+    if (len < _IM_B2_EPSILON) { return (0, z, z); }
+    var nx: f64 = winding * ey / len;
+    var ny: f64 = -winding * ex / len;
+    return (1, nx, ny);
+}
+
+# ── convex hull against a circle ────────────────────────────────────────────────────
+
+# The convex hull of the n points at pts (3-word records, local to a body at (hx, hy) rotated by
+# hrot, either winding) against a circle into out: 1, or 0. A centre inside the hull is pushed out
+# through the least-penetrated face. The normal points from the hull to the circle. Mirrors
+# `convex_hull_circle`.
+fn _im_b2_hull_circle(pts, n, hx: f64, hy: f64, hrot: f64, cx: f64, cy: f64, radius: f64, out): i64 {
+    if (n < 2) { return 0; }
+    var area: f64 = _im_b2_signed_area_2x(pts, n, 24);
+    var winding: f64 = 1.0;
+    if (area < 0.0) { winding = -1.0; }
+    var lcx, lcy = _im_b2_world_to_local(cx, cy, hx, hy, hrot);
+    var c0: f64 = lcx;
+    var c1: f64 = lcy;
+    var zero: f64 = 0.0;
+    var inf: f64 = 1.0 / zero;
+    var best_d2: f64 = inf;
+    var bcx: f64 = load64(pts);
+    var bcy: f64 = load64(pts + 8);
+    var max_sep: f64 = -inf;
+    var snx: f64 = 0.0;
+    var sny: f64 = 1.0;
+    for (var i = 0; i < n; i = i + 1) {
+        var j = i + 1;
+        if (j == n) { j = 0; }
+        var ax: f64 = load64(pts + i * 24);
+        var ay: f64 = load64(pts + i * 24 + 8);
+        var bx: f64 = load64(pts + j * 24);
+        var by: f64 = load64(pts + j * 24 + 8);
+        var qx, qy, t = _im_b2_closest_point_on_segment(ax, ay, bx, by, c0, c1);
+        var d2: f64 = _im_b2_dist_sq(c0, c1, qx, qy);
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            bcx = qx;
+            bcy = qy;
+        }
+        var ok, nx, ny = _im_b2_edge_normal(ax, ay, bx, by, winding);
+        if (ok == 1) {
+            var ex: f64 = c0 - ax;
+            var ey: f64 = c1 - ay;
+            var sep: f64 = _im_b2_dot2(nx, ny, ex, ey);
+            if (sep > max_sep) {
+                max_sep = sep;
+                snx = nx;
+                sny = ny;
+            }
+        }
+    }
+    var onx: f64 = 0.0;
+    var ony: f64 = 0.0;
+    var depth: f64 = 0.0;
+    var ptx: f64 = 0.0;
+    var pty: f64 = 0.0;
+    if (n >= 3 && max_sep <= 0.0) {
+        onx = snx;
+        ony = sny;
+        depth = radius - max_sep;
+        ptx = c0 - snx * max_sep;
+        pty = c1 - sny * max_sep;
+    } else {
+        if (best_d2 >= radius * radius) { return 0; }
+        var dist: f64 = f64_sqrt(best_d2);
+        if (dist < _IM_B2_EPSILON) {
+            onx = snx;
+            ony = sny;
+            depth = radius;
+        } else {
+            onx = (c0 - bcx) / dist;
+            ony = (c1 - bcy) / dist;
+            depth = radius - dist;
+        }
+        ptx = bcx;
+        pty = bcy;
+    }
+    var wnx, wny = _im_b2_rotate(onx, ony, hrot);
+    var wpx, wpy = _im_b2_local_to_world(ptx, pty, hx, hy, hrot);
+    _im_b2_put(out, wnx, wny, depth, wpx, wpy);
+    return 1;
+}
+
+# ── pairs with a round shape ────────────────────────────────────────────────────────
+
+# The single contact of a pair with a round shape (Ball, or Capsule against Ball or Capsule) into
+# out: 1, or 0 when they don't touch or the pair has no round test. Mirrors `round_contact`.
+fn _im_b2_round_contact(a: *ImColliderShape, ax: f64, ay: f64, ra: f64, b: *ImColliderShape, bx: f64, by: f64,
+  rb: f64, out): i64 {
+    var ka = a.kind;
+    var kb = b.kind;
+    if (ka == IM_SHAPE_BALL && kb == IM_SHAPE_BALL) {
+        var r1: f64 = a.radius;
+        var r2: f64 = b.radius;
+        return _im_b2_circle_circle(ax, ay, r1, bx, by, r2, out);
+    }
+    if (ka == IM_SHAPE_BALL && kb == IM_SHAPE_BOX) {
+        var r3: f64 = a.radius;
+        var h1x: f64 = b.half_extents.x;
+        var h1y: f64 = b.half_extents.y;
+        if (_im_b2_circle_obb(ax, ay, r3, bx, by, rb, h1x, h1y, out) == 0) { return 0; }
+        _im_b2_flip(out);
+        return 1;
+    }
+    if (ka == IM_SHAPE_BOX && kb == IM_SHAPE_BALL) {
+        var r4: f64 = b.radius;
+        var h2x: f64 = a.half_extents.x;
+        var h2y: f64 = a.half_extents.y;
+        return _im_b2_circle_obb(bx, by, r4, ax, ay, ra, h2x, h2y, out);
+    }
+    if (ka == IM_SHAPE_CAPSULE && kb == IM_SHAPE_BALL) {
+        var hh1: f64 = a.half_height;
+        var cr1: f64 = a.radius;
+        var br1: f64 = b.radius;
+        return _im_b2_capsule_circle(ax, ay, ra, hh1, cr1, bx, by, br1, out);
+    }
+    if (ka == IM_SHAPE_BALL && kb == IM_SHAPE_CAPSULE) {
+        var hh2: f64 = b.half_height;
+        var cr2: f64 = b.radius;
+        var br2: f64 = a.radius;
+        if (_im_b2_capsule_circle(bx, by, rb, hh2, cr2, ax, ay, br2, out) == 0) { return 0; }
+        _im_b2_flip(out);
+        return 1;
+    }
+    if (ka == IM_SHAPE_CAPSULE && kb == IM_SHAPE_CAPSULE) {
+        var hha: f64 = a.half_height;
+        var cra: f64 = a.radius;
+        var hhb: f64 = b.half_height;
+        var crb: f64 = b.radius;
+        return _im_b2_capsule_capsule(ax, ay, ra, hha, cra, bx, by, rb, hhb, crb, out);
+    }
+    if (ka == IM_SHAPE_CONVEX_HULL && kb == IM_SHAPE_BALL) {
+        var r5: f64 = b.radius;
+        return _im_b2_hull_circle(a.points, a.point_count, ax, ay, ra, bx, by, r5, out);
+    }
+    if (ka == IM_SHAPE_BALL && kb == IM_SHAPE_CONVEX_HULL) {
+        var r6: f64 = a.radius;
+        if (_im_b2_hull_circle(b.points, b.point_count, bx, by, rb, ax, ay, r6, out) == 0) { return 0; }
+        _im_b2_flip(out);
+        return 1;
+    }
+    if (ka == IM_SHAPE_SEGMENT && kb == IM_SHAPE_BALL) {
+        var s1ax: f64 = a.a.x;
+        var s1ay: f64 = a.a.y;
+        var s1bx: f64 = a.b.x;
+        var s1by: f64 = a.b.y;
+        var r7: f64 = b.radius;
+        return _im_b2_segment_circle(ax, ay, ra, s1ax, s1ay, s1bx, s1by, bx, by, r7, out);
+    }
+    if (ka == IM_SHAPE_BALL && kb == IM_SHAPE_SEGMENT) {
+        var s2ax: f64 = b.a.x;
+        var s2ay: f64 = b.a.y;
+        var s2bx: f64 = b.b.x;
+        var s2by: f64 = b.b.y;
+        var r8: f64 = a.radius;
+        if (_im_b2_segment_circle(bx, by, rb, s2ax, s2ay, s2bx, s2by, ax, ay, r8, out) == 0) { return 0; }
+        _im_b2_flip(out);
+        return 1;
+    }
+    return 0;
+}
+
+# ── polygons: Box, ConvexHull, Segment (reference/incident face clipping) ───────────
+
+# Vertices a polygon keeps on the stack before the polygon paths take freelist storage.
+const _IM_B2_POLY_STACK = 16;
+
+# The number of vertices shape s has as a polygon: 4 for a box, 2 for a segment, its points for a
+# hull; 0 for any other shape.
+#must_use
+fn _im_b2_poly_room(s: *ImColliderShape): i64 {
+    if (s.kind == IM_SHAPE_BOX) { return 4; }
+    if (s.kind == IM_SHAPE_SEGMENT) { return 2; }
+    if (s.kind == IM_SHAPE_CONVEX_HULL) { return s.point_count; }
+    return 0;
+}
+
+# The world vertices of polygon-like shape s at (px, py) rotated by rot into out ((x, y) pairs),
+# counter-clockwise: the count, or -1 when s is no polygon (or a hull of fewer than 2 points).
+# Mirrors `polygon_vertices` (and `transform_hull`): one rotation for all the vertices.
+fn _im_b2_polygon_vertices(s: *ImColliderShape, px: f64, py: f64, rot: f64, out): i64 {
+    var k = s.kind;
+    if (k == IM_SHAPE_BOX) {
+        var hx: f64 = s.half_extents.x;
+        var hy: f64 = s.half_extents.y;
+        store64(out, -hx); store64(out + 8, -hy);
+        store64(out + 16, hx); store64(out + 24, -hy);
+        store64(out + 32, hx); store64(out + 40, hy);
+        store64(out + 48, -hx); store64(out + 56, hy);
+        # Rust's local_to_world per vertex, with the rotation's sin_cos (a pure function) taken once.
+        var bs, bc = _im_sin_cos(rot);
+        var s4: f64 = bs;
+        var c4: f64 = bc;
+        for (var i = 0; i < 4; i = i + 1) {
+            var lx: f64 = load64(out + i * 16);
+            var ly: f64 = load64(out + i * 16 + 8);
+            var wx: f64 = px + c4 * lx - s4 * ly;
+            var wy: f64 = py + s4 * lx + c4 * ly;
+            store64(out + i * 16, wx);
+            store64(out + i * 16 + 8, wy);
+        }
+        return 4;
+    }
+    if (k == IM_SHAPE_CONVEX_HULL && s.point_count >= 2) {
+        var n = s.point_count;
+        var sn, cs = _im_sin_cos(rot);
+        var sv: f64 = sn;
+        var cv: f64 = cs;
+        for (var j = 0; j < n; j = j + 1) {
+            var qx: f64 = load64(s.points + j * 24);
+            var qy: f64 = load64(s.points + j * 24 + 8);
+            var tx: f64 = px + cv * qx - sv * qy;
+            var ty: f64 = py + sv * qx + cv * qy;
+            store64(out + j * 16, tx);
+            store64(out + j * 16 + 8, ty);
+        }
+        var area: f64 = _im_b2_signed_area_2x(out, n, 16);
+        if (area < 0.0) {
+            var lo = 0;
+            var hi = n - 1;
+            while (lo < hi) {
+                var x0 = load64(out + lo * 16);
+                var y0 = load64(out + lo * 16 + 8);
+                store64(out + lo * 16, load64(out + hi * 16));
+                store64(out + lo * 16 + 8, load64(out + hi * 16 + 8));
+                store64(out + hi * 16, x0);
+                store64(out + hi * 16 + 8, y0);
+                lo = lo + 1;
+                hi = hi - 1;
+            }
+        }
+        return n;
+    }
+    if (k == IM_SHAPE_SEGMENT) {
+        var ax: f64 = s.a.x;
+        var ay: f64 = s.a.y;
+        var bx: f64 = s.b.x;
+        var by: f64 = s.b.y;
+        var wax, way = _im_b2_world_pos(px, py, rot, ax, ay);
+        var wbx, wby = _im_b2_world_pos(px, py, rot, bx, by);
+        store64(out, wax);
+        store64(out + 8, way);
+        store64(out + 16, wbx);
+        store64(out + 24, wby);
+        return 2;
+    }
+    return 0 - 1;
+}
+
+# The largest separation of polygon 2 from an edge of polygon 1 (both counter-clockwise, (x, y)
+# pairs): (1, edge index, separation), or (0, 0, 0) when polygon 1 has no edge of length. A
+# positive separation is a separating axis. Mirrors `max_separation`.
+#must_use
+fn _im_b2_max_separation(p1, n1, p2, n2): i64 {
+    var found = 0;
+    var edge = 0;
+    var best: f64 = 0.0;
+    for (var i = 0; i < n1; i = i + 1) {
+        var j = i + 1;
+        if (j == n1) { j = 0; }
+        var v1x: f64 = load64(p1 + i * 16);
+        var v1y: f64 = load64(p1 + i * 16 + 8);
+        var wx: f64 = load64(p1 + j * 16);
+        var wy: f64 = load64(p1 + j * 16 + 8);
+        var ok, nx, ny = _im_b2_edge_normal(v1x, v1y, wx, wy, 1.0);
+        if (ok == 1) {
+            var zero: f64 = 0.0;
+            var sep: f64 = 1.0 / zero;
+            for (var q = 0; q < n2; q = q + 1) {
+                var vx: f64 = load64(p2 + q * 16);
+                var vy: f64 = load64(p2 + q * 16 + 8);
+                var ex: f64 = vx - v1x;
+                var ey: f64 = vy - v1y;
+                var d: f64 = _im_b2_dot2(nx, ny, ex, ey);
+                sep = _im_min(sep, d);
+            }
+            if (found == 0 || sep > best) {
+                found = 1;
+                edge = i;
+                best = sep;
+            }
+        }
+    }
+    return (found, edge, best);
+}
+
+# Clips segment v (x0, y0, x1, y1) against the half-plane normal·p <= offset into out: 1 when two
+# points remain, else 0. Mirrors `clip_segment`.
+fn _im_b2_clip_segment(v, nx: f64, ny: f64, offset: f64, out): i64 {
+    var v0x: f64 = load64(v);
+    var v0y: f64 = load64(v + 8);
+    var v1x: f64 = load64(v + 16);
+    var v1y: f64 = load64(v + 24);
+    var e0: f64 = _im_b2_dot2(nx, ny, v0x, v0y);
+    var e1: f64 = _im_b2_dot2(nx, ny, v1x, v1y);
+    var d0: f64 = e0 - offset;
+    var d1: f64 = e1 - offset;
+    var count = 0;
+    if (d0 <= 0.0) {
+        store64(out, v0x);
+        store64(out + 8, v0y);
+        count = 1;
+    }
+    if (d1 <= 0.0) {
+        store64(out + count * 16, v1x);
+        store64(out + count * 16 + 8, v1y);
+        count = count + 1;
+    }
+    if (d0 * d1 < 0.0 && count < 2) {
+        var t: f64 = d0 / (d0 - d1);
+        var x: f64 = v0x + t * (v1x - v0x);
+        var y: f64 = v0y + t * (v1y - v0y);
+        store64(out + count * 16, x);
+        store64(out + count * 16 + 8, y);
+        count = count + 1;
+    }
+    if (count == 2) { return 1; }
+    return 0;
+}
+
+# The manifold of two counter-clockwise polygons (at least 2 vertices each) into out (Box2D's
+# b2CollidePolygons): -1 when a separating axis exists (or the reference edge has no length), else
+# the 0 to 2 contacts the clipping leaves. Normals point from A to B. Mirrors `collide_polygons`.
+fn _im_b2_collide_polygons(pa, na, pb, nb, out): i64 {
+    var fa, edge_a, sa = _im_b2_max_separation(pa, na, pb, nb);
+    if (fa == 0) { return 0 - 1; }
+    var sep_a: f64 = sa;
+    if (sep_a > 0.0) { return 0 - 1; }
+    var fb, edge_b, sb = _im_b2_max_separation(pb, nb, pa, na);
+    if (fb == 0) { return 0 - 1; }
+    var sep_b: f64 = sb;
+    if (sep_b > 0.0) { return 0 - 1; }
+    var ref = pa;
+    var nref = na;
+    var inc = pb;
+    var ninc = nb;
+    var edge = edge_a;
+    var flip = 0;
+    if (sep_b > sep_a + 0.0005) {
+        ref = pb;
+        nref = nb;
+        inc = pa;
+        ninc = na;
+        edge = edge_b;
+        flip = 1;
+    }
+    var e2 = edge + 1;
+    if (e2 == nref) { e2 = 0; }
+    var v11x: f64 = load64(ref + edge * 16);
+    var v11y: f64 = load64(ref + edge * 16 + 8);
+    var v12x: f64 = load64(ref + e2 * 16);
+    var v12y: f64 = load64(ref + e2 * 16 + 8);
+    var rok, rnx0, rny0 = _im_b2_edge_normal(v11x, v11y, v12x, v12y, 1.0);
+    if (rok == 0) { return 0 - 1; }
+    var rnx: f64 = rnx0;
+    var rny: f64 = rny0;
+    var tx: f64 = -rny;
+    var ty: f64 = rnx;
+    var ie = 0;
+    var zero: f64 = 0.0;
+    var min_dot: f64 = 1.0 / zero;
+    for (var i = 0; i < ninc; i = i + 1) {
+        var j = i + 1;
+        if (j == ninc) { j = 0; }
+        var ax: f64 = load64(inc + i * 16);
+        var ay: f64 = load64(inc + i * 16 + 8);
+        var bx: f64 = load64(inc + j * 16);
+        var by: f64 = load64(inc + j * 16 + 8);
+        var ok, nx, ny = _im_b2_edge_normal(ax, ay, bx, by, 1.0);
+        if (ok == 1) {
+            var d: f64 = _im_b2_dot2(nx, ny, rnx, rny);
+            if (d < min_dot) {
+                min_dot = d;
+                ie = i;
+            }
+        }
+    }
+    var ie2 = ie + 1;
+    if (ie2 == ninc) { ie2 = 0; }
+    var incident[32];
+    store64(&incident, load64(inc + ie * 16));
+    store64(&incident + 8, load64(inc + ie * 16 + 8));
+    store64(&incident + 16, load64(inc + ie2 * 16));
+    store64(&incident + 24, load64(inc + ie2 * 16 + 8));
+    var c1[32];
+    var c2[32];
+    var t11: f64 = _im_b2_dot2(tx, ty, v11x, v11y);
+    if (_im_b2_clip_segment(&incident, -tx, -ty, -t11, &c1) == 0) { return 0; }
+    var t12: f64 = _im_b2_dot2(tx, ty, v12x, v12y);
+    if (_im_b2_clip_segment(&c1, tx, ty, t12, &c2) == 0) { return 0; }
+    var front: f64 = _im_b2_dot2(rnx, rny, v11x, v11y);
+    var onx: f64 = rnx;
+    var ony: f64 = rny;
+    if (flip == 1) {
+        onx = -rnx;
+        ony = -rny;
+    }
+    var n = 0;
+    for (var q = 0; q < 2; q = q + 1) {
+        var vx: f64 = load64(&c2 + q * 16);
+        var vy: f64 = load64(&c2 + q * 16 + 8);
+        var dv: f64 = _im_b2_dot2(rnx, rny, vx, vy);
+        var sep: f64 = dv - front;
+        if (sep <= 0.0) {
+            var px: f64 = vx - rnx * sep * 0.5;
+            var py: f64 = vy - rny * sep * 0.5;
+            _im_b2_put(out + n * _IM_B2_CONTACT, onx, ony, -sep, px, py);
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+# The extent (min, max) of the n polygon vertices along (ax, ay). Mirrors `project_hull`.
+#must_use
+fn _im_b2_project_hull(pts, n, ax: f64, ay: f64) {
+    var zero: f64 = 0.0;
+    var mx: f64 = -1.0 / zero;
+    var mn: f64 = -mx;
+    for (var i = 0; i < n; i = i + 1) {
+        var x: f64 = load64(pts + i * 16);
+        var y: f64 = load64(pts + i * 16 + 8);
+        var proj: f64 = x * ax + y * ay;
+        mn = _im_min(mn, proj);
+        mx = _im_max(mx, proj);
+    }
+    return (mn, mx);
+}
+
+# The vertex furthest along (dx, dy), the first of equals. Mirrors `support_point_poly`.
+#must_use
+fn _im_b2_support_point_poly(pts, n, dx: f64, dy: f64) {
+    var bx: f64 = load64(pts);
+    var by: f64 = load64(pts + 8);
+    var best: f64 = bx * dx + by * dy;
+    for (var i = 1; i < n; i = i + 1) {
+        var x: f64 = load64(pts + i * 16);
+        var y: f64 = load64(pts + i * 16 + 8);
+        var d: f64 = x * dx + y * dy;
+        if (d > best) {
+            best = d;
+            bx = x;
+            by = y;
+        }
+    }
+    return (bx, by);
+}
+
+# The single SAT contact of two world polygons, when clipping leaves none, into out: 1, or 0 when
+# an axis separates them. The normal points from A (centre (cax, cay)) to B. Mirrors
+# `sat_polygon_contact`.
+fn _im_b2_sat_polygon_contact(wa, na, wb, nb, cax: f64, cay: f64, cbx: f64, cby: f64, out): i64 {
+    var cdx: f64 = cbx - cax;
+    var cdy: f64 = cby - cay;
+    var zero: f64 = 0.0;
+    var min_ov: f64 = 1.0 / zero;
+    var bax: f64 = 0.0;
+    var bay: f64 = 0.0;
+    for (var h = 0; h < 2; h = h + 1) {
+        var pts = wa;
+        var n = na;
+        if (h == 1) {
+            pts = wb;
+            n = nb;
+        }
+        for (var i = 0; i < n; i = i + 1) {
+            var j = i + 1;
+            if (j == n) { j = 0; }
+            var x0: f64 = load64(pts + i * 16);
+            var y0: f64 = load64(pts + i * 16 + 8);
+            var x1: f64 = load64(pts + j * 16);
+            var y1: f64 = load64(pts + j * 16 + 8);
+            var ok, axw, ayw = _im_b2_edge_normal(x0, y0, x1, y1, 1.0);
+            if (ok == 1) {
+                # Multi-return values are untyped words: bind them before negating.
+                var ax: f64 = axw;
+                var ay: f64 = ayw;
+                var mna, mxa = _im_b2_project_hull(wa, na, ax, ay);
+                var mnb, mxb = _im_b2_project_hull(wb, nb, ax, ay);
+                var hi: f64 = _im_min(mxa, mxb);
+                var lo: f64 = _im_max(mna, mnb);
+                var ov: f64 = hi - lo;
+                if (ov <= 0.0) { return 0; }
+                if (ov < min_ov) {
+                    min_ov = ov;
+                    var side: f64 = _im_b2_dot2(cdx, cdy, ax, ay);
+                    bax = ax;
+                    bay = ay;
+                    if (!(side >= 0.0)) {
+                        bax = -ax;
+                        bay = -ay;
+                    }
+                }
+            }
+        }
+    }
+    if (_im_is_finite(min_ov) == 0) { return 0; }
+    var pax, pay = _im_b2_support_point_poly(wa, na, bax, bay);
+    var pbx, pby = _im_b2_support_point_poly(wb, nb, -bax, -bay);
+    var qax: f64 = pax;
+    var qay: f64 = pay;
+    var qbx: f64 = pbx;
+    var qby: f64 = pby;
+    var px: f64 = (qax + qbx) * 0.5;
+    var py: f64 = (qay + qby) * 0.5;
+    _im_b2_put(out, bax, bay, min_ov, px, py);
+    return 1;
+}
+
+# The contacts of two polygon-like shapes (Box, ConvexHull, Segment) into out: 0 to 2. Mirrors
+# `polygon_contacts`. The vertices live on the stack up to _IM_B2_POLY_STACK each, else on freelist
+# (no contacts when that storage can't be had).
+fn _im_b2_polygon_contacts(a: *ImColliderShape, ax: f64, ay: f64, ra: f64, b: *ImColliderShape, bx: f64, by: f64,
+  rb: f64, out): i64 {
+    var room_a = _im_b2_poly_room(a);
+    var room_b = _im_b2_poly_room(b);
+    var local[512];
+    var mem = &local;
+    var heap = 0;
+    if (room_a > _IM_B2_POLY_STACK || room_b > _IM_B2_POLY_STACK) {
+        heap = fl_alloc((room_a + room_b) * 16 + 16);
+        if (heap == 0) { return 0; }
+        mem = heap;
+    }
+    var va = mem;
+    var vb = mem + 256;
+    if (heap != 0) { vb = mem + room_a * 16 + 8; }
+    var n = 0;
+    var na = _im_b2_polygon_vertices(a, ax, ay, ra, va);
+    var nb = _im_b2_polygon_vertices(b, bx, by, rb, vb);
+    if (na >= 0 && nb >= 0) {
+        n = _im_b2_collide_polygons(va, na, vb, nb, out);
+        if (n < 0) {
+            n = 0;
+        } elif (n == 0) {
+            n = _im_b2_sat_polygon_contact(va, na, vb, nb, ax, ay, bx, by, out);
+        }
+    }
+    if (heap != 0) { fl_free(heap); }
+    return n;
+}
+
+# ── capsules against polygons ───────────────────────────────────────────────────────
+
+# Copies the contact at src to dst (five words; memcpy moves bytes one at a time).
+fn _im_b2_copy_contact(dst, src) {
+    for (var w = 0; w < 5; w = w + 1) { store64(dst + w * 8, load64(src + w * 8)); }
+    return 0;
+}
+
+# A capsule-radius circle at (px, py) against s in s's own frame into out: the box test when s is
+# a Box, the hull test when it is a ConvexHull (Rust's `circle_test` closures).
+fn _im_b2_cap_test(s: *ImColliderShape, cr: f64, px: f64, py: f64, out): i64 {
+    if (s.kind == IM_SHAPE_BOX) {
+        var hx: f64 = s.half_extents.x;
+        var hy: f64 = s.half_extents.y;
+        return _im_b2_circle_aabb(px, py, cr, 0.0, 0.0, hx, hy, out);
+    }
+    return _im_b2_hull_circle(s.points, s.point_count, 0.0, 0.0, 0.0, px, py, cr, out);
+}
+
+# Of two contacts at out, keeps only the deeper one (the first of equals) when their normals differ
+# (dot < 0.999): a manifold shares one normal. Returns the count left.
+fn _im_b2_keep_one_normal(out): i64 {
+    var n0x: f64 = load64(out);
+    var n0y: f64 = load64(out + 8);
+    var n1x: f64 = load64(out + _IM_B2_CONTACT);
+    var n1y: f64 = load64(out + _IM_B2_CONTACT + 8);
+    var dot: f64 = _im_b2_dot2(n0x, n0y, n1x, n1y);
+    if (!(dot < 0.999)) { return 2; }
+    var d0: f64 = load64(out + 16);
+    var d1: f64 = load64(out + _IM_B2_CONTACT + 16);
+    if (!(d0 >= d1)) { _im_b2_copy_contact(out, out + _IM_B2_CONTACT); }
+    return 1;
+}
+
+# The contacts of a capsule (axis end points e: x0, y0, x1, y1, in s's frame, radius cr) against s
+# into out: both end caps; when neither touches, the deeper of the axis midpoint and the axis point
+# nearest the frame's origin. Mirrors `capsule_end_contacts`.
+fn _im_b2_capsule_end_contacts(e, s: *ImColliderShape, cr: f64, out): i64 {
+    var e0x: f64 = load64(e);
+    var e0y: f64 = load64(e + 8);
+    var e1x: f64 = load64(e + 16);
+    var e1y: f64 = load64(e + 24);
+    var n = _im_b2_cap_test(s, cr, e0x, e0y, out);
+    n = n + _im_b2_cap_test(s, cr, e1x, e1y, out + n * _IM_B2_CONTACT);
+    if (n == 2) { n = _im_b2_keep_one_normal(out); }
+    if (n > 0) { return n; }
+    var mx: f64 = (e0x + e1x) * 0.5;
+    var my: f64 = (e0y + e1y) * 0.5;
+    var qx, qy, t = _im_b2_closest_point_on_segment(e0x, e0y, e1x, e1y, 0.0, 0.0);
+    var c1[40];
+    var c2[40];
+    var h1 = _im_b2_cap_test(s, cr, mx, my, &c1);
+    var h2 = _im_b2_cap_test(s, cr, qx, qy, &c2);
+    if (h1 == 1 && h2 == 1) {
+        var d1: f64 = load64(&c1 + 16);
+        var d2: f64 = load64(&c2 + 16);
+        if (d1 >= d2) { h2 = 0; } else { h1 = 0; }
+    }
+    if (h1 == 1) {
+        _im_b2_copy_contact(out, &c1);
+        return 1;
+    }
+    if (h2 == 1) {
+        _im_b2_copy_contact(out, &c2);
+        return 1;
+    }
+    return 0;
+}
+
+# A capsule (at (cx, cy), rotated by crot, half height hh, radius cr) against polygon s (a Box or a
+# ConvexHull at (sx, sy), rotated by srot), worked in s's frame, into out: 0 to 2 contacts with
+# normals from s to the capsule. Mirrors `capsule_obb` and `capsule_hull`.
+fn _im_b2_capsule_in_frame(cx: f64, cy: f64, crot: f64, hh: f64, cr: f64, s: *ImColliderShape, sx: f64, sy: f64,
+  srot: f64, out): i64 {
+    var lx, ly = _im_b2_world_to_local(cx, cy, sx, sy, srot);
+    var lrot: f64 = crot - srot;
+    var e[32];
+    _im_b2_capsule_endpoints(lx, ly, lrot, hh, &e);
+    var n = _im_b2_capsule_end_contacts(&e, s, cr, out);
+    for (var i = 0; i < n; i = i + 1) { _im_b2_box_to_world(out + i * _IM_B2_CONTACT, sx, sy, srot); }
+    return n;
+}
+
+# A capsule against a segment (end points local to a body at (sx, sy) rotated by srot) into out: 0
+# to 2 contacts with normals from the segment to the capsule. Mirrors `capsule_segment`.
+fn _im_b2_capsule_segment(cx: f64, cy: f64, crot: f64, hh: f64, cr: f64, sx: f64, sy: f64, srot: f64, ax: f64,
+  ay: f64, bx: f64, by: f64, out): i64 {
+    var e[32];
+    _im_b2_capsule_endpoints(cx, cy, crot, hh, &e);
+    var e0x: f64 = load64(&e);
+    var e0y: f64 = load64(&e + 8);
+    var e1x: f64 = load64(&e + 16);
+    var e1y: f64 = load64(&e + 24);
+    var n = _im_b2_segment_circle(sx, sy, srot, ax, ay, bx, by, e0x, e0y, cr, out);
+    n = n + _im_b2_segment_circle(sx, sy, srot, ax, ay, bx, by, e1x, e1y, cr, out + n * _IM_B2_CONTACT);
+    if (n == 2) { n = _im_b2_keep_one_normal(out); }
+    if (n > 0) { return n; }
+    var wax, way = _im_b2_world_pos(sx, sy, srot, ax, ay);
+    var wbx, wby = _im_b2_world_pos(sx, sy, srot, bx, by);
+    var cp[32];
+    _im_b2_closest_points_segments(wax, way, wbx, wby, e0x, e0y, e1x, e1y, &cp);
+    var psx: f64 = load64(&cp);
+    var psy: f64 = load64(&cp + 8);
+    var pcx: f64 = load64(&cp + 16);
+    var pcy: f64 = load64(&cp + 24);
+    return _im_b2_circle_circle(psx, psy, 0.0, pcx, pcy, cr, out);
+}
+
+# ── the manifold ────────────────────────────────────────────────────────────────────
+
+# 1 for a Box, ConvexHull or Segment. Mirrors `is_polygon`.
+#must_use
+fn _im_b2_is_polygon(s: *ImColliderShape): i64 {
+    var k = s.kind;
+    if (k == IM_SHAPE_BOX || k == IM_SHAPE_CONVEX_HULL || k == IM_SHAPE_SEGMENT) { return 1; }
+    return 0;
+}
+
+# Every contact between shape A (at (ax, ay), rotated by ra) and shape B into out (room for
+# _IM_B2_MAX_CONTACTS): a one-shot manifold of up to two points sharing one normal, from A to B.
+# Returns the count. Heightfields and triangle meshes get none. Mirrors `generate_contacts_multi`.
+fn _im_b2_generate_contacts_multi(a: *ImColliderShape, ax: f64, ay: f64, ra: f64, b: *ImColliderShape, bx: f64,
+  by: f64, rb: f64, out): i64 {
+    var ka = a.kind;
+    var kb = b.kind;
+    if (_im_b2_is_polygon(a) == 1 && _im_b2_is_polygon(b) == 1) {
+        return _im_b2_polygon_contacts(a, ax, ay, ra, b, bx, by, rb, out);
+    }
+    var n = 0;
+    if (ka == IM_SHAPE_CAPSULE && (kb == IM_SHAPE_BOX || kb == IM_SHAPE_CONVEX_HULL)) {
+        var hh1: f64 = a.half_height;
+        var cr1: f64 = a.radius;
+        n = _im_b2_capsule_in_frame(ax, ay, ra, hh1, cr1, b, bx, by, rb, out);
+        _im_b2_flip_all(out, n);
+        return n;
+    }
+    if (kb == IM_SHAPE_CAPSULE && (ka == IM_SHAPE_BOX || ka == IM_SHAPE_CONVEX_HULL)) {
+        var hh2: f64 = b.half_height;
+        var cr2: f64 = b.radius;
+        return _im_b2_capsule_in_frame(bx, by, rb, hh2, cr2, a, ax, ay, ra, out);
+    }
+    if (ka == IM_SHAPE_CAPSULE && kb == IM_SHAPE_SEGMENT) {
+        var hh3: f64 = a.half_height;
+        var cr3: f64 = a.radius;
+        var s1ax: f64 = b.a.x;
+        var s1ay: f64 = b.a.y;
+        var s1bx: f64 = b.b.x;
+        var s1by: f64 = b.b.y;
+        n = _im_b2_capsule_segment(ax, ay, ra, hh3, cr3, bx, by, rb, s1ax, s1ay, s1bx, s1by, out);
+        _im_b2_flip_all(out, n);
+        return n;
+    }
+    if (kb == IM_SHAPE_CAPSULE && ka == IM_SHAPE_SEGMENT) {
+        var hh4: f64 = b.half_height;
+        var cr4: f64 = b.radius;
+        var s2ax: f64 = a.a.x;
+        var s2ay: f64 = a.a.y;
+        var s2bx: f64 = a.b.x;
+        var s2by: f64 = a.b.y;
+        return _im_b2_capsule_segment(bx, by, rb, hh4, cr4, ax, ay, ra, s2ax, s2ay, s2bx, s2by, out);
+    }
+    return _im_b2_round_contact(a, ax, ay, ra, b, bx, by, rb, out);
+}
+
+# The deepest contact of the manifold into out (room for two): 1, or 0. Mirrors `generate_contact`
+# (test-only in Rust; `deepest` keeps the first of equals).
+fn _im_b2_generate_contact(a: *ImColliderShape, ax: f64, ay: f64, ra: f64, b: *ImColliderShape, bx: f64, by: f64,
+  rb: f64, out): i64 {
+    var n = _im_b2_generate_contacts_multi(a, ax, ay, ra, b, bx, by, rb, out);
+    if (n == 2) {
+        var d0: f64 = load64(out + 16);
+        var d1: f64 = load64(out + _IM_B2_CONTACT + 16);
+        if (!(d0 >= d1)) { _im_b2_copy_contact(out, out + _IM_B2_CONTACT); }
+        return 1;
+    }
+    return n;
+}
+
+# 1 when the shapes touch: the round test alone when either is a Ball, else a non-empty manifold.
+# Mirrors `shapes_touch`.
+#must_use
+fn _im_b2_shapes_touch(a: *ImColliderShape, ax: f64, ay: f64, ra: f64, b: *ImColliderShape, bx: f64, by: f64,
+  rb: f64): i64 {
+    var out[80];
+    var n = 0;
+    if (a.kind == IM_SHAPE_BALL || b.kind == IM_SHAPE_BALL) {
+        n = _im_b2_round_contact(a, ax, ay, ra, b, bx, by, rb, &out);
+    } else {
+        n = _im_b2_generate_contacts_multi(a, ax, ay, ra, b, bx, by, rb, &out);
+    }
+    if (n > 0) { return 1; }
+    return 0;
+}

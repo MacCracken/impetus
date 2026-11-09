@@ -1091,6 +1091,40 @@ fn _par_b2_mass(fp, fl): i64 {
     return 1;
 }
 
+# ── M2c: the 2D narrowphase ─────────────────────────────────────────────────────────
+# Inputs: shape A, A's x, y and rotation, shape B and its pose. `b2::contacts` outputs `v:N` and
+# each contact's normal x, y, depth and point x, y; `b2::shapes_touch` outputs 0 or 1.
+
+fn _par_b2_narrow(fp, fl): i64 {
+    var is_c = _par_eq(fp, fl, "b2::contacts");
+    var is_t = _par_eq(fp, fl, "b2::shapes_touch");
+    if (is_c == 0 && is_t == 0) { return 0; }
+    var sa: ImColliderShape = _im_shape(IM_SHAPE_BALL);
+    var sb: ImColliderShape = _im_shape(IM_SHAPE_BALL);
+    var k = _par_in_shape(0, &sa);
+    var ax: f64 = _par_in(k);
+    var ay: f64 = _par_in(k + 1);
+    var ra: f64 = _par_in(k + 2);
+    k = _par_in_shape(k + 3, &sb);
+    var bx: f64 = _par_in(k);
+    var by: f64 = _par_in(k + 1);
+    var rb: f64 = _par_in(k + 2);
+    var out[80];
+    var n = 0;
+    if (is_t == 1) {
+        _par_got_i(_im_b2_shapes_touch(&sa, ax, ay, ra, &sb, bx, by, rb));
+    } else {
+        n = _im_b2_generate_contacts_multi(&sa, ax, ay, ra, &sb, bx, by, rb, &out);
+        _par_got_seq(n);
+        for (var j = 0; j < n; j = j + 1) {
+            for (var w = 0; w < 5; w = w + 1) { _par_got_f(load64(&out + j * 40 + w * 8)); }
+        }
+    }
+    sa.free();
+    sb.free();
+    return 1;
+}
+
 # `f64::fmt_display` and `serde_json::f64` rows: src/fmtf.cyr's two layouts (ADR 0010).
 fn _par_fmtf(fp, fl): i64 {
     var x: f64 = _par_in(0);
@@ -1455,6 +1489,7 @@ fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_got_n = 0;
     _par_mapped = 0;
     if (_par_eq(mp, ml, "b2_mass") == 1) { return _par_b2_mass(fp, fl); }
+    if (_par_eq(mp, ml, "b2_narrow") == 1) { return _par_b2_narrow(fp, fl); }
     if (_par_eq(mp, ml, "broadphase") == 1) { return _par_broadphase(fp, fl); }
     if (_par_eq(mp, ml, "config") == 1) { return _par_config(fp, fl); }
     if (_par_eq(mp, ml, "fmtf") == 1) { return _par_fmtf(fp, fl); }
@@ -1551,6 +1586,7 @@ fn _par_c_bound(fp, fl): i64 {
     if (_par_eq(fp, fl, "f64::cos") == 1) { return 0; }
     if (_par_eq(fp, fl, "f64::exp") == 1) { return 0; }
     if (_par_eq(fp, fl, "Spring::step") == 1) { return 0; }
+    if (_par_eq(fp, fl, "b2::contacts") == 1) { return 0; }
     if (_par_eq(fp, fl, "f64::atan2") == 1) { return 2; }
     if (_par_eq(fp, fl, "f64::hypot") == 1) { return 2; }
     if (_par_eq(fp, fl, "f64::powf") == 1) { return 2; }

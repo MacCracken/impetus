@@ -54,6 +54,7 @@ harness reads the same files. This README records what is specific to impetus.
 | `spring`, `types` | b2 | M1b | 1,000, 1 | `src/m_spring.rs`, `src/m_types.rs` | — |
 | `broadphase` | b2 | M2 | 76 | `src/m_broadphase.rs` | — |
 | `b2_mass` | b2 | M2 | 75 | `src/m_b2_mass.rs` | — |
+| `b2_narrow` | b2 | M2 | 17,854 (+ 3 corrected) | `src/m_b2_narrow.rs` | — |
 | (private constants) | b2 | M2 | — | — | `src/constants_private.cyr` (`src/t_private.rs`: every library `const` of `aabb_tree.rs`, `spatial_hash.rs` and `backend_2d/types.rs`, emitted or excused) |
 
 ## Format 1
@@ -86,6 +87,11 @@ impetus specifics:
   body (`e:BodyType`, `fixed_rotation`), adds its colliders through the public `add_collider`, and reads the body
   back from `oracle_dump()`. Inputs: `v:<colliders>`, then per collider its shape (`flat::shape`), offset x and y,
   density, and `n:` or the explicit mass. Outputs: mass, inertia (about the body origin), inv_mass, inv_inertia.
+- Narrowphase rows (`b2_narrow.tsv`, the 2D build only) go through the hooks `contacts_2d` and `shapes_touch_2d`.
+  Inputs: shape A (`flat::shape`), A's x, y and rotation, then shape B and its pose. `b2::contacts` (class C)
+  outputs `v:N` and each contact's normal x, y (A to B), depth and world point x, y, in generation order;
+  `b2::shapes_touch` (class A) outputs `i:0` or `i:1`. Every box has finite, non-negative half extents, because a
+  round shape against a box reaches Rust's `f64::clamp(-h, h)`, which panics on an inverted range.
 - `Spring::step` rows (`spring.tsv`) carry a note `[<regime> S=<n>]`: the regime the transition took
   and its **sensitivity**, the most the two outputs move, in ulps, when one exp, sin or cos result
   on the path moves by one ulp. `m_spring.rs` computes it from a transcription of `transition` and
@@ -143,6 +149,9 @@ Standard-library Python, run with `-I`. It never calls the oracle:
   so the step rows match bit for bit;
 - every `broadphase` row is recomputed: the tree's pairs by brute force on the fattened boxes, the hash's by an
   independent rasterisation, the automatic cell size;
+- every `b2_narrow` row is recomputed by a Python transcription of the narrowphase on Python's libm (glibc, as the
+  oracle's), bit for bit. The same transcription on MPFR's sin and cos writes `b2_narrow.cr.tsv`. Its folds are
+  explicit loops, because Python 3.12's `sum()` of floats is compensated;
 - every `b2_mass` body is recomputed: its own `shape_props` and `polygon_mass_props` in Rust's operation order,
   the floors, the parallel-axis sum and `refresh_inverse_mass`;
 - `src/constants_private.cyr` holds every library `const` of the ported modules, each equal to Python's parse of

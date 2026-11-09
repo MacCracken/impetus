@@ -378,6 +378,51 @@ fn bench_b2_world_aabb() {
     return 0;
 }
 
+# b2/contacts_<pair>: one generate_contacts_multi call on a touching pair (Cyrius only: Rust times
+# the narrowphase inside its step benches, M3). The pose index varies the rotation slightly so no
+# call is a repeat of the last.
+fn bench_b2_contacts(name, a: *ImColliderShape, b: *ImColliderShape, bx: f64, by: f64, rb: f64) {
+    var bn = bench_new(name);
+    var out[80];
+    var reps = 100000;
+    bench_batch_start(bn);
+    for (var r = 0; r < reps; r = r + 1) {
+        var jitter: f64 = f64_from(r & 1023) * 0.000001;
+        var rot: f64 = rb + jitter;
+        g_sink = _im_b2_generate_contacts_multi(a, 0.0, 0.0, 0.0, b, bx, by, rot, &out);
+    }
+    bench_batch_stop(bn, reps);
+    bench_report(bn);
+    return 0;
+}
+
+# The narrowphase rows: ball-box, rotated box-box (clipping), a capsule lying on a box (two end
+# caps), and two 8-vertex hulls.
+fn bench_b2_narrowphase() {
+    var ball: ImColliderShape = ImColliderShape_ball(0.5);
+    var bx: ImColliderShape = ImColliderShape_box(1.0, 0.5, 0.0);
+    var cap: ImColliderShape = ImColliderShape_capsule(1.0, 0.25);
+    bench_b2_contacts("b2/contacts_ball_box", &bx, &ball, 0.3, 0.9, 0.0);
+    bench_b2_contacts("b2/contacts_box_box_rotated", &bx, &bx, 0.5, 0.9, 0.3);
+    bench_b2_contacts("b2/contacts_capsule_box_lying", &bx, &cap, 0.0, 0.74, 1.5707963267948966);
+    var w = fl_alloc(8 * 24);
+    for (var j = 0; j < 8; j = j + 1) {
+        var t: f64 = -3.0 + 6.0 * f64_from(j + 1) / 8.0;
+        var d: f64 = 1.0 + t * t;
+        var x: f64 = 1.2 * (1.0 - t * t) / d;
+        var y: f64 = 0.8 * (2.0 * t) / d;
+        var z: f64 = 0.0;
+        store64(w + j * 24, x);
+        store64(w + j * 24 + 8, y);
+        store64(w + j * 24 + 16, z);
+    }
+    var hull: ImColliderShape = ImColliderShape_convex_hull(w, 8);
+    fl_free(w);
+    bench_b2_contacts("b2/contacts_hull8_hull8", &hull, &hull, 0.8, 1.0, 0.4);
+    hull.free();
+    return 0;
+}
+
 # Runs every bench.
 fn main(): i64 {
     alloc_init();
@@ -402,6 +447,7 @@ fn main(): i64 {
     bench_b2_add_collider_mass();
     bench_b2_hull_mass();
     bench_b2_world_aabb();
+    bench_b2_narrowphase();
     return 0;
 }
 

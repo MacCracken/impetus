@@ -626,6 +626,12 @@ def corrections(module, rows):
         elif module == "spring" and fn == "Spring::step":
             x = [tok_f(t) if t.startswith("f:") else int(t[2:]) for t in ins]
             want = list(_cr_spring_step(*x, prim))
+        elif module == "b2_narrow":
+            toks = _np_tokens(fn, _Narrow(prim["sin"], prim["cos"]), _np_args(ins))
+            if not _same_tokens(outs, toks):
+                seen = list(dict.fromkeys(log))
+                out.append((fn, " ".join(ins), " ".join(toks), "oracle " + " ".join(outs) + "; " + "; ".join(seen)))
+            continue
         else:
             continue
         got = [tok_f(t) for t in outs]
@@ -702,6 +708,556 @@ def check_tables(root):
         fail("src/crmath_data.cyr is not crtables.py's output (regenerate with --write)")
     else:
         print(f"crmath_data: current; π and ln 2 to {n} bits, and every table's hi, equal MPFR {MPFR.VERSION}'s")
+
+
+# ── the 2D narrowphase (rust-old/src/backend_2d/narrowphase.rs) ─────────────────────────────
+# A transcription in Rust's expression order, with every `sin_cos` call through the instance's sin
+# and cos: glibc's (Python's math, the same libm as Rust's f64 methods) reproduces the oracle bit for
+# bit; MPFR's gives the corrected oracle. Folds are explicit loops: Python 3.12's sum() of floats is
+# compensated, Rust's is not.
+
+B2_EPSILON = 1e-10
+
+
+def _np_shape(ins, k):
+    """The shape at token k (flat::shape's layout) as a tuple, and the token after it."""
+    kind = ins[k].split(".", 1)[1]
+    k += 1
+    if kind == "Ball":
+        return ("Ball", tok_f(ins[k])), k + 1
+    if kind == "Box":
+        return ("Box", tok_f(ins[k]), tok_f(ins[k + 1])), k + 3
+    if kind == "Capsule":
+        return ("Capsule", tok_f(ins[k]), tok_f(ins[k + 1])), k + 2
+    if kind == "Segment":
+        a = (tok_f(ins[k]), tok_f(ins[k + 1]))
+        b = (tok_f(ins[k + 3]), tok_f(ins[k + 4]))
+        return ("Segment", a, b), k + 6
+    if kind == "ConvexHull":
+        n = int(ins[k][2:])
+        pts = [(tok_f(ins[k + 1 + 3 * j]), tok_f(ins[k + 2 + 3 * j])) for j in range(n)]
+        return ("ConvexHull", pts), k + 1 + 3 * n
+    if kind == "TriMesh":
+        nv = int(ins[k][2:])
+        k += 1 + 3 * nv
+        ni = int(ins[k][2:])
+        return ("TriMesh",), k + 1 + 3 * ni
+    if kind == "Heightfield":
+        nh = int(ins[k][2:])
+        return ("Heightfield",), k + 1 + nh + 3
+    fail(f"b2_narrow: unknown shape {kind}")
+    return ("?",), len(ins)
+
+
+def _np_div(a, b):
+    """IEEE division (Python raises on a zero divisor)."""
+    if b == 0.0:
+        if a == 0.0 or math.isnan(a):
+            return math.nan
+        return math.copysign(math.inf, a) * math.copysign(1.0, b)
+    return a / b
+
+
+class _Narrow:
+    """narrowphase.rs with `sin_cos` from the given sin and cos."""
+
+    def __init__(self, sin, cos):
+        self.sin, self.cos = sin, cos
+
+    def sc(self, x):
+        return self.sin(x), self.cos(x)
+
+    def world_pos(self, bp, br, off):
+        s, c = self.sc(br)
+        return (bp[0] + c * off[0] - s * off[1], bp[1] + s * off[0] + c * off[1])
+
+    def world_to_local(self, wp, bp, br):
+        dx = wp[0] - bp[0]
+        dy = wp[1] - bp[1]
+        s, c = self.sc(br)
+        return (c * dx + s * dy, -s * dx + c * dy)
+
+    def local_to_world(self, lp, bp, br):
+        s, c = self.sc(br)
+        return (bp[0] + c * lp[0] - s * lp[1], bp[1] + s * lp[0] + c * lp[1])
+
+    def rotate(self, v, rot):
+        s, c = self.sc(rot)
+        return (c * v[0] - s * v[1], s * v[0] + c * v[1])
+
+    @staticmethod
+    def dot2(a, b):
+        return a[0] * b[0] + a[1] * b[1]
+
+    @staticmethod
+    def flip(c):
+        n, d, p = c
+        return ((-n[0], -n[1]), d, p)
+
+    @staticmethod
+    def deepest(cs):
+        best = None
+        for c in cs:
+            if c is None:
+                continue
+            if best is not None and best[1] >= c[1]:
+                continue
+            best = c
+        return best
+
+    @staticmethod
+    def signed_area_2x(pts):
+        n = len(pts)
+        acc = -0.0
+        for i in range(n):
+            a, b = pts[i], pts[(i + 1) % n]
+            acc += a[0] * b[1] - b[0] * a[1]
+        return acc
+
+    @staticmethod
+    def edge_normal(a, b, winding):
+        e = (b[0] - a[0], b[1] - a[1])
+        ln = rust_sqrt(e[0] * e[0] + e[1] * e[1])
+        if ln < B2_EPSILON:
+            return None
+        return (_np_div(winding * e[1], ln), _np_div(-winding * e[0], ln))
+
+    def circle_circle(self, pa, ra, pb, rb):
+        dx = pb[0] - pa[0]
+        dy = pb[1] - pa[1]
+        dist_sq = dx * dx + dy * dy
+        sum_r = ra + rb
+        if dist_sq >= sum_r * sum_r:
+            return None
+        dist = rust_sqrt(dist_sq)
+        if dist < B2_EPSILON:
+            normal, depth = (0.0, 1.0), sum_r
+        else:
+            normal, depth = (_np_div(dx, dist), _np_div(dy, dist)), sum_r - dist
+        return (normal, depth, (pa[0] + normal[0] * ra, pa[1] + normal[1] * ra))
+
+    def circle_aabb(self, cp, radius, bp, he):
+        dx = cp[0] - bp[0]
+        dy = cp[1] - bp[1]
+        cx = rust_clamp(dx, -he[0], he[0])
+        cy = rust_clamp(dy, -he[1], he[1])
+        ddx = dx - cx
+        ddy = dy - cy
+        dist_sq = ddx * ddx + ddy * ddy
+        if dist_sq >= radius * radius:
+            return None
+        dist = rust_sqrt(dist_sq)
+        if dist < B2_EPSILON:
+            f0 = he[0] - abs(dx)
+            f1 = he[1] - abs(dy)
+            if f0 < f1:
+                normal, depth = (1.0 if dx >= 0.0 else -1.0, 0.0), f0 + radius
+            else:
+                normal, depth = (0.0, 1.0 if dy >= 0.0 else -1.0), f1 + radius
+        else:
+            normal, depth = (_np_div(ddx, dist), _np_div(ddy, dist)), radius - dist
+        return (normal, depth, (bp[0] + cx, bp[1] + cy))
+
+    def capsule_endpoints(self, pos, rot, hh):
+        s, c = self.sc(rot)
+        dx = -s * hh
+        dy = c * hh
+        return (pos[0] - dx, pos[1] - dy), (pos[0] + dx, pos[1] + dy)
+
+    @staticmethod
+    def closest_on_segment(a, b, p):
+        ab = (b[0] - a[0], b[1] - a[1])
+        len_sq = ab[0] * ab[0] + ab[1] * ab[1]
+        if len_sq < B2_EPSILON_SQ:
+            return a
+        t = _np_div((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1], len_sq)
+        t = rust_clamp(t, 0.0, 1.0)
+        return (a[0] + ab[0] * t, a[1] + ab[1] * t)
+
+    def closest_segments(self, a, b, c, d):
+        def dist_sq(p, q):
+            x, y = p[0] - q[0], p[1] - q[1]
+            return x * x + y * y
+
+        ab = (b[0] - a[0], b[1] - a[1])
+        cd = (d[0] - c[0], d[1] - c[1])
+        d1 = ab[0] * ab[0] + ab[1] * ab[1]
+        d2 = cd[0] * cd[0] + cd[1] * cd[1]
+        pa = self.closest_on_segment(c, d, a)
+        pb = self.closest_on_segment(c, d, b)
+        pc = self.closest_on_segment(a, b, c)
+        pd = self.closest_on_segment(a, b, d)
+        best1, best2, best_d = a, pa, dist_sq(a, pa)
+        for p1, p2 in ((b, pb), (pc, c), (pd, d)):
+            dd = dist_sq(p1, p2)
+            if dd < best_d:
+                best1, best2, best_d = p1, p2, dd
+        if d1 > B2_EPSILON_SQ and d2 > B2_EPSILON_SQ:
+            r = (a[0] - c[0], a[1] - c[1])
+            d3 = ab[0] * cd[0] + ab[1] * cd[1]
+            d4 = ab[0] * r[0] + ab[1] * r[1]
+            d5 = cd[0] * r[0] + cd[1] * r[1]
+            denom = d1 * d2 - d3 * d3
+            if abs(denom) > B2_EPSILON_SQ:
+                s = rust_clamp(_np_div(d3 * d5 - d4 * d2, denom), 0.0, 1.0)
+                t = rust_clamp(_np_div(d3 * s + d5, d2), 0.0, 1.0)
+                s = rust_clamp(_np_div(t * d3 - d4, d1), 0.0, 1.0)
+                t = rust_clamp(_np_div(d3 * s + d5, d2), 0.0, 1.0)
+                p1 = (a[0] + ab[0] * s, a[1] + ab[1] * s)
+                p2 = (c[0] + cd[0] * t, c[1] + cd[1] * t)
+                if dist_sq(p1, p2) < best_d:
+                    best1, best2 = p1, p2
+        return best1, best2
+
+    def capsule_circle(self, cpos, crot, hh, cr, bpos, br):
+        e0, e1 = self.capsule_endpoints(cpos, crot, hh)
+        return self.circle_circle(self.closest_on_segment(e0, e1, bpos), cr, bpos, br)
+
+    def capsule_capsule(self, pa, ra, hha, cra, pb, rb, hhb, crb):
+        a1, a2 = self.capsule_endpoints(pa, ra, hha)
+        b1, b2 = self.capsule_endpoints(pb, rb, hhb)
+        cpa, cpb = self.closest_segments(a1, a2, b1, b2)
+        return self.circle_circle(cpa, cra, cpb, crb)
+
+    def transform_hull(self, pts, pos, rot):
+        s, c = self.sc(rot)
+        return [(pos[0] + c * p[0] - s * p[1], pos[1] + s * p[0] + c * p[1]) for p in pts]
+
+    @staticmethod
+    def project(pts, axis):
+        mn, mx = math.inf, -math.inf
+        for p in pts:
+            proj = p[0] * axis[0] + p[1] * axis[1]
+            mn = rust_min(mn, proj)
+            mx = rust_max(mx, proj)
+        return mn, mx
+
+    @staticmethod
+    def support(pts, d):
+        best = pts[0]
+        best_dot = best[0] * d[0] + best[1] * d[1]
+        for p in pts[1:]:
+            dd = p[0] * d[0] + p[1] * d[1]
+            if dd > best_dot:
+                best_dot, best = dd, p
+        return best
+
+    def box_to_world(self, c, bp, br):
+        n, d, p = c
+        return (self.rotate(n, br), d, self.local_to_world(p, bp, br))
+
+    def circle_obb(self, cp, r, bp, br, he):
+        local = self.world_to_local(cp, bp, br)
+        c = self.circle_aabb(local, r, (0.0, 0.0), he)
+        return None if c is None else self.box_to_world(c, bp, br)
+
+    def end_contacts(self, e0, e1, test):
+        out = [c for c in (test(e0), test(e1)) if c is not None]
+        if len(out) == 2 and self.dot2(out[0][0], out[1][0]) < 0.999:
+            out = [out[0] if out[0][1] >= out[1][1] else out[1]]
+        if not out:
+            mid = ((e0[0] + e1[0]) * 0.5, (e0[1] + e1[1]) * 0.5)
+            nearest = self.closest_on_segment(e0, e1, (0.0, 0.0))
+            best = self.deepest([test(mid), test(nearest)])
+            if best is not None:
+                out.append(best)
+        return out
+
+    def capsule_obb(self, cpos, crot, hh, cr, bp, br, he):
+        lp = self.world_to_local(cpos, bp, br)
+        e0, e1 = self.capsule_endpoints(lp, crot - br, hh)
+        cs = self.end_contacts(e0, e1, lambda p: self.circle_aabb(p, cr, (0.0, 0.0), he))
+        return [self.box_to_world(c, bp, br) for c in cs]
+
+    def capsule_hull(self, cpos, crot, hh, cr, pts, hp, hr):
+        lp = self.world_to_local(cpos, hp, hr)
+        e0, e1 = self.capsule_endpoints(lp, crot - hr, hh)
+        cs = self.end_contacts(e0, e1, lambda p: self.hull_circle(pts, (0.0, 0.0), 0.0, p, cr))
+        return [self.box_to_world(c, hp, hr) for c in cs]
+
+    def capsule_segment(self, cpos, crot, hh, cr, sp, sr, sa, sb):
+        e0, e1 = self.capsule_endpoints(cpos, crot, hh)
+        out = [c for c in (self.segment_circle(sp, sr, sa, sb, e, cr) for e in (e0, e1)) if c is not None]
+        if len(out) == 2 and self.dot2(out[0][0], out[1][0]) < 0.999:
+            out = [out[0] if out[0][1] >= out[1][1] else out[1]]
+        if not out:
+            wa = self.world_pos(sp, sr, sa)
+            wb = self.world_pos(sp, sr, sb)
+            on_seg, on_cap = self.closest_segments(wa, wb, e0, e1)
+            c = self.circle_circle(on_seg, 0.0, on_cap, cr)
+            if c is not None:
+                out.append(c)
+        return out
+
+    def hull_circle(self, pts, hp, hr, cp, radius):
+        n = len(pts)
+        if n < 2:
+            return None
+        winding = -1.0 if self.signed_area_2x(pts) < 0.0 else 1.0
+        c = self.world_to_local(cp, hp, hr)
+        best_d2, best_cl = math.inf, pts[0]
+        max_sep, sep_n = -math.inf, (0.0, 1.0)
+        for i in range(n):
+            a, b = pts[i], pts[(i + 1) % n]
+            cl = self.closest_on_segment(a, b, c)
+            x, y = c[0] - cl[0], c[1] - cl[1]
+            d2 = x * x + y * y
+            if d2 < best_d2:
+                best_d2, best_cl = d2, cl
+            nrm = self.edge_normal(a, b, winding)
+            if nrm is not None:
+                sep = self.dot2(nrm, (c[0] - a[0], c[1] - a[1]))
+                if sep > max_sep:
+                    max_sep, sep_n = sep, nrm
+        if n >= 3 and max_sep <= 0.0:
+            normal = sep_n
+            depth = radius - max_sep
+            point = (c[0] - sep_n[0] * max_sep, c[1] - sep_n[1] * max_sep)
+        else:
+            if best_d2 >= radius * radius:
+                return None
+            dist = rust_sqrt(best_d2)
+            if dist < B2_EPSILON:
+                normal, depth, point = sep_n, radius, best_cl
+            else:
+                normal = (_np_div(c[0] - best_cl[0], dist), _np_div(c[1] - best_cl[1], dist))
+                depth, point = radius - dist, best_cl
+        return (self.rotate(normal, hr), depth, self.local_to_world(point, hp, hr))
+
+    def segment_circle(self, sp, sr, sa, sb, cp, cr):
+        s, c = self.sc(sr)
+        wa = (sp[0] + c * sa[0] - s * sa[1], sp[1] + s * sa[0] + c * sa[1])
+        wb = (sp[0] + c * sb[0] - s * sb[1], sp[1] + s * sb[0] + c * sb[1])
+        cl = self.closest_on_segment(wa, wb, cp)
+        dx = cp[0] - cl[0]
+        dy = cp[1] - cl[1]
+        dist_sq = dx * dx + dy * dy
+        if dist_sq >= cr * cr:
+            return None
+        dist = rust_sqrt(dist_sq)
+        if dist < B2_EPSILON:
+            return ((0.0, 1.0), cr, cl)
+        return ((_np_div(dx, dist), _np_div(dy, dist)), cr - dist, cl)
+
+    def polygon_vertices(self, s, pos, rot):
+        if s[0] == "Box":
+            hx, hy = s[1], s[2]
+            return [self.local_to_world(p, pos, rot) for p in ((-hx, -hy), (hx, -hy), (hx, hy), (-hx, hy))]
+        if s[0] == "ConvexHull" and len(s[1]) >= 2:
+            v = self.transform_hull(s[1], pos, rot)
+            if self.signed_area_2x(v) < 0.0:
+                v.reverse()
+            return v
+        if s[0] == "Segment":
+            return [self.world_pos(pos, rot, s[1]), self.world_pos(pos, rot, s[2])]
+        return None
+
+    def max_separation(self, p1, p2):
+        n = len(p1)
+        best = None
+        for i in range(n):
+            v1 = p1[i]
+            nrm = self.edge_normal(v1, p1[(i + 1) % n], 1.0)
+            if nrm is None:
+                continue
+            sep = math.inf
+            for v in p2:
+                sep = rust_min(sep, self.dot2(nrm, (v[0] - v1[0], v[1] - v1[1])))
+            if best is None or sep > best[1]:
+                best = (i, sep)
+        return best
+
+    def clip(self, v, normal, offset):
+        d0 = self.dot2(normal, v[0]) - offset
+        d1 = self.dot2(normal, v[1]) - offset
+        out = []
+        if d0 <= 0.0:
+            out.append(v[0])
+        if d1 <= 0.0:
+            out.append(v[1])
+        if d0 * d1 < 0.0 and len(out) < 2:
+            t = _np_div(d0, d0 - d1)
+            out.append((v[0][0] + t * (v[1][0] - v[0][0]), v[0][1] + t * (v[1][1] - v[0][1])))
+        return out if len(out) == 2 else None
+
+    def collide_polygons(self, pa, pb):
+        ra = self.max_separation(pa, pb)
+        if ra is None or ra[1] > 0.0:
+            return None
+        rb = self.max_separation(pb, pa)
+        if rb is None or rb[1] > 0.0:
+            return None
+        if rb[1] > ra[1] + 5e-4:
+            ref, inc, edge, flip = pb, pa, rb[0], True
+        else:
+            ref, inc, edge, flip = pa, pb, ra[0], False
+        v11, v12 = ref[edge], ref[(edge + 1) % len(ref)]
+        rn = self.edge_normal(v11, v12, 1.0)
+        if rn is None:
+            return None
+        tangent = (-rn[1], rn[0])
+        ie, min_dot = 0, math.inf
+        for i in range(len(inc)):
+            nrm = self.edge_normal(inc[i], inc[(i + 1) % len(inc)], 1.0)
+            if nrm is not None:
+                d = self.dot2(nrm, rn)
+                if d < min_dot:
+                    min_dot, ie = d, i
+        incident = [inc[ie], inc[(ie + 1) % len(inc)]]
+        c = self.clip(incident, (-tangent[0], -tangent[1]), -self.dot2(tangent, v11))
+        if c is not None:
+            c = self.clip(c, tangent, self.dot2(tangent, v12))
+        if c is None:
+            return []
+        front = self.dot2(rn, v11)
+        normal = (-rn[0], -rn[1]) if flip else rn
+        out = []
+        for v in c:
+            sep = self.dot2(rn, v) - front
+            if sep <= 0.0:
+                out.append((normal, -sep, (v[0] - rn[0] * sep * 0.5, v[1] - rn[1] * sep * 0.5)))
+        return out
+
+    def sat(self, wa, wb, ca, cb):
+        cd = (cb[0] - ca[0], cb[1] - ca[1])
+        min_ov, best = math.inf, (0.0, 0.0)
+        for h in (wa, wb):
+            n = len(h)
+            for i in range(n):
+                axis = self.edge_normal(h[i], h[(i + 1) % n], 1.0)
+                if axis is None:
+                    continue
+                mna, mxa = self.project(wa, axis)
+                mnb, mxb = self.project(wb, axis)
+                ov = rust_min(mxa, mxb) - rust_max(mna, mnb)
+                if ov <= 0.0:
+                    return None
+                if ov < min_ov:
+                    min_ov = ov
+                    best = axis if self.dot2(cd, axis) >= 0.0 else (-axis[0], -axis[1])
+        if not math.isfinite(min_ov):
+            return None
+        pa = self.support(wa, best)
+        pb = self.support(wb, (-best[0], -best[1]))
+        return (best, min_ov, ((pa[0] + pb[0]) * 0.5, (pa[1] + pb[1]) * 0.5))
+
+    def polygon_contacts(self, a, pa, ra, b, pb, rb):
+        va = self.polygon_vertices(a, pa, ra)
+        vb = self.polygon_vertices(b, pb, rb)
+        if va is None or vb is None:
+            return []
+        cs = self.collide_polygons(va, vb)
+        if cs is None:
+            return []
+        if cs:
+            return cs
+        c = self.sat(va, vb, pa, pb)
+        return [] if c is None else [c]
+
+    def round_contact(self, a, pa, ra, b, pb, rb):
+        ka, kb = a[0], b[0]
+        if ka == "Ball" and kb == "Ball":
+            return self.circle_circle(pa, a[1], pb, b[1])
+        if ka == "Ball" and kb == "Box":
+            c = self.circle_obb(pa, a[1], pb, rb, (b[1], b[2]))
+            return None if c is None else self.flip(c)
+        if ka == "Box" and kb == "Ball":
+            return self.circle_obb(pb, b[1], pa, ra, (a[1], a[2]))
+        if ka == "Capsule" and kb == "Ball":
+            return self.capsule_circle(pa, ra, a[1], a[2], pb, b[1])
+        if ka == "Ball" and kb == "Capsule":
+            c = self.capsule_circle(pb, rb, b[1], b[2], pa, a[1])
+            return None if c is None else self.flip(c)
+        if ka == "Capsule" and kb == "Capsule":
+            return self.capsule_capsule(pa, ra, a[1], a[2], pb, rb, b[1], b[2])
+        if ka == "ConvexHull" and kb == "Ball":
+            return self.hull_circle(a[1], pa, ra, pb, b[1])
+        if ka == "Ball" and kb == "ConvexHull":
+            c = self.hull_circle(b[1], pb, rb, pa, a[1])
+            return None if c is None else self.flip(c)
+        if ka == "Segment" and kb == "Ball":
+            return self.segment_circle(pa, ra, a[1], a[2], pb, b[1])
+        if ka == "Ball" and kb == "Segment":
+            c = self.segment_circle(pb, rb, b[1], b[2], pa, a[1])
+            return None if c is None else self.flip(c)
+        return None
+
+    def contacts(self, a, pa, ra, b, pb, rb):
+        poly = ("Box", "ConvexHull", "Segment")
+        ka, kb = a[0], b[0]
+        if ka in poly and kb in poly:
+            return self.polygon_contacts(a, pa, ra, b, pb, rb)
+        if ka == "Capsule" and kb == "Box":
+            return [self.flip(c) for c in self.capsule_obb(pa, ra, a[1], a[2], pb, rb, (b[1], b[2]))]
+        if ka == "Box" and kb == "Capsule":
+            return self.capsule_obb(pb, rb, b[1], b[2], pa, ra, (a[1], a[2]))
+        if ka == "Capsule" and kb == "ConvexHull":
+            return [self.flip(c) for c in self.capsule_hull(pa, ra, a[1], a[2], b[1], pb, rb)]
+        if ka == "ConvexHull" and kb == "Capsule":
+            return self.capsule_hull(pb, rb, b[1], b[2], a[1], pa, ra)
+        if ka == "Capsule" and kb == "Segment":
+            return [self.flip(c) for c in self.capsule_segment(pa, ra, a[1], a[2], pb, rb, b[1], b[2])]
+        if ka == "Segment" and kb == "Capsule":
+            return self.capsule_segment(pb, rb, b[1], b[2], pa, ra, a[1], a[2])
+        c = self.round_contact(a, pa, ra, b, pb, rb)
+        return [] if c is None else [c]
+
+    def touch(self, a, pa, ra, b, pb, rb):
+        if a[0] == "Ball" or b[0] == "Ball":
+            return self.round_contact(a, pa, ra, b, pb, rb) is not None
+        return len(self.contacts(a, pa, ra, b, pb, rb)) > 0
+
+
+def _np_args(ins):
+    """(shape A, pose A, shape B, pose B) of a b2_narrow row, checking every token is used."""
+    a, k = _np_shape(ins, 0)
+    pa, ra = (tok_f(ins[k]), tok_f(ins[k + 1])), tok_f(ins[k + 2])
+    b, k = _np_shape(ins, k + 3)
+    pb, rb = (tok_f(ins[k]), tok_f(ins[k + 1])), tok_f(ins[k + 2])
+    if k + 3 != len(ins):
+        fail(f"b2_narrow: {len(ins) - k - 3} input tokens left over")
+    return a, pa, ra, b, pb, rb
+
+
+def _np_tokens(fn, narrow, args):
+    """The output tokens of a b2_narrow row computed by `narrow`."""
+    if fn == "b2::shapes_touch":
+        return [f"i:{int(narrow.touch(*args))}"]
+    cs = narrow.contacts(*args)
+    out = [f"v:{len(cs)}"]
+    for n, d, p in cs:
+        out += [f"f:{bits(x):016x}" for x in (n[0], n[1], d, p[0], p[1])]
+    return out
+
+
+def _same_tokens(got, want):
+    """Token lists equal, floats compared by `same` (any NaN equals any NaN)."""
+    if len(got) != len(want):
+        return False
+    for g, w in zip(got, want):
+        if g.startswith("f:") and w.startswith("f:"):
+            if not same(tok_f(g), tok_f(w)):
+                return False
+        elif g != w:
+            return False
+    return True
+
+
+GLIBC_NARROW = _Narrow(lambda x: _sin_cos(x)[0], lambda x: _sin_cos(x)[1])
+
+
+def check_b2_narrow(rows):
+    """Recomputes every narrowphase row on glibc's sin and cos (the oracle's own libm)."""
+    counted = 0
+    for fn, cls, ins, outs, note in rows:
+        if fn not in ("b2::contacts", "b2::shapes_touch"):
+            fail(f"b2_narrow: unknown function {fn}")
+            continue
+        want = _np_tokens(fn, GLIBC_NARROW, _np_args(ins))
+        if not _same_tokens(outs, want):
+            fail(f"b2_narrow: {note[:160]}: Python computes {' '.join(want)[:200]}")
+        counted += 1
+    return counted
 
 
 # The private constants t_private.rs extracts: file, Cyrius prefix, consts it doesn't carry.
@@ -998,7 +1554,7 @@ def main():
     for name in names:
         rows = read_module(golden / f"{name}.tsv")
         total += len(rows)
-        if name in ("math", "spring"):
+        if name in ("math", "spring", "b2_narrow"):
             check_corrections(root, name, golden / f"{name}.tsv", rows)
         if name == "constants":
             check_constants(root, rows)
@@ -1011,6 +1567,8 @@ def main():
             print(f"json: {check_json(rows)} documents checked against Python's json")
         elif name == "broadphase":
             print(f"broadphase: {check_broadphase(rows)} rows recomputed (brute force, rasterisation)")
+        elif name == "b2_narrow":
+            print(f"b2_narrow: {check_b2_narrow(rows)} rows recomputed (a transcription on Python's libm)")
         elif name == "b2_mass":
             print(f"b2_mass: {check_b2_mass(rows)} bodies recomputed (shape_props, parallel-axis sum)")
         elif name == "spring":

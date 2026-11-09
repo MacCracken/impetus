@@ -31,10 +31,10 @@ root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 MODULES = [
     "error", "config", "material", "units", "force",
     "body", "collider", "joint", "event", "query", "arena", "contact_tracker", "spring",
-    "aabb_tree", "spatial_hash", "backend_2d/types",
+    "aabb_tree", "spatial_hash", "backend_2d/types", "backend_2d/narrowphase",
 ]
 PENDING_MODULES = {
-    "backend_2d/narrowphase": "M2", "backend_2d/raycast": "M2",
+    "backend_2d/raycast": "M2",
     "backend_2d/solver": "M3", "backend_2d/joints": "M3", "backend_2d/state": "M3",
     "backend_2d/tests": "M3", "particle": "M3", "world": "M3",
     "backend_3d/types": "M4", "backend_3d/narrowphase": "M4", "backend_3d/raycast": "M4",
@@ -78,6 +78,12 @@ FN_RENAMES = {
     "pair_key": "_im_pair_key",
     # `union` is a reserved word in Cyrius.
     "IslandManager::union": "ImIslandManager::unite",
+    # The 2D narrowphase is backend-internal (`pub(super)`): private `_im_b2_` helpers here.
+    **{f: f"_im_b2_{f}" for f in (
+        "world_pos", "world_to_local", "local_to_world", "ordered_manifold_key", "generate_contact",
+        "shapes_touch", "circle_circle", "circle_aabb", "capsule_endpoints", "closest_point_on_segment",
+        "generate_contacts_multi",
+    )},
 }
 # Rust field -> the Cyrius fields that carry it (Option<T> is a presence flag plus the value).
 FIELD_RENAMES = {
@@ -111,6 +117,8 @@ EXCEPTIONS = {
     "spring::impl Debug for StepCache": "StepCache is private; there is no Debug in the port",
     "backend_2d/types::type ManifoldKey": "a manifold key is two collider handle words, ordered as "
                                           "a pair key (src/contact_tracker.cyr)",
+    "backend_2d/narrowphase::type Contact2": "a contact is a five-word record (normal, depth, point; "
+                                             "_IM_B2_CONTACT bytes) in a caller's buffer",
 }
 
 
