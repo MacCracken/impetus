@@ -26,10 +26,75 @@ pub struct Spring {
     target: f64,
     /// Spring stiffness (higher = snappier). Units: force per unit displacement.
     stiffness: f64,
-    /// Damping coefficient (higher = less oscillation). Critical damping = 2*sqrt(stiffness).
+    /// Damping coefficient (higher = less oscillation). Critical damping = 2·√stiffness.
     damping: f64,
     /// Threshold below which the spring is considered settled.
     settle_threshold: f64,
+    /// Cached step transition for the last `(dt, stiffness, damping)`.
+    #[serde(skip)]
+    cache: StepCache,
+}
+
+/// The exact step is linear in (displacement, velocity): `[y; v] = M·[y0; v0]`.
+/// `M` depends only on `dt`, stiffness and damping, so it's cached for the
+/// common fixed-timestep case. Ignored by equality and serialization.
+#[derive(Clone, Copy, Default)]
+struct StepCache {
+    key: Option<(f64, f64, f64)>,
+    m: [f64; 4],
+}
+
+impl PartialEq for StepCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for StepCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StepCache")
+    }
+}
+
+/// Transition matrix `[m00, m01, m10, m11]` of the damped oscillator
+/// `y'' = −k·y − c·y'` over `dt`.
+fn transition(k: f64, c: f64, dt: f64) -> [f64; 4] {
+    let alpha = 0.5 * c;
+    let disc = alpha * alpha - k;
+    let scale = alpha * alpha + k.abs();
+    if disc.abs() <= 1e-9 * scale || scale == 0.0 {
+        // Critically damped (or free motion when k = c = 0).
+        let e = (-alpha * dt).exp();
+        [
+            e * (1.0 + alpha * dt),
+            e * dt,
+            -e * alpha * alpha * dt,
+            e * (1.0 - alpha * dt),
+        ]
+    } else if disc < 0.0 {
+        // Under-damped.
+        let wd = (-disc).sqrt();
+        let e = (-alpha * dt).exp();
+        let (sin, cos) = (wd * dt).sin_cos();
+        [
+            e * (cos + alpha / wd * sin),
+            e * sin / wd,
+            -e * k / wd * sin,
+            e * (cos - alpha / wd * sin),
+        ]
+    } else {
+        // Over-damped: two real roots.
+        let beta = disc.sqrt();
+        let (r1, r2) = (-alpha + beta, -alpha - beta);
+        let d = r1 - r2;
+        let (e1, e2) = ((r1 * dt).exp(), (r2 * dt).exp());
+        [
+            (r1 * e2 - r2 * e1) / d,
+            (e1 - e2) / d,
+            r1 * r2 * (e2 - e1) / d,
+            (r1 * e1 - r2 * e2) / d,
+        ]
+    }
 }
 
 impl Spring {
@@ -38,7 +103,9 @@ impl Spring {
     /// - `from`: initial position
     /// - `to`: target position
     /// - `stiffness`: spring constant (try 100-500 for UI)
-    /// - `damping`: damping ratio (try 10-30 for UI; use `critically_damped` for no overshoot)
+    /// - `damping`: damping coefficient (critical damping is `2·√stiffness`;
+    ///   try 10-30 for UI, or use `critically_damped` for no overshoot)
+    #[must_use]
     pub fn new(from: f64, to: f64, stiffness: f64, damping: f64) -> Self {
         Self {
             position: from,
@@ -47,42 +114,68 @@ impl Spring {
             stiffness,
             damping,
             settle_threshold: 0.01,
+            cache: StepCache::default(),
         }
     }
 
     /// Create a spring that's critically damped (no overshoot).
-    ///
-    /// # Panics
-    /// Panics if `stiffness` is negative.
+    /// A negative `stiffness` is treated as its magnitude.
+    #[must_use]
     pub fn critically_damped(from: f64, to: f64, stiffness: f64) -> Self {
-        debug_assert!(stiffness >= 0.0, "stiffness must be non-negative");
-        Self::new(from, to, stiffness, 2.0 * stiffness.abs().sqrt())
+        let k = stiffness.abs();
+        Self::new(from, to, k, 2.0 * k.sqrt())
     }
 
     /// Create an over-damped spring (slow approach, no overshoot).
-    ///
-    /// # Panics
-    /// Panics if `stiffness` is negative.
+    /// A negative `stiffness` is treated as its magnitude.
+    #[must_use]
     pub fn over_damped(from: f64, to: f64, stiffness: f64) -> Self {
-        debug_assert!(stiffness >= 0.0, "stiffness must be non-negative");
-        Self::new(from, to, stiffness, 3.0 * stiffness.abs().sqrt())
+        let k = stiffness.abs();
+        Self::new(from, to, k, 3.0 * k.sqrt())
     }
 
     /// Create an under-damped spring (bouncy overshoot).
-    ///
-    /// # Panics
-    /// Panics if `stiffness` is negative.
+    /// A negative `stiffness` is treated as its magnitude.
+    #[must_use]
     pub fn under_damped(from: f64, to: f64, stiffness: f64) -> Self {
-        debug_assert!(stiffness >= 0.0, "stiffness must be non-negative");
-        Self::new(from, to, stiffness, 0.5 * stiffness.abs().sqrt())
+        let k = stiffness.abs();
+        Self::new(from, to, k, 0.5 * k.sqrt())
     }
 
-    /// Step the spring by `dt` seconds (semi-implicit Euler).
+    /// Advance the spring by `dt` seconds.
+    ///
+    /// Uses the exact solution of the damped oscillator
+    /// `x'' = −k·(x − target) − c·x'`, so the result is the same whether a
+    /// second is covered by one step or by many, and it stays stable for any
+    /// `dt` and stiffness (a long frame hitch can't make it explode).
+    /// A non-positive or NaN `dt` does nothing.
+    #[inline]
     pub fn step(&mut self, dt: f64) {
-        let displacement = self.position - self.target;
-        let force = -self.stiffness * displacement - self.damping * self.velocity;
-        self.velocity += force * dt;
-        self.position += self.velocity * dt;
+        if dt.is_nan() || dt <= 0.0 {
+            return;
+        }
+        if dt.is_infinite() {
+            if self.damping > 0.0 && self.stiffness >= 0.0 {
+                self.snap();
+            }
+            return;
+        }
+        let key = (dt, self.stiffness, self.damping);
+        if self.cache.key != Some(key) {
+            self.cache = StepCache {
+                key: Some(key),
+                m: transition(self.stiffness, self.damping, dt),
+            };
+        }
+        let m = self.cache.m;
+        let y0 = self.position - self.target;
+        let v0 = self.velocity;
+        let y = m[0] * y0 + m[1] * v0;
+        let v = m[2] * y0 + m[3] * v0;
+        if y.is_finite() && v.is_finite() {
+            self.position = self.target + y;
+            self.velocity = v;
+        }
     }
 
     /// Current position.
@@ -173,6 +266,7 @@ pub struct Spring2d {
 
 impl Spring2d {
     /// Create a 2D spring.
+    #[must_use]
     pub fn new(from: [f64; 2], to: [f64; 2], stiffness: f64, damping: f64) -> Self {
         Self {
             x: Spring::new(from[0], to[0], stiffness, damping),
@@ -181,6 +275,7 @@ impl Spring2d {
     }
 
     /// Critically damped 2D spring.
+    #[must_use]
     pub fn critically_damped(from: [f64; 2], to: [f64; 2], stiffness: f64) -> Self {
         Self {
             x: Spring::critically_damped(from[0], to[0], stiffness),
@@ -189,6 +284,7 @@ impl Spring2d {
     }
 
     /// Step both axes.
+    #[inline]
     pub fn step(&mut self, dt: f64) {
         self.x.step(dt);
         self.y.step(dt);
@@ -235,6 +331,7 @@ pub struct Spring3d {
 
 impl Spring3d {
     /// Create a 3D spring.
+    #[must_use]
     pub fn new(from: [f64; 3], to: [f64; 3], stiffness: f64, damping: f64) -> Self {
         Self {
             x: Spring::new(from[0], to[0], stiffness, damping),
@@ -244,6 +341,7 @@ impl Spring3d {
     }
 
     /// Critically damped 3D spring.
+    #[must_use]
     pub fn critically_damped(from: [f64; 3], to: [f64; 3], stiffness: f64) -> Self {
         Self {
             x: Spring::critically_damped(from[0], to[0], stiffness),
@@ -253,6 +351,7 @@ impl Spring3d {
     }
 
     /// Step all axes.
+    #[inline]
     pub fn step(&mut self, dt: f64) {
         self.x.step(dt);
         self.y.step(dt);
@@ -425,5 +524,56 @@ mod tests {
         s.set_damping(25.0);
         assert_eq!(s.stiffness(), 500.0);
         assert_eq!(s.damping(), 25.0);
+    }
+
+    #[test]
+    fn step_is_stable_for_large_dt_and_stiffness() {
+        // A 0.5 s frame hitch used to throw this spring to ~7500.
+        let mut s = Spring::critically_damped(0.0, 100.0, 300.0);
+        s.step(0.5);
+        assert!(
+            s.position() <= 100.0 + 1e-9 && s.position() > 99.0,
+            "{}",
+            s.position()
+        );
+        // Very stiff spring at 60 fps used to diverge.
+        let mut s = Spring::critically_damped(0.0, 100.0, 2500.0);
+        for _ in 0..120 {
+            s.step(1.0 / 60.0);
+            assert!(s.position().abs() < 101.0);
+        }
+        assert!(s.is_settled());
+    }
+
+    #[test]
+    fn step_is_exact_regardless_of_step_count() {
+        for (k, c) in [(300.0, 15.0), (400.0, 40.0), (100.0, 60.0), (0.0, 5.0)] {
+            let mut one = Spring::new(0.0, 10.0, k, c);
+            one.set_velocity(3.0);
+            let mut many = one.clone();
+            one.step(0.8);
+            for _ in 0..800 {
+                many.step(0.001);
+            }
+            assert!(
+                (one.position() - many.position()).abs() < 1e-9,
+                "k={k} c={c}"
+            );
+            assert!(
+                (one.velocity() - many.velocity()).abs() < 1e-9,
+                "k={k} c={c}"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_dt_is_ignored() {
+        let mut s = Spring::new(0.0, 1.0, 100.0, 10.0);
+        for dt in [0.0, -1.0, f64::NAN] {
+            s.step(dt);
+            assert_eq!(s.position(), 0.0);
+        }
+        s.step(f64::INFINITY);
+        assert_eq!(s.position(), 1.0);
     }
 }

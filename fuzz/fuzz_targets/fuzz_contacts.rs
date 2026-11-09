@@ -6,8 +6,8 @@ use impetus::{
     BodyDesc, BodyType, ColliderDesc, ColliderShape, PhysicsMaterial, PhysicsWorld, WorldConfig,
 };
 
-/// Interpret arbitrary bytes as two circles and step the simulation.
-/// Verifies no panics and no NaN in the resulting body states.
+// Interpret arbitrary bytes as two circles and step the simulation.
+// Verifies no panics and no NaN in the resulting body states.
 fuzz_target!(|data: &[u8]| {
     if data.len() < 40 {
         return;

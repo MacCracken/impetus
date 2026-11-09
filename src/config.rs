@@ -20,7 +20,12 @@ pub enum SolverKind {
     /// with warm starting and accumulated impulses.
     SequentialImpulse,
     /// Extended Position-Based Dynamics (XPBD). Position-based solver with compliant
-    /// constraints. More stable for stiff stacks and ragdolls.
+    /// constraints.
+    ///
+    /// **2D only and experimental**: the 3D backend always uses
+    /// `SequentialImpulse`. In 2D, XPBD supports contacts and the Fixed,
+    /// Revolute, Distance, Spring and Rope joints; Prismatic, Wheel and Mouse
+    /// joints, motors, limits and `break_force` have no effect under XPBD.
     Xpbd,
 }
 
@@ -35,14 +40,15 @@ pub struct WorldConfig {
     pub velocity_iterations: u32,
     /// Solver position iterations (default: 1).
     pub position_iterations: u32,
-    /// Enable deterministic mode (default: true).
+    /// Reserved; the simulation is always deterministic (default: true).
     pub deterministic: bool,
     /// Simulation step counter.
     pub step: u64,
     /// Baumgarte positional correction: allowed penetration before correction (default: 0.01).
     #[serde(default = "default_slop")]
     pub position_slop: f64,
-    /// Baumgarte positional correction: fraction of penetration corrected per iteration (default: 0.2).
+    /// Baumgarte positional correction: fraction of penetration corrected per step
+    /// when `constraint_frequency` is 0 (default: 0.2).
     #[serde(default = "default_correction")]
     pub position_correction: f64,
     /// Maximum velocity magnitude for CCD — clamps velocity to prevent tunneling (default: 100.0).
@@ -50,6 +56,8 @@ pub struct WorldConfig {
     pub max_velocity: f64,
     /// Number of sub-steps per timestep for improved stability (default: 1).
     /// Higher values improve stacking stability at a cost of performance.
+    /// Forces applied before `step()` act over the whole timestep, and
+    /// collision events are reported once per `step()`. `0` is treated as 1.
     #[serde(default = "default_sub_steps")]
     pub sub_steps: u32,
     /// Soft constraint frequency in Hz (default: 30.0).
@@ -122,9 +130,113 @@ impl Default for WorldConfig {
     }
 }
 
+impl WorldConfig {
+    /// Largest accepted `sub_steps`.
+    pub const MAX_SUB_STEPS: u32 = 4096;
+    /// Largest accepted `velocity_iterations` / `position_iterations`.
+    pub const MAX_ITERATIONS: u32 = 10_000;
+
+    /// Check that every setting is usable: a finite positive timestep,
+    /// finite gravity, `sub_steps ≤ MAX_SUB_STEPS`, iteration counts
+    /// `≤ MAX_ITERATIONS`, non-negative finite slop,
+    /// correction in `[0, 1]`, positive `max_velocity` (`∞` disables the
+    /// clamp), and non-negative finite constraint frequency and damping ratio.
+    ///
+    /// `PhysicsWorld::new` accepts any config; use
+    /// [`PhysicsWorld::try_new`](crate::PhysicsWorld::try_new) to validate.
+    ///
+    /// # Errors
+    /// [`ImpetusError::InvalidConfig`](crate::ImpetusError::InvalidConfig)
+    /// naming the first offending field.
+    pub fn validate(&self) -> crate::Result<()> {
+        let bad = |field: &str, value: &dyn std::fmt::Debug| {
+            Err(crate::ImpetusError::InvalidConfig(format!(
+                "{field} = {value:?}"
+            )))
+        };
+        if !(self.timestep.is_finite() && self.timestep > 0.0) {
+            return bad("timestep", &self.timestep);
+        }
+        if !self.gravity.iter().all(|g| g.is_finite()) {
+            return bad("gravity", &self.gravity);
+        }
+        if self.sub_steps > Self::MAX_SUB_STEPS {
+            return bad("sub_steps", &self.sub_steps);
+        }
+        if self.velocity_iterations > Self::MAX_ITERATIONS {
+            return bad("velocity_iterations", &self.velocity_iterations);
+        }
+        if self.position_iterations > Self::MAX_ITERATIONS {
+            return bad("position_iterations", &self.position_iterations);
+        }
+        if !(self.position_slop.is_finite() && self.position_slop >= 0.0) {
+            return bad("position_slop", &self.position_slop);
+        }
+        if !(0.0..=1.0).contains(&self.position_correction) {
+            return bad("position_correction", &self.position_correction);
+        }
+        if self.max_velocity.is_nan() || self.max_velocity <= 0.0 {
+            return bad("max_velocity", &self.max_velocity);
+        }
+        if !(self.constraint_frequency.is_finite() && self.constraint_frequency >= 0.0) {
+            return bad("constraint_frequency", &self.constraint_frequency);
+        }
+        if !(self.constraint_damping_ratio.is_finite() && self.constraint_damping_ratio >= 0.0) {
+            return bad("constraint_damping_ratio", &self.constraint_damping_ratio);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_accepts_default_and_rejects_bad_values() {
+        assert!(WorldConfig::default().validate().is_ok());
+        let bad = [
+            WorldConfig {
+                timestep: -1.0,
+                ..WorldConfig::default()
+            },
+            WorldConfig {
+                timestep: f64::NAN,
+                ..WorldConfig::default()
+            },
+            WorldConfig {
+                gravity: [0.0, f64::NAN, 0.0],
+                ..WorldConfig::default()
+            },
+            WorldConfig {
+                sub_steps: u32::MAX,
+                ..WorldConfig::default()
+            },
+            WorldConfig {
+                position_correction: 2.0,
+                ..WorldConfig::default()
+            },
+            WorldConfig {
+                max_velocity: 0.0,
+                ..WorldConfig::default()
+            },
+            WorldConfig {
+                constraint_frequency: -1.0,
+                ..WorldConfig::default()
+            },
+        ];
+        for c in bad {
+            assert!(
+                matches!(c.validate(), Err(crate::ImpetusError::InvalidConfig(_))),
+                "{c:?}"
+            );
+        }
+        let unclamped = WorldConfig {
+            max_velocity: f64::INFINITY,
+            ..WorldConfig::default()
+        };
+        assert!(unclamped.validate().is_ok());
+    }
 
     #[test]
     fn default_config() {

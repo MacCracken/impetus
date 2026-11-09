@@ -3,7 +3,7 @@ use impetus::{
     PhysicsWorld,
     body::{BodyDesc, BodyState, BodyType},
     collider::{ColliderDesc, ColliderShape},
-    config::WorldConfig,
+    config::{BroadphaseKind, WorldConfig},
     force::{Force, Impulse},
     joint::{JointDesc, JointType},
     material::PhysicsMaterial,
@@ -710,6 +710,125 @@ fn bench_substep(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Contact manifolds, joints and broadphase (added with the v1.4 solver work)
+// ---------------------------------------------------------------------------
+
+fn box_collider(half: [f64; 3]) -> ColliderDesc {
+    ColliderDesc {
+        shape: ColliderShape::Box { half_extents: half },
+        offset: [0.0, 0.0, 0.0],
+        material: PhysicsMaterial::default(),
+        is_sensor: false,
+        mass: None,
+        collision_layer: 0xFFFF_FFFF,
+        collision_mask: 0xFFFF_FFFF,
+    }
+}
+
+fn bench_stacking(c: &mut Criterion) {
+    let mut group = c.benchmark_group("stacking");
+
+    // A settled 10-box stack: polygon clipping + block solver every step.
+    group.bench_function("box_stack_10", |b| {
+        let mut world = PhysicsWorld::new(WorldConfig::default());
+        let ground = world.add_body(BodyDesc {
+            body_type: BodyType::Static,
+            ..Default::default()
+        });
+        world.add_collider(ground, box_collider([10.0, 0.5, 10.0]));
+        let mut top = None;
+        for i in 0..10 {
+            let body = world.add_body(BodyDesc {
+                position: [0.0, 1.0 + i as f64, 0.0],
+                ..Default::default()
+            });
+            world.add_collider(body, box_collider([0.5, 0.5, 0.5]));
+            top = Some(body);
+        }
+        for _ in 0..120 {
+            world.step();
+        }
+        // Keep the stack awake so every iteration solves all contacts.
+        let top = top.expect("stack has a top box");
+        b.iter(|| {
+            world.apply_force(top, Force::new(0.0, -1.0, 0.0));
+            world.step()
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_joints(c: &mut Criterion) {
+    let mut group = c.benchmark_group("joints");
+
+    // A 20-link hanging chain of revolute joints.
+    group.bench_function("revolute_chain_20", |b| {
+        let mut world = PhysicsWorld::new(WorldConfig::default());
+        let mut prev = world.add_body(BodyDesc {
+            body_type: BodyType::Static,
+            position: [0.0, 20.0, 0.0],
+            ..Default::default()
+        });
+        for i in 0..20 {
+            let link = world.add_body(BodyDesc {
+                position: [0.5 + i as f64, 20.0, 0.0],
+                ..Default::default()
+            });
+            world.add_collider(link, box_collider([0.5, 0.05, 0.05]));
+            world.add_joint(JointDesc {
+                body_a: prev,
+                body_b: link,
+                joint_type: JointType::Revolute {
+                    anchor: [0.0, 0.0],
+                    limits: None,
+                },
+                local_anchor_a: if i == 0 { [0.0, 0.0] } else { [0.5, 0.0] },
+                local_anchor_b: [-0.5, 0.0],
+                motor: None,
+                damping: 0.0,
+                break_force: None,
+            });
+            prev = link;
+        }
+        b.iter(|| world.step())
+    });
+
+    group.finish();
+}
+
+fn bench_broadphase(c: &mut Criterion) {
+    let mut group = c.benchmark_group("broadphase");
+
+    // 1000 balls in a row with the AABB tree (sorted inserts used to
+    // degenerate the tree into a list).
+    group.bench_function("aabb_tree_1000_row", |b| {
+        let mut world = PhysicsWorld::new(WorldConfig {
+            broadphase: BroadphaseKind::AabbTree,
+            gravity: [0.0, 0.0, 0.0],
+            ..WorldConfig::default()
+        });
+        for i in 0..1000 {
+            let body = world.add_body(BodyDesc {
+                position: [i as f64 * 1.5, 0.0, 0.0],
+                linear_velocity: [0.0, 0.1, 0.0],
+                ..Default::default()
+            });
+            world.add_collider(
+                body,
+                ColliderDesc {
+                    shape: ColliderShape::Ball { radius: 0.5 },
+                    ..box_collider([0.5, 0.5, 0.5])
+                },
+            );
+        }
+        b.iter(|| world.step())
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_world,
@@ -723,5 +842,8 @@ criterion_group!(
     bench_mutation,
     bench_springs,
     bench_substep,
+    bench_stacking,
+    bench_joints,
+    bench_broadphase,
 );
 criterion_main!(benches);

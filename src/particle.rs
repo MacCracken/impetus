@@ -10,8 +10,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ForceField {
-    /// Radial attraction/repulsion: F = strength * dir / |r|^falloff
-    /// Positive strength = attraction, negative = repulsion.
+    /// Radial attraction/repulsion: `F = strength · dir / (|r|² + ε²)^(falloff/2)`
+    /// with a small softening length `ε = 0.01` so the force stays finite at
+    /// the centre. Positive strength = attraction, negative = repulsion.
+    /// A `radius` of 0 (or less) means unlimited range.
     Radial {
         center: [f64; 3],
         strength: f64,
@@ -73,6 +75,7 @@ pub struct Particle {
 
 impl Particle {
     /// Create a new particle.
+    #[must_use]
     pub fn new(position: [f64; 3], velocity: [f64; 3], lifetime: f64) -> Self {
         Self {
             handle: ParticleHandle(0), // Set by the world on spawn
@@ -88,38 +91,44 @@ impl Particle {
         }
     }
 
-    /// Set the collision radius (must be non-negative).
+    /// Set the collision radius. Negative or NaN radii become 0 (no
+    /// collision).
+    #[must_use]
     pub fn with_radius(mut self, radius: f64) -> Self {
-        debug_assert!(radius >= 0.0, "particle radius must be non-negative");
         self.radius = radius.max(0.0);
         self
     }
 
     /// Set the drag coefficient.
+    #[must_use]
     pub fn with_drag(mut self, drag: f64) -> Self {
         self.drag = drag;
         self
     }
 
     /// Set the restitution (bounciness).
+    #[must_use]
     pub fn with_restitution(mut self, restitution: f64) -> Self {
         self.restitution = restitution;
         self
     }
 
     /// Set the gravity scale.
+    #[must_use]
     pub fn with_gravity_scale(mut self, scale: f64) -> Self {
         self.gravity_scale = scale;
         self
     }
 
     /// Set linear damping.
+    #[must_use]
     pub fn with_damping(mut self, damping: f64) -> Self {
         self.damping = damping;
         self
     }
 
     /// Set a sub-emitter that fires when this particle dies.
+    #[must_use]
     pub fn with_sub_emitter(mut self, sub: SubEmitter) -> Self {
         self.on_death_emit = Some(sub);
         self
@@ -167,6 +176,7 @@ pub struct ParticleEmitter {
 
 impl ParticleEmitter {
     /// Create a new emitter.
+    #[must_use]
     pub fn new(position: [f64; 3], velocity: [f64; 3], rate: f64) -> Self {
         Self {
             handle: EmitterHandle(0), // Set by the world on add
@@ -185,30 +195,35 @@ impl ParticleEmitter {
     }
 
     /// Set velocity spread (randomization per axis).
+    #[must_use]
     pub fn with_spread(mut self, spread: [f64; 3]) -> Self {
         self.velocity_spread = spread;
         self
     }
 
     /// Set particle lifetime.
+    #[must_use]
     pub fn with_lifetime(mut self, lifetime: f64) -> Self {
         self.particle_lifetime = lifetime;
         self
     }
 
     /// Set particle radius.
+    #[must_use]
     pub fn with_radius(mut self, radius: f64) -> Self {
         self.particle_radius = radius;
         self
     }
 
     /// Set particle gravity scale.
+    #[must_use]
     pub fn with_gravity_scale(mut self, scale: f64) -> Self {
         self.particle_gravity_scale = scale;
         self
     }
 
     /// Set particle damping.
+    #[must_use]
     pub fn with_damping(mut self, damping: f64) -> Self {
         self.particle_damping = damping;
         self

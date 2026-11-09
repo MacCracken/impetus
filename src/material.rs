@@ -3,12 +3,15 @@
 use serde::{Deserialize, Serialize};
 
 /// Rule for combining material properties between two colliding bodies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[non_exhaustive]
 pub enum CombineRule {
     /// Use the minimum of the two values.
     Min,
     /// Use the average of the two values.
+    #[default]
     Average,
     /// Multiply the two values.
     Multiply,
@@ -16,14 +19,10 @@ pub enum CombineRule {
     Max,
 }
 
-impl Default for CombineRule {
-    fn default() -> Self {
-        Self::Average
-    }
-}
-
 impl CombineRule {
     /// Combine two values using the given rule.
+    #[must_use]
+    #[inline]
     pub fn combine(self, a: f64, b: f64) -> f64 {
         match self {
             Self::Average => (a + b) * 0.5,
@@ -41,7 +40,8 @@ pub struct PhysicsMaterial {
     pub friction: f64,
     /// Coefficient of restitution / bounciness (0.0 = clay, 1.0 = superball).
     pub restitution: f64,
-    /// Density in kg/m² (2D) or kg/m³ (3D). 0.0 = use shape default.
+    /// Density in kg/m² (2D) or kg/m³ (3D). A collider's mass is
+    /// `density × area/volume` unless `ColliderDesc::mass` overrides it.
     pub density: f64,
     /// Coefficient of static friction. If `None`, defaults to `friction * 1.5`.
     /// Static friction is higher than kinetic friction and determines the
@@ -83,6 +83,8 @@ impl Default for PhysicsMaterial {
 impl PhysicsMaterial {
     /// Returns the effective static friction coefficient.
     /// If `static_friction` is `None`, returns `friction * 1.5`.
+    #[must_use]
+    #[inline]
     pub fn effective_static_friction(&self) -> f64 {
         self.static_friction.unwrap_or(self.friction * 1.5)
     }
@@ -91,6 +93,7 @@ impl PhysicsMaterial {
 /// Named material presets.
 impl PhysicsMaterial {
     /// Low friction, low bounce surface (ice rink).
+    #[must_use]
     pub fn ice() -> Self {
         Self {
             friction: 0.05,
@@ -100,6 +103,7 @@ impl PhysicsMaterial {
         }
     }
     /// High friction, bouncy surface (rubber).
+    #[must_use]
     pub fn rubber() -> Self {
         Self {
             friction: 1.0,
@@ -109,6 +113,7 @@ impl PhysicsMaterial {
         }
     }
     /// Moderate friction, low density surface (wood).
+    #[must_use]
     pub fn wood() -> Self {
         Self {
             friction: 0.4,
@@ -118,6 +123,7 @@ impl PhysicsMaterial {
         }
     }
     /// Moderate friction, high density surface (steel).
+    #[must_use]
     pub fn steel() -> Self {
         Self {
             friction: 0.6,
@@ -127,6 +133,7 @@ impl PhysicsMaterial {
         }
     }
     /// Low friction, maximum bounce surface (super ball).
+    #[must_use]
     pub fn bouncy() -> Self {
         Self {
             friction: 0.3,

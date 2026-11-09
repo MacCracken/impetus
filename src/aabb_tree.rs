@@ -278,75 +278,74 @@ impl<K: Copy + Eq + Ord> AabbTree<K> {
         true
     }
 
-    /// Query all unique overlapping leaf pairs.
+    /// Query all unique overlapping leaf pairs (iterative; no recursion, so
+    /// deep trees can't overflow the stack).
+    #[must_use]
     pub fn query_pairs(&self) -> BTreeSet<(K, K)> {
         let mut pairs = BTreeSet::new();
         if self.root == NULL_NODE {
             return pairs;
         }
-
-        // Collect all leaves
-        let mut leaves = Vec::new();
-        self.collect_leaves(self.root, &mut leaves);
-
-        // For each leaf, query the tree for overlaps
-        for &leaf in &leaves {
-            let aabb = &self.nodes[leaf as usize].aabb;
-            let key_a = match self.nodes[leaf as usize].key {
-                Some(k) => k,
-                None => continue,
+        let mut stack: Vec<u32> = Vec::with_capacity(64);
+        for leaf in self.leaves() {
+            let leaf_node = &self.nodes[leaf as usize];
+            let Some(key_a) = leaf_node.key else {
+                continue;
             };
-            self.query_overlap_recursive(self.root, aabb, key_a, leaf, &mut pairs);
+            let aabb = leaf_node.aabb;
+            stack.clear();
+            stack.push(self.root);
+            while let Some(node) = stack.pop() {
+                let n = &self.nodes[node as usize];
+                if !n.aabb.overlaps(&aabb) {
+                    continue;
+                }
+                if n.is_leaf() {
+                    // Report each pair once (from its lower-indexed leaf).
+                    if node > leaf
+                        && let Some(key_b) = n.key
+                    {
+                        pairs.insert(if key_a < key_b {
+                            (key_a, key_b)
+                        } else {
+                            (key_b, key_a)
+                        });
+                    }
+                } else {
+                    stack.push(n.left);
+                    stack.push(n.right);
+                }
+            }
         }
-
         pairs
     }
 
-    fn query_overlap_recursive(
-        &self,
-        node: u32,
-        query_aabb: &TreeAabb,
-        query_key: K,
-        query_leaf: u32,
-        pairs: &mut BTreeSet<(K, K)>,
-    ) {
-        if node == NULL_NODE {
-            return;
+    /// All leaf node indices (iterative depth-first).
+    fn leaves(&self) -> Vec<u32> {
+        let mut leaves = Vec::new();
+        if self.root == NULL_NODE {
+            return leaves;
         }
-
-        let n = &self.nodes[node as usize];
-        if !n.aabb.overlaps(query_aabb) {
-            return;
-        }
-
-        if n.is_leaf() {
-            if node != query_leaf
-                && let Some(key_b) = n.key
-            {
-                let pair = if query_key < key_b {
-                    (query_key, key_b)
-                } else {
-                    (key_b, query_key)
-                };
-                pairs.insert(pair);
+        let mut stack = vec![self.root];
+        while let Some(node) = stack.pop() {
+            let n = &self.nodes[node as usize];
+            if n.is_leaf() {
+                leaves.push(node);
+            } else {
+                stack.push(n.left);
+                stack.push(n.right);
             }
-            return;
         }
-
-        self.query_overlap_recursive(n.left, query_aabb, query_key, query_leaf, pairs);
-        self.query_overlap_recursive(n.right, query_aabb, query_key, query_leaf, pairs);
+        leaves
     }
 
-    fn collect_leaves(&self, node: u32, leaves: &mut Vec<u32>) {
-        if node == NULL_NODE {
-            return;
-        }
-        let n = &self.nodes[node as usize];
-        if n.is_leaf() {
-            leaves.push(node);
+    /// Height of the tree (0 for a single leaf, −1 when empty).
+    #[cfg(test)]
+    fn height(&self) -> i32 {
+        if self.root == NULL_NODE {
+            -1
         } else {
-            self.collect_leaves(n.left, leaves);
-            self.collect_leaves(n.right, leaves);
+            self.nodes[self.root as usize].height
         }
     }
 
@@ -365,22 +364,101 @@ impl<K: Copy + Eq + Ord> AabbTree<K> {
         self.free_list.push(idx);
     }
 
+    /// Walk from `node` to the root, rebalancing and refitting heights and
+    /// bounds along the way.
     fn fix_upwards(&mut self, mut node: u32) {
         while node != NULL_NODE {
+            node = self.balance(node);
             let left = self.nodes[node as usize].left;
             let right = self.nodes[node as usize].right;
-            if left == NULL_NODE || right == NULL_NODE {
-                node = self.nodes[node as usize].parent;
-                continue;
+            if left != NULL_NODE && right != NULL_NODE {
+                self.nodes[node as usize].height = 1 + self.nodes[left as usize]
+                    .height
+                    .max(self.nodes[right as usize].height);
+                self.nodes[node as usize].aabb = self.nodes[left as usize]
+                    .aabb
+                    .merged(&self.nodes[right as usize].aabb);
             }
-            self.nodes[node as usize].height = 1 + self.nodes[left as usize]
-                .height
-                .max(self.nodes[right as usize].height);
-            self.nodes[node as usize].aabb = self.nodes[left as usize]
-                .aabb
-                .merged(&self.nodes[right as usize].aabb);
             node = self.nodes[node as usize].parent;
         }
+    }
+
+    /// Replace `old` with `new` as a child of `parent` (or as the root).
+    fn replace_child(&mut self, parent: u32, old: u32, new: u32) {
+        if parent == NULL_NODE {
+            self.root = new;
+        } else if self.nodes[parent as usize].left == old {
+            self.nodes[parent as usize].left = new;
+        } else {
+            self.nodes[parent as usize].right = new;
+        }
+    }
+
+    /// AVL-style rotation (Box2D `b2DynamicTree::Balance`): if `a`'s children
+    /// differ in height by more than one, promote the taller child. Returns
+    /// the node now at `a`'s position.
+    fn balance(&mut self, a: u32) -> u32 {
+        let na = &self.nodes[a as usize];
+        if na.is_leaf() || na.height < 2 {
+            return a;
+        }
+        let (b, c) = (na.left, na.right);
+        let h = |t: &Self, i: u32| t.nodes[i as usize].height;
+        let bal = h(self, c) - h(self, b);
+
+        if bal > 1 {
+            // Promote C.
+            let (f, g) = (self.nodes[c as usize].left, self.nodes[c as usize].right);
+            let a_parent = self.nodes[a as usize].parent;
+            self.nodes[c as usize].left = a;
+            self.nodes[c as usize].parent = a_parent;
+            self.nodes[a as usize].parent = c;
+            self.replace_child(a_parent, a, c);
+            let (keep, give) = if h(self, f) > h(self, g) {
+                (f, g)
+            } else {
+                (g, f)
+            };
+            self.nodes[c as usize].right = keep;
+            self.nodes[a as usize].right = give;
+            self.nodes[give as usize].parent = a;
+            self.nodes[a as usize].aabb = self.nodes[b as usize]
+                .aabb
+                .merged(&self.nodes[give as usize].aabb);
+            self.nodes[c as usize].aabb = self.nodes[a as usize]
+                .aabb
+                .merged(&self.nodes[keep as usize].aabb);
+            self.nodes[a as usize].height = 1 + h(self, b).max(h(self, give));
+            self.nodes[c as usize].height = 1 + h(self, a).max(h(self, keep));
+            return c;
+        }
+        if bal < -1 {
+            // Promote B.
+            let (d, e) = (self.nodes[b as usize].left, self.nodes[b as usize].right);
+            let a_parent = self.nodes[a as usize].parent;
+            self.nodes[b as usize].left = a;
+            self.nodes[b as usize].parent = a_parent;
+            self.nodes[a as usize].parent = b;
+            self.replace_child(a_parent, a, b);
+            let (keep, give) = if h(self, d) > h(self, e) {
+                (d, e)
+            } else {
+                (e, d)
+            };
+            self.nodes[b as usize].right = keep;
+            self.nodes[a as usize].left = give;
+            self.nodes[give as usize].parent = a;
+            self.nodes[a as usize].aabb = self.nodes[c as usize]
+                .aabb
+                .merged(&self.nodes[give as usize].aabb);
+            self.nodes[b as usize].aabb = self.nodes[a as usize]
+                .aabb
+                .merged(&self.nodes[keep as usize].aabb);
+            self.nodes[a as usize].height = 1 + h(self, c).max(h(self, give));
+            self.nodes[b as usize].height = 1 + h(self, a).max(h(self, keep));
+            return b;
+        }
+        a
     }
 }
 
@@ -461,5 +539,50 @@ mod tests {
         let pairs = tree.query_pairs();
         // All 10 nodes overlap, so C(10,2) = 45 pairs
         assert_eq!(pairs.len(), 45);
+    }
+
+    #[test]
+    fn sorted_inserts_stay_balanced() {
+        let mut tree: AabbTree<u64> = AabbTree::new();
+        for i in 0..1000 {
+            let x = i as f64;
+            tree.insert(i, TreeAabb::from_2d([x, 0.0], [x + 1.0, 1.0]));
+        }
+        assert!(tree.height() < 30, "height = {}", tree.height());
+        // Neighbours (touching after fattening) overlap; distant ones don't.
+        let pairs = tree.query_pairs();
+        assert!(pairs.contains(&(0, 1)) && pairs.contains(&(998, 999)));
+        assert!(!pairs.contains(&(0, 5)));
+    }
+
+    #[test]
+    fn pairs_match_brute_force() {
+        let mut tree: AabbTree<u64> = AabbTree::new();
+        let mut boxes = Vec::new();
+        // Deterministic pseudo-random layout.
+        let mut s = 12345u64;
+        let mut rnd = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (s >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for i in 0..200u64 {
+            let x = rnd() * 50.0;
+            let y = rnd() * 50.0;
+            let w = 0.5 + rnd() * 3.0;
+            let aabb = TreeAabb::from_2d([x, y], [x + w, y + w]);
+            tree.insert(i, aabb);
+            boxes.push(aabb.fattened(AABB_MARGIN));
+        }
+        let mut expected = BTreeSet::new();
+        for i in 0..boxes.len() {
+            for j in i + 1..boxes.len() {
+                if boxes[i].overlaps(&boxes[j]) {
+                    expected.insert((i as u64, j as u64));
+                }
+            }
+        }
+        assert_eq!(tree.query_pairs(), expected);
     }
 }

@@ -13,6 +13,7 @@ pub struct Force {
 
 impl Force {
     /// Create a force with the given x, y, z components applied at the center of mass.
+    #[must_use]
     pub fn new(x: f64, y: f64, z: f64) -> Self {
         Self {
             vector: [x, y, z],
@@ -21,6 +22,7 @@ impl Force {
     }
 
     /// Create a force applied at a specific point relative to the body center.
+    #[must_use]
     pub fn at_point(x: f64, y: f64, z: f64, px: f64, py: f64, pz: f64) -> Self {
         Self {
             vector: [x, y, z],
@@ -29,6 +31,7 @@ impl Force {
     }
 
     /// Gravity force for a given mass.
+    #[must_use]
     pub fn gravity(mass: f64, g: f64) -> Self {
         Self::new(0.0, -mass * g, 0.0)
     }
@@ -51,6 +54,7 @@ pub struct Impulse {
 
 impl Impulse {
     /// Create an impulse with the given x, y, z components applied at the center of mass.
+    #[must_use]
     pub fn new(x: f64, y: f64, z: f64) -> Self {
         Self {
             vector: [x, y, z],
@@ -59,6 +63,7 @@ impl Impulse {
     }
 
     /// Create an impulse applied at a specific point relative to the body center.
+    #[must_use]
     pub fn at_point(x: f64, y: f64, z: f64, px: f64, py: f64, pz: f64) -> Self {
         Self {
             vector: [x, y, z],
@@ -82,6 +87,7 @@ pub struct Torque {
 
 impl Torque {
     /// Create a torque with the given value in Newton-meters.
+    #[must_use]
     pub fn new(value: f64) -> Self {
         Self { value }
     }

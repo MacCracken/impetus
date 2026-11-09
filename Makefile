@@ -10,13 +10,19 @@ all: check deny vet semver doc
 fmt:
 	cargo fmt --all -- --check
 
-# Lint (zero warnings)
+# Lint (zero warnings) — every backend combination (3d wins when both are on)
 clippy:
 	cargo clippy --all-features --all-targets -- -D warnings
+	cargo clippy --all-targets -- -D warnings
+	cargo clippy --no-default-features --features 2d,serialize --all-targets -- -D warnings
+	cargo clippy --no-default-features --features 3d --all-targets -- -D warnings
+	cargo clippy --no-default-features --all-targets -- -D warnings
 
-# Run test suite
+# Run test suite — 2D backend (default) and 3D backend (--all-features)
 test:
+	cargo test --features serialize
 	cargo test --all-features
+	cargo test --no-default-features
 
 # Security audit
 audit:
@@ -38,9 +44,12 @@ semver:
 bench:
 	./scripts/bench-history.sh
 
-# Generate coverage report
+# Generate coverage report (2D and 3D runs merged)
 coverage:
-	cargo llvm-cov --all-features --html --output-dir coverage/
+	cargo llvm-cov clean --workspace
+	cargo llvm-cov --no-report --features serialize
+	cargo llvm-cov --no-report --all-features
+	cargo llvm-cov report --html --output-dir coverage/
 	@echo "Coverage report: coverage/html/index.html"
 
 # Build release
@@ -50,6 +59,7 @@ build:
 # Generate documentation
 doc:
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
 # Clean build artifacts
 clean:

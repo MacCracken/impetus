@@ -1,8 +1,8 @@
 //! World state serialization for replay and network sync.
 //!
-//! Captures a complete snapshot of the physics world (bodies, colliders, joints,
-//! config) as bytes. Use for save/load, deterministic replay, and network state
-//! transfer.
+//! Captures a snapshot of the physics world (bodies, colliders, joints,
+//! particles, emitters, config) as bytes for save/load and state transfer.
+//! See [`PhysicsWorld::try_restore`] for what a snapshot does not capture.
 
 use serde::{Deserialize, Serialize};
 
@@ -54,17 +54,23 @@ pub struct JointSnapshot {
 }
 
 /// Serialize world state to bytes.
+///
+/// # Errors
+/// [`ImpetusError::Serialize`] if encoding fails.
 pub fn serialize_world(world: &PhysicsWorld) -> Result<Vec<u8>, ImpetusError> {
     let snapshot = world.snapshot();
     bitcode::serialize(&snapshot).map_err(|e| ImpetusError::Serialize(e.to_string()))
 }
 
 /// Deserialize world state from bytes and restore it.
+///
+/// # Errors
+/// [`ImpetusError::Deserialize`] if the bytes don't decode or the snapshot is
+/// invalid (see [`PhysicsWorld::try_restore`]); the world is then unchanged.
 pub fn deserialize_world(world: &mut PhysicsWorld, data: &[u8]) -> Result<(), ImpetusError> {
     let snapshot: WorldSnapshot =
         bitcode::deserialize(data).map_err(|e| ImpetusError::Deserialize(e.to_string()))?;
-    world.restore(&snapshot);
-    Ok(())
+    world.try_restore(&snapshot)
 }
 
 #[cfg(test)]

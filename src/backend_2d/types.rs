@@ -25,8 +25,6 @@ pub(super) const MANIFOLD_MATCH_THRESHOLD: f64 = 0.02;
 /// Maximum number of contact points per manifold in 2D.
 /// Increased from 2 to 4 for one-shot manifold generation (edge clipping).
 pub(super) const MAX_MANIFOLD_POINTS: usize = 4;
-/// Separation tolerance for re-validating old manifold points.
-pub(super) const MANIFOLD_REVALIDATION_TOLERANCE: f64 = 0.02;
 /// Warm starting scale factor — slightly less than 1.0 for stability.
 pub(super) const WARM_START_FACTOR: f64 = 0.95;
 
@@ -103,6 +101,38 @@ impl RigidBody2d {
         self.body_type == BodyType::Static
     }
 
+    /// Derive `inv_mass` / `inv_inertia` from `mass` / `inertia`: only
+    /// dynamic bodies with finite positive mass get non-zero inverses.
+    pub(super) fn refresh_inverse_mass(&mut self) {
+        if self.is_dynamic() && self.mass > 0.0 && self.mass.is_finite() {
+            self.inv_mass = 1.0 / self.mass;
+            self.inv_inertia = if self.fixed_rotation
+                || self.inertia.is_nan()
+                || self.inertia <= 0.0
+                || !self.inertia.is_finite()
+            {
+                0.0
+            } else {
+                1.0 / self.inertia
+            };
+        } else {
+            self.inv_mass = 0.0;
+            self.inv_inertia = 0.0;
+        }
+    }
+
+    /// Inverse mass and inverse inertia as seen by the constraint solver:
+    /// zero (infinite mass) for static, kinematic and sleeping bodies.
+    #[inline]
+    #[must_use]
+    pub(super) fn solver_inv_mass(&self) -> (f64, f64) {
+        if self.is_dynamic() && !self.is_sleeping {
+            (self.inv_mass, self.inv_inertia)
+        } else {
+            (0.0, 0.0)
+        }
+    }
+
     pub(super) fn integrate_velocities(&mut self, gravity: [f64; 2], dt: f64, max_velocity: f64) {
         if !self.is_dynamic() || self.inv_mass == 0.0 {
             return;
@@ -144,8 +174,11 @@ impl RigidBody2d {
         if self.is_static() {
             return;
         }
-        // Dynamic bodies need mass; kinematic bodies move from user-set velocity
-        if self.is_dynamic() && self.inv_mass == 0.0 {
+        // Dynamic bodies need mass and must be awake; kinematic bodies move
+        // from user-set velocity
+        if self.is_dynamic() && (self.inv_mass == 0.0 || self.is_sleeping) {
+            self.pseudo_velocity = [0.0, 0.0];
+            self.pseudo_angular_velocity = 0.0;
             return;
         }
 
@@ -291,61 +324,117 @@ impl Collider2d {
         }
     }
 
-    /// Compute mass from shape and material. Returns at least a small positive value
-    /// for dynamic bodies to avoid division by zero.
-    pub(super) fn compute_mass(&self) -> f64 {
-        if let Some(m) = self.mass {
-            return m.max(MIN_MASS);
-        }
-        let area = match &self.shape {
-            ColliderShape::Ball { radius } => std::f64::consts::PI * radius * radius,
-            ColliderShape::Box { half_extents } => 4.0 * half_extents[0] * half_extents[1],
-            ColliderShape::Capsule {
-                half_height,
-                radius,
-            } => 2.0 * half_height * 2.0 * radius + std::f64::consts::PI * radius * radius,
-            ColliderShape::Segment { a, b } => {
-                // Treat as thin rod with small thickness
-                let dx = b[0] - a[0];
-                let dy = b[1] - a[1];
-                let len = (dx * dx + dy * dy).sqrt();
-                len * 0.01 // 1cm thick
-            }
-            _ => 1.0,
-        };
-        (area * self.material.density).max(MIN_MASS)
-    }
-
-    /// Compute moment of inertia about center of mass.
-    pub(super) fn compute_inertia(&self, mass: f64) -> f64 {
-        let i = match &self.shape {
-            ColliderShape::Ball { radius } => 0.5 * mass * radius * radius,
+    /// Area, local centroid (collider frame) and polar moment of inertia per
+    /// unit mass about that centroid.
+    fn shape_props(&self) -> (f64, [f64; 2], f64) {
+        const FALLBACK: (f64, [f64; 2], f64) = (1.0, [0.0, 0.0], 1.0);
+        match &self.shape {
+            ColliderShape::Ball { radius } => (
+                std::f64::consts::PI * radius * radius,
+                [0.0, 0.0],
+                0.5 * radius * radius,
+            ),
             ColliderShape::Box { half_extents } => {
                 let w = 2.0 * half_extents[0];
                 let h = 2.0 * half_extents[1];
-                mass * (w * w + h * h) / 12.0
+                ((w * h).abs(), [0.0, 0.0], (w * w + h * h) / 12.0)
             }
             ColliderShape::Capsule {
                 half_height,
                 radius,
             } => {
-                let rect_area = 2.0 * half_height * 2.0 * radius;
-                let circle_area = std::f64::consts::PI * radius * radius;
-                let total_area = rect_area + circle_area;
-                let rect_mass = mass * rect_area / total_area;
-                let w = 2.0 * radius;
-                let h = 2.0 * half_height;
-                rect_mass * (w * w + h * h) / 12.0 + (mass - rect_mass) * 0.5 * radius * radius
+                // Rectangle plus two half-discs (Box2D `b2ComputeCapsuleMass`).
+                let (h, r) = (half_height.abs(), radius.abs());
+                let rect_area = 4.0 * h * r;
+                let circle_area = std::f64::consts::PI * r * r;
+                let area = rect_area + circle_area;
+                if area <= 0.0 {
+                    return FALLBACK;
+                }
+                let lc = 4.0 * r / (3.0 * std::f64::consts::PI);
+                let rect_i = rect_area * (4.0 * r * r + 4.0 * h * h) / 12.0;
+                let circle_i = circle_area * (0.5 * r * r + h * h + 2.0 * h * lc);
+                (area, [0.0, 0.0], (rect_i + circle_i) / area)
             }
             ColliderShape::Segment { a, b } => {
+                // Thin rod, 1 cm thick.
                 let dx = b[0] - a[0];
                 let dy = b[1] - a[1];
                 let len = (dx * dx + dy * dy).sqrt();
-                mass * len * len / 12.0 // thin rod
+                (
+                    len * 0.01,
+                    [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5],
+                    len * len / 12.0,
+                )
             }
-            _ => mass,
+            ColliderShape::ConvexHull { points } => {
+                let pts: Vec<[f64; 2]> = points.iter().map(|p| [p[0], p[1]]).collect();
+                polygon_mass_props(&pts).unwrap_or(FALLBACK)
+            }
+            ColliderShape::TriMesh { vertices, indices } => {
+                let mut area = 0.0;
+                let mut c = [0.0, 0.0];
+                let mut second = 0.0; // Σ aᵢ (iᵢ + |cᵢ|²)
+                for tri in indices {
+                    let v = |i: u32| vertices.get(i as usize).map(|p| [p[0], p[1]]);
+                    let (Some(p0), Some(p1), Some(p2)) = (v(tri[0]), v(tri[1]), v(tri[2])) else {
+                        continue;
+                    };
+                    if let Some((ai, ci, ii)) = polygon_mass_props(&[p0, p1, p2]) {
+                        area += ai;
+                        c[0] += ai * ci[0];
+                        c[1] += ai * ci[1];
+                        second += ai * (ii + ci[0] * ci[0] + ci[1] * ci[1]);
+                    }
+                }
+                if area <= 0.0 {
+                    return FALLBACK;
+                }
+                let c = [c[0] / area, c[1] / area];
+                (
+                    area,
+                    c,
+                    (second / area - c[0] * c[0] - c[1] * c[1]).max(0.0),
+                )
+            }
+            ColliderShape::Heightfield { .. } => FALLBACK,
+        }
+    }
+
+    /// Collider centroid in the collider's local frame.
+    #[cfg(test)]
+    #[must_use]
+    pub(super) fn local_centroid(&self) -> [f64; 2] {
+        self.shape_props().1
+    }
+
+    /// `(mass, inertia about the centroid, local centroid)` in one pass.
+    #[must_use]
+    pub(super) fn mass_properties(&self) -> (f64, f64, [f64; 2]) {
+        let (area, centroid, i_per_mass) = self.shape_props();
+        let mass = match self.mass {
+            Some(m) => m.max(MIN_MASS),
+            None => (area * self.material.density).max(MIN_MASS),
         };
-        i.max(MIN_INERTIA)
+        (mass, (mass * i_per_mass).max(MIN_INERTIA), centroid)
+    }
+
+    /// Compute mass from shape and material (or the explicit `mass`). Always
+    /// at least `MIN_MASS`, so dynamic bodies never divide by zero.
+    #[cfg(test)]
+    #[must_use]
+    pub(super) fn compute_mass(&self) -> f64 {
+        if let Some(m) = self.mass {
+            return m.max(MIN_MASS);
+        }
+        (self.shape_props().0 * self.material.density).max(MIN_MASS)
+    }
+
+    /// Moment of inertia about the collider's centroid for a given mass.
+    #[cfg(test)]
+    #[must_use]
+    pub(super) fn compute_inertia(&self, mass: f64) -> f64 {
+        (mass * self.shape_props().2).max(MIN_INERTIA)
     }
 }
 
@@ -363,6 +452,9 @@ pub(crate) struct Joint2d {
     pub motor: Option<crate::joint::JointMotor>,
     pub damping: f64,
     pub break_force: Option<f64>,
+    /// Relative rotation `rot_b − rot_a` when the joint was created; Fixed and
+    /// Prismatic joints hold it.
+    pub reference_angle: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +519,8 @@ pub(super) struct ContactManifold {
     pub body_b: BodyHandle,
     pub normal: [f64; 2],
     pub points: Vec<ManifoldPoint>, // Up to MAX_MANIFOLD_POINTS (4 in 2D)
+    /// Accumulated rolling-resistance angular impulse (for warm starting).
+    pub rolling_impulse: f64,
 }
 
 /// Key for looking up manifolds between collider pairs.
@@ -488,5 +582,108 @@ impl IslandManager {
             self.parent[rb as usize] = ra;
             self.rank[ra as usize] += 1;
         }
+    }
+}
+
+/// Area, centroid and polar moment of inertia per unit mass (about the
+/// centroid) of a simple polygon, either winding (Box2D
+/// `b2ComputePolygonMass`). `None` for fewer than three points or zero area.
+fn polygon_mass_props(pts: &[[f64; 2]]) -> Option<(f64, [f64; 2], f64)> {
+    if pts.len() < 3 {
+        return None;
+    }
+    let o = pts[0];
+    let (mut area, mut cx, mut cy, mut i_o) = (0.0, 0.0, 0.0, 0.0);
+    for w in 1..pts.len() - 1 {
+        let e1 = [pts[w][0] - o[0], pts[w][1] - o[1]];
+        let e2 = [pts[w + 1][0] - o[0], pts[w + 1][1] - o[1]];
+        let d = e1[0] * e2[1] - e1[1] * e2[0];
+        let tri = 0.5 * d;
+        area += tri;
+        cx += tri * (e1[0] + e2[0]) / 3.0;
+        cy += tri * (e1[1] + e2[1]) / 3.0;
+        let intx2 = e1[0] * e1[0] + e2[0] * e1[0] + e2[0] * e2[0];
+        let inty2 = e1[1] * e1[1] + e2[1] * e1[1] + e2[1] * e2[1];
+        i_o += (0.25 / 3.0 * d) * (intx2 + inty2);
+    }
+    if area.abs() < EPSILON_SQ || !area.is_finite() {
+        return None;
+    }
+    let c = [cx / area, cy / area];
+    let i_c = i_o / area - (c[0] * c[0] + c[1] * c[1]);
+    Some((area.abs(), [o[0] + c[0], o[1] + c[1]], i_c.max(0.0)))
+}
+
+#[cfg(test)]
+mod mass_tests {
+    use super::*;
+
+    fn collider(shape: ColliderShape, offset: [f64; 2]) -> Collider2d {
+        Collider2d::from_desc(
+            ColliderHandle(0),
+            BodyHandle(0),
+            &ColliderDesc {
+                shape,
+                offset: [offset[0], offset[1], 0.0],
+                material: PhysicsMaterial::default(),
+                is_sensor: false,
+                mass: None,
+                collision_layer: u32::MAX,
+                collision_mask: u32::MAX,
+            },
+        )
+    }
+
+    #[test]
+    fn hull_square_matches_box() {
+        for pts in [
+            vec![
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [2.0, 2.0, 0.0],
+                [0.0, 2.0, 0.0],
+            ],
+            vec![
+                [0.0, 2.0, 0.0],
+                [2.0, 2.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+        ] {
+            let hull = collider(ColliderShape::ConvexHull { points: pts }, [0.0, 0.0]);
+            let bx = collider(
+                ColliderShape::Box {
+                    half_extents: [1.0, 1.0, 0.0],
+                },
+                [0.0, 0.0],
+            );
+            assert!((hull.compute_mass() - bx.compute_mass()).abs() < 1e-12);
+            let m = hull.compute_mass();
+            assert!((hull.compute_inertia(m) - bx.compute_inertia(m)).abs() < 1e-12);
+            let c = hull.local_centroid();
+            assert!((c[0] - 1.0).abs() < 1e-12 && (c[1] - 1.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn capsule_inertia_includes_cap_offset() {
+        let cap = collider(
+            ColliderShape::Capsule {
+                half_height: 1.0,
+                radius: 0.5,
+            },
+            [0.0, 0.0],
+        );
+        let m = cap.compute_mass();
+        let r: f64 = 0.5;
+        let h: f64 = 1.0;
+        let rect = 4.0 * h * r;
+        let circ = std::f64::consts::PI * r * r;
+        let lc = 4.0 * r / (3.0 * std::f64::consts::PI);
+        let expected = m
+            * (rect * (4.0 * r * r + 4.0 * h * h) / 12.0
+                + circ * (0.5 * r * r + h * h + 2.0 * h * lc))
+            / (rect + circ);
+        assert!((cap.compute_inertia(m) - expected).abs() < 1e-12);
     }
 }

@@ -1,653 +1,561 @@
-//! Joint constraint solvers for the 2D physics backend.
+//! Joint constraint solver for the 2D physics backend.
+//!
+//! Joints are velocity-level constraints solved with accumulated, clamped
+//! impulses (sequential impulses), interleaved with the contact solver:
+//!
+//! - rigid constraints (point, distance, angle, axis) use a Baumgarte bias
+//!   `β·C/dt` to remove drift;
+//! - springs (Spring, Wheel suspension, Mouse) and joint damping are *soft*
+//!   constraints (Box2D's implicit spring formulation), so their response is
+//!   stable for stiff springs and independent of the iteration count;
+//! - limits are one-sided (speculative) constraints and motors are velocity
+//!   constraints whose accumulated impulse is clamped to `max_force · dt`.
+//!
+//! Geometry (anchors, errors, effective masses) is computed once per sub-step
+//! in [`PhysicsState2d::prepare_joints`]; positions don't change while
+//! velocities are iterated.
 
 use crate::arena::ArenaHandle;
-use crate::body::BodyHandle;
-use crate::joint::{JointMotor, JointType};
+use crate::joint::JointType;
 
 use super::body_ah;
 use super::state::PhysicsState2d;
-use super::types::{EPSILON, EPSILON_SQ, Joint2d};
+use super::types::{EPSILON, Joint2d, RigidBody2d};
+
+/// Fraction of a rigid joint's position error removed per step.
+const JOINT_BAUMGARTE: f64 = 0.2;
+
+// ---------------------------------------------------------------------------
+// Small vector helpers
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn cross(a: [f64; 2], b: [f64; 2]) -> f64 {
+    a[0] * b[1] - a[1] * b[0]
+}
+
+#[inline]
+fn dot(a: [f64; 2], b: [f64; 2]) -> f64 {
+    a[0] * b[0] + a[1] * b[1]
+}
+
+#[inline]
+fn rotate(v: [f64; 2], rot: f64) -> [f64; 2] {
+    let (s, c) = rot.sin_cos();
+    [c * v[0] - s * v[1], s * v[0] + c * v[1]]
+}
+
+#[inline]
+fn normalize(v: [f64; 2]) -> Option<[f64; 2]> {
+    let len = v[0].hypot(v[1]);
+    (len > EPSILON && len.is_finite()).then(|| [v[0] / len, v[1] / len])
+}
+
+/// Soft-constraint coefficients for a spring of stiffness `k` and damping `c`
+/// (Box2D): returns `(gamma, bias_per_unit_error)`, or `None` if both are zero.
+#[inline]
+fn soft(k: f64, c: f64, dt: f64) -> Option<(f64, f64)> {
+    let k = if k.is_finite() { k.max(0.0) } else { 0.0 };
+    let c = if c.is_finite() { c.max(0.0) } else { 0.0 };
+    let g = dt * (c + dt * k);
+    (g > EPSILON).then(|| {
+        let gamma = 1.0 / g;
+        (gamma, dt * k * gamma)
+    })
+}
+
+/// Clamp bound for a motor/mouse impulse: `|max_force|·dt`; NaN → 0.
+#[inline]
+fn impulse_cap(max_force: f64, dt: f64) -> f64 {
+    let cap = (max_force * dt).abs();
+    if cap.is_nan() { 0.0 } else { cap }
+}
+
+// ---------------------------------------------------------------------------
+// Constraint rows
+// ---------------------------------------------------------------------------
+
+/// Body data the solver needs, copied once per sub-step.
+#[derive(Clone, Copy)]
+struct BodyRef {
+    handle: Option<ArenaHandle>,
+    inv_mass: f64,
+    inv_inertia: f64,
+}
+
+impl BodyRef {
+    fn of(handle: ArenaHandle, b: Option<&RigidBody2d>) -> Self {
+        match b {
+            Some(b) => {
+                let (inv_mass, inv_inertia) = b.solver_inv_mass();
+                Self {
+                    handle: Some(handle),
+                    inv_mass,
+                    inv_inertia,
+                }
+            }
+            None => Self {
+                handle: None,
+                inv_mass: 0.0,
+                inv_inertia: 0.0,
+            },
+        }
+    }
+}
+
+/// A scalar velocity constraint `Cdot = lin·(vB − vA) + ang_b·ωB − ang_a·ωA`.
+#[derive(Clone, Copy)]
+struct Row {
+    lin: [f64; 2],
+    ang_a: f64,
+    ang_b: f64,
+    mass: f64,
+    bias: f64,
+    gamma: f64,
+    lo: f64,
+    hi: f64,
+    acc: f64,
+}
+
+impl Row {
+    fn new(lin: [f64; 2], ang_a: f64, ang_b: f64, a: &BodyRef, b: &BodyRef, gamma: f64) -> Self {
+        let k = (a.inv_mass + b.inv_mass) * dot(lin, lin)
+            + a.inv_inertia * ang_a * ang_a
+            + b.inv_inertia * ang_b * ang_b
+            + gamma;
+        Self {
+            lin,
+            ang_a,
+            ang_b,
+            mass: if k > EPSILON { 1.0 / k } else { 0.0 },
+            bias: 0.0,
+            gamma,
+            lo: f64::NEG_INFINITY,
+            hi: f64::INFINITY,
+            acc: 0.0,
+        }
+    }
+
+    /// Rigid bilateral constraint with Baumgarte bias.
+    fn rigid(mut self, error: f64, dt: f64) -> Self {
+        self.bias = JOINT_BAUMGARTE * error / dt;
+        self
+    }
+
+    /// One-sided constraint `C ≥ 0` (impulse ≥ 0). While separated the bias
+    /// lets it close the gap within this step; once violated it corrects.
+    fn one_sided(mut self, c: f64, dt: f64) -> Self {
+        self.bias = if c > 0.0 {
+            c / dt
+        } else {
+            JOINT_BAUMGARTE * c / dt
+        };
+        self.lo = 0.0;
+        self
+    }
+
+    fn solve(&mut self, va: &mut Vel, vb: &mut Vel, a: &BodyRef, b: &BodyRef) {
+        if self.mass == 0.0 {
+            return;
+        }
+        let cdot = dot(self.lin, [vb.v[0] - va.v[0], vb.v[1] - va.v[1]]) + self.ang_b * vb.w
+            - self.ang_a * va.w;
+        let lambda = -self.mass * (cdot + self.bias + self.gamma * self.acc);
+        let mut new = (self.acc + lambda).clamp(self.lo, self.hi);
+        if !new.is_finite() {
+            new = 0.0;
+        }
+        let d = new - self.acc;
+        self.acc = new;
+        va.v[0] -= self.lin[0] * d * a.inv_mass;
+        va.v[1] -= self.lin[1] * d * a.inv_mass;
+        va.w -= self.ang_a * d * a.inv_inertia;
+        vb.v[0] += self.lin[0] * d * b.inv_mass;
+        vb.v[1] += self.lin[1] * d * b.inv_mass;
+        vb.w += self.ang_b * d * b.inv_inertia;
+    }
+}
+
+/// A 2D point-to-point constraint (anchors coincide), solved as a 2x2 block.
+#[derive(Clone, Copy)]
+struct PointBlock {
+    ra: [f64; 2],
+    rb: [f64; 2],
+    /// Inverse of the effective-mass matrix `K + γI`.
+    inv_k: [[f64; 2]; 2],
+    bias: [f64; 2],
+    gamma: f64,
+    /// Maximum accumulated impulse magnitude (∞ = rigid).
+    max_impulse: f64,
+    acc: [f64; 2],
+}
+
+impl PointBlock {
+    fn new(ra: [f64; 2], rb: [f64; 2], a: &BodyRef, b: &BodyRef, gamma: f64) -> Option<Self> {
+        let (ma, ia, mb, ib) = (a.inv_mass, a.inv_inertia, b.inv_mass, b.inv_inertia);
+        let k11 = ma + mb + ia * ra[1] * ra[1] + ib * rb[1] * rb[1] + gamma;
+        let k12 = -ia * ra[0] * ra[1] - ib * rb[0] * rb[1];
+        let k22 = ma + mb + ia * ra[0] * ra[0] + ib * rb[0] * rb[0] + gamma;
+        let det = k11 * k22 - k12 * k12;
+        if det.is_nan() || det.abs() <= EPSILON || !det.is_finite() {
+            return None;
+        }
+        let inv = 1.0 / det;
+        Some(Self {
+            ra,
+            rb,
+            inv_k: [[k22 * inv, -k12 * inv], [-k12 * inv, k11 * inv]],
+            bias: [0.0, 0.0],
+            gamma,
+            max_impulse: f64::INFINITY,
+            acc: [0.0, 0.0],
+        })
+    }
+
+    fn solve(&mut self, va: &mut Vel, vb: &mut Vel, a: &BodyRef, b: &BodyRef) {
+        let cdot = {
+            let pa = va.at(self.ra);
+            let pb = vb.at(self.rb);
+            [pb[0] - pa[0], pb[1] - pa[1]]
+        };
+        let rhs = [
+            cdot[0] + self.bias[0] + self.gamma * self.acc[0],
+            cdot[1] + self.bias[1] + self.gamma * self.acc[1],
+        ];
+        let lambda = [
+            -(self.inv_k[0][0] * rhs[0] + self.inv_k[0][1] * rhs[1]),
+            -(self.inv_k[1][0] * rhs[0] + self.inv_k[1][1] * rhs[1]),
+        ];
+        let mut new = [self.acc[0] + lambda[0], self.acc[1] + lambda[1]];
+        let mag = new[0].hypot(new[1]);
+        if mag > self.max_impulse {
+            new = [
+                new[0] * self.max_impulse / mag,
+                new[1] * self.max_impulse / mag,
+            ];
+        }
+        if !(new[0].is_finite() && new[1].is_finite()) {
+            new = [0.0, 0.0];
+        }
+        let d = [new[0] - self.acc[0], new[1] - self.acc[1]];
+        self.acc = new;
+        va.v[0] -= d[0] * a.inv_mass;
+        va.v[1] -= d[1] * a.inv_mass;
+        va.w -= cross(self.ra, d) * a.inv_inertia;
+        vb.v[0] += d[0] * b.inv_mass;
+        vb.v[1] += d[1] * b.inv_mass;
+        vb.w += cross(self.rb, d) * b.inv_inertia;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Vel {
+    v: [f64; 2],
+    w: f64,
+}
+
+impl Vel {
+    #[inline]
+    fn at(&self, r: [f64; 2]) -> [f64; 2] {
+        [self.v[0] - self.w * r[1], self.v[1] + self.w * r[0]]
+    }
+}
+
+/// One joint's constraints for the current sub-step.
+pub(super) struct PreparedJoint {
+    handle: ArenaHandle,
+    a: BodyRef,
+    b: BodyRef,
+    point: Option<PointBlock>,
+    rows: Vec<Row>,
+    /// Index into `rows` of the row whose impulse counts toward breaking
+    /// (when there is no point block).
+    break_row: Option<usize>,
+    break_force: Option<f64>,
+}
+
+impl PreparedJoint {
+    /// Linear constraint force magnitude this step (for `break_force`).
+    fn linear_force(&self, dt: f64) -> f64 {
+        let impulse = match (&self.point, self.break_row) {
+            (Some(p), _) => p.acc[0].hypot(p.acc[1]),
+            (None, Some(i)) => self.rows.get(i).map_or(0.0, |r| r.acc.abs()),
+            (None, None) => 0.0,
+        };
+        if dt > EPSILON { impulse / dt } else { 0.0 }
+    }
+}
 
 impl PhysicsState2d {
-    // -----------------------------------------------------------------------
-    // Joint constraint solver
-    // -----------------------------------------------------------------------
+    /// Build every joint's constraint rows for this sub-step.
+    pub(super) fn prepare_joints(&self, dt: f64) -> Vec<PreparedJoint> {
+        if dt <= EPSILON {
+            return Vec::new();
+        }
+        self.joints
+            .iter()
+            .filter_map(|(handle, joint)| self.prepare_joint(handle, joint, dt))
+            .collect()
+    }
 
-    pub(super) fn solve_joints(&mut self, dt: f64, iterations: u32) {
-        // Collect (ArenaHandle, Joint2d) pairs so we can track handles for breaking.
-        let joints: Vec<(ArenaHandle, Joint2d)> =
-            self.joints.iter().map(|(ah, j)| (ah, j.clone())).collect();
+    fn prepare_joint(&self, handle: ArenaHandle, j: &Joint2d, dt: f64) -> Option<PreparedJoint> {
+        let ah_a = body_ah(j.body_a);
+        let ah_b = body_ah(j.body_b);
+        let ba = self.bodies.get(ah_a);
+        let bb = self.bodies.get(ah_b);
+        let a = BodyRef::of(ah_a, ba);
+        let b = BodyRef::of(ah_b, bb);
 
-        // Track constraint forces for joint breaking.
-        // We accumulate the maximum constraint force per joint across iterations.
-        let mut constraint_forces: Vec<f64> = vec![0.0; joints.len()];
+        // Mouse joint drags body A toward a world target; treat the target as
+        // a static "body".
+        if let JointType::Mouse {
+            target,
+            stiffness,
+            damping,
+            max_force,
+        } = &j.joint_type
+        {
+            let ba = ba?;
+            let anchor = rotate(j.local_anchor_a, ba.rotation);
+            let ground = BodyRef {
+                handle: None,
+                inv_mass: 0.0,
+                inv_inertia: 0.0,
+            };
+            let (gamma, beta) = soft(*stiffness, *damping, dt).unwrap_or((0.0, 0.0));
+            // Ground is "A", the dragged body is "B": C = anchor − target.
+            let mut p = PointBlock::new([0.0, 0.0], anchor, &ground, &a, gamma)?;
+            let c = [
+                ba.position[0] + anchor[0] - target[0],
+                ba.position[1] + anchor[1] - target[1],
+            ];
+            p.bias = [c[0] * beta, c[1] * beta];
+            p.max_impulse = impulse_cap(*max_force, dt);
+            return Some(PreparedJoint {
+                handle,
+                a: ground,
+                b: a,
+                point: Some(p),
+                rows: Vec::new(),
+                break_row: None,
+                break_force: j.break_force,
+            });
+        }
 
-        for _ in 0..iterations {
-            for (ji, (_ah, joint)) in joints.iter().enumerate() {
-                let force = match &joint.joint_type {
-                    JointType::Fixed => self.solve_fixed_joint(joint),
-                    JointType::Distance { length } => self.solve_distance_joint(joint, *length),
-                    JointType::Spring {
-                        rest_length,
-                        stiffness,
-                        damping,
-                    } => self.solve_spring_joint(joint, *rest_length, *stiffness, *damping, dt),
-                    JointType::Revolute { limits, .. } => {
-                        let f = self.solve_revolute_joint(joint, limits.as_ref());
-                        if let Some(motor) = &joint.motor {
-                            self.solve_revolute_motor(joint, motor, dt);
-                        }
-                        f
-                    }
-                    JointType::Prismatic { axis, limits } => {
-                        let f = self.solve_prismatic_joint(joint, *axis, limits.as_ref());
-                        if let Some(motor) = &joint.motor {
-                            self.solve_prismatic_motor(joint, *axis, motor, dt);
-                        }
-                        f
-                    }
-                    JointType::Wheel {
-                        axis,
-                        stiffness,
-                        damping,
-                    } => self.solve_wheel_joint(joint, *axis, *stiffness, *damping, dt),
-                    JointType::Rope { max_length } => self.solve_rope_joint(joint, *max_length),
-                    JointType::Mouse {
-                        target,
-                        stiffness,
-                        damping,
-                        max_force,
-                    } => {
-                        self.solve_mouse_joint(joint, *target, *stiffness, *damping, *max_force, dt)
-                    }
-                };
-                constraint_forces[ji] = constraint_forces[ji].max(force);
-                // Apply joint damping for non-Spring joints (Spring has its own damping).
-                if joint.damping > 0.0 && !matches!(joint.joint_type, JointType::Spring { .. }) {
-                    self.apply_joint_damping(joint, dt);
+        let (pa, rot_a) = ba.map_or(([0.0, 0.0], 0.0), |b| (b.position, b.rotation));
+        let (pb, rot_b) = bb.map_or(([0.0, 0.0], 0.0), |b| (b.position, b.rotation));
+        if a.inv_mass == 0.0 && b.inv_mass == 0.0 && a.inv_inertia == 0.0 && b.inv_inertia == 0.0 {
+            return None;
+        }
+        // Anchors relative to each body centre; a missing body anchors in world space.
+        let ra = if ba.is_some() {
+            rotate(j.local_anchor_a, rot_a)
+        } else {
+            [0.0, 0.0]
+        };
+        let rb = if bb.is_some() {
+            rotate(j.local_anchor_b, rot_b)
+        } else {
+            [0.0, 0.0]
+        };
+        let anchor_a = if ba.is_some() {
+            [pa[0] + ra[0], pa[1] + ra[1]]
+        } else {
+            j.local_anchor_a
+        };
+        let anchor_b = if bb.is_some() {
+            [pb[0] + rb[0], pb[1] + rb[1]]
+        } else {
+            j.local_anchor_b
+        };
+        let d = [anchor_b[0] - anchor_a[0], anchor_b[1] - anchor_a[1]];
+        let angle = rot_b - rot_a;
+
+        let mut point = None;
+        let mut rows: Vec<Row> = Vec::new();
+        let mut break_row = None;
+
+        let rigid_point = |gamma: f64| {
+            PointBlock::new(ra, rb, &a, &b, gamma).map(|mut p| {
+                p.bias = [JOINT_BAUMGARTE * d[0] / dt, JOINT_BAUMGARTE * d[1] / dt];
+                p
+            })
+        };
+        let angular_row = || Row::new([0.0, 0.0], 1.0, 1.0, &a, &b, 0.0);
+        // Row along unit direction `u` between the anchors.
+        let anchor_row =
+            |u: [f64; 2], gamma: f64| Row::new(u, cross(ra, u), cross(rb, u), &a, &b, gamma);
+        // Row along a direction fixed in body A (prismatic/wheel): A's
+        // angular term uses the full A-centre → B-anchor arm.
+        let axis_row = |u: [f64; 2]| {
+            let arm_a = [d[0] + ra[0], d[1] + ra[1]];
+            Row::new(u, cross(arm_a, u), cross(rb, u), &a, &b, 0.0)
+        };
+
+        match &j.joint_type {
+            JointType::Fixed => {
+                point = rigid_point(0.0);
+                rows.push(angular_row().rigid(angle - j.reference_angle, dt));
+            }
+            JointType::Revolute { limits, .. } => {
+                point = rigid_point(0.0);
+                if let Some([lo, hi]) = limits {
+                    rows.push(angular_row().one_sided(angle - lo, dt));
+                    let mut upper = Row::new([0.0, 0.0], -1.0, -1.0, &a, &b, 0.0);
+                    upper = upper.one_sided(hi - angle, dt);
+                    rows.push(upper);
                 }
+                if let Some(m) = &j.motor {
+                    let mut r = angular_row();
+                    r.bias = -m.target_velocity;
+                    let cap = impulse_cap(m.max_force, dt);
+                    r.lo = -cap;
+                    r.hi = cap;
+                    rows.push(r);
+                }
+            }
+            JointType::Prismatic { axis, limits } => {
+                let ax = normalize(rotate(*axis, rot_a))?;
+                let perp = [-ax[1], ax[0]];
+                break_row = Some(rows.len());
+                rows.push(axis_row(perp).rigid(dot(d, perp), dt));
+                rows.push(angular_row().rigid(angle - j.reference_angle, dt));
+                let translation = dot(d, ax);
+                if let Some([lo, hi]) = limits {
+                    rows.push(axis_row(ax).one_sided(translation - lo, dt));
+                    let mut upper = axis_row(ax);
+                    upper.lin = [-ax[0], -ax[1]];
+                    upper.ang_a = -upper.ang_a;
+                    upper.ang_b = -upper.ang_b;
+                    rows.push(upper.one_sided(hi - translation, dt));
+                }
+                if let Some(m) = &j.motor {
+                    let mut r = axis_row(ax);
+                    r.bias = -m.target_velocity;
+                    let cap = impulse_cap(m.max_force, dt);
+                    r.lo = -cap;
+                    r.hi = cap;
+                    rows.push(r);
+                }
+            }
+            JointType::Wheel {
+                axis,
+                stiffness,
+                damping,
+            } => {
+                let ax = normalize(rotate(*axis, rot_a))?;
+                let perp = [-ax[1], ax[0]];
+                break_row = Some(rows.len());
+                rows.push(axis_row(perp).rigid(dot(d, perp), dt));
+                if let Some((gamma, beta)) = soft(*stiffness, *damping, dt) {
+                    let mut r = axis_row(ax);
+                    r = Row::new(r.lin, r.ang_a, r.ang_b, &a, &b, gamma);
+                    r.bias = dot(d, ax) * beta;
+                    rows.push(r);
+                }
+            }
+            JointType::Spring {
+                rest_length,
+                stiffness,
+                damping,
+            } => {
+                let u = normalize(d)?;
+                let (gamma, beta) = soft(*stiffness, *damping, dt)?;
+                let mut r = anchor_row(u, gamma);
+                r.bias = (d[0].hypot(d[1]) - rest_length) * beta;
+                break_row = Some(rows.len());
+                rows.push(r);
+            }
+            JointType::Distance { length } => {
+                let u = normalize(d)?;
+                break_row = Some(rows.len());
+                rows.push(anchor_row(u, 0.0).rigid(d[0].hypot(d[1]) - length, dt));
+            }
+            JointType::Rope { max_length } => {
+                let u = normalize(d)?;
+                // C = max_length − dist ≥ 0: impulse pulls the anchors together.
+                let r = Row::new([-u[0], -u[1]], -cross(ra, u), -cross(rb, u), &a, &b, 0.0);
+                break_row = Some(rows.len());
+                rows.push(r.one_sided(max_length - d[0].hypot(d[1]), dt));
+            }
+            JointType::Mouse { .. } => return None,
+        }
+
+        // Generic joint damping (springs, wheels and mice have their own).
+        if j.damping > 0.0 && j.damping.is_finite() {
+            let gamma = 1.0 / (dt * j.damping);
+            match &j.joint_type {
+                JointType::Revolute { .. } | JointType::Wheel { .. } => {
+                    rows.push(Row::new([0.0, 0.0], 1.0, 1.0, &a, &b, gamma));
+                }
+                JointType::Prismatic { axis, .. } => {
+                    if let Some(ax) = normalize(rotate(*axis, rot_a)) {
+                        let r = axis_row(ax);
+                        rows.push(Row::new(r.lin, r.ang_a, r.ang_b, &a, &b, gamma));
+                    }
+                }
+                JointType::Distance { .. } | JointType::Rope { .. } => {
+                    if let Some(u) = normalize(d) {
+                        rows.push(anchor_row(u, gamma));
+                    }
+                }
+                _ => {}
             }
         }
 
-        // Joint breaking — remove joints whose constraint force exceeded break_force.
-        let mut broken: Vec<ArenaHandle> = Vec::new();
-        for (ji, (ah, joint)) in joints.iter().enumerate() {
-            if let Some(bf) = joint.break_force
-                && constraint_forces[ji] > bf
+        Some(PreparedJoint {
+            handle,
+            a,
+            b,
+            point,
+            rows,
+            break_row,
+            break_force: j.break_force,
+        })
+    }
+
+    /// One Gauss–Seidel pass over every prepared joint.
+    pub(super) fn solve_joints_once(&mut self, joints: &mut [PreparedJoint]) {
+        for pj in joints.iter_mut() {
+            let read = |h: Option<ArenaHandle>| {
+                h.and_then(|h| self.bodies.get(h)).map_or(
+                    Vel {
+                        v: [0.0, 0.0],
+                        w: 0.0,
+                    },
+                    |b| Vel {
+                        v: b.linear_velocity,
+                        w: b.angular_velocity,
+                    },
+                )
+            };
+            let mut va = read(pj.a.handle);
+            let mut vb = read(pj.b.handle);
+            for row in &mut pj.rows {
+                row.solve(&mut va, &mut vb, &pj.a, &pj.b);
+            }
+            if let Some(p) = &mut pj.point {
+                p.solve(&mut va, &mut vb, &pj.a, &pj.b);
+            }
+            for (side, vel) in [(&pj.a, va), (&pj.b, vb)] {
+                if (side.inv_mass > 0.0 || side.inv_inertia > 0.0)
+                    && let Some(b) = side.handle.and_then(|h| self.bodies.get_mut(h))
+                {
+                    b.linear_velocity = vel.v;
+                    b.angular_velocity = vel.w;
+                }
+            }
+        }
+    }
+
+    /// Remove joints whose linear constraint force exceeded `break_force`.
+    pub(super) fn break_joints(&mut self, joints: &[PreparedJoint], dt: f64) {
+        for pj in joints {
+            if let Some(limit) = pj.break_force
+                && pj.linear_force(dt) > limit
             {
-                broken.push(*ah);
+                self.joints.remove(pj.handle);
             }
         }
-        for ah in broken {
-            self.joints.remove(ah);
-        }
-    }
-
-    /// Apply velocity damping proportional to relative velocity at anchor points.
-    fn apply_joint_damping(&mut self, joint: &Joint2d, dt: f64) {
-        let anchor_a = self.world_anchor(joint.body_a, joint.local_anchor_a);
-        let anchor_b = self.world_anchor(joint.body_b, joint.local_anchor_b);
-
-        let (vel_a, angvel_a, pos_a, inv_mass_a) = match self.bodies.get(body_ah(joint.body_a)) {
-            Some(b) if b.is_dynamic() => (
-                b.linear_velocity,
-                b.angular_velocity,
-                b.position,
-                b.inv_mass,
-            ),
-            Some(b) => (b.linear_velocity, b.angular_velocity, b.position, 0.0),
-            None => return,
-        };
-        let (vel_b, angvel_b, pos_b, inv_mass_b) = match self.bodies.get(body_ah(joint.body_b)) {
-            Some(b) if b.is_dynamic() => (
-                b.linear_velocity,
-                b.angular_velocity,
-                b.position,
-                b.inv_mass,
-            ),
-            Some(b) => (b.linear_velocity, b.angular_velocity, b.position, 0.0),
-            None => return,
-        };
-
-        let inv_mass_sum = inv_mass_a + inv_mass_b;
-        if inv_mass_sum == 0.0 {
-            return;
-        }
-
-        // Velocity at anchor point = linear_vel + angular_vel x r
-        let ra = [anchor_a[0] - pos_a[0], anchor_a[1] - pos_a[1]];
-        let rb = [anchor_b[0] - pos_b[0], anchor_b[1] - pos_b[1]];
-        let va = [vel_a[0] - angvel_a * ra[1], vel_a[1] + angvel_a * ra[0]];
-        let vb = [vel_b[0] - angvel_b * rb[1], vel_b[1] + angvel_b * rb[0]];
-        let rel_vel = [vb[0] - va[0], vb[1] - va[1]];
-
-        let rel_speed_sq = rel_vel[0] * rel_vel[0] + rel_vel[1] * rel_vel[1];
-        if rel_speed_sq < EPSILON_SQ {
-            return;
-        }
-
-        // Damping impulse: -damping * relative_velocity * dt, distributed by inverse mass
-        let impulse = [
-            -joint.damping * rel_vel[0] * dt,
-            -joint.damping * rel_vel[1] * dt,
-        ];
-
-        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
-            && ba.is_dynamic()
-        {
-            ba.linear_velocity[0] -= impulse[0] * ba.inv_mass;
-            ba.linear_velocity[1] -= impulse[1] * ba.inv_mass;
-        }
-        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
-            && bb.is_dynamic()
-        {
-            bb.linear_velocity[0] += impulse[0] * bb.inv_mass;
-            bb.linear_velocity[1] += impulse[1] * bb.inv_mass;
-        }
-    }
-
-    /// Apply a revolute motor: drives relative angular velocity toward `target_velocity`,
-    /// clamped by `max_force` (torque).
-    fn solve_revolute_motor(&mut self, joint: &Joint2d, motor: &JointMotor, dt: f64) {
-        let angvel_a = self
-            .bodies
-            .get(body_ah(joint.body_a))
-            .map(|b| b.angular_velocity)
-            .unwrap_or(0.0);
-        let angvel_b = self
-            .bodies
-            .get(body_ah(joint.body_b))
-            .map(|b| b.angular_velocity)
-            .unwrap_or(0.0);
-        let inv_inertia_a = self
-            .bodies
-            .get(body_ah(joint.body_a))
-            .filter(|b| b.is_dynamic())
-            .map(|b| b.inv_inertia)
-            .unwrap_or(0.0);
-        let inv_inertia_b = self
-            .bodies
-            .get(body_ah(joint.body_b))
-            .filter(|b| b.is_dynamic())
-            .map(|b| b.inv_inertia)
-            .unwrap_or(0.0);
-
-        let inv_inertia_sum = inv_inertia_a + inv_inertia_b;
-        if inv_inertia_sum == 0.0 {
-            return;
-        }
-
-        let rel_angvel = angvel_b - angvel_a;
-        let error = motor.target_velocity - rel_angvel;
-        // Impulse = error / inv_inertia_sum, clamped by max_force * dt
-        let max_impulse = motor.max_force * dt;
-        let impulse = (error / inv_inertia_sum).clamp(-max_impulse, max_impulse);
-
-        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
-            && ba.is_dynamic()
-        {
-            ba.angular_velocity -= impulse * ba.inv_inertia;
-        }
-        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
-            && bb.is_dynamic()
-        {
-            bb.angular_velocity += impulse * bb.inv_inertia;
-        }
-    }
-
-    /// Apply a prismatic motor: drives relative linear velocity along `axis` toward
-    /// `target_velocity`, clamped by `max_force`.
-    fn solve_prismatic_motor(
-        &mut self,
-        joint: &Joint2d,
-        axis: [f64; 2],
-        motor: &JointMotor,
-        dt: f64,
-    ) {
-        let axis_len = (axis[0] * axis[0] + axis[1] * axis[1]).sqrt();
-        if axis_len < EPSILON {
-            return;
-        }
-        let ax = [axis[0] / axis_len, axis[1] / axis_len];
-
-        let vel_a = self
-            .bodies
-            .get(body_ah(joint.body_a))
-            .map(|b| b.linear_velocity)
-            .unwrap_or([0.0, 0.0]);
-        let vel_b = self
-            .bodies
-            .get(body_ah(joint.body_b))
-            .map(|b| b.linear_velocity)
-            .unwrap_or([0.0, 0.0]);
-        let inv_mass_a = self
-            .bodies
-            .get(body_ah(joint.body_a))
-            .filter(|b| b.is_dynamic())
-            .map(|b| b.inv_mass)
-            .unwrap_or(0.0);
-        let inv_mass_b = self
-            .bodies
-            .get(body_ah(joint.body_b))
-            .filter(|b| b.is_dynamic())
-            .map(|b| b.inv_mass)
-            .unwrap_or(0.0);
-
-        let inv_mass_sum = inv_mass_a + inv_mass_b;
-        if inv_mass_sum == 0.0 {
-            return;
-        }
-
-        let rel_vel = [vel_b[0] - vel_a[0], vel_b[1] - vel_a[1]];
-        let rel_speed_along_axis = rel_vel[0] * ax[0] + rel_vel[1] * ax[1];
-        let error = motor.target_velocity - rel_speed_along_axis;
-        let max_impulse = motor.max_force * dt;
-        let impulse = (error / inv_mass_sum).clamp(-max_impulse, max_impulse);
-
-        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
-            && ba.is_dynamic()
-        {
-            ba.linear_velocity[0] -= impulse * ax[0] * ba.inv_mass;
-            ba.linear_velocity[1] -= impulse * ax[1] * ba.inv_mass;
-        }
-        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
-            && bb.is_dynamic()
-        {
-            bb.linear_velocity[0] += impulse * ax[0] * bb.inv_mass;
-            bb.linear_velocity[1] += impulse * ax[1] * bb.inv_mass;
-        }
-    }
-
-    pub(super) fn world_anchor(&self, body: BodyHandle, local: [f64; 2]) -> [f64; 2] {
-        let rb = match self.bodies.get(body_ah(body)) {
-            Some(b) => b,
-            None => return local,
-        };
-        let (sin, cos) = rb.rotation.sin_cos();
-        [
-            rb.position[0] + cos * local[0] - sin * local[1],
-            rb.position[1] + sin * local[0] + cos * local[1],
-        ]
-    }
-
-    fn solve_fixed_joint(&mut self, joint: &Joint2d) -> f64 {
-        let anchor_a = self.world_anchor(joint.body_a, joint.local_anchor_a);
-        let anchor_b = self.world_anchor(joint.body_b, joint.local_anchor_b);
-        let diff = [anchor_b[0] - anchor_a[0], anchor_b[1] - anchor_a[1]];
-        let force = (diff[0] * diff[0] + diff[1] * diff[1]).sqrt();
-
-        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
-            && ba.is_dynamic()
-        {
-            ba.position[0] += diff[0] * 0.5;
-            ba.position[1] += diff[1] * 0.5;
-        }
-        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
-            && bb.is_dynamic()
-        {
-            bb.position[0] -= diff[0] * 0.5;
-            bb.position[1] -= diff[1] * 0.5;
-        }
-        force
-    }
-
-    fn solve_distance_joint(&mut self, joint: &Joint2d, length: f64) -> f64 {
-        let anchor_a = self.world_anchor(joint.body_a, joint.local_anchor_a);
-        let anchor_b = self.world_anchor(joint.body_b, joint.local_anchor_b);
-        let diff = [anchor_b[0] - anchor_a[0], anchor_b[1] - anchor_a[1]];
-        let dist_sq = diff[0] * diff[0] + diff[1] * diff[1];
-
-        if dist_sq < EPSILON_SQ {
-            return 0.0;
-        }
-        let dist = dist_sq.sqrt();
-        let force = (dist - length).abs();
-
-        let n = [diff[0] / dist, diff[1] / dist];
-        let correction = (dist - length) * 0.5;
-
-        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
-            && ba.is_dynamic()
-        {
-            ba.position[0] += n[0] * correction;
-            ba.position[1] += n[1] * correction;
-        }
-        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
-            && bb.is_dynamic()
-        {
-            bb.position[0] -= n[0] * correction;
-            bb.position[1] -= n[1] * correction;
-        }
-        force
-    }
-
-    fn solve_spring_joint(
-        &mut self,
-        joint: &Joint2d,
-        rest_length: f64,
-        stiffness: f64,
-        damping: f64,
-        dt: f64,
-    ) -> f64 {
-        let anchor_a = self.world_anchor(joint.body_a, joint.local_anchor_a);
-        let anchor_b = self.world_anchor(joint.body_b, joint.local_anchor_b);
-        let diff = [anchor_b[0] - anchor_a[0], anchor_b[1] - anchor_a[1]];
-        let dist_sq = diff[0] * diff[0] + diff[1] * diff[1];
-
-        if dist_sq < EPSILON_SQ {
-            return 0.0;
-        }
-        let dist = dist_sq.sqrt();
-
-        let n = [diff[0] / dist, diff[1] / dist];
-        let spring_force = stiffness * (dist - rest_length);
-
-        let vel_a = self
-            .bodies
-            .get(body_ah(joint.body_a))
-            .map(|b| b.linear_velocity)
-            .unwrap_or([0.0, 0.0]);
-        let vel_b = self
-            .bodies
-            .get(body_ah(joint.body_b))
-            .map(|b| b.linear_velocity)
-            .unwrap_or([0.0, 0.0]);
-        let rel_vel = [vel_b[0] - vel_a[0], vel_b[1] - vel_a[1]];
-        let damping_force = damping * (rel_vel[0] * n[0] + rel_vel[1] * n[1]);
-
-        let total_force = spring_force + damping_force;
-        let force = [total_force * n[0] * dt, total_force * n[1] * dt];
-
-        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
-            && ba.is_dynamic()
-        {
-            ba.linear_velocity[0] += force[0] * ba.inv_mass;
-            ba.linear_velocity[1] += force[1] * ba.inv_mass;
-        }
-        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
-            && bb.is_dynamic()
-        {
-            bb.linear_velocity[0] -= force[0] * bb.inv_mass;
-            bb.linear_velocity[1] -= force[1] * bb.inv_mass;
-        }
-        total_force.abs()
-    }
-
-    fn solve_revolute_joint(&mut self, joint: &Joint2d, limits: Option<&[f64; 2]>) -> f64 {
-        let force = self.solve_fixed_joint(joint);
-
-        if let Some([lo, hi]) = limits {
-            let rot_a = self
-                .bodies
-                .get(body_ah(joint.body_a))
-                .map(|b| b.rotation)
-                .unwrap_or(0.0);
-            let rot_b = self
-                .bodies
-                .get(body_ah(joint.body_b))
-                .map(|b| b.rotation)
-                .unwrap_or(0.0);
-            let rel_angle = rot_b - rot_a;
-
-            if rel_angle < *lo {
-                let c = (lo - rel_angle) * 0.5;
-                if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
-                    && ba.is_dynamic()
-                {
-                    ba.rotation -= c;
-                }
-                if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
-                    && bb.is_dynamic()
-                {
-                    bb.rotation += c;
-                }
-            } else if rel_angle > *hi {
-                let c = (rel_angle - hi) * 0.5;
-                if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
-                    && ba.is_dynamic()
-                {
-                    ba.rotation += c;
-                }
-                if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
-                    && bb.is_dynamic()
-                {
-                    bb.rotation -= c;
-                }
-            }
-        }
-        force
-    }
-
-    fn solve_prismatic_joint(
-        &mut self,
-        joint: &Joint2d,
-        axis: [f64; 2],
-        limits: Option<&[f64; 2]>,
-    ) -> f64 {
-        let anchor_a = self.world_anchor(joint.body_a, joint.local_anchor_a);
-        let anchor_b = self.world_anchor(joint.body_b, joint.local_anchor_b);
-        let diff = [anchor_b[0] - anchor_a[0], anchor_b[1] - anchor_a[1]];
-
-        let axis_len = (axis[0] * axis[0] + axis[1] * axis[1]).sqrt();
-        if axis_len < EPSILON {
-            return 0.0;
-        }
-        let ax = [axis[0] / axis_len, axis[1] / axis_len];
-        let perp = [-ax[1], ax[0]];
-        let perp_error = diff[0] * perp[0] + diff[1] * perp[1];
-        let correction = perp_error * 0.5;
-
-        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
-            && ba.is_dynamic()
-        {
-            ba.position[0] += perp[0] * correction;
-            ba.position[1] += perp[1] * correction;
-        }
-        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
-            && bb.is_dynamic()
-        {
-            bb.position[0] -= perp[0] * correction;
-            bb.position[1] -= perp[1] * correction;
-        }
-
-        if let Some([lo, hi]) = limits {
-            let along = diff[0] * ax[0] + diff[1] * ax[1];
-            if along < *lo {
-                let c = (lo - along) * 0.5;
-                if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
-                    && ba.is_dynamic()
-                {
-                    ba.position[0] -= ax[0] * c;
-                    ba.position[1] -= ax[1] * c;
-                }
-                if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
-                    && bb.is_dynamic()
-                {
-                    bb.position[0] += ax[0] * c;
-                    bb.position[1] += ax[1] * c;
-                }
-            } else if along > *hi {
-                let c = (along - hi) * 0.5;
-                if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
-                    && ba.is_dynamic()
-                {
-                    ba.position[0] += ax[0] * c;
-                    ba.position[1] += ax[1] * c;
-                }
-                if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
-                    && bb.is_dynamic()
-                {
-                    bb.position[0] -= ax[0] * c;
-                    bb.position[1] -= ax[1] * c;
-                }
-            }
-        }
-        perp_error.abs()
-    }
-
-    /// Wheel joint — constrains perpendicular to axis (like prismatic), applies
-    /// spring force along axis, allows free rotation.
-    fn solve_wheel_joint(
-        &mut self,
-        joint: &Joint2d,
-        axis: [f64; 2],
-        stiffness: f64,
-        damping: f64,
-        dt: f64,
-    ) -> f64 {
-        let anchor_a = self.world_anchor(joint.body_a, joint.local_anchor_a);
-        let anchor_b = self.world_anchor(joint.body_b, joint.local_anchor_b);
-        let diff = [anchor_b[0] - anchor_a[0], anchor_b[1] - anchor_a[1]];
-
-        let axis_len = (axis[0] * axis[0] + axis[1] * axis[1]).sqrt();
-        if axis_len < EPSILON {
-            return 0.0;
-        }
-        let ax = [axis[0] / axis_len, axis[1] / axis_len];
-        let perp = [-ax[1], ax[0]];
-
-        // 1. Constrain perpendicular movement (like prismatic)
-        let perp_error = diff[0] * perp[0] + diff[1] * perp[1];
-        let correction = perp_error * 0.5;
-
-        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
-            && ba.is_dynamic()
-        {
-            ba.position[0] += perp[0] * correction;
-            ba.position[1] += perp[1] * correction;
-        }
-        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
-            && bb.is_dynamic()
-        {
-            bb.position[0] -= perp[0] * correction;
-            bb.position[1] -= perp[1] * correction;
-        }
-
-        // 2. Spring force along the axis (suspension)
-        let along = diff[0] * ax[0] + diff[1] * ax[1];
-        let spring_force = stiffness * along;
-
-        let vel_a = self
-            .bodies
-            .get(body_ah(joint.body_a))
-            .map(|b| b.linear_velocity)
-            .unwrap_or([0.0, 0.0]);
-        let vel_b = self
-            .bodies
-            .get(body_ah(joint.body_b))
-            .map(|b| b.linear_velocity)
-            .unwrap_or([0.0, 0.0]);
-        let rel_vel = [vel_b[0] - vel_a[0], vel_b[1] - vel_a[1]];
-        let rel_vel_along = rel_vel[0] * ax[0] + rel_vel[1] * ax[1];
-        let damping_force = damping * rel_vel_along;
-
-        let total_force = spring_force + damping_force;
-        let force = [total_force * ax[0] * dt, total_force * ax[1] * dt];
-
-        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
-            && ba.is_dynamic()
-        {
-            ba.linear_velocity[0] += force[0] * ba.inv_mass;
-            ba.linear_velocity[1] += force[1] * ba.inv_mass;
-        }
-        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
-            && bb.is_dynamic()
-        {
-            bb.linear_velocity[0] -= force[0] * bb.inv_mass;
-            bb.linear_velocity[1] -= force[1] * bb.inv_mass;
-        }
-
-        // No angular constraint — free rotation
-        total_force.abs()
-    }
-
-    /// Rope joint — inequality constraint, only prevents exceeding max distance.
-    fn solve_rope_joint(&mut self, joint: &Joint2d, max_length: f64) -> f64 {
-        let anchor_a = self.world_anchor(joint.body_a, joint.local_anchor_a);
-        let anchor_b = self.world_anchor(joint.body_b, joint.local_anchor_b);
-        let diff = [anchor_b[0] - anchor_a[0], anchor_b[1] - anchor_a[1]];
-        let dist_sq = diff[0] * diff[0] + diff[1] * diff[1];
-
-        if dist_sq < EPSILON_SQ {
-            return 0.0;
-        }
-        let dist = dist_sq.sqrt();
-
-        // Inequality: only act when distance exceeds max_length
-        if dist <= max_length {
-            return 0.0;
-        }
-
-        let n = [diff[0] / dist, diff[1] / dist];
-        let correction = (dist - max_length) * 0.5;
-
-        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
-            && ba.is_dynamic()
-        {
-            ba.position[0] += n[0] * correction;
-            ba.position[1] += n[1] * correction;
-        }
-        if let Some(bb) = self.bodies.get_mut(body_ah(joint.body_b))
-            && bb.is_dynamic()
-        {
-            bb.position[0] -= n[0] * correction;
-            bb.position[1] -= n[1] * correction;
-        }
-        dist - max_length
-    }
-
-    /// Mouse joint — drags body_a toward a world-space target with clamped spring force.
-    fn solve_mouse_joint(
-        &mut self,
-        joint: &Joint2d,
-        target: [f64; 3],
-        stiffness: f64,
-        damping: f64,
-        max_force: f64,
-        dt: f64,
-    ) -> f64 {
-        let anchor_a = self.world_anchor(joint.body_a, joint.local_anchor_a);
-        let target_2d = [target[0], target[1]];
-        let diff = [target_2d[0] - anchor_a[0], target_2d[1] - anchor_a[1]];
-        let dist_sq = diff[0] * diff[0] + diff[1] * diff[1];
-
-        if dist_sq < EPSILON_SQ {
-            return 0.0;
-        }
-
-        // Spring force toward target
-        let spring_force = [stiffness * diff[0], stiffness * diff[1]];
-
-        // Damping force
-        let vel_a = self
-            .bodies
-            .get(body_ah(joint.body_a))
-            .map(|b| b.linear_velocity)
-            .unwrap_or([0.0, 0.0]);
-        let damping_force = [-damping * vel_a[0], -damping * vel_a[1]];
-
-        let mut total = [
-            (spring_force[0] + damping_force[0]) * dt,
-            (spring_force[1] + damping_force[1]) * dt,
-        ];
-
-        // Clamp by max_force
-        let force_mag = (total[0] * total[0] + total[1] * total[1]).sqrt();
-        let max_impulse = max_force * dt;
-        if force_mag > max_impulse && force_mag > EPSILON {
-            let scale = max_impulse / force_mag;
-            total[0] *= scale;
-            total[1] *= scale;
-        }
-
-        if let Some(ba) = self.bodies.get_mut(body_ah(joint.body_a))
-            && ba.is_dynamic()
-        {
-            ba.linear_velocity[0] += total[0] * ba.inv_mass;
-            ba.linear_velocity[1] += total[1] * ba.inv_mass;
-        }
-
-        let applied = (total[0] * total[0] + total[1] * total[1]).sqrt();
-        if dt > EPSILON { applied / dt } else { 0.0 }
     }
 }

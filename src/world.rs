@@ -36,7 +36,19 @@ pub struct PhysicsWorld {
 }
 
 impl PhysicsWorld {
-    /// Create a new physics world.
+    /// Create a validated physics world.
+    ///
+    /// # Errors
+    /// [`ImpetusError::InvalidConfig`](crate::ImpetusError::InvalidConfig) if
+    /// [`WorldConfig::validate`] rejects the config.
+    pub fn try_new(config: WorldConfig) -> crate::Result<Self> {
+        config.validate()?;
+        Ok(Self::new(config))
+    }
+
+    /// Create a new physics world. The config is not validated; see
+    /// [`try_new`](Self::try_new).
+    #[must_use]
     pub fn new(config: WorldConfig) -> Self {
         Self {
             config,
@@ -69,7 +81,7 @@ impl PhysicsWorld {
             let num_sub_steps = self.config.sub_steps.max(1);
             let sub_dt = self.config.timestep / num_sub_steps as f64;
             for _ in 0..num_sub_steps {
-                self.collision_events = self.backend_2d.step(
+                self.backend_2d.step(
                     self.config.gravity,
                     sub_dt,
                     self.config.velocity_iterations,
@@ -83,22 +95,30 @@ impl PhysicsWorld {
                     self.config.solver,
                 );
             }
+            self.collision_events = self.backend_2d.finish_step();
         }
 
+        // The 3D backend always uses the sequential-impulse solver; XPBD
+        // (`SolverKind::Xpbd`) is 2D-only.
         #[cfg(feature = "3d")]
         {
-            self.collision_events = self.backend_3d.step(
-                self.config.gravity,
-                self.config.timestep,
-                self.config.velocity_iterations,
-                self.config.position_iterations,
-                self.config.position_slop,
-                self.config.position_correction,
-                self.config.max_velocity,
-                self.config.constraint_frequency,
-                self.config.constraint_damping_ratio,
-                self.config.broadphase,
-            );
+            let num_sub_steps = self.config.sub_steps.max(1);
+            let sub_dt = self.config.timestep / num_sub_steps as f64;
+            for _ in 0..num_sub_steps {
+                self.backend_3d.step(
+                    self.config.gravity,
+                    sub_dt,
+                    self.config.velocity_iterations,
+                    self.config.position_iterations,
+                    self.config.position_slop,
+                    self.config.position_correction,
+                    self.config.max_velocity,
+                    self.config.constraint_frequency,
+                    self.config.constraint_damping_ratio,
+                    self.config.broadphase,
+                );
+            }
+            self.collision_events = self.backend_3d.finish_step();
         }
 
         #[cfg(not(any(feature = "2d", feature = "3d")))]
@@ -120,17 +140,27 @@ impl PhysicsWorld {
             if !emitter.active {
                 continue;
             }
-            if emitter.rate <= 0.0 {
+            // Non-positive, NaN or infinite rates emit nothing.
+            if !(emitter.rate > 0.0 && emitter.rate.is_finite()) {
                 continue;
             }
             emitter.accumulator += dt;
             let interval = 1.0 / emitter.rate;
+            let mut spawned = 0usize;
             while emitter.accumulator >= interval {
+                if spawned >= MAX_SPAWNS_PER_EMITTER_STEP {
+                    // Drop the backlog rather than carrying it forever.
+                    emitter.accumulator = 0.0;
+                    break;
+                }
+                spawned += 1;
                 emitter.accumulator -= interval;
-                // Golden ratio based spread for both axes
-                let sx = (self.next_particle_id as f64 * 0.618033).fract() * 2.0 - 1.0;
-                let sy = (self.next_particle_id as f64 * 0.381966).fract() * 2.0 - 1.0;
-                let sz = (self.next_particle_id as f64 * 0.291796).fract() * 2.0 - 1.0;
+                // R3 low-discrepancy sequence (generalised golden ratio):
+                // independent, evenly spread offsets on each axis.
+                let n = self.next_particle_id as f64;
+                let sx = (0.5 + n * R3_ALPHA[0]).fract() * 2.0 - 1.0;
+                let sy = (0.5 + n * R3_ALPHA[1]).fract() * 2.0 - 1.0;
+                let sz = (0.5 + n * R3_ALPHA[2]).fract() * 2.0 - 1.0;
                 let vx = emitter.velocity[0] + emitter.velocity_spread[0] * sx;
                 let vy = emitter.velocity[1] + emitter.velocity_spread[1] * sy;
                 let vz = emitter.velocity[2] + emitter.velocity_spread[2] * sz;
@@ -179,7 +209,9 @@ impl PhysicsWorld {
                         if *radius > 0.0 && dist > *radius {
                             continue;
                         }
-                        let force_mag = strength / dist.powf(*falloff);
+                        // Softened so the force stays bounded near the centre.
+                        let force_mag = strength
+                            / (dist_sq + FIELD_SOFTENING * FIELD_SOFTENING).powf(falloff * 0.5);
                         let dir = [dx / dist, dy / dist, dz / dist];
                         p.velocity[0] += dir[0] * force_mag * dt;
                         p.velocity[1] += dir[1] * force_mag * dt;
@@ -208,8 +240,8 @@ impl PhysicsWorld {
                     + p.velocity[2] * p.velocity[2];
                 if speed_sq > 1e-20 {
                     let speed = speed_sq.sqrt();
-                    let drag_force = p.drag * speed_sq;
-                    let factor = (drag_force * dt / speed).min(speed); // clamp to not reverse
+                    // Δv = c·v²·dt, clamped so drag never reverses the motion.
+                    let factor = (p.drag * speed_sq * dt).min(speed);
                     p.velocity[0] -= (p.velocity[0] / speed) * factor;
                     p.velocity[1] -= (p.velocity[1] / speed) * factor;
                     p.velocity[2] -= (p.velocity[2] / speed) * factor;
@@ -306,11 +338,12 @@ impl PhysicsWorld {
                 continue;
             }
 
-            let px = p.position[0];
-            let py = p.position[1];
             let pr = p.radius;
 
             for info in &infos {
+                // Use the live position: earlier contacts this step may have moved it.
+                let px = p.position[0];
+                let py = p.position[1];
                 // AABB pre-check: skip colliders whose AABB doesn't overlap the
                 // particle's bounding box.
                 if px + pr < info.aabb_min[0]
@@ -360,8 +393,9 @@ impl PhysicsWorld {
                     p.position,
                     p.radius,
                     &collider.shape,
-                    rb.position.into(),
-                    collider.offset.into(),
+                    rb.position,
+                    rb.rotation,
+                    collider.offset,
                 );
 
                 if let Some((normal, depth)) = contact {
@@ -814,6 +848,7 @@ impl PhysicsWorld {
 
     /// Capture a snapshot of the current world state for serialization.
     #[cfg(feature = "serialize")]
+    #[must_use]
     pub fn snapshot(&self) -> crate::serialize::WorldSnapshot {
         use crate::serialize::*;
 
@@ -953,9 +988,49 @@ impl PhysicsWorld {
         }
     }
 
-    /// Restore world state from a snapshot. Replaces all current state.
+    /// Largest arena index (body, collider or joint slot) accepted from a
+    /// snapshot. Restoring allocates every slot up to the largest index, so
+    /// this bounds the memory an untrusted snapshot can request.
     #[cfg(feature = "serialize")]
+    pub const MAX_SNAPSHOT_INDEX: u32 = 1 << 20;
+
+    /// Restore world state from a snapshot.
+    ///
+    /// Deprecated: an invalid snapshot is silently ignored (the world is left
+    /// unchanged). Use [`try_restore`](Self::try_restore).
+    #[cfg(feature = "serialize")]
+    #[deprecated(
+        since = "1.4.0",
+        note = "use `try_restore`, which validates the snapshot and reports errors"
+    )]
     pub fn restore(&mut self, snapshot: &crate::serialize::WorldSnapshot) {
+        let _ = self.try_restore(snapshot);
+    }
+
+    /// Restore world state from a snapshot, replacing the bodies, colliders,
+    /// joints, particles, emitters and config.
+    ///
+    /// Not captured by snapshots (planned for 2.0): force fields (left as
+    /// they are), contact manifolds and warm-start impulses, sleep state, and
+    /// the arena free list — so the next handles allocated after a restore
+    /// can differ from the original world's, and the first step after a
+    /// restore re-establishes contacts. In the 3D backend only rotation about
+    /// Z is captured.
+    ///
+    /// # Errors
+    /// The world is left unchanged and an error is returned if the snapshot's
+    /// config fails [`WorldConfig::validate`], a handle is duplicated or has
+    /// an index above [`MAX_SNAPSHOT_INDEX`](Self::MAX_SNAPSHOT_INDEX), or a
+    /// collider or joint refers to a body that isn't in the snapshot.
+    #[cfg(feature = "serialize")]
+    pub fn try_restore(&mut self, snapshot: &crate::serialize::WorldSnapshot) -> crate::Result<()> {
+        validate_snapshot(snapshot)?;
+        self.restore_unchecked(snapshot);
+        Ok(())
+    }
+
+    #[cfg(feature = "serialize")]
+    fn restore_unchecked(&mut self, snapshot: &crate::serialize::WorldSnapshot) {
         self.config = snapshot.config.clone();
         self.next_particle_id = snapshot.next_particle_id;
         self.next_emitter_id = snapshot.next_emitter_id;
@@ -1017,9 +1092,158 @@ impl PhysicsWorld {
     }
 }
 
+/// Reject snapshots that would corrupt a world or exhaust memory on restore.
+#[cfg(feature = "serialize")]
+fn validate_snapshot(snapshot: &crate::serialize::WorldSnapshot) -> crate::Result<()> {
+    use std::collections::BTreeSet;
+
+    use crate::ImpetusError;
+    use crate::joint::JointType;
+
+    snapshot.config.validate()?;
+    let invalid = |what: String| {
+        Err(ImpetusError::Deserialize(format!(
+            "invalid snapshot: {what}"
+        )))
+    };
+    let index_ok = |raw: u64| (raw as u32) <= PhysicsWorld::MAX_SNAPSHOT_INDEX;
+
+    let mut bodies = BTreeSet::new();
+    for b in &snapshot.bodies {
+        if !index_ok(b.handle.0) {
+            return invalid(format!("body handle {:?} index too large", b.handle));
+        }
+        if !bodies.insert(b.handle) {
+            return invalid(format!("duplicate body handle {:?}", b.handle));
+        }
+    }
+    let mut colliders = BTreeSet::new();
+    for c in &snapshot.colliders {
+        if !index_ok(c.handle.0) {
+            return invalid(format!("collider handle {:?} index too large", c.handle));
+        }
+        if !colliders.insert(c.handle) {
+            return invalid(format!("duplicate collider handle {:?}", c.handle));
+        }
+        if !bodies.contains(&c.body) {
+            return invalid(format!(
+                "collider {:?} on missing body {:?}",
+                c.handle, c.body
+            ));
+        }
+    }
+    let mut joints = BTreeSet::new();
+    for j in &snapshot.joints {
+        if !index_ok(j.handle.0) {
+            return invalid(format!("joint handle {:?} index too large", j.handle));
+        }
+        if !joints.insert(j.handle) {
+            return invalid(format!("duplicate joint handle {:?}", j.handle));
+        }
+        let needs_b = !matches!(j.desc.joint_type, JointType::Mouse { .. });
+        if !bodies.contains(&j.desc.body_a) || (needs_b && !bodies.contains(&j.desc.body_b)) {
+            return invalid(format!("joint {:?} on missing body", j.handle));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Particle-vs-collider overlap (circle vs shape)
 // ---------------------------------------------------------------------------
+
+/// Softening length for radial force fields.
+const FIELD_SOFTENING: f64 = 0.01;
+
+/// Most particles one emitter may spawn in a single step.
+const MAX_SPAWNS_PER_EMITTER_STEP: usize = 10_000;
+
+/// R3 sequence increments: 1/φ₃, 1/φ₃², 1/φ₃³ with φ₃ ≈ 1.2207 the plastic-like
+/// root of x⁴ = x + 1 (Roberts, "The Unreasonable Effectiveness of
+/// Quasirandom Sequences").
+const R3_ALPHA: [f64; 3] = [
+    0.819_172_513_396_164_4,
+    0.671_043_606_703_789_2,
+    0.549_700_477_901_970_4,
+];
+
+/// Particle (sphere of `radius`, centre `local` in the box's frame) vs an
+/// axis-aligned box centred at the origin. Returns (normal from box to
+/// particle, depth). A centre inside the box is pushed out through the
+/// nearest face.
+#[cfg(any(feature = "2d", feature = "3d"))]
+fn particle_vs_local_box<const N: usize>(
+    local: [f64; N],
+    radius: f64,
+    half_extents: [f64; N],
+) -> Option<([f64; N], f64)> {
+    let mut diff = [0.0; N];
+    let mut dist_sq = 0.0;
+    let mut inside = true;
+    for i in 0..N {
+        let he = half_extents[i].abs();
+        let c = local[i].clamp(-he, he);
+        diff[i] = local[i] - c;
+        dist_sq += diff[i] * diff[i];
+        inside &= local[i].abs() <= he;
+    }
+    if inside {
+        // Least-penetration axis.
+        let mut axis = 0;
+        let mut pen = f64::INFINITY;
+        for i in 0..N {
+            let p = half_extents[i].abs() - local[i].abs();
+            if p < pen {
+                pen = p;
+                axis = i;
+            }
+        }
+        let mut n = [0.0; N];
+        n[axis] = if local[axis] >= 0.0 { 1.0 } else { -1.0 };
+        return Some((n, pen + radius));
+    }
+    let dist = dist_sq.sqrt();
+    if dist < radius && dist > 1e-12 {
+        Some((diff.map(|d| d / dist), radius - dist))
+    } else {
+        None
+    }
+}
+
+/// Particle vs a round shape: a sphere/circle around the closest point on a
+/// segment `a`–`b` (a point when `a == b`) with radius `shape_radius`.
+#[cfg(any(feature = "2d", feature = "3d"))]
+fn particle_vs_rounded_segment<const N: usize>(
+    pos: [f64; N],
+    radius: f64,
+    a: [f64; N],
+    b: [f64; N],
+    shape_radius: f64,
+) -> Option<([f64; N], f64)> {
+    let mut ab = [0.0; N];
+    let mut ap = [0.0; N];
+    for i in 0..N {
+        ab[i] = b[i] - a[i];
+        ap[i] = pos[i] - a[i];
+    }
+    let len_sq: f64 = ab.iter().map(|x| x * x).sum();
+    let t = if len_sq < 1e-20 {
+        0.0
+    } else {
+        (ap.iter().zip(&ab).map(|(p, q)| p * q).sum::<f64>() / len_sq).clamp(0.0, 1.0)
+    };
+    let mut d = [0.0; N];
+    for i in 0..N {
+        d[i] = pos[i] - (a[i] + ab[i] * t);
+    }
+    let dist = d.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let overlap = radius + shape_radius - dist;
+    if overlap > 0.0 && dist > 1e-12 {
+        Some((d.map(|x| x / dist), overlap))
+    } else {
+        None
+    }
+}
 
 #[cfg(all(feature = "2d", not(feature = "3d")))]
 fn particle_vs_collider_2d(
@@ -1031,66 +1255,42 @@ fn particle_vs_collider_2d(
 ) -> Option<([f64; 2], f64)> {
     use crate::collider::ColliderShape;
 
+    let (sin, cos) = shape_rot.sin_cos();
     match shape {
         ColliderShape::Ball {
             radius: shape_radius,
-        } => {
-            let dx = pos[0] - shape_pos[0];
-            let dy = pos[1] - shape_pos[1];
-            let dist = (dx * dx + dy * dy).sqrt();
-            let overlap = (radius + shape_radius) - dist;
-            if overlap > 0.0 && dist > 1e-10 {
-                Some(([dx / dist, dy / dist], overlap))
-            } else {
-                None
-            }
-        }
+        } => particle_vs_rounded_segment(pos, radius, shape_pos, shape_pos, *shape_radius),
         ColliderShape::Box { half_extents } => {
-            let dx = pos[0] - shape_pos[0];
-            let dy = pos[1] - shape_pos[1];
-            let cx = dx.clamp(-half_extents[0], half_extents[0]);
-            let cy = dy.clamp(-half_extents[1], half_extents[1]);
-            let diff_x = dx - cx;
-            let diff_y = dy - cy;
-            let dist = (diff_x * diff_x + diff_y * diff_y).sqrt();
-            if dist < radius && dist > 1e-10 {
-                Some(([diff_x / dist, diff_y / dist], radius - dist))
-            } else {
-                None
-            }
+            let d = [pos[0] - shape_pos[0], pos[1] - shape_pos[1]];
+            let local = [cos * d[0] + sin * d[1], -sin * d[0] + cos * d[1]];
+            particle_vs_local_box(local, radius, [half_extents[0], half_extents[1]])
+                .map(|(n, depth)| ([cos * n[0] - sin * n[1], sin * n[0] + cos * n[1]], depth))
         }
         ColliderShape::Capsule {
             half_height,
             radius: cap_radius,
         } => {
-            // Capsule = segment with radius. Find closest point on segment to particle.
-            let (sin, cos) = shape_rot.sin_cos();
-            let ep_a = [
+            // Capsule axis is local Y.
+            let a = [
                 shape_pos[0] + sin * half_height,
                 shape_pos[1] - cos * half_height,
             ];
-            let ep_b = [
+            let b = [
                 shape_pos[0] - sin * half_height,
                 shape_pos[1] + cos * half_height,
             ];
-            let ab = [ep_b[0] - ep_a[0], ep_b[1] - ep_a[1]];
-            let len_sq = ab[0] * ab[0] + ab[1] * ab[1];
-            let closest = if len_sq < 1e-20 {
-                ep_a
-            } else {
-                let t = ((pos[0] - ep_a[0]) * ab[0] + (pos[1] - ep_a[1]) * ab[1]) / len_sq;
-                let t = t.clamp(0.0, 1.0);
-                [ep_a[0] + ab[0] * t, ep_a[1] + ab[1] * t]
-            };
-            let dx = pos[0] - closest[0];
-            let dy = pos[1] - closest[1];
-            let dist = (dx * dx + dy * dy).sqrt();
-            let overlap = (radius + cap_radius) - dist;
-            if overlap > 0.0 && dist > 1e-10 {
-                Some(([dx / dist, dy / dist], overlap))
-            } else {
-                None
-            }
+            particle_vs_rounded_segment(pos, radius, a, b, *cap_radius)
+        }
+        ColliderShape::Segment { a, b } => {
+            let wa = [
+                shape_pos[0] + cos * a[0] - sin * a[1],
+                shape_pos[1] + sin * a[0] + cos * a[1],
+            ];
+            let wb = [
+                shape_pos[0] + cos * b[0] - sin * b[1],
+                shape_pos[1] + sin * b[0] + cos * b[1],
+            ];
+            particle_vs_rounded_segment(pos, radius, wa, wb, 0.0)
         }
         _ => None,
     }
@@ -1101,72 +1301,45 @@ fn particle_vs_collider_3d(
     pos: [f64; 3],
     radius: f64,
     shape: &crate::collider::ColliderShape,
-    body_pos: [f64; 3],
-    collider_offset: [f64; 3],
+    body_pos: hisab::DVec3,
+    body_rot: hisab::DQuat,
+    collider_offset: hisab::DVec3,
 ) -> Option<([f64; 3], f64)> {
     use crate::collider::ColliderShape;
+    use hisab::DVec3;
 
-    let shape_pos = [
-        body_pos[0] + collider_offset[0],
-        body_pos[1] + collider_offset[1],
-        body_pos[2] + collider_offset[2],
-    ];
-
+    let center = body_pos + body_rot * collider_offset;
+    let p = DVec3::from_array(pos);
+    let to_world = |n: [f64; 3]| (body_rot * DVec3::from_array(n)).to_array();
     match shape {
         ColliderShape::Ball {
             radius: shape_radius,
         } => {
-            let dx = pos[0] - shape_pos[0];
-            let dy = pos[1] - shape_pos[1];
-            let dz = pos[2] - shape_pos[2];
-            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
-            let overlap = (radius + shape_radius) - dist;
-            if overlap > 0.0 && dist > 1e-10 {
-                Some(([dx / dist, dy / dist, dz / dist], overlap))
-            } else {
-                None
-            }
+            let c = center.to_array();
+            particle_vs_rounded_segment(pos, radius, c, c, *shape_radius)
         }
         ColliderShape::Box { half_extents } => {
-            let dx = pos[0] - shape_pos[0];
-            let dy = pos[1] - shape_pos[1];
-            let dz = pos[2] - shape_pos[2];
-            let he_z = if half_extents.len() > 2 {
-                half_extents[2]
-            } else {
-                0.0
-            };
-            let cx = dx.clamp(-half_extents[0], half_extents[0]);
-            let cy = dy.clamp(-half_extents[1], half_extents[1]);
-            let cz = dz.clamp(-he_z, he_z);
-            let diff_x = dx - cx;
-            let diff_y = dy - cy;
-            let diff_z = dz - cz;
-            let dist = (diff_x * diff_x + diff_y * diff_y + diff_z * diff_z).sqrt();
-            if dist < radius && dist > 1e-10 {
-                Some(([diff_x / dist, diff_y / dist, diff_z / dist], radius - dist))
-            } else {
-                None
-            }
+            let local = (body_rot.inverse() * (p - center)).to_array();
+            particle_vs_local_box(local, radius, *half_extents).map(|(n, d)| (to_world(n), d))
         }
         ColliderShape::Capsule {
             half_height,
             radius: cap_radius,
         } => {
-            // Capsule along Y axis
-            let dy_from_center = pos[1] - shape_pos[1];
-            let closest_y = dy_from_center.clamp(-half_height, *half_height);
-            let closest = [shape_pos[0], shape_pos[1] + closest_y, shape_pos[2]];
-            let dx = pos[0] - closest[0];
-            let dy = pos[1] - closest[1];
-            let dz = pos[2] - closest[2];
-            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
-            let overlap = (radius + cap_radius) - dist;
-            if overlap > 0.0 && dist > 1e-10 {
-                Some(([dx / dist, dy / dist, dz / dist], overlap))
-            } else {
-                None
-            }
+            // Capsule axis is local Y.
+            let axis = body_rot * DVec3::new(0.0, *half_height, 0.0);
+            particle_vs_rounded_segment(
+                pos,
+                radius,
+                (center - axis).to_array(),
+                (center + axis).to_array(),
+                *cap_radius,
+            )
+        }
+        ColliderShape::Segment { a, b } => {
+            let wa = (center + body_rot * DVec3::from_array(*a)).to_array();
+            let wb = (center + body_rot * DVec3::from_array(*b)).to_array();
+            particle_vs_rounded_segment(pos, radius, wa, wb, 0.0)
         }
         _ => None,
     }

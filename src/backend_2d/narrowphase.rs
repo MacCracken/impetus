@@ -49,6 +49,12 @@ pub(super) fn ordered_manifold_key(
 // Narrowphase contact generation
 // ---------------------------------------------------------------------------
 
+/// A contact: (normal from A to B, penetration depth, world-space point).
+pub(super) type Contact2 = ([f64; 2], f64, [f64; 2]);
+
+/// Deepest contact between two shapes, or `None` if they don't touch.
+/// Normal points from A to B.
+#[cfg(test)]
 pub(super) fn generate_contact(
     shape_a: &ColliderShape,
     pos_a: [f64; 2],
@@ -56,34 +62,51 @@ pub(super) fn generate_contact(
     shape_b: &ColliderShape,
     pos_b: [f64; 2],
     rot_b: f64,
-) -> Option<([f64; 2], f64, [f64; 2])> {
+) -> Option<Contact2> {
+    deepest(generate_contacts_multi(
+        shape_a, pos_a, rot_a, shape_b, pos_b, rot_b,
+    ))
+}
+
+/// Whether two shapes touch, without building a manifold when a single
+/// round-shape test answers it (used by overlap queries).
+pub(super) fn shapes_touch(
+    shape_a: &ColliderShape,
+    pos_a: [f64; 2],
+    rot_a: f64,
+    shape_b: &ColliderShape,
+    pos_b: [f64; 2],
+    rot_b: f64,
+) -> bool {
+    if matches!(shape_a, ColliderShape::Ball { .. })
+        || matches!(shape_b, ColliderShape::Ball { .. })
+    {
+        return round_contact(shape_a, pos_a, rot_a, shape_b, pos_b, rot_b).is_some();
+    }
+    !generate_contacts_multi(shape_a, pos_a, rot_a, shape_b, pos_b, rot_b).is_empty()
+}
+
+/// Single-point contact for pairs involving a round shape (Ball, Capsule).
+/// Returns `None` for unsupported pairs. Normal points from A to B.
+fn round_contact(
+    shape_a: &ColliderShape,
+    pos_a: [f64; 2],
+    rot_a: f64,
+    shape_b: &ColliderShape,
+    pos_b: [f64; 2],
+    rot_b: f64,
+) -> Option<Contact2> {
     match (shape_a, shape_b) {
         // Ball vs Ball
         (ColliderShape::Ball { radius: ra }, ColliderShape::Ball { radius: rb }) => {
             circle_circle(pos_a, *ra, pos_b, *rb)
         }
-        // Ball vs Box
+        // Ball vs Box (oriented). `circle_obb` returns box→ball normals.
         (ColliderShape::Ball { radius }, ColliderShape::Box { half_extents }) => {
-            circle_aabb(pos_a, *radius, pos_b, [half_extents[0], half_extents[1]])
+            circle_obb(pos_a, *radius, pos_b, rot_b, he2(half_extents)).map(flip_normal)
         }
         (ColliderShape::Box { half_extents }, ColliderShape::Ball { radius }) => {
-            circle_aabb(pos_b, *radius, pos_a, [half_extents[0], half_extents[1]])
-                .map(|(n, d, p)| ([-n[0], -n[1]], d, p))
-        }
-        // Box vs Box — use OBB-OBB SAT when either box is rotated, fast AABB path otherwise
-        (ColliderShape::Box { half_extents: he_a }, ColliderShape::Box { half_extents: he_b }) => {
-            if rot_a.abs() < EPSILON && rot_b.abs() < EPSILON {
-                aabb_aabb_contact(pos_a, [he_a[0], he_a[1]], pos_b, [he_b[0], he_b[1]])
-            } else {
-                obb_obb_contact(
-                    pos_a,
-                    rot_a,
-                    [he_a[0], he_a[1]],
-                    pos_b,
-                    rot_b,
-                    [he_b[0], he_b[1]],
-                )
-            }
+            circle_obb(pos_b, *radius, pos_a, rot_a, he2(half_extents))
         }
         // Capsule vs Ball
         (
@@ -101,36 +124,6 @@ pub(super) fn generate_contact(
             },
         ) => capsule_circle(pos_b, rot_b, *hh, *cr, pos_a, *br)
             .map(|(n, d, p)| ([-n[0], -n[1]], d, p)),
-        // Capsule vs Box
-        (
-            ColliderShape::Capsule {
-                half_height: hh,
-                radius: cr,
-            },
-            ColliderShape::Box { half_extents },
-        ) => capsule_aabb(
-            pos_a,
-            rot_a,
-            *hh,
-            *cr,
-            pos_b,
-            [half_extents[0], half_extents[1]],
-        ),
-        (
-            ColliderShape::Box { half_extents },
-            ColliderShape::Capsule {
-                half_height: hh,
-                radius: cr,
-            },
-        ) => capsule_aabb(
-            pos_b,
-            rot_b,
-            *hh,
-            *cr,
-            pos_a,
-            [half_extents[0], half_extents[1]],
-        )
-        .map(|(n, d, p)| ([-n[0], -n[1]], d, p)),
         // Capsule vs Capsule
         (
             ColliderShape::Capsule {
@@ -150,20 +143,6 @@ pub(super) fn generate_contact(
             convex_hull_circle(points, pos_b, rot_b, pos_a, *radius)
                 .map(|(n, d, p)| ([-n[0], -n[1]], d, p))
         }
-        // ConvexHull vs ConvexHull
-        (
-            ColliderShape::ConvexHull { points: pts_a },
-            ColliderShape::ConvexHull { points: pts_b },
-        ) => convex_convex_contact(pts_a, pos_a, rot_a, pts_b, pos_b, rot_b),
-        // ConvexHull vs Box (treat box as 4-vertex convex hull)
-        (ColliderShape::ConvexHull { points }, ColliderShape::Box { half_extents }) => {
-            let box_pts = box_to_convex_points(*half_extents);
-            convex_convex_contact(points, pos_a, rot_a, &box_pts, pos_b, rot_b)
-        }
-        (ColliderShape::Box { half_extents }, ColliderShape::ConvexHull { points }) => {
-            let box_pts = box_to_convex_points(*half_extents);
-            convex_convex_contact(&box_pts, pos_a, rot_a, points, pos_b, rot_b)
-        }
         // Segment vs Ball
         (ColliderShape::Segment { a, b }, ColliderShape::Ball { radius }) => {
             segment_circle(pos_a, rot_a, *a, *b, pos_b, *radius)
@@ -172,111 +151,8 @@ pub(super) fn generate_contact(
             segment_circle(pos_b, rot_b, *a, *b, pos_a, *radius)
                 .map(|(n, d, p)| ([-n[0], -n[1]], d, p))
         }
-        // Segment vs Box
-        (ColliderShape::Segment { a, b }, ColliderShape::Box { half_extents }) => segment_box(
-            pos_a,
-            rot_a,
-            *a,
-            *b,
-            pos_b,
-            rot_b,
-            [half_extents[0], half_extents[1]],
-        ),
-        (ColliderShape::Box { half_extents }, ColliderShape::Segment { a, b }) => segment_box(
-            pos_b,
-            rot_b,
-            *a,
-            *b,
-            pos_a,
-            rot_a,
-            [half_extents[0], half_extents[1]],
-        )
-        .map(|(n, d, p)| ([-n[0], -n[1]], d, p)),
         _ => None,
     }
-}
-
-/// ConvexHull vs Circle contact.
-/// `hull_points` are in the hull's local space. `hull_pos`/`hull_rot` transform them to world.
-/// Returns (normal_from_hull_to_circle, depth, contact_point).
-fn convex_hull_circle(
-    hull_points: &[[f64; 3]],
-    hull_pos: [f64; 2],
-    hull_rot: f64,
-    circle_pos: [f64; 2],
-    radius: f64,
-) -> Option<([f64; 2], f64, [f64; 2])> {
-    if hull_points.len() < 2 {
-        return None;
-    }
-
-    let (sin, cos) = hull_rot.sin_cos();
-
-    // Transform hull points to world space (2D)
-    let world_pts: Vec<[f64; 2]> = hull_points
-        .iter()
-        .map(|p| {
-            [
-                hull_pos[0] + cos * p[0] - sin * p[1],
-                hull_pos[1] + sin * p[0] + cos * p[1],
-            ]
-        })
-        .collect();
-
-    // Find closest point on hull perimeter to circle center
-    let n = world_pts.len();
-    let mut best_dist_sq = f64::INFINITY;
-    let mut best_closest = world_pts[0];
-
-    for i in 0..n {
-        let a = world_pts[i];
-        let b = world_pts[(i + 1) % n];
-        let (closest, _) = closest_point_on_segment(a, b, circle_pos);
-        let dx = circle_pos[0] - closest[0];
-        let dy = circle_pos[1] - closest[1];
-        let dist_sq = dx * dx + dy * dy;
-        if dist_sq < best_dist_sq {
-            best_dist_sq = dist_sq;
-            best_closest = closest;
-        }
-    }
-
-    if best_dist_sq >= radius * radius {
-        return None;
-    }
-
-    let dx = circle_pos[0] - best_closest[0];
-    let dy = circle_pos[1] - best_closest[1];
-    let dist = best_dist_sq.sqrt();
-
-    let (normal, depth) = if dist < EPSILON {
-        // Circle center is on the hull edge — find the closest edge and use its outward normal
-        let mut best_edge_normal = [0.0, 1.0];
-        let mut best_edge_dist_sq = f64::INFINITY;
-        for i in 0..n {
-            let a = world_pts[i];
-            let b = world_pts[(i + 1) % n];
-            let (cp, _) = closest_point_on_segment(a, b, circle_pos);
-            let ex = cp[0] - circle_pos[0];
-            let ey = cp[1] - circle_pos[1];
-            let d2 = ex * ex + ey * ey;
-            if d2 < best_edge_dist_sq {
-                best_edge_dist_sq = d2;
-                // Edge outward normal (assuming CCW winding)
-                let edge_dx = b[0] - a[0];
-                let edge_dy = b[1] - a[1];
-                let edge_len = (edge_dx * edge_dx + edge_dy * edge_dy).sqrt();
-                if edge_len > EPSILON {
-                    best_edge_normal = [edge_dy / edge_len, -edge_dx / edge_len];
-                }
-            }
-        }
-        (best_edge_normal, radius)
-    } else {
-        ([dx / dist, dy / dist], radius - dist)
-    };
-
-    Some((normal, depth, best_closest))
 }
 
 pub(super) fn circle_circle(
@@ -341,121 +217,6 @@ pub(super) fn circle_aabb(
 
     let point = [box_pos[0] + closest_x, box_pos[1] + closest_y];
     Some((normal, depth, point))
-}
-
-pub(super) fn aabb_aabb_contact(
-    pos_a: [f64; 2],
-    he_a: [f64; 2],
-    pos_b: [f64; 2],
-    he_b: [f64; 2],
-) -> Option<([f64; 2], f64, [f64; 2])> {
-    let dx = pos_b[0] - pos_a[0];
-    let dy = pos_b[1] - pos_a[1];
-
-    let overlap_x = he_a[0] + he_b[0] - dx.abs();
-    let overlap_y = he_a[1] + he_b[1] - dy.abs();
-
-    if overlap_x <= 0.0 || overlap_y <= 0.0 {
-        return None;
-    }
-
-    let (normal, depth) = if overlap_x < overlap_y {
-        let sign = if dx >= 0.0 { 1.0 } else { -1.0 };
-        ([sign, 0.0], overlap_x)
-    } else {
-        let sign = if dy >= 0.0 { 1.0 } else { -1.0 };
-        ([0.0, sign], overlap_y)
-    };
-
-    let point = [
-        pos_a[0] + normal[0] * he_a[0],
-        pos_a[1] + normal[1] * he_a[1],
-    ];
-    Some((normal, depth, point))
-}
-
-// ---------------------------------------------------------------------------
-// OBB-OBB contact (Separating Axis Theorem for 2D oriented bounding boxes)
-// ---------------------------------------------------------------------------
-
-/// OBB-OBB contact using 2D SAT with 4 separating axes (2 edge normals per box).
-/// Returns (normal_from_a_to_b, penetration_depth, contact_point).
-#[allow(clippy::too_many_arguments)]
-fn obb_obb_contact(
-    pos_a: [f64; 2],
-    rot_a: f64,
-    he_a: [f64; 2],
-    pos_b: [f64; 2],
-    rot_b: f64,
-    he_b: [f64; 2],
-) -> Option<([f64; 2], f64, [f64; 2])> {
-    let (sin_a, cos_a) = rot_a.sin_cos();
-    let (sin_b, cos_b) = rot_b.sin_cos();
-
-    // Local axes for each box
-    let axes_a = [[cos_a, sin_a], [-sin_a, cos_a]];
-    let axes_b = [[cos_b, sin_b], [-sin_b, cos_b]];
-
-    // Centre-to-centre vector
-    let d = [pos_b[0] - pos_a[0], pos_b[1] - pos_a[1]];
-
-    let mut min_overlap = f64::INFINITY;
-    let mut best_axis = [0.0f64; 2];
-
-    // Test all 4 axes (2 per box)
-    let all_axes = [axes_a[0], axes_a[1], axes_b[0], axes_b[1]];
-
-    for axis in &all_axes {
-        // Project half-extents of A onto axis
-        let proj_a = he_a[0] * (axes_a[0][0] * axis[0] + axes_a[0][1] * axis[1]).abs()
-            + he_a[1] * (axes_a[1][0] * axis[0] + axes_a[1][1] * axis[1]).abs();
-        // Project half-extents of B onto axis
-        let proj_b = he_b[0] * (axes_b[0][0] * axis[0] + axes_b[0][1] * axis[1]).abs()
-            + he_b[1] * (axes_b[1][0] * axis[0] + axes_b[1][1] * axis[1]).abs();
-        // Distance between centres along this axis
-        let dist = d[0] * axis[0] + d[1] * axis[1];
-
-        let overlap = proj_a + proj_b - dist.abs();
-        if overlap <= 0.0 {
-            return None; // Separating axis found
-        }
-
-        if overlap < min_overlap {
-            min_overlap = overlap;
-            // Normal should point from A to B
-            if dist >= 0.0 {
-                best_axis = *axis;
-            } else {
-                best_axis = [-axis[0], -axis[1]];
-            }
-        }
-    }
-
-    // Contact point: midpoint of support points on each box's surface toward the other.
-    let cp_a = obb_support_point(pos_a, he_a, &axes_a, best_axis);
-    let cp_b = obb_support_point(pos_b, he_b, &axes_b, [-best_axis[0], -best_axis[1]]);
-    let point = [(cp_a[0] + cp_b[0]) * 0.5, (cp_a[1] + cp_b[1]) * 0.5];
-
-    Some((best_axis, min_overlap, point))
-}
-
-/// Compute the support point of an OBB in a given direction.
-/// Returns the corner of the box that is furthest in `dir`.
-#[inline]
-fn obb_support_point(
-    center: [f64; 2],
-    half_extents: [f64; 2],
-    axes: &[[f64; 2]; 2],
-    dir: [f64; 2],
-) -> [f64; 2] {
-    let mut point = center;
-    for i in 0..2 {
-        let dot = axes[i][0] * dir[0] + axes[i][1] * dir[1];
-        let sign = if dot >= 0.0 { 1.0 } else { -1.0 };
-        point[0] += sign * half_extents[i] * axes[i][0];
-        point[1] += sign * half_extents[i] * axes[i][1];
-    }
-    point
 }
 
 // ---------------------------------------------------------------------------
@@ -565,41 +326,6 @@ fn capsule_circle(
     circle_circle(closest, cap_radius, circle_pos, circle_radius)
 }
 
-/// Capsule vs AABB contact. Treats capsule as circle at closest segment point to box.
-fn capsule_aabb(
-    cap_pos: [f64; 2],
-    cap_rot: f64,
-    half_height: f64,
-    cap_radius: f64,
-    box_pos: [f64; 2],
-    half_extents: [f64; 2],
-) -> Option<([f64; 2], f64, [f64; 2])> {
-    let (ep_a, ep_b) = capsule_endpoints(cap_pos, cap_rot, half_height);
-
-    // Find closest point on capsule segment to box center, then test as circle vs AABB
-    // For better accuracy, test both endpoints and midpoint, take deepest
-    let candidates = [ep_a, ep_b, cap_pos];
-    let mut best: Option<([f64; 2], f64, [f64; 2])> = None;
-
-    for &pt in &candidates {
-        if let Some((n, d, p)) = circle_aabb(pt, cap_radius, box_pos, half_extents)
-            && (best.is_none() || d > best.as_ref().unwrap().1)
-        {
-            best = Some((n, d, p));
-        }
-    }
-
-    // Also test closest point on segment to box center
-    let (closest, _) = closest_point_on_segment(ep_a, ep_b, box_pos);
-    if let Some((n, d, p)) = circle_aabb(closest, cap_radius, box_pos, half_extents)
-        && (best.is_none() || d > best.as_ref().unwrap().1)
-    {
-        best = Some((n, d, p));
-    }
-
-    best
-}
-
 /// Capsule vs capsule contact.
 #[allow(clippy::too_many_arguments)]
 fn capsule_capsule(
@@ -622,18 +348,6 @@ fn capsule_capsule(
 // ConvexHull-vs-ConvexHull (2D SAT)
 // ---------------------------------------------------------------------------
 
-/// Convert a box (half_extents) into 4 convex hull points in local space (CCW).
-fn box_to_convex_points(half_extents: [f64; 3]) -> Vec<[f64; 3]> {
-    let hx = half_extents[0];
-    let hy = half_extents[1];
-    vec![
-        [-hx, -hy, 0.0],
-        [hx, -hy, 0.0],
-        [hx, hy, 0.0],
-        [-hx, hy, 0.0],
-    ]
-}
-
 /// Transform hull points from local to world 2D.
 fn transform_hull(points: &[[f64; 3]], pos: [f64; 2], rot: f64) -> Vec<[f64; 2]> {
     let (sin, cos) = rot.sin_cos();
@@ -646,72 +360,6 @@ fn transform_hull(points: &[[f64; 3]], pos: [f64; 2], rot: f64) -> Vec<[f64; 2]>
             ]
         })
         .collect()
-}
-
-/// 2D SAT (Separating Axis Theorem) for two convex polygons.
-/// Returns (normal_from_a_to_b, penetration_depth, contact_point).
-fn convex_convex_contact(
-    points_a: &[[f64; 3]],
-    pos_a: [f64; 2],
-    rot_a: f64,
-    points_b: &[[f64; 3]],
-    pos_b: [f64; 2],
-    rot_b: f64,
-) -> Option<([f64; 2], f64, [f64; 2])> {
-    let world_a = transform_hull(points_a, pos_a, rot_a);
-    let world_b = transform_hull(points_b, pos_b, rot_b);
-
-    if world_a.len() < 2 || world_b.len() < 2 {
-        return None;
-    }
-
-    let mut min_overlap = f64::INFINITY;
-    let mut best_axis = [0.0f64; 2];
-
-    // Centre-to-centre direction for consistent normal orientation
-    let center_d = [pos_b[0] - pos_a[0], pos_b[1] - pos_a[1]];
-
-    // Test edge normals from both polygons
-    for hull in [&world_a, &world_b] {
-        let n = hull.len();
-        for i in 0..n {
-            let j = (i + 1) % n;
-            let edge = [hull[j][0] - hull[i][0], hull[j][1] - hull[i][1]];
-            let len = (edge[0] * edge[0] + edge[1] * edge[1]).sqrt();
-            if len < EPSILON {
-                continue;
-            }
-            // Outward normal (perpendicular to edge)
-            let axis = [-edge[1] / len, edge[0] / len];
-
-            // Project both hulls onto this axis
-            let (min_a, max_a) = project_hull(&world_a, axis);
-            let (min_b, max_b) = project_hull(&world_b, axis);
-
-            let overlap = (max_a.min(max_b)) - (min_a.max(min_b));
-            if overlap <= 0.0 {
-                return None; // Separating axis found
-            }
-
-            if overlap < min_overlap {
-                min_overlap = overlap;
-                // Ensure normal points from A to B
-                let dot = center_d[0] * axis[0] + center_d[1] * axis[1];
-                if dot >= 0.0 {
-                    best_axis = axis;
-                } else {
-                    best_axis = [-axis[0], -axis[1]];
-                }
-            }
-        }
-    }
-
-    // Contact point: average of support points
-    let cp_a = support_point_poly(&world_a, best_axis);
-    let cp_b = support_point_poly(&world_b, [-best_axis[0], -best_axis[1]]);
-    let point = [(cp_a[0] + cp_b[0]) * 0.5, (cp_a[1] + cp_b[1]) * 0.5];
-
-    Some((best_axis, min_overlap, point))
 }
 
 /// Project all points of a 2D polygon onto an axis, return (min, max).
@@ -743,11 +391,504 @@ fn support_point_poly(points: &[[f64; 2]], dir: [f64; 2]) -> [f64; 2] {
 }
 
 // ---------------------------------------------------------------------------
-// One-shot manifold generation — Sutherland-Hodgman clipping
+// Small helpers
 // ---------------------------------------------------------------------------
 
-/// Generate multiple contact points for box-box / convex-convex via edge clipping.
-/// Returns up to 4 contact points (normal, depth, point) with a shared normal.
+#[inline]
+fn he2(he: &[f64; 3]) -> [f64; 2] {
+    [he[0], he[1]]
+}
+
+#[inline]
+fn flip_normal((n, d, p): Contact2) -> Contact2 {
+    ([-n[0], -n[1]], d, p)
+}
+
+#[inline]
+fn dot2(a: [f64; 2], b: [f64; 2]) -> f64 {
+    a[0] * b[0] + a[1] * b[1]
+}
+
+#[inline]
+fn rotate(v: [f64; 2], rot: f64) -> [f64; 2] {
+    let (sin, cos) = rot.sin_cos();
+    [cos * v[0] - sin * v[1], sin * v[0] + cos * v[1]]
+}
+
+/// The deepest contact of a set.
+fn deepest(contacts: impl IntoIterator<Item = Contact2>) -> Option<Contact2> {
+    contacts
+        .into_iter()
+        .fold(None, |best: Option<Contact2>, c| match best {
+            Some(b) if b.1 >= c.1 => Some(b),
+            _ => Some(c),
+        })
+}
+
+/// Twice the signed area of a polygon (positive for counter-clockwise).
+fn signed_area_2x(pts: &[[f64; 2]]) -> f64 {
+    let n = pts.len();
+    (0..n)
+        .map(|i| {
+            let a = pts[i];
+            let b = pts[(i + 1) % n];
+            a[0] * b[1] - b[0] * a[1]
+        })
+        .sum()
+}
+
+/// Outward unit normal of edge `a → b` for a polygon with the given winding
+/// (`+1.0` counter-clockwise, `-1.0` clockwise). `None` for degenerate edges.
+#[inline]
+fn edge_normal(a: [f64; 2], b: [f64; 2], winding: f64) -> Option<[f64; 2]> {
+    let e = [b[0] - a[0], b[1] - a[1]];
+    let len = (e[0] * e[0] + e[1] * e[1]).sqrt();
+    if len < EPSILON {
+        return None;
+    }
+    Some([winding * e[1] / len, -winding * e[0] / len])
+}
+
+// ---------------------------------------------------------------------------
+// Oriented-box queries (computed in the box's local frame)
+// ---------------------------------------------------------------------------
+
+/// Map a contact computed in a box's local frame back to world space.
+#[inline]
+fn box_to_world((n, d, p): Contact2, box_pos: [f64; 2], box_rot: f64) -> Contact2 {
+    (rotate(n, box_rot), d, local_to_world(p, box_pos, box_rot))
+}
+
+/// Circle vs oriented box. Normal points from the box toward the circle.
+fn circle_obb(
+    circle_pos: [f64; 2],
+    radius: f64,
+    box_pos: [f64; 2],
+    box_rot: f64,
+    half_extents: [f64; 2],
+) -> Option<Contact2> {
+    let local = world_to_local(circle_pos, box_pos, box_rot);
+    circle_aabb(local, radius, [0.0, 0.0], half_extents).map(|c| box_to_world(c, box_pos, box_rot))
+}
+
+/// Capsule vs oriented box: one contact per penetrating end cap (so a capsule
+/// lying on a box gets a two-point manifold), falling back to the axis point
+/// nearest the box centre. Normals point from the box toward the capsule.
+#[allow(clippy::too_many_arguments)]
+fn capsule_obb(
+    cap_pos: [f64; 2],
+    cap_rot: f64,
+    half_height: f64,
+    cap_radius: f64,
+    box_pos: [f64; 2],
+    box_rot: f64,
+    half_extents: [f64; 2],
+) -> Vec<Contact2> {
+    let local_pos = world_to_local(cap_pos, box_pos, box_rot);
+    let local_rot = cap_rot - box_rot;
+    let (e0, e1) = capsule_endpoints(local_pos, local_rot, half_height);
+    capsule_end_contacts(e0, e1, |p| {
+        circle_aabb(p, cap_radius, [0.0, 0.0], half_extents)
+    })
+    .into_iter()
+    .map(|c| box_to_world(c, box_pos, box_rot))
+    .collect()
+}
+
+/// Contacts for a capsule (segment `e0`–`e1`) against another shape, using
+/// `circle_test(centre)` for a capsule-radius circle at a given axis point.
+/// Tests both end caps; if neither touches, tests the axis midpoint and the
+/// axis point nearest the origin of the test frame. When the two end caps give
+/// different normals only the deeper one is kept (a manifold shares one
+/// normal).
+fn capsule_end_contacts(
+    e0: [f64; 2],
+    e1: [f64; 2],
+    mut circle_test: impl FnMut([f64; 2]) -> Option<Contact2>,
+) -> Vec<Contact2> {
+    let mut out: Vec<Contact2> = [e0, e1].into_iter().filter_map(&mut circle_test).collect();
+    if out.len() == 2 && dot2(out[0].0, out[1].0) < 0.999 {
+        let keep = if out[0].1 >= out[1].1 { 0 } else { 1 };
+        out = vec![out[keep]];
+    }
+    if out.is_empty() {
+        let mid = [(e0[0] + e1[0]) * 0.5, (e0[1] + e1[1]) * 0.5];
+        let (nearest, _) = closest_point_on_segment(e0, e1, [0.0, 0.0]);
+        out.extend(deepest([mid, nearest].into_iter().filter_map(circle_test)));
+    }
+    out
+}
+
+/// Capsule vs convex hull. Normals point from the hull toward the capsule.
+fn capsule_hull(
+    cap_pos: [f64; 2],
+    cap_rot: f64,
+    half_height: f64,
+    cap_radius: f64,
+    hull_points: &[[f64; 3]],
+    hull_pos: [f64; 2],
+    hull_rot: f64,
+) -> Vec<Contact2> {
+    // Work in the hull's frame so the fallback axis point is "nearest the hull origin".
+    let local_pos = world_to_local(cap_pos, hull_pos, hull_rot);
+    let (e0, e1) = capsule_endpoints(local_pos, cap_rot - hull_rot, half_height);
+    capsule_end_contacts(e0, e1, |p| {
+        convex_hull_circle(hull_points, [0.0, 0.0], 0.0, p, cap_radius)
+    })
+    .into_iter()
+    .map(|c| box_to_world(c, hull_pos, hull_rot))
+    .collect()
+}
+
+/// Capsule vs segment. Normals point from the segment toward the capsule.
+#[allow(clippy::too_many_arguments)]
+fn capsule_segment(
+    cap_pos: [f64; 2],
+    cap_rot: f64,
+    half_height: f64,
+    cap_radius: f64,
+    seg_pos: [f64; 2],
+    seg_rot: f64,
+    seg_a: [f64; 3],
+    seg_b: [f64; 3],
+) -> Vec<Contact2> {
+    let (e0, e1) = capsule_endpoints(cap_pos, cap_rot, half_height);
+    let mut out = Vec::with_capacity(2);
+    for e in [e0, e1] {
+        if let Some(c) = segment_circle(seg_pos, seg_rot, seg_a, seg_b, e, cap_radius) {
+            out.push(c);
+        }
+    }
+    if out.len() == 2 && dot2(out[0].0, out[1].0) < 0.999 {
+        let keep = if out[0].1 >= out[1].1 { 0 } else { 1 };
+        out = vec![out[keep]];
+    }
+    if out.is_empty() {
+        let wa = world_pos(seg_pos, seg_rot, [seg_a[0], seg_a[1]]);
+        let wb = world_pos(seg_pos, seg_rot, [seg_b[0], seg_b[1]]);
+        let (on_seg, on_cap) = closest_points_segments(wa, wb, e0, e1);
+        out.extend(circle_circle(on_seg, 0.0, on_cap, cap_radius));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Convex hull vs circle
+// ---------------------------------------------------------------------------
+
+/// ConvexHull vs Circle contact. `hull_points` are in the hull's local frame
+/// (either winding). Handles a circle centre inside the hull. Returns
+/// (normal from hull to circle, depth, point on the hull surface).
+fn convex_hull_circle(
+    hull_points: &[[f64; 3]],
+    hull_pos: [f64; 2],
+    hull_rot: f64,
+    circle_pos: [f64; 2],
+    radius: f64,
+) -> Option<Contact2> {
+    let n = hull_points.len();
+    if n < 2 {
+        return None;
+    }
+    let pts: Vec<[f64; 2]> = hull_points.iter().map(|p| [p[0], p[1]]).collect();
+    let winding = if signed_area_2x(&pts) < 0.0 {
+        -1.0
+    } else {
+        1.0
+    };
+    let c = world_to_local(circle_pos, hull_pos, hull_rot);
+
+    let mut best_dist_sq = f64::INFINITY;
+    let mut best_closest = pts[0];
+    let mut max_sep = f64::NEG_INFINITY;
+    let mut sep_normal = [0.0, 1.0];
+    for i in 0..n {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        let (cp, _) = closest_point_on_segment(a, b, c);
+        let d2 = (c[0] - cp[0]).powi(2) + (c[1] - cp[1]).powi(2);
+        if d2 < best_dist_sq {
+            best_dist_sq = d2;
+            best_closest = cp;
+        }
+        if let Some(nrm) = edge_normal(a, b, winding) {
+            let sep = dot2(nrm, [c[0] - a[0], c[1] - a[1]]);
+            if sep > max_sep {
+                max_sep = sep;
+                sep_normal = nrm;
+            }
+        }
+    }
+
+    let (normal, depth, point) = if n >= 3 && max_sep <= 0.0 {
+        // Centre inside the hull: push out through the least-penetrated face.
+        let on_face = [
+            c[0] - sep_normal[0] * max_sep,
+            c[1] - sep_normal[1] * max_sep,
+        ];
+        (sep_normal, radius - max_sep, on_face)
+    } else {
+        if best_dist_sq >= radius * radius {
+            return None;
+        }
+        let dist = best_dist_sq.sqrt();
+        if dist < EPSILON {
+            (sep_normal, radius, best_closest)
+        } else {
+            (
+                [
+                    (c[0] - best_closest[0]) / dist,
+                    (c[1] - best_closest[1]) / dist,
+                ],
+                radius - dist,
+                best_closest,
+            )
+        }
+    };
+    Some((
+        rotate(normal, hull_rot),
+        depth,
+        local_to_world(point, hull_pos, hull_rot),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Polygon contacts (Box, ConvexHull, Segment) — reference/incident face clipping
+// ---------------------------------------------------------------------------
+
+/// World-space vertices of a polygon-like shape, counter-clockwise.
+/// Boxes and convex hulls are polygons; a segment is a two-vertex polygon.
+fn polygon_vertices(shape: &ColliderShape, pos: [f64; 2], rot: f64) -> Option<Vec<[f64; 2]>> {
+    match shape {
+        ColliderShape::Box { half_extents } => {
+            let (hx, hy) = (half_extents[0], half_extents[1]);
+            Some(
+                [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]]
+                    .into_iter()
+                    .map(|p| local_to_world(p, pos, rot))
+                    .collect(),
+            )
+        }
+        ColliderShape::ConvexHull { points } if points.len() >= 2 => {
+            let mut v = transform_hull(points, pos, rot);
+            if signed_area_2x(&v) < 0.0 {
+                v.reverse();
+            }
+            Some(v)
+        }
+        ColliderShape::Segment { a, b } => Some(vec![
+            world_pos(pos, rot, [a[0], a[1]]),
+            world_pos(pos, rot, [b[0], b[1]]),
+        ]),
+        _ => None,
+    }
+}
+
+/// Largest separation of `poly2` from any edge of `poly1` (both CCW).
+/// Returns (edge index, separation); separation > 0 means a separating axis.
+fn max_separation(poly1: &[[f64; 2]], poly2: &[[f64; 2]]) -> Option<(usize, f64)> {
+    let n = poly1.len();
+    let mut best: Option<(usize, f64)> = None;
+    for i in 0..n {
+        let v1 = poly1[i];
+        let Some(nrm) = edge_normal(v1, poly1[(i + 1) % n], 1.0) else {
+            continue;
+        };
+        let sep = poly2
+            .iter()
+            .map(|v| dot2(nrm, [v[0] - v1[0], v[1] - v1[1]]))
+            .fold(f64::INFINITY, f64::min);
+        if best.is_none_or(|(_, b)| sep > b) {
+            best = Some((i, sep));
+        }
+    }
+    best
+}
+
+/// Clip segment `v` against the half-plane `normal·p <= offset`.
+/// Returns `None` when fewer than two points remain.
+fn clip_segment(v: [[f64; 2]; 2], normal: [f64; 2], offset: f64) -> Option<[[f64; 2]; 2]> {
+    let d0 = dot2(normal, v[0]) - offset;
+    let d1 = dot2(normal, v[1]) - offset;
+    let mut out = [[0.0; 2]; 2];
+    let mut count = 0;
+    if d0 <= 0.0 {
+        out[count] = v[0];
+        count += 1;
+    }
+    if d1 <= 0.0 {
+        out[count] = v[1];
+        count += 1;
+    }
+    if d0 * d1 < 0.0 && count < 2 {
+        let t = d0 / (d0 - d1);
+        out[count] = [
+            v[0][0] + t * (v[1][0] - v[0][0]),
+            v[0][1] + t * (v[1][1] - v[0][1]),
+        ];
+        count += 1;
+    }
+    (count == 2).then_some(out)
+}
+
+/// Contact manifold between two convex polygons (CCW, ≥2 vertices each),
+/// following the reference/incident face method (Box2D `b2CollidePolygons`).
+///
+/// Returns `None` if a separating axis exists, otherwise up to two contacts
+/// (possibly none if clipping degenerates). Normals point from A to B.
+fn collide_polygons(poly_a: &[[f64; 2]], poly_b: &[[f64; 2]]) -> Option<Vec<Contact2>> {
+    /// Tolerance favouring A as the reference polygon (frame coherence).
+    const REFERENCE_TOLERANCE: f64 = 5e-4;
+
+    let (edge_a, sep_a) = max_separation(poly_a, poly_b)?;
+    if sep_a > 0.0 {
+        return None;
+    }
+    let (edge_b, sep_b) = max_separation(poly_b, poly_a)?;
+    if sep_b > 0.0 {
+        return None;
+    }
+
+    let (ref_poly, inc_poly, ref_edge, flip) = if sep_b > sep_a + REFERENCE_TOLERANCE {
+        (poly_b, poly_a, edge_b, true)
+    } else {
+        (poly_a, poly_b, edge_a, false)
+    };
+
+    let n_ref = ref_poly.len();
+    let v11 = ref_poly[ref_edge];
+    let v12 = ref_poly[(ref_edge + 1) % n_ref];
+    let ref_normal = edge_normal(v11, v12, 1.0)?;
+    let tangent = [-ref_normal[1], ref_normal[0]];
+
+    // Incident edge: the edge of the incident polygon most anti-parallel to the reference normal.
+    let n_inc = inc_poly.len();
+    let mut inc_edge = 0;
+    let mut min_dot = f64::INFINITY;
+    for i in 0..n_inc {
+        if let Some(nrm) = edge_normal(inc_poly[i], inc_poly[(i + 1) % n_inc], 1.0) {
+            let d = dot2(nrm, ref_normal);
+            if d < min_dot {
+                min_dot = d;
+                inc_edge = i;
+            }
+        }
+    }
+    let incident = [inc_poly[inc_edge], inc_poly[(inc_edge + 1) % n_inc]];
+
+    // Clip the incident edge to the reference edge's side planes.
+    let Some(clipped) = clip_segment(incident, [-tangent[0], -tangent[1]], -dot2(tangent, v11))
+        .and_then(|c| clip_segment(c, tangent, dot2(tangent, v12)))
+    else {
+        return Some(Vec::new());
+    };
+
+    let front = dot2(ref_normal, v11);
+    let normal = if flip {
+        [-ref_normal[0], -ref_normal[1]]
+    } else {
+        ref_normal
+    };
+    let contacts = clipped
+        .into_iter()
+        .filter_map(|v| {
+            let sep = dot2(ref_normal, v) - front;
+            (sep <= 0.0).then(|| {
+                // Midway between the incident vertex and the reference face.
+                let p = [
+                    v[0] - ref_normal[0] * sep * 0.5,
+                    v[1] - ref_normal[1] * sep * 0.5,
+                ];
+                (normal, -sep, p)
+            })
+        })
+        .collect();
+    Some(contacts)
+}
+
+/// Single-point SAT contact between two world-space polygons — fallback when
+/// clipping degenerates. Normal points from A to B.
+fn sat_polygon_contact(
+    world_a: &[[f64; 2]],
+    world_b: &[[f64; 2]],
+    center_a: [f64; 2],
+    center_b: [f64; 2],
+) -> Option<Contact2> {
+    let center_d = [center_b[0] - center_a[0], center_b[1] - center_a[1]];
+    let mut min_overlap = f64::INFINITY;
+    let mut best_axis = [0.0f64; 2];
+    for hull in [world_a, world_b] {
+        let n = hull.len();
+        for i in 0..n {
+            let Some(axis) = edge_normal(hull[i], hull[(i + 1) % n], 1.0) else {
+                continue;
+            };
+            let (min_a, max_a) = project_hull(world_a, axis);
+            let (min_b, max_b) = project_hull(world_b, axis);
+            let overlap = max_a.min(max_b) - min_a.max(min_b);
+            if overlap <= 0.0 {
+                return None;
+            }
+            if overlap < min_overlap {
+                min_overlap = overlap;
+                best_axis = if dot2(center_d, axis) >= 0.0 {
+                    axis
+                } else {
+                    [-axis[0], -axis[1]]
+                };
+            }
+        }
+    }
+    if !min_overlap.is_finite() {
+        return None;
+    }
+    let cp_a = support_point_poly(world_a, best_axis);
+    let cp_b = support_point_poly(world_b, [-best_axis[0], -best_axis[1]]);
+    let point = [(cp_a[0] + cp_b[0]) * 0.5, (cp_a[1] + cp_b[1]) * 0.5];
+    Some((best_axis, min_overlap, point))
+}
+
+/// Contacts between two polygon-like shapes (Box, ConvexHull, Segment).
+fn polygon_contacts(
+    shape_a: &ColliderShape,
+    pos_a: [f64; 2],
+    rot_a: f64,
+    shape_b: &ColliderShape,
+    pos_b: [f64; 2],
+    rot_b: f64,
+) -> Vec<Contact2> {
+    let (Some(va), Some(vb)) = (
+        polygon_vertices(shape_a, pos_a, rot_a),
+        polygon_vertices(shape_b, pos_b, rot_b),
+    ) else {
+        return Vec::new();
+    };
+    match collide_polygons(&va, &vb) {
+        None => Vec::new(),
+        Some(contacts) if !contacts.is_empty() => contacts,
+        Some(_) => sat_polygon_contact(&va, &vb, pos_a, pos_b)
+            .into_iter()
+            .collect(),
+    }
+}
+
+#[inline]
+fn is_polygon(shape: &ColliderShape) -> bool {
+    matches!(
+        shape,
+        ColliderShape::Box { .. }
+            | ColliderShape::ConvexHull { .. }
+            | ColliderShape::Segment { .. }
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Contact manifold generation
+// ---------------------------------------------------------------------------
+
+/// All contact points between two shapes (one-shot manifold, up to two points
+/// sharing one normal). Normals point from A to B. Unsupported pairs
+/// (Heightfield, TriMesh) produce no contacts.
 pub(super) fn generate_contacts_multi(
     shape_a: &ColliderShape,
     pos_a: [f64; 2],
@@ -755,395 +896,84 @@ pub(super) fn generate_contacts_multi(
     shape_b: &ColliderShape,
     pos_b: [f64; 2],
     rot_b: f64,
-) -> Vec<([f64; 2], f64, [f64; 2])> {
+) -> Vec<Contact2> {
+    use ColliderShape::{Box as BoxS, Capsule, ConvexHull, Segment};
     match (shape_a, shape_b) {
-        // OBB vs OBB — use clipping for multi-point manifold when rotated
-        (ColliderShape::Box { half_extents: he_a }, ColliderShape::Box { half_extents: he_b }) => {
-            // Only use clipping when at least one box is rotated — axis-aligned
-            // boxes use the fast AABB path (single contact point).
-            if rot_a.abs() < EPSILON && rot_b.abs() < EPSILON {
-                if let Some(c) =
-                    aabb_aabb_contact(pos_a, [he_a[0], he_a[1]], pos_b, [he_b[0], he_b[1]])
-                {
-                    return vec![c];
-                }
-                return vec![];
-            }
-            let result = clip_obb_obb(
-                pos_a,
-                rot_a,
-                [he_a[0], he_a[1]],
-                pos_b,
-                rot_b,
-                [he_b[0], he_b[1]],
-            );
-            if result.is_empty() {
-                // Fallback to SAT single-point if clipping produces no contacts
-                if let Some(c) = obb_obb_contact(
-                    pos_a,
-                    rot_a,
-                    [he_a[0], he_a[1]],
-                    pos_b,
-                    rot_b,
-                    [he_b[0], he_b[1]],
-                ) {
-                    return vec![c];
-                }
-            }
-            result
+        (a, b) if is_polygon(a) && is_polygon(b) => {
+            polygon_contacts(a, pos_a, rot_a, b, pos_b, rot_b)
         }
-        // ConvexHull vs ConvexHull — use clipping
+        // Capsule vs Box / ConvexHull / Segment: helpers return other→capsule normals.
         (
-            ColliderShape::ConvexHull { points: pts_a },
-            ColliderShape::ConvexHull { points: pts_b },
-        ) => clip_convex_convex(pts_a, pos_a, rot_a, pts_b, pos_b, rot_b),
-        // ConvexHull vs Box
-        (ColliderShape::ConvexHull { points }, ColliderShape::Box { half_extents }) => {
-            let box_pts = box_to_convex_points(*half_extents);
-            clip_convex_convex(points, pos_a, rot_a, &box_pts, pos_b, rot_b)
-        }
-        (ColliderShape::Box { half_extents }, ColliderShape::ConvexHull { points }) => {
-            let box_pts = box_to_convex_points(*half_extents);
-            clip_convex_convex(&box_pts, pos_a, rot_a, points, pos_b, rot_b)
-        }
-        // All other shapes: delegate to single-contact generation
-        _ => {
-            if let Some(c) = generate_contact(shape_a, pos_a, rot_a, shape_b, pos_b, rot_b) {
-                vec![c]
-            } else {
-                vec![]
-            }
-        }
+            Capsule {
+                half_height,
+                radius,
+            },
+            BoxS { half_extents },
+        ) => capsule_obb(
+            pos_a,
+            rot_a,
+            *half_height,
+            *radius,
+            pos_b,
+            rot_b,
+            he2(half_extents),
+        )
+        .into_iter()
+        .map(flip_normal)
+        .collect(),
+        (
+            BoxS { half_extents },
+            Capsule {
+                half_height,
+                radius,
+            },
+        ) => capsule_obb(
+            pos_b,
+            rot_b,
+            *half_height,
+            *radius,
+            pos_a,
+            rot_a,
+            he2(half_extents),
+        ),
+        (
+            Capsule {
+                half_height,
+                radius,
+            },
+            ConvexHull { points },
+        ) => capsule_hull(pos_a, rot_a, *half_height, *radius, points, pos_b, rot_b)
+            .into_iter()
+            .map(flip_normal)
+            .collect(),
+        (
+            ConvexHull { points },
+            Capsule {
+                half_height,
+                radius,
+            },
+        ) => capsule_hull(pos_b, rot_b, *half_height, *radius, points, pos_a, rot_a),
+        (
+            Capsule {
+                half_height,
+                radius,
+            },
+            Segment { a, b },
+        ) => capsule_segment(pos_a, rot_a, *half_height, *radius, pos_b, rot_b, *a, *b)
+            .into_iter()
+            .map(flip_normal)
+            .collect(),
+        (
+            Segment { a, b },
+            Capsule {
+                half_height,
+                radius,
+            },
+        ) => capsule_segment(pos_b, rot_b, *half_height, *radius, pos_a, rot_a, *a, *b),
+        _ => round_contact(shape_a, pos_a, rot_a, shape_b, pos_b, rot_b)
+            .into_iter()
+            .collect(),
     }
-}
-
-/// Clip OBB-OBB to produce multi-point manifold via Sutherland-Hodgman.
-#[allow(clippy::too_many_arguments)]
-fn clip_obb_obb(
-    pos_a: [f64; 2],
-    rot_a: f64,
-    he_a: [f64; 2],
-    pos_b: [f64; 2],
-    rot_b: f64,
-    he_b: [f64; 2],
-) -> Vec<([f64; 2], f64, [f64; 2])> {
-    let verts_a = obb_vertices(pos_a, rot_a, he_a);
-    let verts_b = obb_vertices(pos_b, rot_b, he_b);
-    clip_polygons_to_contacts(&verts_a, &verts_b, pos_a, pos_b)
-}
-
-/// Clip convex-convex to produce multi-point manifold.
-fn clip_convex_convex(
-    points_a: &[[f64; 3]],
-    pos_a: [f64; 2],
-    rot_a: f64,
-    points_b: &[[f64; 3]],
-    pos_b: [f64; 2],
-    rot_b: f64,
-) -> Vec<([f64; 2], f64, [f64; 2])> {
-    let verts_a = transform_hull(points_a, pos_a, rot_a);
-    let verts_b = transform_hull(points_b, pos_b, rot_b);
-    if verts_a.len() < 2 || verts_b.len() < 2 {
-        return vec![];
-    }
-    clip_polygons_to_contacts(&verts_a, &verts_b, pos_a, pos_b)
-}
-
-/// Get the 4 vertices of an OBB in world space (CCW order).
-fn obb_vertices(pos: [f64; 2], rot: f64, he: [f64; 2]) -> Vec<[f64; 2]> {
-    let (sin, cos) = rot.sin_cos();
-    let local = [
-        [-he[0], -he[1]],
-        [he[0], -he[1]],
-        [he[0], he[1]],
-        [-he[0], he[1]],
-    ];
-    local
-        .iter()
-        .map(|p| {
-            [
-                pos[0] + cos * p[0] - sin * p[1],
-                pos[1] + sin * p[0] + cos * p[1],
-            ]
-        })
-        .collect()
-}
-
-/// Core clipping: find reference/incident edge, clip, produce contact points.
-fn clip_polygons_to_contacts(
-    verts_a: &[[f64; 2]],
-    verts_b: &[[f64; 2]],
-    center_a: [f64; 2],
-    center_b: [f64; 2],
-) -> Vec<([f64; 2], f64, [f64; 2])> {
-    // SAT to find minimum penetration axis and reference face
-    let center_d = [center_b[0] - center_a[0], center_b[1] - center_a[1]];
-
-    struct FaceQuery {
-        depth: f64,
-        normal: [f64; 2],
-        index: usize,
-    }
-
-    fn find_min_sep(poly: &[[f64; 2]], other: &[[f64; 2]], flip_normal: bool) -> Option<FaceQuery> {
-        let n = poly.len();
-        let mut best: Option<FaceQuery> = None;
-        for i in 0..n {
-            let j = (i + 1) % n;
-            let edge = [poly[j][0] - poly[i][0], poly[j][1] - poly[i][1]];
-            let len = (edge[0] * edge[0] + edge[1] * edge[1]).sqrt();
-            if len < EPSILON {
-                continue;
-            }
-            let mut normal = [-edge[1] / len, edge[0] / len];
-            if flip_normal {
-                normal = [-normal[0], -normal[1]];
-            }
-
-            // Find minimum projection of other polygon's vertices onto this normal
-            // relative to the face
-            let face_d = poly[i][0] * normal[0] + poly[i][1] * normal[1];
-            let mut min_sep = f64::INFINITY;
-            for v in other {
-                let d = v[0] * normal[0] + v[1] * normal[1] - face_d;
-                min_sep = min_sep.min(d);
-            }
-
-            // min_sep < 0 means overlap; we want the axis with the least overlap (most negative)
-            if min_sep > EPSILON {
-                return None; // Separating axis found — no collision
-            }
-
-            let depth = -min_sep;
-            if best.is_none() || depth < best.as_ref().unwrap().depth {
-                best = Some(FaceQuery {
-                    depth,
-                    normal,
-                    index: i,
-                });
-            }
-        }
-        best
-    }
-
-    let query_a = match find_min_sep(verts_a, verts_b, false) {
-        Some(q) => q,
-        None => return vec![],
-    };
-    let query_b = match find_min_sep(verts_b, verts_a, false) {
-        Some(q) => q,
-        None => return vec![],
-    };
-
-    // Choose reference face (the one with less penetration for stability)
-    let (ref_verts, inc_verts, ref_idx, mut normal, _flip) = if query_a.depth <= query_b.depth {
-        (verts_a, verts_b, query_a.index, query_a.normal, false)
-    } else {
-        (verts_b, verts_a, query_b.index, query_b.normal, true)
-    };
-
-    // Ensure normal points from A to B
-    let dot = center_d[0] * normal[0] + center_d[1] * normal[1];
-    if dot < 0.0 {
-        normal = [-normal[0], -normal[1]];
-    }
-
-    // Reference edge
-    let ref_n = ref_verts.len();
-    let v1 = ref_verts[ref_idx];
-    let v2 = ref_verts[(ref_idx + 1) % ref_n];
-
-    // Tangent along reference edge
-    let ref_edge = [v2[0] - v1[0], v2[1] - v1[1]];
-    let ref_len = (ref_edge[0] * ref_edge[0] + ref_edge[1] * ref_edge[1]).sqrt();
-    if ref_len < EPSILON {
-        return vec![];
-    }
-    let tangent = [ref_edge[0] / ref_len, ref_edge[1] / ref_len];
-
-    // Find incident edge on incident polygon (the edge most anti-normal)
-    let inc_n = inc_verts.len();
-    let mut min_dot = f64::INFINITY;
-    let mut inc_idx = 0;
-    for i in 0..inc_n {
-        let j = (i + 1) % inc_n;
-        let edge = [
-            inc_verts[j][0] - inc_verts[i][0],
-            inc_verts[j][1] - inc_verts[i][1],
-        ];
-        let edge_len = (edge[0] * edge[0] + edge[1] * edge[1]).sqrt();
-        if edge_len < EPSILON {
-            continue;
-        }
-        let edge_normal = [-edge[1] / edge_len, edge[0] / edge_len];
-        let d = edge_normal[0] * normal[0] + edge_normal[1] * normal[1];
-        if d < min_dot {
-            min_dot = d;
-            inc_idx = i;
-        }
-    }
-
-    // Clip incident edge against reference face side planes
-    let mut clip_pts = vec![inc_verts[inc_idx], inc_verts[(inc_idx + 1) % inc_n]];
-
-    // Side plane 1: tangent direction, offset at v1
-    let offset1 = tangent[0] * v1[0] + tangent[1] * v1[1];
-    clip_pts = clip_segment_to_line(&clip_pts, tangent, offset1);
-    if clip_pts.is_empty() {
-        return vec![];
-    }
-
-    // Side plane 2: negative tangent direction, offset at v2
-    let neg_tangent = [-tangent[0], -tangent[1]];
-    let offset2 = neg_tangent[0] * v2[0] + neg_tangent[1] * v2[1];
-    clip_pts = clip_segment_to_line(&clip_pts, neg_tangent, offset2);
-    if clip_pts.is_empty() {
-        return vec![];
-    }
-
-    // Keep only points behind the reference face (penetrating)
-    let ref_offset = normal[0] * v1[0] + normal[1] * v1[1];
-    let mut contacts = Vec::new();
-    for pt in &clip_pts {
-        let sep = normal[0] * pt[0] + normal[1] * pt[1] - ref_offset;
-        if sep <= EPSILON {
-            contacts.push((normal, -sep, *pt));
-        }
-    }
-
-    // Reduce to MAX_MANIFOLD_POINTS if needed
-    if contacts.len() > super::types::MAX_MANIFOLD_POINTS {
-        contacts = reduce_contacts(contacts);
-    }
-
-    contacts
-}
-
-/// Sutherland-Hodgman: clip a polygon against a half-plane defined by
-/// normal·p >= offset.
-fn clip_segment_to_line(points: &[[f64; 2]], normal: [f64; 2], offset: f64) -> Vec<[f64; 2]> {
-    let mut output = Vec::with_capacity(points.len() + 1);
-    let n = points.len();
-    for i in 0..n {
-        let a = points[i];
-        let b = points[(i + 1) % n];
-        let da = normal[0] * a[0] + normal[1] * a[1] - offset;
-        let db = normal[0] * b[0] + normal[1] * b[1] - offset;
-
-        if da >= 0.0 {
-            output.push(a);
-        }
-        if (da >= 0.0) != (db >= 0.0) {
-            // Edge crosses the plane — compute intersection
-            let denom = da - db;
-            if denom.abs() > EPSILON {
-                let t = da / denom;
-                output.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
-            }
-        }
-    }
-    output
-}
-
-/// Reduce contacts to MAX_MANIFOLD_POINTS (4) via area maximization.
-/// Selects the subset of points that maximizes the contact area.
-fn reduce_contacts(contacts: Vec<([f64; 2], f64, [f64; 2])>) -> Vec<([f64; 2], f64, [f64; 2])> {
-    let max_pts = super::types::MAX_MANIFOLD_POINTS;
-    if contacts.len() <= max_pts {
-        return contacts;
-    }
-
-    /// Pick the first index not already in `selected`.
-    fn first_unselected(n: usize, selected: &[usize]) -> usize {
-        (0..n).find(|i| !selected.contains(i)).unwrap_or(0)
-    }
-
-    let mut selected = Vec::with_capacity(max_pts);
-    let n = contacts.len();
-
-    // 1. Start with deepest penetration point
-    let deepest = contacts
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    selected.push(deepest);
-
-    // 2. Pick the point farthest from the first
-    let p0 = contacts[deepest].2;
-    let farthest = contacts
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !selected.contains(i))
-        .max_by(|(_, a), (_, b)| {
-            let da = dist_sq_2d(a.2, p0);
-            let db = dist_sq_2d(b.2, p0);
-            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(i, _)| i)
-        .unwrap_or_else(|| first_unselected(n, &selected));
-    selected.push(farthest);
-
-    // 3. Pick point that maximizes triangle area with first two
-    if n > 2 && max_pts > 2 {
-        let p1 = contacts[farthest].2;
-        let third = contacts
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !selected.contains(i))
-            .max_by(|(_, a), (_, b)| {
-                let area_a = triangle_area_2x(p0, p1, a.2).abs();
-                let area_b = triangle_area_2x(p0, p1, b.2).abs();
-                area_a
-                    .partial_cmp(&area_b)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|(i, _)| i)
-            .unwrap_or_else(|| first_unselected(n, &selected));
-        selected.push(third);
-    }
-
-    // 4. Pick point that maximizes quadrilateral area
-    if n > 3 && max_pts > 3 {
-        let p1 = contacts[selected[1]].2;
-        let p2 = contacts[selected[2]].2;
-        let fourth = contacts
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !selected.contains(i))
-            .max_by(|(_, a), (_, b)| {
-                let area_a = quad_area(p0, p1, p2, a.2);
-                let area_b = quad_area(p0, p1, p2, b.2);
-                area_a
-                    .partial_cmp(&area_b)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|(i, _)| i)
-            .unwrap_or_else(|| first_unselected(n, &selected));
-        selected.push(fourth);
-    }
-
-    selected.into_iter().map(|i| contacts[i]).collect()
-}
-
-#[inline]
-fn dist_sq_2d(a: [f64; 2], b: [f64; 2]) -> f64 {
-    (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)
-}
-
-/// 2x signed triangle area (cross product of two edges).
-#[inline]
-fn triangle_area_2x(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
-    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
-}
-
-/// Area metric for selecting the 4th point: sum of triangle areas from the
-/// candidate to each edge of the existing triangle.
-#[inline]
-fn quad_area(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> f64 {
-    // Use the area of the quadrilateral ABDC (sum of two triangles)
-    triangle_area_2x(a, b, d).abs() + triangle_area_2x(b, c, d).abs()
 }
 
 // ---------------------------------------------------------------------------
@@ -1188,70 +1018,6 @@ fn segment_circle(
     };
 
     Some((normal, depth, closest))
-}
-
-/// Segment-vs-Box: find overlap between a line segment and an axis-aligned box.
-#[allow(clippy::too_many_arguments)]
-fn segment_box(
-    seg_pos: [f64; 2],
-    seg_rot: f64,
-    seg_a: [f64; 3],
-    seg_b: [f64; 3],
-    box_pos: [f64; 2],
-    _box_rot: f64,
-    half_extents: [f64; 2],
-) -> Option<([f64; 2], f64, [f64; 2])> {
-    // Transform segment to world space
-    let (sin, cos) = seg_rot.sin_cos();
-    let wa = [
-        seg_pos[0] + cos * seg_a[0] - sin * seg_a[1],
-        seg_pos[1] + sin * seg_a[0] + cos * seg_a[1],
-    ];
-    let wb = [
-        seg_pos[0] + cos * seg_b[0] - sin * seg_b[1],
-        seg_pos[1] + sin * seg_b[0] + cos * seg_b[1],
-    ];
-
-    // Find closest point on segment to box center
-    let (closest_on_seg, _) = closest_point_on_segment(wa, wb, box_pos);
-
-    // Clamp that point to box bounds to find closest point on box
-    let dx = closest_on_seg[0] - box_pos[0];
-    let dy = closest_on_seg[1] - box_pos[1];
-    let cx = dx.clamp(-half_extents[0], half_extents[0]);
-    let cy = dy.clamp(-half_extents[1], half_extents[1]);
-    let box_closest = [box_pos[0] + cx, box_pos[1] + cy];
-
-    // Now find closest point on segment to that box point
-    let (seg_closest, _) = closest_point_on_segment(wa, wb, box_closest);
-
-    let diff_x = seg_closest[0] - box_closest[0];
-    let diff_y = seg_closest[1] - box_closest[1];
-    let dist_sq = diff_x * diff_x + diff_y * diff_y;
-
-    // Segment has zero radius — we need the segment point to be inside the box
-    // or touching it. Check if segment point is inside the box.
-    let rel_x = seg_closest[0] - box_pos[0];
-    let rel_y = seg_closest[1] - box_pos[1];
-
-    if rel_x.abs() <= half_extents[0] && rel_y.abs() <= half_extents[1] {
-        // Segment point is inside the box — push out along minimum penetration axis
-        let pen_x = half_extents[0] - rel_x.abs();
-        let pen_y = half_extents[1] - rel_y.abs();
-        if pen_x < pen_y {
-            let sign = if rel_x >= 0.0 { 1.0 } else { -1.0 };
-            Some(([sign, 0.0], pen_x, seg_closest))
-        } else {
-            let sign = if rel_y >= 0.0 { 1.0 } else { -1.0 };
-            Some(([0.0, sign], pen_y, seg_closest))
-        }
-    } else if dist_sq < EPSILON_SQ {
-        // Touching but not inside — very shallow contact
-        None
-    } else {
-        // Not overlapping
-        None
-    }
 }
 
 #[cfg(test)]
@@ -1322,24 +1088,121 @@ mod tests {
         );
     }
 
+    fn bx(hx: f64, hy: f64) -> ColliderShape {
+        ColliderShape::Box {
+            half_extents: [hx, hy, 0.0],
+        }
+    }
+
+    fn square_hull(h: f64, clockwise: bool) -> ColliderShape {
+        let mut points = vec![[-h, -h, 0.0], [h, -h, 0.0], [h, h, 0.0], [-h, h, 0.0]];
+        if clockwise {
+            points.reverse();
+        }
+        ColliderShape::ConvexHull { points }
+    }
+
+    /// Normal must point from A to B for every box pairing, in both orders.
     #[test]
-    fn contact_reduction_preserves_deepest() {
-        // Create 6 contacts, verify reduction picks the deepest
-        let contacts = vec![
-            ([1.0, 0.0], 0.1, [0.0, 0.0]),
-            ([1.0, 0.0], 0.5, [1.0, 0.0]), // deepest
-            ([1.0, 0.0], 0.2, [0.0, 1.0]),
-            ([1.0, 0.0], 0.3, [1.0, 1.0]),
-            ([1.0, 0.0], 0.15, [0.5, 0.5]),
-            ([1.0, 0.0], 0.05, [0.5, 0.0]),
+    fn box_pair_normals_point_a_to_b() {
+        let ball = ColliderShape::Ball { radius: 0.5 };
+        let cap = ColliderShape::Capsule {
+            half_height: 0.5,
+            radius: 0.25,
+        };
+        let seg = ColliderShape::Segment {
+            a: [-0.5, 0.0, 0.0],
+            b: [0.5, 0.0, 0.0],
+        };
+        let floor = bx(5.0, 0.5);
+        for (other, y) in [(&ball, 0.9), (&cap, 1.2), (&seg, 0.45)] {
+            let (n, d, _) = generate_contact(other, [0.0, y], 0.0, &floor, [0.0, 0.0], 0.0)
+                .expect("other-on-floor contact");
+            assert!(n[1] < -0.99 && d > 0.0, "(X, Box): n = {n:?}");
+            let (n, _, _) = generate_contact(&floor, [0.0, 0.0], 0.0, other, [0.0, y], 0.0)
+                .expect("floor-under-other contact");
+            assert!(n[1] > 0.99, "(Box, X): n = {n:?}");
+        }
+    }
+
+    /// Ball/Capsule vs Box must use the box's rotation.
+    #[test]
+    fn round_vs_rotated_box_respects_rotation() {
+        let thin = bx(1.0, 0.1);
+        let rot = std::f64::consts::FRAC_PI_2; // spans x ∈ [-0.1, 0.1], y ∈ [-1, 1]
+        let ball = ColliderShape::Ball { radius: 0.3 };
+        assert!(generate_contact(&ball, [0.8, 0.0], 0.0, &thin, [0.0, 0.0], rot).is_none());
+        let (n, d, _) = generate_contact(&ball, [0.35, 0.5], 0.0, &thin, [0.0, 0.0], rot)
+            .expect("ball touches rotated box side");
+        assert!(n[0] < -0.99, "n = {n:?}");
+        assert!((d - 0.05).abs() < 1e-9, "d = {d}");
+    }
+
+    /// Two overlapping hulls must collide with a two-point manifold, for
+    /// either winding.
+    #[test]
+    fn hull_hull_two_point_manifold() {
+        for cw in [false, true] {
+            let h = square_hull(1.0, cw);
+            let c = generate_contacts_multi(&h, [0.0, 0.0], 0.0, &h, [0.0, 1.9], 0.0);
+            assert_eq!(c.len(), 2, "cw={cw}: {c:?}");
+            for (n, d, _) in &c {
+                assert!(n[1] > 0.99 && (d - 0.1).abs() < 1e-9, "n={n:?} d={d}");
+            }
+        }
+    }
+
+    /// Nearly flat resting boxes get two contacts, located under the top box.
+    #[test]
+    fn resting_boxes_two_points_under_top_box() {
+        let ground = bx(10.0, 0.5);
+        let small = bx(0.5, 0.5);
+        for rot in [0.0, 1e-3] {
+            let c = generate_contacts_multi(&ground, [0.0, 0.0], 0.0, &small, [8.0, 0.99], rot);
+            assert_eq!(c.len(), 2, "rot={rot}: {c:?}");
+            for (n, _, p) in &c {
+                assert!(n[1] > 0.99, "n = {n:?}");
+                assert!((7.4..=8.6).contains(&p[0]), "p = {p:?}");
+            }
+        }
+    }
+
+    /// A circle centred inside a hull is pushed out through the nearest face.
+    #[test]
+    fn circle_inside_hull_pushes_out() {
+        let pts = vec![
+            [-1.0, -1.0, 0.0],
+            [1.0, -1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [-1.0, 1.0, 0.0],
         ];
-        let reduced = reduce_contacts(contacts);
-        assert!(reduced.len() <= super::super::types::MAX_MANIFOLD_POINTS);
-        // The deepest point (depth=0.5) should be in the result
-        assert!(
-            reduced.iter().any(|(_, d, _)| (*d - 0.5).abs() < 1e-10),
-            "deepest point should be preserved"
-        );
+        let (n, d, _) = convex_hull_circle(&pts, [0.0, 0.0], 0.0, [0.0, 0.8], 0.5).unwrap();
+        assert!(n[1] > 0.99 && (d - 0.7).abs() < 1e-9, "n={n:?} d={d}");
+        assert!(convex_hull_circle(&pts, [0.0, 0.0], 0.0, [0.0, 0.0], 0.2).is_some());
+    }
+
+    /// A capsule lying on a box and a box resting on a segment both get two
+    /// contacts.
+    #[test]
+    fn lying_capsule_and_segment_floor_two_points() {
+        let cap = ColliderShape::Capsule {
+            half_height: 1.0,
+            radius: 0.25,
+        };
+        let floor = bx(5.0, 0.5);
+        let lying = std::f64::consts::FRAC_PI_2;
+        let c = generate_contacts_multi(&floor, [0.0, 0.0], 0.0, &cap, [0.0, 0.74], lying);
+        assert_eq!(c.len(), 2, "{c:?}");
+
+        let seg = ColliderShape::Segment {
+            a: [-5.0, 0.0, 0.0],
+            b: [5.0, 0.0, 0.0],
+        };
+        let c = generate_contacts_multi(&seg, [0.0, 0.0], 0.0, &bx(0.5, 0.5), [1.0, 0.49], 0.0);
+        assert_eq!(c.len(), 2, "{c:?}");
+        for (n, _, _) in &c {
+            assert!(n[1] > 0.99, "n = {n:?}");
+        }
     }
 
     #[test]

@@ -2,59 +2,27 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use impetus::{
-    BodyDesc, BodyType, ColliderDesc, ColliderShape, PhysicsMaterial, PhysicsWorld, WorldConfig,
-};
+use impetus::serialize::{deserialize_world, serialize_world};
+use impetus::{PhysicsWorld, WorldConfig};
 
-/// Feed arbitrary bytes to the world as a JSON snapshot and try to roundtrip.
-/// If deserialization succeeds, verify that re-serialization produces a valid
-/// snapshot and that stepping the restored world does not panic.
+// Feed arbitrary bytes to the snapshot decoder and the config parser.
+//
+// Neither may panic. A snapshot that `try_restore` accepts must produce a
+// world that steps and re-serializes without panicking; a JSON config that
+// passes `WorldConfig::validate` must step.
 fuzz_target!(|data: &[u8]| {
-    // Try to interpret bytes as a JSON WorldConfig (simpler, more likely to parse)
-    if let Ok(text) = std::str::from_utf8(data) {
-        if let Ok(config) = serde_json::from_str::<WorldConfig>(text) {
-            // Valid config: create world with it and step
-            let mut world = PhysicsWorld::new(config);
+    let mut world = PhysicsWorld::new(WorldConfig::default());
+    if deserialize_world(&mut world, data).is_ok() {
+        for _ in 0..3 {
             world.step();
         }
+        let _ = serialize_world(&world);
     }
 
-    // Also test that a real world can survive arbitrary mutations:
-    // Build a small world, serialize, and verify roundtrip
-    if data.len() >= 8 {
-        let mut world = PhysicsWorld::new(WorldConfig::default());
-        let body = world.add_body(BodyDesc {
-            body_type: BodyType::Dynamic,
-            position: [0.0, 0.0, 0.0],
-            ..BodyDesc::default()
-        });
-        world.add_collider(
-            body,
-            ColliderDesc {
-                shape: ColliderShape::Ball { radius: 1.0 },
-                offset: [0.0, 0.0, 0.0],
-                material: PhysicsMaterial::default(),
-                is_sensor: false,
-                mass: None,
-                collision_layer: 0xFFFF_FFFF,
-                collision_mask: 0xFFFF_FFFF,
-            },
-        );
-
-        // Step a number of times dictated by the input
-        let steps = (data[0] as u32) % 10;
-        for _ in 0..steps {
-            world.step();
-        }
-
-        // Verify body state is finite
-        if let Ok(state) = world.get_body_state(body) {
-            for v in &state.position {
-                assert!(v.is_finite());
-            }
-            for v in &state.linear_velocity {
-                assert!(v.is_finite());
-            }
-        }
+    if let Ok(text) = std::str::from_utf8(data)
+        && let Ok(config) = serde_json::from_str::<WorldConfig>(text)
+        && let Ok(mut world) = PhysicsWorld::try_new(config)
+    {
+        world.step();
     }
 });

@@ -1,6 +1,6 @@
 //! PhysicsState2d struct definition and add/remove/get/set methods.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::ImpetusError;
 use crate::arena::Arena;
@@ -24,7 +24,7 @@ pub(crate) struct PhysicsState2d {
     /// Persistent contact manifolds keyed by ordered collider pair.
     pub(super) manifolds: BTreeMap<ManifoldKey, ContactManifold>,
     /// Previous frame's manifold keys for collision event generation.
-    pub(super) prev_manifold_keys: BTreeSet<ManifoldKey>,
+    pub(super) contact_tracker: crate::contact_tracker::ContactTracker,
     /// Union-find structure for simulation islands.
     pub(super) island_manager: IslandManager,
 }
@@ -37,7 +37,7 @@ impl PhysicsState2d {
             joints: Arena::new(),
             body_colliders: BTreeMap::new(),
             manifolds: BTreeMap::new(),
-            prev_manifold_keys: BTreeSet::new(),
+            contact_tracker: crate::contact_tracker::ContactTracker::default(),
             island_manager: IslandManager::new(0),
         }
     }
@@ -59,20 +59,14 @@ impl PhysicsState2d {
         // Insert with placeholder handle, patch after arena assigns slot.
         let collider = Collider2d::from_desc(ColliderHandle(0), body, desc);
 
-        // Accumulate mass properties onto the body
-        if let Some(rb) = self.bodies.get_mut(body_ah(body))
-            && rb.is_dynamic()
-        {
-            let c_mass = collider.compute_mass();
-            let c_inertia = collider.compute_inertia(c_mass);
-            rb.mass += c_mass;
-            rb.inertia += c_inertia;
-            rb.inv_mass = 1.0 / rb.mass;
-            rb.inv_inertia = if rb.fixed_rotation {
-                0.0
-            } else {
-                1.0 / rb.inertia
-            };
+        // Add this collider's mass and inertia (about the body origin) to the
+        // body — the same sum `recompute_mass` would produce.
+        let (m, i_c, cen) = collider.mass_properties();
+        let d = [collider.offset[0] + cen[0], collider.offset[1] + cen[1]];
+        if let Some(rb) = self.bodies.get_mut(body_ah(body)) {
+            rb.mass += m;
+            rb.inertia += i_c + m * (d[0] * d[0] + d[1] * d[1]);
+            rb.refresh_inverse_mass();
         }
 
         let ah = self.colliders.insert(collider);
@@ -84,8 +78,40 @@ impl PhysicsState2d {
         handle
     }
 
+    /// Recompute a body's mass and rotational inertia from its colliders.
+    ///
+    /// The body origin is treated as the centre of mass; each collider's
+    /// inertia is shifted to it with the parallel-axis theorem. Only dynamic
+    /// bodies get a non-zero inverse mass.
+    pub(super) fn recompute_mass(&mut self, body: BodyHandle) {
+        let mut mass = 0.0_f64;
+        let mut inertia = 0.0_f64;
+        if let Some(handles) = self.body_colliders.get(&body) {
+            for ch in handles {
+                if let Some(c) = self.colliders.get(coll_ah(*ch)) {
+                    let (m, i_c, cen) = c.mass_properties();
+                    let d = [c.offset[0] + cen[0], c.offset[1] + cen[1]];
+                    mass += m;
+                    inertia += i_c + m * (d[0] * d[0] + d[1] * d[1]);
+                }
+            }
+        }
+        let Some(rb) = self.bodies.get_mut(body_ah(body)) else {
+            return;
+        };
+        rb.mass = mass;
+        rb.inertia = inertia;
+        rb.refresh_inverse_mass();
+    }
+
     pub fn add_joint(&mut self, desc: &JointDesc) -> JointHandle {
-        let ah = self.joints.insert(Joint2d {
+        let joint = self.joint_from_desc(desc);
+        joint_from(self.joints.insert(joint))
+    }
+
+    fn joint_from_desc(&self, desc: &JointDesc) -> Joint2d {
+        let rot = |h: BodyHandle| self.bodies.get(body_ah(h)).map_or(0.0, |b| b.rotation);
+        Joint2d {
             body_a: desc.body_a,
             body_b: desc.body_b,
             joint_type: desc.joint_type.clone(),
@@ -94,8 +120,8 @@ impl PhysicsState2d {
             motor: desc.motor.clone(),
             damping: desc.damping,
             break_force: desc.break_force,
-        });
-        joint_from(ah)
+            reference_angle: rot(desc.body_b) - rot(desc.body_a),
+        }
     }
 
     pub fn apply_force(&mut self, body: BodyHandle, force: &Force) {
@@ -137,7 +163,34 @@ impl PhysicsState2d {
         }
     }
 
+    /// Wake a body and everything touching or jointed to it — used before
+    /// removals so bodies resting on the removed object don't hang in the air.
+    fn wake_neighbours(&mut self, body: BodyHandle) {
+        let mut wake: Vec<BodyHandle> = vec![body];
+        for m in self.manifolds.values() {
+            if m.body_a == body {
+                wake.push(m.body_b);
+            } else if m.body_b == body {
+                wake.push(m.body_a);
+            }
+        }
+        for (_, j) in self.joints.iter() {
+            if j.body_a == body {
+                wake.push(j.body_b);
+            } else if j.body_b == body {
+                wake.push(j.body_a);
+            }
+        }
+        for h in wake {
+            if let Some(rb) = self.bodies.get_mut(body_ah(h)) {
+                rb.is_sleeping = false;
+                rb.sleep_timer = 0.0;
+            }
+        }
+    }
+
     pub fn remove_body(&mut self, handle: BodyHandle) {
+        self.wake_neighbours(handle);
         self.bodies.remove(body_ah(handle));
         if let Some(collider_handles) = self.body_colliders.remove(&handle) {
             for ch in &collider_handles {
@@ -158,6 +211,7 @@ impl PhysicsState2d {
             .remove(coll_ah(handle))
             .ok_or_else(|| ImpetusError::ColliderNotFound(format!("{:?}", handle)))?;
         let body = collider.body;
+        self.wake_neighbours(body);
 
         // Remove from parent body's collider list
         if let Some(list) = self.body_colliders.get_mut(&body) {
@@ -169,43 +223,23 @@ impl PhysicsState2d {
             .retain(|(a, b), _| *a != handle && *b != handle);
 
         // Recompute mass/inertia from remaining colliders
-        if let Some(rb) = self.bodies.get_mut(body_ah(body))
-            && rb.is_dynamic()
-        {
-            let mut mass = 0.0_f64;
-            let mut inertia = 0.0_f64;
-            if let Some(collider_handles) = self.body_colliders.get(&body) {
-                for ch in collider_handles {
-                    if let Some(c) = self.colliders.get(coll_ah(*ch)) {
-                        let cm = c.compute_mass();
-                        mass += cm;
-                        inertia += c.compute_inertia(cm);
-                    }
-                }
-            }
-            rb.mass = mass;
-            rb.inertia = inertia;
-            if mass > 0.0 {
-                rb.inv_mass = 1.0 / mass;
-                rb.inv_inertia = if rb.fixed_rotation {
-                    0.0
-                } else {
-                    1.0 / inertia
-                };
-            } else {
-                rb.inv_mass = 0.0;
-                rb.inv_inertia = 0.0;
-            }
-        }
+        self.recompute_mass(body);
 
         Ok(())
     }
 
     /// Remove a joint by handle.
     pub fn remove_joint(&mut self, handle: JointHandle) -> Result<(), ImpetusError> {
-        self.joints
+        let joint = self
+            .joints
             .remove(joint_ah(handle))
             .ok_or_else(|| ImpetusError::JointNotFound(format!("{:?}", handle)))?;
+        for h in [joint.body_a, joint.body_b] {
+            if let Some(rb) = self.bodies.get_mut(body_ah(h)) {
+                rb.is_sleeping = false;
+                rb.sleep_timer = 0.0;
+            }
+        }
         Ok(())
     }
 
@@ -227,40 +261,17 @@ impl PhysicsState2d {
         desc: &ColliderDesc,
     ) {
         let collider = Collider2d::from_desc(handle, body, desc);
-        if let Some(rb) = self.bodies.get_mut(body_ah(body))
-            && rb.is_dynamic()
-        {
-            let c_mass = collider.compute_mass();
-            let c_inertia = collider.compute_inertia(c_mass);
-            rb.mass += c_mass;
-            rb.inertia += c_inertia;
-            rb.inv_mass = 1.0 / rb.mass;
-            rb.inv_inertia = if rb.fixed_rotation {
-                0.0
-            } else {
-                1.0 / rb.inertia
-            };
+        if self.colliders.insert_at(coll_ah(handle), collider) {
+            self.body_colliders.entry(body).or_default().push(handle);
+            self.recompute_mass(body);
         }
-        self.colliders.insert_at(coll_ah(handle), collider);
-        self.body_colliders.entry(body).or_default().push(handle);
     }
 
     /// Insert a joint at a specific handle (for snapshot restore).
     #[cfg(feature = "serialize")]
     pub fn add_joint_at(&mut self, handle: JointHandle, desc: &JointDesc) {
-        self.joints.insert_at(
-            joint_ah(handle),
-            Joint2d {
-                body_a: desc.body_a,
-                body_b: desc.body_b,
-                joint_type: desc.joint_type.clone(),
-                local_anchor_a: desc.local_anchor_a,
-                local_anchor_b: desc.local_anchor_b,
-                motor: desc.motor.clone(),
-                damping: desc.damping,
-                break_force: desc.break_force,
-            },
-        );
+        let joint = self.joint_from_desc(desc);
+        self.joints.insert_at(joint_ah(handle), joint);
     }
 
     pub fn body_count(&self) -> usize {
@@ -311,26 +322,15 @@ impl PhysicsState2d {
             .get_mut(body_ah(handle))
             .ok_or_else(|| ImpetusError::BodyNotFound(format!("{:?}", handle)))?;
         rb.body_type = body_type;
-        // Reset mass properties if switching to/from static
-        match body_type {
-            BodyType::Static | BodyType::Kinematic => {
-                rb.inv_mass = 0.0;
-                rb.inv_inertia = 0.0;
-                rb.linear_velocity = [0.0, 0.0];
-                rb.angular_velocity = 0.0;
-            }
-            BodyType::Dynamic => {
-                // Recompute from colliders if mass is zero
-                if rb.mass > 0.0 {
-                    rb.inv_mass = 1.0 / rb.mass;
-                    rb.inv_inertia = if rb.fixed_rotation {
-                        0.0
-                    } else {
-                        1.0 / rb.inertia
-                    };
-                }
-            }
+        rb.is_sleeping = false;
+        rb.sleep_timer = 0.0;
+        if matches!(body_type, BodyType::Static | BodyType::Kinematic) {
+            rb.linear_velocity = [0.0, 0.0];
+            rb.angular_velocity = 0.0;
         }
+        // Mass properties depend on the body type (only dynamic bodies have
+        // finite mass); a body created static gets its mass here.
+        self.recompute_mass(handle);
         Ok(())
     }
 }

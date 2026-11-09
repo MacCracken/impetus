@@ -59,6 +59,21 @@ fn circle_aabb_inside() {
     assert!(d > 0.0);
 }
 
+fn aabb_aabb_contact(
+    pa: [f64; 2],
+    ha: [f64; 2],
+    pb: [f64; 2],
+    hb: [f64; 2],
+) -> Option<([f64; 2], f64, [f64; 2])> {
+    let a = ColliderShape::Box {
+        half_extents: [ha[0], ha[1], 0.0],
+    };
+    let b = ColliderShape::Box {
+        half_extents: [hb[0], hb[1], 0.0],
+    };
+    generate_contact(&a, pa, 0.0, &b, pb, 0.0)
+}
+
 #[test]
 fn aabb_aabb_overlap() {
     let r = aabb_aabb_contact([0.0, 0.0], [1.0, 1.0], [1.5, 0.0], [1.0, 1.0]);
@@ -649,7 +664,7 @@ fn sensor_generates_events_no_physics() {
     );
 
     let vel_before = state.bodies.get(body_ah(ball)).unwrap().linear_velocity;
-    let events = state.step(
+    let events = state.step_frame(
         [0.0, 0.0, 0.0],
         1.0 / 60.0,
         4,
@@ -684,7 +699,7 @@ fn kinematic_body_moves_from_velocity() {
     });
 
     let dt = 1.0 / 60.0;
-    state.step(
+    state.step_frame(
         [0.0, -9.81, 0.0],
         dt,
         4,
@@ -748,7 +763,7 @@ fn remove_body_cleans_collision_pairs() {
     );
 
     // Step to generate collision manifolds
-    state.step(
+    state.step_frame(
         [0.0, 0.0, 0.0],
         1.0 / 60.0,
         4,
@@ -867,7 +882,7 @@ fn body_falls_asleep_when_stationary() {
     let dt = 1.0 / 60.0;
     let steps_needed = (SLEEP_TIME_THRESHOLD / dt).ceil() as usize + 10;
     for _ in 0..steps_needed {
-        state.step(
+        state.step_frame(
             [0.0, 0.0, 0.0],
             dt,
             4,
@@ -914,7 +929,7 @@ fn sleeping_body_skips_integration() {
 
     let pos_before = state.bodies.get(body_ah(bh)).unwrap().position;
     // Step with gravity — sleeping body should not move
-    state.step(
+    state.step_frame(
         [0.0, -9.81, 0.0],
         1.0 / 60.0,
         4,
@@ -1029,7 +1044,7 @@ fn moving_body_does_not_sleep() {
 
     // Step many times — body is moving so should not sleep
     for _ in 0..100 {
-        state.step(
+        state.step_frame(
             [0.0, 0.0, 0.0],
             1.0 / 60.0,
             4,
@@ -1115,7 +1130,7 @@ fn contact_wakes_sleeping_body() {
 
     // Step until contact
     for _ in 0..60 {
-        state.step(
+        state.step_frame(
             [0.0, 0.0, 0.0],
             1.0 / 60.0,
             4,
@@ -1181,7 +1196,7 @@ fn collision_layers_prevent_collision() {
         },
     );
 
-    let events = state.step(
+    let events = state.step_frame(
         [0.0, 0.0, 0.0],
         1.0 / 60.0,
         4,
@@ -1240,7 +1255,7 @@ fn collision_layers_allow_same_layer() {
         },
     );
 
-    let events = state.step(
+    let events = state.step_frame(
         [0.0, 0.0, 0.0],
         1.0 / 60.0,
         4,
@@ -1299,7 +1314,7 @@ fn collision_layers_asymmetric_mask() {
         },
     );
 
-    let events = state.step(
+    let events = state.step_frame(
         [0.0, 0.0, 0.0],
         1.0 / 60.0,
         4,
@@ -1358,7 +1373,7 @@ fn collision_layers_default_collide_everything() {
         },
     );
 
-    let events = state.step(
+    let events = state.step_frame(
         [0.0, 0.0, 0.0],
         1.0 / 60.0,
         4,
@@ -1637,7 +1652,7 @@ fn manifold_persistence() {
 
     // Run enough steps for the box to fall and make contact with the floor
     for _ in 0..60 {
-        state.step(
+        state.step_frame(
             [0.0, -9.81, 0.0],
             1.0 / 60.0,
             8,
@@ -1732,7 +1747,7 @@ fn warm_start_stabilizes_stack() {
 
     let dt = 1.0 / 60.0;
     for _ in 0..300 {
-        state.step(
+        state.step_frame(
             [0.0, -9.81, 0.0],
             dt,
             8,
@@ -1805,7 +1820,7 @@ fn wheel_joint_constrains_perpendicular() {
     });
 
     for _ in 0..60 {
-        state.step(
+        state.step_frame(
             [0.0, -9.81, 0.0],
             1.0 / 60.0,
             4,
@@ -1871,7 +1886,7 @@ fn rope_joint_allows_closer_than_max() {
 
     let initial_y = state.bodies.get(body_ah(b)).unwrap().position[1];
     for _ in 0..30 {
-        state.step(
+        state.step_frame(
             [0.0, -9.81, 0.0],
             1.0 / 60.0,
             4,
@@ -1933,7 +1948,7 @@ fn rope_joint_prevents_exceeding_max_length() {
     });
 
     for _ in 0..120 {
-        state.step(
+        state.step_frame(
             [0.0, -9.81, 0.0],
             1.0 / 60.0,
             4,
@@ -2002,7 +2017,7 @@ fn mouse_joint_drags_body_toward_target() {
     });
 
     for _ in 0..120 {
-        state.step(
+        state.step_frame(
             [0.0, 0.0, 0.0],
             1.0 / 60.0,
             4,
@@ -2069,7 +2084,7 @@ fn joint_breaking_removes_joint() {
     assert!(state.joints.contains(joint_ah(jh)));
 
     for _ in 0..10 {
-        state.step(
+        state.step_frame(
             [0.0, -9.81, 0.0],
             1.0 / 60.0,
             4,
@@ -2130,7 +2145,7 @@ fn joint_not_broken_when_force_below_threshold() {
     });
 
     for _ in 0..10 {
-        state.step(
+        state.step_frame(
             [0.0, -9.81, 0.0],
             1.0 / 60.0,
             4,
@@ -2227,7 +2242,7 @@ fn multi_point_manifold() {
     let mut found_impulse = false;
     let mut max_points = 0;
     for _ in 0..120 {
-        state.step(
+        state.step_frame(
             [0.0, -9.81, 0.0],
             dt,
             8,
@@ -2362,7 +2377,7 @@ fn simulation_islands_sleep() {
     let dt = 1.0 / 60.0;
     let steps_needed = (SLEEP_TIME_THRESHOLD / dt).ceil() as usize + 30;
     for _ in 0..steps_needed {
-        state.step(
+        state.step_frame(
             [0.0, 0.0, 0.0],
             dt,
             4,
@@ -2385,7 +2400,7 @@ fn simulation_islands_sleep() {
 
     // Wake cluster B by applying a force
     state.apply_force(body_b1, &Force::new(100.0, 0.0, 0.0));
-    state.step(
+    state.step_frame(
         [0.0, 0.0, 0.0],
         dt,
         4,
@@ -2475,7 +2490,7 @@ fn static_friction_holds() {
     // Let the box settle on the floor
     let dt = 1.0 / 60.0;
     for _ in 0..60 {
-        state.step(
+        state.step_frame(
             [0.0, -9.81, 0.0],
             dt,
             8,
@@ -2495,7 +2510,7 @@ fn static_friction_holds() {
     // Apply a small horizontal force — should be held by static friction
     for _ in 0..30 {
         state.apply_force(box_body, &Force::new(1.0, 0.0, 0.0));
-        state.step(
+        state.step_frame(
             [0.0, -9.81, 0.0],
             dt,
             8,
@@ -2723,7 +2738,7 @@ fn xpbd_ball_on_floor_rests() {
 
     let dt = 1.0 / 60.0;
     for _ in 0..300 {
-        state.step(
+        state.step_frame(
             [0.0, -9.81, 0.0],
             dt,
             20,
@@ -2769,7 +2784,7 @@ fn xpbd_zero_gravity_no_drift() {
 
     let dt = 1.0 / 60.0;
     for _ in 0..60 {
-        state.step(
+        state.step_frame(
             [0.0, 0.0, 0.0],
             dt,
             4,
@@ -2842,7 +2857,7 @@ fn xpbd_distance_joint_maintains_length() {
 
     let dt = 1.0 / 60.0;
     for _ in 0..120 {
-        state.step(
+        state.step_frame(
             [0.0, 0.0, 0.0],
             dt,
             8,

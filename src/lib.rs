@@ -34,8 +34,14 @@ mod backend_2d;
 #[cfg(feature = "3d")]
 mod backend_3d;
 
+// Shared backend infrastructure (only needed when a backend is compiled).
+#[cfg(any(feature = "2d", feature = "3d"))]
 mod aabb_tree;
+#[cfg(any(feature = "2d", feature = "3d"))]
 mod arena;
+#[cfg(any(feature = "2d", feature = "3d"))]
+mod contact_tracker;
+#[cfg(any(feature = "2d", feature = "3d"))]
 mod spatial_hash;
 
 mod error;
@@ -80,6 +86,11 @@ pub use units::{PhysicsUnit, Quantity};
 pub use world::PhysicsWorld;
 
 pub type Result<T> = std::result::Result<T, ImpetusError>;
+
+/// Compiles the README's code blocks as doctests so they can't drift from the API.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 // Compile-time Send + Sync assertions for public types.
 const _: () = {

@@ -28,3 +28,7 @@ Single-contact shapes (ball, capsule, segment) still use the existing `generate_
 - MAX_MANIFOLD_POINTS increased from 2 to 4
 - Block solver (2-point) still handles the common case; manifolds with 3-4 points use the per-point solver path
 - Slightly more narrowphase compute per box-box pair (clipping vs single support point), but fewer solver iterations needed for convergence
+
+## Update (1.4)
+
+The original clipping used inward edge normals, so convex hulls never produced contacts and rotated boxes fell back to a single SAT point. It was replaced by Box2D's reference/incident-face method (`collide_polygons`), which also handles segments as two-vertex polygons and axis-aligned boxes; area-maximising reduction is no longer needed (≤ 2 points in 2D). See also [006](006-manifold-rebuild-per-frame.md).

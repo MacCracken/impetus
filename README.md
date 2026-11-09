@@ -23,17 +23,17 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 ## Features
 
-- **2D and 3D** — feature-gated backends with spatial hash broadphase
+- **2D and 3D** — feature-gated backends with spatial hash or dynamic AABB tree broadphase
 - **Native f64** — full double precision via hisab's DVec3/DQuat
-- **Deterministic** — fixed timestep, reproducible simulation for replay and network sync
-- **Serializable** — bincode world snapshots for save/load and network state transfer
+- **Deterministic** — fixed timestep and ordered (BTree) iteration: the same inputs on the same platform give bit-identical results
+- **Serializable** — bitcode world snapshots for save/load and state transfer, validated on restore
 - **Physics particles** — debris, projectiles with gravity, drag, collider interaction, emitters
-- **Spring animation** — standalone damped harmonic oscillator (1D/2D/3D) for UI/compositor use
+- **Spring animation** — standalone damped harmonic oscillator (1D/2D/3D) for UI/compositor use, solved exactly so any frame time is stable
 - **Unit-aware** — `Quantity` type with `PhysicsUnit` enum (Newtons, meters, kg, etc.)
 - **Material presets** — ice, rubber, wood, steel, bouncy with physically plausible defaults
-- **Joint system** — fixed, revolute, prismatic, spring, distance constraints
-- **Spatial queries** — raycast with hit point and normal
-- **Collision events** — started/stopped events with contact data
+- **Joint system** — fixed, revolute (limits, motor), prismatic (limits, motor), spring, distance, rope, wheel and mouse joints, with breaking (revolute, prismatic and motors are 2D-only for now)
+- **Spatial queries** — raycast with hit point and normal, sphere/AABB overlap
+- **Collision events** — started/ongoing/stopped events per collider pair, reported once per step
 - **Zero external physics deps** — broadphase, narrowphase, solver all built on hisab
 
 ## Quick Start
@@ -56,6 +56,8 @@ world.add_collider(ball, ColliderDesc {
     material: PhysicsMaterial::rubber(),
     is_sensor: false,
     mass: None,
+    collision_layer: u32::MAX,
+    collision_mask: u32::MAX,
 });
 
 // Add a static floor
@@ -70,6 +72,8 @@ world.add_collider(floor, ColliderDesc {
     material: PhysicsMaterial::wood(),
     is_sensor: false,
     mass: None,
+    collision_layer: u32::MAX,
+    collision_mask: u32::MAX,
 });
 
 // Apply a sideways force and step
@@ -95,9 +99,11 @@ let [x, y] = pos.position();
 | Flag | Default | Description |
 |------|---------|-------------|
 | `2d` | yes | 2D physics backend |
-| `3d` | no | 3D physics backend (uses hisab DVec3/DQuat) |
-| `serialize` | no | bincode world snapshots |
-| `full` | no | all features |
+| `3d` | no | 3D physics backend (uses hisab DVec3/DQuat); takes precedence over `2d` when both are enabled |
+| `serialize` | no | bitcode world snapshots |
+| `full` | no | all features (selects the 3D backend) |
+
+Requires Rust 1.99 or newer (edition 2024).
 
 ## Documentation
 

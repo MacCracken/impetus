@@ -6,6 +6,74 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-09
+
+Audit and repair sweep. Simulation results change: most items below fix
+physically wrong behaviour, so replays recorded with 1.3 will diverge.
+
+### Changed
+- **toolchain** — Rust 1.89 → 1.99.1 (`rust-toolchain.toml`); MSRV 1.89 → 1.99; edition 2024
+- **deps** — hisab 1.3 → 1.4; serde 1.0.229, serde_json 1.0.154, thiserror 2.0.21 (lockfile); CI actions checkout v7, codecov-action v7, action-gh-release v3
+- **ci** — every backend combination is linted and tested (`--all-features` compiles only the 3D backend, so the 2D backend and its tests were never run in CI); coverage merges 2D and 3D runs; README code blocks are doctested
+- **world** — `sub_steps` now applies to the 3D backend too; forces applied before `step()` act over the whole step (were cleared after the first sub-step); collision events are diffed once per step (Started was lost with sub-steps), and a contact that starts and ends within one step reports Started then Stopped
+- **joints (2D)** — velocity-level constraint solver with angular terms, soft springs, clamped motors and limits, interleaved with contacts ([ADR 005](docs/adr/005-velocity-level-joints.md)); Fixed and Prismatic hold their creation-time relative rotation; prismatic/wheel axes are in body A's frame; `break_force` is the linear constraint force in newtons; generic joint `damping` acts on relative angular velocity (revolute, wheel), along the axis (prismatic) or along the anchors (distance, rope)
+- **joints (3D)** — Fixed, Distance, Rope and Wheel are velocity-level, mass-weighted constraints; spring/wheel/mouse/damping forces apply once per sub-step (were multiplied by the iteration count); Fixed also locks rotation; Wheel constrains both axes perpendicular to the suspension (z was ignored); `break_force` compares the reaction force
+- **friction (3D)** — two tangent directions with their own effective mass, clamped to μ·N; static friction holds when the impulse needed to stop slipping fits within μ_s·N
+- **manifolds (2D)** — rebuilt each frame with impulses carried over from matching points, instead of accumulating stale points ([ADR 006](docs/adr/006-manifold-rebuild-per-frame.md))
+- **sleep (2D)** — islands sleep atomically and no longer merge through static or kinematic bodies; sleeping bodies are immovable in the solver and are woken when a contact begins or a neighbour is removed
+- **spring** — `Spring::step` uses the exact closed-form solution (was semi-implicit Euler, which diverged for `k·dt` large enough, e.g. a 0.5 s frame hitch); one long step equals many short ones; the step's transition matrix is cached while `dt`, stiffness and damping are unchanged; non-positive/NaN `dt` is ignored; negative stiffness in the presets is treated as its magnitude (was a debug-only panic)
+- **particles** — drag is quadratic as documented (was linear); emitter spread uses an R3 low-discrepancy sequence (x and y offsets were ~perfectly anti-correlated); radial fields are softened (ε = 0.01) so they stay finite near the centre
+- **mass properties** — collider offsets contribute via the parallel-axis theorem (the body origin is the centre of mass); capsule inertia includes the cap offsets; 2D convex hulls and tri-meshes use their real area and inertia, 3D hulls/meshes their bounding volume (were fixed at 1 m²/m³)
+- **bridge** — `youngs_to_bulk_modulus` returns `f64::INFINITY` at ν ≥ 0.5 (incompressible) instead of 0 or a negative modulus
+- **broadphase** — dynamic AABB tree rebalances (AVL rotations) and traverses iteratively; the spatial hash keeps huge/non-finite AABBs out of the grid
+- **docs** — README (quick start compiles, bitcode not bincode, feature list), architecture overview, testing guide and roadmap brought up to date
+
+### Added
+- **config** — `WorldConfig::validate()` with `MAX_SUB_STEPS` / `MAX_ITERATIONS`
+- **world** — `PhysicsWorld::try_new(config)`; `PhysicsWorld::try_restore(&snapshot)` validates a snapshot (config, unique handles, handle index ≤ `PhysicsWorld::MAX_SNAPSHOT_INDEX`, colliders/joints on existing bodies) before replacing state; `serialize::deserialize_world` uses it
+- **narrowphase (2D)** — Capsule vs ConvexHull, Capsule vs Segment, Segment vs ConvexHull contacts; two-point manifolds for capsules lying on boxes and for boxes resting on segments
+- **raycast** — 2D rays hit segments and convex hulls; 3D rays hit capsules
+- **tests** — `tests/regressions.rs` (30 tests, one per fixed defect, run on whichever backend is built) plus ~60 new unit tests; unit tests went from 271 → 298 (2D build) and 229 → 274 (3D build)
+- **benches** — `stacking/box_stack_10`, `joints/revolute_chain_20`, `broadphase/aabb_tree_1000_row`
+- **fuzz** — `fuzz_serialize` now fuzzes snapshot decoding and validated config parsing
+
+### Deprecated
+- **world** — `PhysicsWorld::restore` (silently ignores invalid snapshots); use `try_restore`
+
+### Fixed
+- **narrowphase** — Ball/Capsule/Segment vs Box normals were inverted in both argument orders (2D and 3D), so balls fell through box floors and box contacts never bounced; these pairs also ignored box rotation (2D)
+- **narrowphase (2D)** — polygon clipping used inward normals, so ConvexHull pairs generated no contacts and rotated boxes got a single point; axis-aligned box contacts sat at the centre of A's face; a circle centred inside a hull got an inward normal (or no contact); hulls wound clockwise misbehaved
+- **narrowphase (3D)** — GJK gave up on collinear initial simplices; EPA returned None at its iteration cap; OBB SAT skipped the 9 edge-edge axes (phantom contacts); box contact points caused spurious torque; segment closest points were wrong when clamped or parallel; capsule-box missed end-cap contacts; hull-sphere treated the hull as a polyline
+- **solver** — restitution was recomputed from the live velocity each iteration (an elastic ball kept approaching at −10 m/s); the block solver skipped the normal impulse when ill-conditioned and dropped coupling terms in its clamping cases; warm-start scaling wasn't stored back; Baumgarte correction was missing `/dt` (≈60× too weak) and every contact point re-applied the full correction; rolling friction scaled with iterations × points; friction clamp could panic on a negative/NaN coefficient
+- **solver (3D)** — body-space inverse inertia was used as world-space (wrong angular response for rotated bodies); friction used the normal effective mass and ignored static friction
+- **bodies** — `set_body_type(Dynamic)` on a body created static/kinematic left it with zero mass (frozen); sleeping bodies kept drifting on residual velocity
+- **joints** — motors panicked (`clamp`) on negative or NaN `max_force`; joint damping could reverse velocities
+- **queries** — 2D/3D raycasts and 2D overlap queries ignored box rotation; rays starting inside a box reported the entry normal; a zero ray direction cast along +Y in 3D
+- **particles** — an infinite emitter rate hung `step()` (spawns are capped per step); fast particles tunnelled into boxes once their centre was inside; 3D particle collisions ignored body rotation; 2D particle collisions used a stale position for later colliders
+- **snapshots** — a hostile snapshot could request a ~4 billion-slot allocation, double-count mass with duplicate handles, or insert orphan colliders; restore was O(n²) in the number of entities
+- **broadphase** — the AABB tree degenerated into a list for sorted inserts (O(n²) pairs, recursion depth n); a NaN or infinite AABB made the spatial hash loop over ~4 billion cells
+- **removal (2D)** — removing a body, collider or joint now wakes what was resting on it
+- **library code** — remaining `unwrap()` / `unreachable!()` / `debug_assert!` in library paths replaced
+
+### Known limitations (planned for 2.0)
+- Snapshots don't capture force fields, contact manifolds, sleep state, arena free-list order, or 3D orientation beyond Z — see the roadmap's 2.0 section
+- 3D Revolute, Prismatic and motors are accepted but have no effect; 3D has no islands
+- XPBD (2D only) lacks prismatic/wheel/mouse joints, motors, limits and breaking
+
+### Performance
+Measured with `./scripts/bench-history.sh` on the same machine, baseline = this
+release's toolchain/dependency update before any repairs (2026-11-09T08:48Z),
+final = 2026-11-09T09:49Z. (The 1.99 toolchain itself was checked against 1.89
+on this machine and benchmarks the same.)
+
+- world/step_empty: 140.3 ns → 114.9 ns (−18%)
+- queries/raycast_100_bodies: 1.06 µs → 0.96 µs (−9%), with rotated boxes, segments and hulls now hittable
+- particles/step_1000_particles: 6.46 µs → 5.49 µs (−15%)
+- springs/spring_settle_frames: 1.77 µs → 1.47 µs (−17%); spring_1d_step 4.95 ns → 4.98 ns (exact step at Euler cost via the cached transition)
+- world/step_100_bodies 99.6 µs → 100.6 µs, step_1000_bodies 844 µs → 853 µs (≈ +1%, noise level)
+- **Slower, by design:** substep/step_100_bodies_substep4 455 µs → 628 µs (+38%) — the balls in this bench used to fall through the box floor (inverted normals) and now come to rest on it, so the step solves a full contact pile; mutation/set_body_type 4.3 ns → 14.1 ns (recomputes mass instead of leaving a body frozen); springs/spring_2d_step 5.0 ns → 6.0 ns; queries/overlap_sphere_100_bodies 1.25 µs → 1.34 µs (+8%, precise rotated tests)
+- New: stacking/box_stack_10 10.5 µs, joints/revolute_chain_20 14.3 µs, broadphase/aabb_tree_1000_row 506 µs (the unbalanced tree was O(n²) for sorted inserts)
+
 ## [1.3.0]
 
 ### Added
@@ -132,6 +200,9 @@ Initial public release.
 - CI: check, security audit, cargo-deny, test (Linux/macOS/Windows), MSRV 1.89, coverage, doc, semver
 - Supply-chain hardening: cargo-vet config, cargo-deny strict mode
 
-[Unreleased]: https://github.com/MacCracken/impetus/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/MacCracken/impetus/compare/v0.23.3...v1.0.0
-[0.23.3]: https://github.com/MacCracken/impetus/releases/tag/v0.23.3
+[Unreleased]: https://github.com/MacCracken/impetus/compare/1.4.0...HEAD
+[1.4.0]: https://github.com/MacCracken/impetus/compare/1.3.0...1.4.0
+[1.3.0]: https://github.com/MacCracken/impetus/compare/1.2.0...1.3.0
+[1.2.0]: https://github.com/MacCracken/impetus/compare/1.1.0...1.2.0
+[1.0.0]: https://github.com/MacCracken/impetus/compare/0.23.3...1.0.0
+[0.23.3]: https://github.com/MacCracken/impetus/releases/tag/0.23.3

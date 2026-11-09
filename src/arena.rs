@@ -39,6 +39,9 @@ pub(crate) struct Arena<T> {
     entries: Vec<Entry<T>>,
     free_head: Option<u32>,
     len: usize,
+    /// Set by `insert_at`: the free list must be rebuilt before the next
+    /// `insert` (keeps bulk restore O(n) instead of O(n²)).
+    free_list_stale: bool,
 }
 
 #[allow(dead_code)]
@@ -48,37 +51,37 @@ impl<T> Arena<T> {
             entries: Vec::new(),
             free_head: None,
             len: 0,
+            free_list_stale: false,
         }
     }
 
     /// Insert a value, returning its handle.
     pub fn insert(&mut self, value: T) -> ArenaHandle {
+        if self.free_list_stale {
+            self.rebuild_free_list();
+        }
         self.len += 1;
 
-        if let Some(free_idx) = self.free_head {
-            // Reuse a free slot
-            let idx = free_idx as usize;
-            let generation = match &self.entries[idx] {
-                Entry::Free {
-                    next_free,
-                    generation,
-                } => {
-                    self.free_head = *next_free;
-                    *generation
-                }
-                Entry::Occupied { .. } => unreachable!(),
-            };
-            self.entries[idx] = Entry::Occupied { value, generation };
-            ArenaHandle::new(free_idx, generation)
-        } else {
-            // Append new slot
-            let idx = self.entries.len() as u32;
-            self.entries.push(Entry::Occupied {
-                value,
-                generation: 0,
-            });
-            ArenaHandle::new(idx, 0)
+        // Reuse a free slot if the free list points at one.
+        if let Some(free_idx) = self.free_head
+            && let Some(Entry::Free {
+                next_free,
+                generation,
+            }) = self.entries.get(free_idx as usize)
+        {
+            let generation = *generation;
+            self.free_head = *next_free;
+            self.entries[free_idx as usize] = Entry::Occupied { value, generation };
+            return ArenaHandle::new(free_idx, generation);
         }
+
+        // Append a new slot.
+        let idx = self.entries.len() as u32;
+        self.entries.push(Entry::Occupied {
+            value,
+            generation: 0,
+        });
+        ArenaHandle::new(idx, 0)
     }
 
     /// Remove a value by handle. Returns the value if the handle was valid.
@@ -107,7 +110,7 @@ impl<T> Arena<T> {
 
         match old {
             Entry::Occupied { value, .. } => Some(value),
-            Entry::Free { .. } => unreachable!(),
+            Entry::Free { .. } => None,
         }
     }
 
@@ -174,53 +177,41 @@ impl<T> Arena<T> {
 
     /// Insert a value at a specific handle (index + generation).
     /// Used for snapshot restore where handles must be preserved.
-    /// Grows the entries vector if needed. Returns false if the slot is
-    /// already occupied (caller bug).
+    /// Grows the entries vector if needed (new gaps are free slots of
+    /// generation 0). Returns false if the slot is already occupied.
+    ///
+    /// The free list is rebuilt lazily on the next [`insert`](Self::insert),
+    /// so restoring `n` entries is O(n + max index). Callers must bound the
+    /// index: it allocates up to `index + 1` slots.
     pub fn insert_at(&mut self, handle: ArenaHandle, value: T) -> bool {
         let idx = handle.index() as usize;
-        let target_gen = handle.generation();
-
-        // Grow if necessary, filling with free slots
-        while self.entries.len() <= idx {
-            self.entries.push(Entry::Free {
-                next_free: self.free_head,
+        if idx >= self.entries.len() {
+            self.entries.resize_with(idx + 1, || Entry::Free {
+                next_free: None,
                 generation: 0,
             });
-            self.free_head = Some((self.entries.len() - 1) as u32);
+        } else if matches!(self.entries[idx], Entry::Occupied { .. }) {
+            return false;
         }
-
-        // If the slot is currently free, remove it from the free list
-        match &self.entries[idx] {
-            Entry::Free { .. } => {
-                self.rebuild_free_list_excluding(idx as u32);
-            }
-            Entry::Occupied { .. } => return false,
-        }
-
         self.entries[idx] = Entry::Occupied {
             value,
-            generation: target_gen,
+            generation: handle.generation(),
         };
         self.len += 1;
+        self.free_list_stale = true;
         true
     }
 
-    /// Rebuild the free list, excluding a specific index.
-    fn rebuild_free_list_excluding(&mut self, exclude: u32) {
+    /// Rebuild the free list from the entries (lowest index first).
+    fn rebuild_free_list(&mut self) {
         self.free_head = None;
         for i in (0..self.entries.len()).rev() {
-            if i as u32 == exclude {
-                continue;
-            }
-            if let Entry::Free { generation, .. } = &self.entries[i] {
-                let g = *generation;
-                self.entries[i] = Entry::Free {
-                    next_free: self.free_head,
-                    generation: g,
-                };
+            if let Entry::Free { next_free, .. } = &mut self.entries[i] {
+                *next_free = self.free_head;
                 self.free_head = Some(i as u32);
             }
         }
+        self.free_list_stale = false;
     }
 
     /// Remove all entries for which the predicate returns `false`.
@@ -236,11 +227,10 @@ impl<T> Arena<T> {
                 Entry::Free { .. } => false,
             };
             if should_remove {
-                let cur_gen = match &self.entries[idx] {
-                    Entry::Occupied { generation, .. } => *generation,
-                    _ => unreachable!(),
+                let Entry::Occupied { generation, .. } = &self.entries[idx] else {
+                    continue;
                 };
-                let new_gen = cur_gen.wrapping_add(1);
+                let new_gen = generation.wrapping_add(1);
                 self.entries[idx] = Entry::Free {
                     next_free: self.free_head,
                     generation: new_gen,

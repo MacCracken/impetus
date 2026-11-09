@@ -41,12 +41,19 @@ pub fn deformation_velocity_to_strain_rate(velocity_ms: f64, length_m: f64) -> f
 /// Convert Young's modulus (Pa) and Poisson's ratio to bulk modulus (Pa).
 ///
 /// K = E / (3 × (1 - 2ν))
+///
+/// ν ≥ 0.5 is the incompressible limit and returns `f64::INFINITY` (for
+/// E > 0; 0 otherwise) rather than a zero or negative modulus.
 #[must_use]
 #[inline]
 pub fn youngs_to_bulk_modulus(youngs_modulus_pa: f64, poisson_ratio: f64) -> f64 {
     let denom = 3.0 * (1.0 - 2.0 * poisson_ratio);
-    if denom.abs() < 1e-15 {
-        return 0.0;
+    if denom <= 1e-15 {
+        return if youngs_modulus_pa > 0.0 {
+            f64::INFINITY
+        } else {
+            0.0
+        };
     }
     youngs_modulus_pa / denom
 }
@@ -90,9 +97,13 @@ pub fn angular_to_tangential_velocity(angular_vel_rads: f64, radius_m: f64) -> f
 /// Convert body segment mass (kg) and dimensions (length, width, depth in m)
 /// to a box inertia tensor diagonal `[Ixx, Iyy, Izz]` (kg·m²).
 ///
+/// Axes: length along X, width along Y, depth along Z. (Note that
+/// [`segment_to_cylinder_inertia`] puts the length along Y.)
+///
 /// Uses the solid rectangular box formula:
 /// `Ixx = m/12 × (w² + d²)`, `Iyy = m/12 × (l² + d²)`, `Izz = m/12 × (l² + w²)`
 #[must_use]
+#[inline]
 pub fn segment_to_box_inertia(mass_kg: f64, length_m: f64, width_m: f64, depth_m: f64) -> [f64; 3] {
     let m12 = mass_kg / 12.0;
     let l2 = length_m * length_m;
@@ -125,9 +136,11 @@ pub fn muscle_force_to_joint_torque(force_n: f64, moment_arm_m: f64) -> f64 {
 
 /// Convert bone segment to cylinder inertia tensor diagonal [Ixx, Iyy, Izz] (kg·m²).
 ///
-/// Models a bone as a solid cylinder along Y-axis:
+/// Models a bone as a solid cylinder along the Y axis (unlike
+/// [`segment_to_box_inertia`], whose length is along X):
 /// Ixx = Izz = m/12 × (3r² + h²), Iyy = m/2 × r²
 #[must_use]
+#[inline]
 pub fn segment_to_cylinder_inertia(mass_kg: f64, length_m: f64, radius_m: f64) -> [f64; 3] {
     let r2 = radius_m * radius_m;
     let h2 = length_m * length_m;
@@ -136,10 +149,8 @@ pub fn segment_to_cylinder_inertia(mass_kg: f64, length_m: f64, radius_m: f64) -
     [ixx, iyy, ixx]
 }
 
-/// Convert gait ground reaction force (N) to a downward force vector [0, -F, 0].
-///
-/// GRF acts at the foot contact point, directed into the ground.
-/// Returns the reaction force (upward) that the ground exerts on the body.
+/// Convert gait ground reaction force (N) to the upward force vector
+/// `[0, |F|, 0]` that the ground exerts on the body at the foot contact.
 #[must_use]
 #[inline]
 pub fn gait_grf_to_force_vector(grf_n: f64) -> [f64; 3] {
@@ -151,6 +162,7 @@ pub fn gait_grf_to_force_vector(grf_n: f64) -> [f64; 3] {
 ///
 /// Returns (force_vector, application_point).
 #[must_use]
+#[inline]
 pub fn body_com_gravity(
     com_position: [f64; 3],
     mass_kg: f64,

@@ -1,7 +1,8 @@
 //! Unit-aware physics quantities.
 //!
-//! Bridges abaco-core's UnitCategory with physics quantities so forces are in
-//! Newtons, distances in meters, masses in kilograms — not raw floats.
+//! Lightweight value-plus-unit tags so forces are in Newtons, distances in
+//! meters, masses in kilograms — not raw floats. (No unit arithmetic or
+//! conversion beyond degrees → radians.)
 
 use serde::{Deserialize, Serialize};
 
@@ -34,49 +35,71 @@ pub enum PhysicsUnit {
 
 impl Quantity {
     /// Create a quantity with the given value and unit.
+    #[must_use]
+    #[inline]
     pub fn new(value: f64, unit: PhysicsUnit) -> Self {
         Self { value, unit }
     }
 
     /// Create a distance quantity in meters.
+    #[must_use]
+    #[inline]
     pub fn meters(value: f64) -> Self {
         Self::new(value, PhysicsUnit::Meters)
     }
     /// Create a mass quantity in kilograms.
+    #[must_use]
+    #[inline]
     pub fn kilograms(value: f64) -> Self {
         Self::new(value, PhysicsUnit::Kilograms)
     }
     /// Create a time quantity in seconds.
+    #[must_use]
+    #[inline]
     pub fn seconds(value: f64) -> Self {
         Self::new(value, PhysicsUnit::Seconds)
     }
     /// Create a force quantity in Newtons.
+    #[must_use]
+    #[inline]
     pub fn newtons(value: f64) -> Self {
         Self::new(value, PhysicsUnit::Newtons)
     }
     /// Create an energy quantity in Joules.
+    #[must_use]
+    #[inline]
     pub fn joules(value: f64) -> Self {
         Self::new(value, PhysicsUnit::Joules)
     }
     /// Create an angle quantity in radians.
+    #[must_use]
+    #[inline]
     pub fn radians(value: f64) -> Self {
         Self::new(value, PhysicsUnit::Radians)
     }
     /// Create an angle quantity in degrees.
+    #[must_use]
+    #[inline]
     pub fn degrees(value: f64) -> Self {
         Self::new(value, PhysicsUnit::Degrees)
     }
     /// Create a velocity quantity in meters per second.
+    #[must_use]
+    #[inline]
     pub fn meters_per_second(value: f64) -> Self {
         Self::new(value, PhysicsUnit::MetersPerSecond)
     }
     /// Create a pressure quantity in Pascals.
+    #[must_use]
+    #[inline]
     pub fn pascals(value: f64) -> Self {
         Self::new(value, PhysicsUnit::Pascals)
     }
 
-    /// Convert degrees to radians.
+    /// The value in radians for angle quantities (degrees are converted).
+    /// Non-angle quantities return their raw value unchanged.
     #[must_use]
+    #[inline]
     pub fn to_radians(&self) -> f64 {
         match self.unit {
             PhysicsUnit::Degrees => self.value * std::f64::consts::PI / 180.0,

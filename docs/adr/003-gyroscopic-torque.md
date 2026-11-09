@@ -23,3 +23,7 @@ This is the implicit Euler form — subtracting `ω × (I·ω)` from the torque 
 - Negligible performance cost (one cross product and one matrix-vector multiply per dynamic body per step)
 - Bodies with uniform inertia are unaffected
 - Existing tests continue to pass because the term is zero for symmetric shapes
+
+## Update (1.4)
+
+The explicit term mixed the body-frame inertia tensor with world-frame angular velocity and could add energy. It is now evaluated in the body frame with one implicit (backward-Euler) Newton step and projected back onto the pre-step rotational kinetic energy, since the gyroscopic term does no work. Angular impulses everywhere use the world-space inverse inertia `R·I⁻¹·Rᵀ`.
