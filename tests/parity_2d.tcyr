@@ -1045,6 +1045,52 @@ fn _par_broadphase(fp, fl): i64 {
     return 0;
 }
 
+# ── M2b: the 2D backend's types ─────────────────────────────────────────────────────
+# `b2::body_mass`: a body from its type and fixed_rotation, each collider (shape, offset, density,
+# explicit mass) added in order as state.rs's add_collider does; the output is the body's mass,
+# inertia and inverses.
+
+fn _par_b2_mass(fp, fl): i64 {
+    if (_par_eq(fp, fl, "b2::body_mass") != 1) { return 0; }
+    var bd: ImBodyDesc = ImBodyDesc_default();
+    bd.body_type = _par_in_enum(0, "BodyType.", &body_type_name, 3);
+    bd.fixed_rotation = _par_in(1);
+    var b: ImRigidBody2d = ImRigidBody2d_from_desc(0, bd);
+    var n = _par_in(2);
+    var k = 3;
+    for (var j = 0; j < n; j = j + 1) {
+        var sh: ImColliderShape = _im_shape(IM_SHAPE_BALL);
+        k = _par_in_shape(k, &sh);
+        var d: ImColliderDesc = ImColliderDesc_new(sh);
+        var ox: f64 = _par_in(k);
+        var oy: f64 = _par_in(k + 1);
+        var den: f64 = _par_in(k + 2);
+        d.offset = ImVec3_new(ox, oy, 0.0);
+        var mat: ImPhysicsMaterial = ImPhysicsMaterial_default();
+        mat.density = den;
+        d.material = mat;
+        if (_par_in_is_none(k + 3) == 0) {
+            var ms: f64 = _par_in(k + 3);
+            d.has_mass = 1;
+            d.mass = ms;
+        }
+        var c: ImCollider2d = ImCollider2d_from_desc(j, 0, d);
+        _im_b2_add_collider_mass(&b, &c);
+        c.free();
+        sh.free();
+        k = k + 4;
+    }
+    var m: f64 = b.mass;
+    var i: f64 = b.inertia;
+    var im: f64 = b.inv_mass;
+    var ii: f64 = b.inv_inertia;
+    _par_got_f(m);
+    _par_got_f(i);
+    _par_got_f(im);
+    _par_got_f(ii);
+    return 1;
+}
+
 # `f64::fmt_display` and `serde_json::f64` rows: src/fmtf.cyr's two layouts (ADR 0010).
 fn _par_fmtf(fp, fl): i64 {
     var x: f64 = _par_in(0);
@@ -1408,6 +1454,7 @@ fn _par_json(fp, fl): i64 {
 fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_got_n = 0;
     _par_mapped = 0;
+    if (_par_eq(mp, ml, "b2_mass") == 1) { return _par_b2_mass(fp, fl); }
     if (_par_eq(mp, ml, "broadphase") == 1) { return _par_broadphase(fp, fl); }
     if (_par_eq(mp, ml, "config") == 1) { return _par_config(fp, fl); }
     if (_par_eq(mp, ml, "fmtf") == 1) { return _par_fmtf(fp, fl); }

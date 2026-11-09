@@ -704,6 +704,52 @@ def check_tables(root):
         print(f"crmath_data: current; π and ln 2 to {n} bits, and every table's hi, equal MPFR {MPFR.VERSION}'s")
 
 
+# The private constants t_private.rs extracts: file, Cyrius prefix, consts it doesn't carry.
+PRIVATE_SOURCES = (
+    ("aabb_tree.rs", "_IM_", {"NULL_NODE"}),
+    ("spatial_hash.rs", "_IM_", set()),
+    ("backend_2d/types.rs", "_IM_B2_", {"FALLBACK"}),
+)
+PRIVATE_CONST = re.compile(r"^\s*(?:pub(?:\((?:super|crate)\))?\s+)?const\s+(\w+)\s*:\s*([\w(),\[\]; ]+?)\s*=\s*(.+?);")
+
+
+def check_private(root):
+    """src/constants_private.cyr holds every library const of the ported modules, each equal to
+    Python's own parse of the Rust literal; the b2 floors this script uses are the same values."""
+    before = len(FAILS)
+    cyr = {}
+    for line in (root / "src/constants_private.cyr").read_text().splitlines():
+        m = re.match(r"^(?:var (\w+): f64|const (\w+)) = ([-0-9.]+);$", line)
+        if m:
+            cyr[m.group(1) or m.group(2)] = m.group(3)
+    seen = set()
+    for file, prefix, excused in PRIVATE_SOURCES:
+        src = (root / "rust-old/src" / file).read_text()
+        for marker in ("#[cfg(test)]\nmod tests", "#[cfg(test)]\nmod mass_tests"):
+            src = src.split(marker, 1)[0]
+        for line in src.splitlines():
+            m = PRIVATE_CONST.match(line)
+            if not m or m.group(1) in excused:
+                continue
+            name, ty, lit = prefix + m.group(1), m.group(2), m.group(3).replace("_", "")
+            seen.add(name)
+            if name not in cyr:
+                fail(f"constants_private: {name} (rust-old/src/{file}) is missing")
+            elif ty == "f64":
+                if float(cyr[name]) != float(lit):
+                    fail(f"constants_private: {name} = {cyr[name]}, Rust's literal reads {float(lit)!r}")
+            elif int(cyr[name]) != int(lit):
+                fail(f"constants_private: {name} = {cyr[name]}, Rust's is {lit}")
+    for name in sorted(set(cyr) - seen):
+        fail(f"constants_private: {name} has no const in the listed Rust sources")
+    for name, mine in (("_IM_B2_MIN_MASS", B2_MIN_MASS), ("_IM_B2_MIN_INERTIA", B2_MIN_INERTIA),
+                       ("_IM_B2_EPSILON_SQ", B2_EPSILON_SQ)):
+        if name in cyr and float(cyr[name]) != mine:
+            fail(f"validate.py's {name} differs from the generated one")
+    if len(FAILS) == before:
+        print(f"constants_private: {len(seen)} constants equal Python's parse of the Rust literals")
+
+
 def _pairs_tokens(pairs):
     out = [f"v:{len(pairs)}"]
     for a, b in pairs:
@@ -806,9 +852,141 @@ def check_broadphase(rows):
     return counted
 
 
+# The 2D backend's mass floors and polygon area cut (rust-old/src/backend_2d/types.rs).
+B2_MIN_MASS = 1e-6
+B2_MIN_INERTIA = 1e-10
+B2_EPSILON_SQ = 1e-20
+B2_FALLBACK = (1.0, (0.0, 0.0), 1.0)
+
+
+def _polygon_mass(pts):
+    """`polygon_mass_props` in Rust's expression order: (area, centroid, inertia per unit mass), or None."""
+    if len(pts) < 3:
+        return None
+    o = pts[0]
+    area = cx = cy = i_o = 0.0
+    for w in range(1, len(pts) - 1):
+        e1 = (pts[w][0] - o[0], pts[w][1] - o[1])
+        e2 = (pts[w + 1][0] - o[0], pts[w + 1][1] - o[1])
+        d = e1[0] * e2[1] - e1[1] * e2[0]
+        tri = 0.5 * d
+        area += tri
+        cx += tri * (e1[0] + e2[0]) / 3.0
+        cy += tri * (e1[1] + e2[1]) / 3.0
+        intx2 = e1[0] * e1[0] + e2[0] * e1[0] + e2[0] * e2[0]
+        inty2 = e1[1] * e1[1] + e2[1] * e1[1] + e2[1] * e2[1]
+        i_o += (0.25 / 3.0 * d) * (intx2 + inty2)
+    if abs(area) < B2_EPSILON_SQ or not math.isfinite(area):
+        return None
+    c = (cx / area, cy / area)
+    i_c = i_o / area - (c[0] * c[0] + c[1] * c[1])
+    return (abs(area), (o[0] + c[0], o[1] + c[1]), rust_max(i_c, 0.0))
+
+
+def _b2_shape(ins, k):
+    """The shape at token k (flat::shape's layout): (shape_props, next token)."""
+    kind = ins[k].split(".", 1)[1]
+    k += 1
+    if kind == "Ball":
+        r = tok_f(ins[k])
+        return (math.pi * r * r, (0.0, 0.0), 0.5 * r * r), k + 1
+    if kind == "Box":
+        w = 2.0 * tok_f(ins[k])
+        h = 2.0 * tok_f(ins[k + 1])
+        return (abs(w * h), (0.0, 0.0), (w * w + h * h) / 12.0), k + 3
+    if kind == "Capsule":
+        h, r = abs(tok_f(ins[k])), abs(tok_f(ins[k + 1]))
+        rect_area = 4.0 * h * r
+        circle_area = math.pi * r * r
+        area = rect_area + circle_area
+        if not area > 0.0:
+            return B2_FALLBACK, k + 2
+        lc = 4.0 * r / (3.0 * math.pi)
+        rect_i = rect_area * (4.0 * r * r + 4.0 * h * h) / 12.0
+        circle_i = circle_area * (0.5 * r * r + h * h + 2.0 * h * lc)
+        return (area, (0.0, 0.0), (rect_i + circle_i) / area), k + 2
+    if kind == "Segment":
+        a = (tok_f(ins[k]), tok_f(ins[k + 1]))
+        b = (tok_f(ins[k + 3]), tok_f(ins[k + 4]))
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        ln = rust_sqrt(dx * dx + dy * dy)
+        return (ln * 0.01, ((a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5), ln * ln / 12.0), k + 6
+    if kind == "ConvexHull":
+        n = int(ins[k][2:])
+        pts = [(tok_f(ins[k + 1 + 3 * j]), tok_f(ins[k + 2 + 3 * j])) for j in range(n)]
+        return (_polygon_mass(pts) or B2_FALLBACK), k + 1 + 3 * n
+    if kind == "TriMesh":
+        nv = int(ins[k][2:])
+        verts = [(tok_f(ins[k + 1 + 3 * j]), tok_f(ins[k + 2 + 3 * j])) for j in range(nv)]
+        k += 1 + 3 * nv
+        ni = int(ins[k][2:])
+        tris = [[tok_i(ins[k + 1 + 3 * j + q]) for q in range(3)] for j in range(ni)]
+        k += 1 + 3 * ni
+        area = 0.0
+        c = [0.0, 0.0]
+        second = 0.0
+        for tri in tris:
+            if any(not 0 <= i < nv for i in tri):
+                continue
+            p = _polygon_mass([verts[i] for i in tri])
+            if p is not None:
+                ai, ci, ii = p
+                area += ai
+                c[0] += ai * ci[0]
+                c[1] += ai * ci[1]
+                second += ai * (ii + ci[0] * ci[0] + ci[1] * ci[1])
+        if not area > 0.0:
+            return B2_FALLBACK, k
+        c = (c[0] / area, c[1] / area)
+        return (area, c, rust_max(second / area - c[0] * c[0] - c[1] * c[1], 0.0)), k
+    if kind == "Heightfield":
+        nh = int(ins[k][2:])
+        return B2_FALLBACK, k + 1 + nh + 3
+    fail(f"b2_mass: unknown shape {kind}")
+    return B2_FALLBACK, len(ins)
+
+
+def check_b2_mass(rows):
+    """Recomputes every body's mass, inertia and inverses: shape_props, mass_properties, state.rs's
+    accumulation (parallel-axis shift to the body origin) and refresh_inverse_mass."""
+    counted = 0
+    for fn, cls, ins, outs, note in rows:
+        if fn != "b2::body_mass":
+            fail(f"b2_mass: unknown function {fn}")
+            continue
+        dynamic = ins[0] == "e:BodyType.Dynamic"
+        fixed = tok_i(ins[1]) == 1
+        n = int(ins[2][2:])
+        k = 3
+        mass = inertia = 0.0
+        for _ in range(n):
+            (area, cen, ipm), k = _b2_shape(ins, k)
+            ox, oy, density = tok_f(ins[k]), tok_f(ins[k + 1]), tok_f(ins[k + 2])
+            explicit = None if ins[k + 3] == "n:" else tok_f(ins[k + 3])
+            k += 4
+            m = rust_max(explicit if explicit is not None else area * density, B2_MIN_MASS)
+            ic = rust_max(m * ipm, B2_MIN_INERTIA)
+            dx, dy = ox + cen[0], oy + cen[1]
+            mass += m
+            inertia += ic + m * (dx * dx + dy * dy)
+        inv_m = inv_i = 0.0
+        if dynamic and mass > 0.0 and math.isfinite(mass):
+            inv_m = 1.0 / mass
+            if not (fixed or math.isnan(inertia) or inertia <= 0.0 or not math.isfinite(inertia)):
+                inv_i = 1.0 / inertia
+        if k != len(ins):
+            fail(f"b2_mass: {note}: {len(ins) - k} input tokens left over")
+        want = (mass, inertia, inv_m, inv_i)
+        if not all(same(tok_f(o), w) for o, w in zip(outs, want)) or len(outs) != 4:
+            fail(f"b2_mass: {note}: Python computes {want!r}")
+        counted += 1
+    return counted
+
+
 def main():
     root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
     check_tables(root)
+    check_private(root)
     golden = root / "tests/golden"
     names = sorted(p.stem for p in golden.glob("*.tsv") if not p.name.endswith(".cr.tsv"))
     index = [
@@ -833,6 +1011,8 @@ def main():
             print(f"json: {check_json(rows)} documents checked against Python's json")
         elif name == "broadphase":
             print(f"broadphase: {check_broadphase(rows)} rows recomputed (brute force, rasterisation)")
+        elif name == "b2_mass":
+            print(f"b2_mass: {check_b2_mass(rows)} bodies recomputed (shape_props, parallel-axis sum)")
         elif name == "spring":
             print(f"spring: {check_spring(rows)} rows recomputed (step on Python's libm)")
         elif name in ("config", "material", "units", "force"):

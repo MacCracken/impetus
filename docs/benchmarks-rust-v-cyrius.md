@@ -116,3 +116,43 @@ M3.
 - The query does the same per leaf.
 - The hash is 2.4× faster than the tree on this layout, which is what the structures predict for uniform boxes.
 
+
+## M2 part 2: the 2D backend's types (2026-11-09)
+
+Cyrius-only rows, 100,000 iterations each, x86_64 ELF. Rust has no bench for these alone. Its nearest row,
+`bodies/add_body_with_collider`, also covers the world's arena and map inserts, so the like-for-like comparison waits
+for M3; it was measured today for context: **253 ns** (criterion, 250.2–257.0).
+
+| Bench | Body | Cyrius |
+|---|---|---|
+| `b2/add_collider_mass_ball` | a body and a ball collider from their descriptors, the mass added | 545 ns |
+| `b2/hull16_mass_properties` | mass, inertia and centroid of a 16-vertex hull (14 triangles) | 578 ns |
+| `b2/world_aabb_box_rotated` | a box's world AABB at a rotation (one correctly rounded sin_cos) | 261 ns |
+
+**Reading it.** The mass half alone takes 2.2× Rust's whole insert. A scratch split shows where the time goes:
+
+| Step | Cyrius |
+|---|---|
+| `ImRigidBody2d_from_desc` | 58 ns |
+| `ImCollider2d_from_desc` | 405 ns |
+| of which `ImColliderShape::clone`, a ball (no arrays) | 349 ns |
+| `_im_b2_add_collider_mass` | 82 ns |
+| of which `mass_properties` | 46 ns |
+
+The shape copy is one 168-byte `memcpy`, and the stdlib's `memcpy` copies a byte at a time. A portable word loop is
+4–8× faster:
+
+| Bytes | `memcpy` (byte loop) | word loop + byte tail |
+|---|---|---|
+| 24 | 43 ns | 11 ns |
+| 168 | 260 ns | 35 ns |
+| 256 | 393 ns | 50 ns |
+| 4,096 | 6.17 µs | 0.77 µs |
+
+That is upstream finding **S5** (port plan §8). The port also calls `memcpy`:
+- for every arena insert and get (M3's body records are about 250 B);
+- for the spatial hash's 24-byte record moves, once per record per merge pass. How much of the M2a hash row that
+  costs is to measure in the profiling before M3;
+- in every JSON reader.
+
+The port isn't changed for speed. The world AABB's 261 ns is mostly its `sin_cos` (209 ns in `math/sin_cos_cr`).

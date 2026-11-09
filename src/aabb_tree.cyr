@@ -184,7 +184,7 @@ fn _im_box_contains(a, b): i64 {
     return 1;
 }
 
-# Writes aabb, fattened by 0.1 a side (Rust's AABB_MARGIN), into the six words at d.
+# Writes aabb, fattened by _IM_AABB_MARGIN (0.1) a side, into the six words at d.
 fn _im_box_fat(d, aabb: ImTreeAabb) {
     var x0: f64 = aabb.min.x;
     var y0: f64 = aabb.min.y;
@@ -192,12 +192,13 @@ fn _im_box_fat(d, aabb: ImTreeAabb) {
     var x1: f64 = aabb.max.x;
     var y1: f64 = aabb.max.y;
     var z1: f64 = aabb.max.z;
-    var a0: f64 = x0 - 0.1;
-    var a1: f64 = y0 - 0.1;
-    var a2: f64 = z0 - 0.1;
-    var b0: f64 = x1 + 0.1;
-    var b1: f64 = y1 + 0.1;
-    var b2: f64 = z1 + 0.1;
+    var m: f64 = _IM_AABB_MARGIN;
+    var a0: f64 = x0 - m;
+    var a1: f64 = y0 - m;
+    var a2: f64 = z0 - m;
+    var b0: f64 = x1 + m;
+    var b1: f64 = y1 + m;
+    var b2: f64 = z1 + m;
     store64(d, _im_bits(a0));
     store64(d + 8, _im_bits(a1));
     store64(d + 16, _im_bits(a2));

@@ -220,6 +220,23 @@ fn ImColliderShape_segment(a: ImVec3, b: ImVec3): ImColliderShape {
 }
 
 impl ImColliderShape {
+    # A copy with arrays of its own (Rust's derived `Clone`): the copy is freed separately. An array
+    # that can't be copied (no memory) comes back empty.
+    #must_use
+    fn clone(self): ImColliderShape {
+        var c: ImColliderShape;
+        memcpy(&c, self, sizeof(ImColliderShape));
+        c.points = _im_copy_words(self.points, self.point_count * 3);
+        if (c.points == 0) { c.point_count = 0; }
+        c.vertices = _im_copy_words(self.vertices, self.vertex_count * 3);
+        if (c.vertices == 0) { c.vertex_count = 0; }
+        c.indices = _im_copy_words(self.indices, self.index_count * 3);
+        if (c.indices == 0) { c.index_count = 0; }
+        c.heights = _im_copy_words(self.heights, self.height_count);
+        if (c.heights == 0) { c.height_count = 0; }
+        return c;
+    }
+
     # Releases the shape's arrays (none for the fixed-size kinds) and clears them.
     fn free(self) {
         if (self.points != 0) { fl_free(self.points); }

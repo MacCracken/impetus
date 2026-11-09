@@ -12,9 +12,12 @@ checks that src/ defines the Cyrius name the naming rules give (port plan §7.4)
 - `impl Enum { pub fn m(self ...) }`       -> `fn <snake(Enum)>_m(`
 - `impl Default for X`                     -> `fn Im<X>_default(`
 - `pub const X` (also inside an impl)      -> `const IM_X =` (src/constants.cyr), or a PENDING_CONSTS entry
+- `pub(super)` / `pub(crate) const X`      -> `<PRIVATE_PREFIX[module]>X`, a const or f64 global
+                                              (src/constants_private.cyr, generated)
 - `pub enum E` and each variant V          -> `enum <ENUM_NAMES[E]> {` and `<ENUM_PREFIX[E]><SNAKE(V)> =`
 - `pub struct S` and each `pub` field f    -> `struct Im<S> {` with a field f, or FIELD_RENAMES' fields
-A function the naming rules would name otherwise is in FN_RENAMES; anything else needs an
+`pub`, `pub(crate)` and `pub(super)` items all count: the backend's types are crate-internal in
+Rust but are the port's surface all the same. A function the naming rules would name otherwise is in FN_RENAMES; anything else needs an
 EXCEPTIONS entry with its reason. Every file under rust-old/src must be in
 MODULES, PENDING_MODULES (a later milestone), DEFERRED_MODULES or NOT_APPLICABLE_MODULES. Exits 1
 on a missing item, an EXCEPTIONS entry that names no Rust item, or a file unaccounted for.
@@ -28,10 +31,9 @@ root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 MODULES = [
     "error", "config", "material", "units", "force",
     "body", "collider", "joint", "event", "query", "arena", "contact_tracker", "spring",
-    "aabb_tree", "spatial_hash",
+    "aabb_tree", "spatial_hash", "backend_2d/types",
 ]
 PENDING_MODULES = {
-    "backend_2d/types": "M2",
     "backend_2d/narrowphase": "M2", "backend_2d/raycast": "M2",
     "backend_2d/solver": "M3", "backend_2d/joints": "M3", "backend_2d/state": "M3",
     "backend_2d/tests": "M3", "particle": "M3", "world": "M3",
@@ -74,13 +76,22 @@ FN_RENAMES = {
     "Arena::iter_mut": "ImArena::slot_handle",
     # pub(crate) in Rust: a private helper here.
     "pair_key": "_im_pair_key",
+    # `union` is a reserved word in Cyrius.
+    "IslandManager::union": "ImIslandManager::unite",
 }
 # Rust field -> the Cyrius fields that carry it (Option<T> is a presence flag plus the value).
 FIELD_RENAMES = {
     ("PhysicsMaterial", "static_friction"): ["has_static_friction", "static_friction"],
     ("Force", "point"): ["has_point", "point"],
     ("Impulse", "point"): ["has_point", "point"],
+    ("Collider2d", "mass"): ["has_mass", "mass"],
+    ("Joint2d", "motor"): ["has_motor", "motor"],
+    ("Joint2d", "break_force"): ["has_break_force", "break_force"],
+    # A Vec is its records' address and their count.
+    ("ContactManifold", "points"): ["points", "point_count"],
 }
+# The Cyrius prefix of a module's crate-internal constants (scripts/oracle/src/t_private.rs).
+PRIVATE_PREFIX = {"backend_2d/types": "_IM_B2_"}
 PENDING_CONSTS = {"MAX_SNAPSHOT_INDEX": "M6, with the snapshot module"}
 EXCEPTIONS = {
     "units::impl Display for Quantity": "`impl ImQuantity { fn fmt(self, sb) }`: src/fmtf.cyr's "
@@ -98,6 +109,8 @@ EXCEPTIONS = {
     "spring::impl PartialEq for StepCache": "StepCache is private: ImSpring's cache_* fields, which "
                                              "ImSpring::eq ignores as Rust's equality does",
     "spring::impl Debug for StepCache": "StepCache is private; there is no Debug in the port",
+    "backend_2d/types::type ManifoldKey": "a manifold key is two collider handle words, ordered as "
+                                          "a pair key (src/contact_tracker.cyr)",
 }
 
 
@@ -114,13 +127,14 @@ def snake(camel):
 
 
 def library_part(text):
-    cut = text.find("#[cfg(test)]\nmod tests")
+    cut = text.find("#[cfg(test)]\nmod ")
     return text if cut < 0 else text[:cut]
 
 
 def cyrius_index():
     """Every fn, impl method (as Type_m), const, enum member, enum and struct field in src/."""
     fns, consts, members, enums, structs = set(), set(), set(), set(), {}
+    globals_ = set()
     for path in sorted((root / "src").glob("*.cyr")):
         impl = None
         depth = 0
@@ -135,6 +149,9 @@ def cyrius_index():
             m = re.match(r"const (\w+) =", s)
             if m:
                 consts.add(m.group(1))
+            m = re.match(r"var (\w+): f64 =", line)
+            if m:
+                globals_.add(m.group(1))
             m = re.match(r"(IM_\w+) = -?\d+;", s)
             if m:
                 members.add(m.group(1))
@@ -158,7 +175,10 @@ def cyrius_index():
         for m in re.finditer(r"struct (\w+) \{\n(.*?)\n\}", text, re.S):
             structs[m.group(1)] = {l.strip().split(":")[0].rstrip(";").strip()
                                    for l in m.group(2).splitlines() if l.strip() and not l.strip().startswith("#")}
-    return fns, consts, members, enums, structs
+    return fns, consts | globals_, members, enums, structs
+
+
+VIS = r"pub(?:\((?:crate|super)\))?"
 
 
 def rust_items(module):
@@ -177,11 +197,11 @@ def rust_items(module):
         if (m := re.match(r"impl(?:<[^>]*>)? (\w+)(?:<[^>]*>)? \{", s)):
             owner, trait = m.group(1), None
             continue
-        if (m := re.match(r"pub(?:\(crate\))? enum (\w+)", s)):
+        if (m := re.match(VIS + r" enum (\w+)", s)):
             enum_name, struct_name = m.group(1), None
             items.append(("enum", None, enum_name, None))
             continue
-        if (m := re.match(r"pub(?:\(crate\))? struct (\w+)", s)):
+        if (m := re.match(VIS + r" struct (\w+)", s)):
             struct_name, enum_name = m.group(1), None
             items.append(("struct", None, struct_name, None))
             continue
@@ -192,11 +212,13 @@ def rust_items(module):
             items.append(("variant", enum_name, m.group(1), None))
         if struct_name and (m := re.match(r"pub (\w+):", s)):
             items.append(("field", struct_name, m.group(1), None))
-        if (m := re.match(r"pub(?:\(crate\))? fn (\w+)(?:<[^>]*>)?\((&?(?:mut )?self)?", s)):
+        if (m := re.match(VIS + r" fn (\w+)(?:<[^>]*>)?\((&?(?:mut )?self)?", s)):
             items.append(("fn", owner, m.group(1), bool(m.group(2))))
         if (m := re.match(r"pub const (\w+):", s)):
             items.append(("const", owner, m.group(1), None))
-        if (m := re.match(r"pub(?:\(crate\))? type (\w+)", s)):
+        if (m := re.match(r"pub\((?:crate|super)\) const (\w+):", s)):
+            items.append(("pconst", owner, m.group(1), None))
+        if (m := re.match(VIS + r" type (\w+)", s)):
             items.append(("type", None, m.group(1), None))
     return items
 
@@ -251,6 +273,10 @@ def main():
                 want = FIELD_RENAMES.get((owner, name), [name])
                 have = structs.get(f"Im{owner}", set())
                 (ok := ok + 1) if all(w in have for w in want) else missing.append(f"{label} -> fields {want}")
+                continue
+            if kind == "pconst":
+                want = PRIVATE_PREFIX.get(module, "_IM_") + name
+                (ok := ok + 1) if want in consts else missing.append(f"{label} -> {want}")
                 continue
             if kind == "const":
                 if name in PENDING_CONSTS:

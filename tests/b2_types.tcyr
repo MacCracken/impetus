@@ -1,0 +1,365 @@
+# b2_types.tcyr — the ported Rust tests of rust-old/src/backend_2d/types.rs (M2b): the AABB, mass and
+# world-AABB tests of backend_2d/tests.rs and types.rs's mass_tests, plus Cyrius-only tests of the
+# inverse masses, integration, the island union-find and the collider's own copy of its shape.
+
+include "tests/lib_2d.cyr"
+
+# 1 when |got − want| < eps.
+fn near(got: f64, want: f64, eps: f64): i64 {
+    var d: f64 = f64_abs(got - want);
+    if (d < eps) { return 1; }
+    return 0;
+}
+
+# A collider of `shape` at offset (ox, oy) on body 0, the default material (density 1). The
+# collider holds its own copy of the shape's arrays; the caller frees both.
+fn coll(shape: ImColliderShape, ox: f64, oy: f64): ImCollider2d {
+    var d: ImColliderDesc = ImColliderDesc_new(shape);
+    d.offset = ImVec3_new(ox, oy, 0.0);
+    return ImCollider2d_from_desc(0, 0, d);
+}
+
+# The hull of the n (x, y) pairs given as f64 words at p, z = 0.
+fn hull2(p, n): ImColliderShape {
+    var w = fl_alloc(n * 24);
+    for (var j = 0; j < n; j = j + 1) {
+        store64(w + j * 24, load64(p + j * 16));
+        store64(w + j * 24 + 8, load64(p + j * 16 + 8));
+        var z: f64 = 0.0;
+        store64(w + j * 24 + 16, z);
+    }
+    var s: ImColliderShape = ImColliderShape_convex_hull(w, n);
+    fl_free(w);
+    return s;
+}
+
+# A body of type t, fixed rotation `fixed`, at the origin.
+fn body(t, fixed): ImRigidBody2d {
+    var d: ImBodyDesc = ImBodyDesc_default();
+    d.body_type = t;
+    d.fixed_rotation = fixed;
+    return ImRigidBody2d_from_desc(0, d);
+}
+
+# Runs the ported backend type tests.
+fn main() {
+    alloc_init();
+    var zero: f64 = 0.0;
+    var nan: f64 = zero / zero;
+    var eps: f64 = 0.000001;
+    var tight: f64 = 0.000000000001;
+
+    # ── backend_2d/tests.rs: AABB overlap ──
+    test_group("aabb_overlaps");
+    var a: ImAabb2d = ImAabb2d_new(0.0, 0.0, 2.0, 2.0);
+    var b: ImAabb2d = ImAabb2d_new(1.0, 1.0, 3.0, 3.0);
+    assert_eq(a.overlaps(&b), 1, "a overlaps b");
+    assert_eq(b.overlaps(&a), 1, "b overlaps a");
+
+    test_group("aabb_no_overlap");
+    a = ImAabb2d_new(0.0, 0.0, 1.0, 1.0);
+    b = ImAabb2d_new(2.0, 2.0, 3.0, 3.0);
+    assert_eq(a.overlaps(&b), 0, "apart");
+
+    # ── backend_2d/tests.rs: mass and inertia ──
+    test_group("ball_mass");
+    var c: ImCollider2d = coll(ImColliderShape_ball(1.0), 0.0, 0.0);
+    var pi: f64 = _IM_PI;
+    assert_eq(near(c.compute_mass(), pi, eps), 1, "pi r^2");
+    c.free();
+
+    test_group("box_mass");
+    c = coll(ImColliderShape_box(1.0, 1.0, 0.0), 0.0, 0.0);
+    assert_eq(near(c.compute_mass(), 4.0, eps), 1, "2 x 2");
+    c.free();
+
+    test_group("segment_mass_nonzero");
+    c = coll(ImColliderShape_segment(ImVec3_new(0.0, 0.0, 0.0), ImVec3_new(10.0, 0.0, 0.0)), 0.0, 0.0);
+    var sm: f64 = c.compute_mass();
+    assert_eq(sm > 0.0, 1, "> 0");
+    c.free();
+
+    test_group("explicit_mass_overrides");
+    c = coll(ImColliderShape_ball(1.0), 0.0, 0.0);
+    c.has_mass = 1;
+    c.mass = 42.0;
+    assert_eq(near(c.compute_mass(), 42.0, eps), 1, "42");
+    c.free();
+
+    test_group("multiple_colliders_accumulate_mass");
+    var rb: ImRigidBody2d = body(IM_BODY_DYNAMIC, 0);
+    c = coll(ImColliderShape_ball(1.0), 0.0, 0.0);
+    _im_b2_add_collider_mass(&rb, &c);
+    c.free();
+    var first: f64 = rb.mass;
+    c = coll(ImColliderShape_ball(1.0), 1.0, 0.0);
+    _im_b2_add_collider_mass(&rb, &c);
+    c.free();
+    var second: f64 = rb.mass;
+    assert_eq(second > first, 1, "grows");
+    assert_eq(near(second, 2.0 * first, eps), 1, "doubles");
+
+    # ── backend_2d/tests.rs: world AABBs ──
+    test_group("world_aabb_ball_no_rotation");
+    c = coll(ImColliderShape_ball(1.0), 0.0, 0.0);
+    var bx: ImAabb2d = c.world_aabb(ImVec2_new(5.0, 3.0), 0.0);
+    assert_eq(near(bx.min.x, 4.0, eps), 1, "min x");
+    assert_eq(near(bx.max.x, 6.0, eps), 1, "max x");
+    assert_eq(near(bx.min.y, 2.0, eps), 1, "min y");
+    assert_eq(near(bx.max.y, 4.0, eps), 1, "max y");
+    c.free();
+
+    test_group("world_aabb_box_with_rotation");
+    c = coll(ImColliderShape_box(2.0, 1.0, 0.0), 0.0, 0.0);
+    bx = c.world_aabb(ImVec2_new(0.0, 0.0), 1.5707963267948966);
+    var wdt: f64 = bx.max.x - bx.min.x;
+    var hgt: f64 = bx.max.y - bx.min.y;
+    assert_eq(near(wdt, 2.0, 0.01), 1, "width 2");
+    assert_eq(near(hgt, 4.0, 0.01), 1, "height 4");
+    c.free();
+
+    test_group("world_aabb_with_offset");
+    c = coll(ImColliderShape_ball(0.5), 3.0, 0.0);
+    bx = c.world_aabb(ImVec2_new(0.0, 0.0), 0.0);
+    assert_eq(near(bx.min.x, 2.5, eps), 1, "min x");
+    assert_eq(near(bx.max.x, 3.5, eps), 1, "max x");
+    c.free();
+
+    # ── types.rs mass_tests ──
+    test_group("hull_square_matches_box");
+    var sq[64];
+    var sq_cw[64];
+    for (var w = 0; w < 2; w = w + 1) {
+        # (0,0) (2,0) (2,2) (0,2), then the reverse order.
+        var xs0: f64 = 0.0;
+        var xs1: f64 = 2.0;
+        store64(&sq, xs0); store64(&sq + 8, xs0);
+        store64(&sq + 16, xs1); store64(&sq + 24, xs0);
+        store64(&sq + 32, xs1); store64(&sq + 40, xs1);
+        store64(&sq + 48, xs0); store64(&sq + 56, xs1);
+        var pts = &sq;
+        if (w == 1) {
+            for (var q = 0; q < 4; q = q + 1) {
+                store64(&sq_cw + q * 16, load64(&sq + (3 - q) * 16));
+                store64(&sq_cw + q * 16 + 8, load64(&sq + (3 - q) * 16 + 8));
+            }
+            pts = &sq_cw;
+        }
+        var hs: ImColliderShape = hull2(pts, 4);
+        var hull: ImCollider2d = coll(hs, 0.0, 0.0);
+        hs.free();
+        var bxc: ImCollider2d = coll(ImColliderShape_box(1.0, 1.0, 0.0), 0.0, 0.0);
+        var hm: f64 = hull.compute_mass();
+        var bm: f64 = bxc.compute_mass();
+        assert_eq(near(hm, bm, tight), 1, "mass");
+        var hi: f64 = hull.compute_inertia(hm);
+        var bi: f64 = bxc.compute_inertia(hm);
+        assert_eq(near(hi, bi, tight), 1, "inertia");
+        var cen: ImVec2 = hull.local_centroid();
+        assert_eq(near(cen.x, 1.0, tight), 1, "centroid x");
+        assert_eq(near(cen.y, 1.0, tight), 1, "centroid y");
+        hull.free();
+        bxc.free();
+    }
+
+    test_group("capsule_inertia_includes_cap_offset");
+    c = coll(ImColliderShape_capsule(1.0, 0.5), 0.0, 0.0);
+    var cm: f64 = c.compute_mass();
+    var r: f64 = 0.5;
+    var h: f64 = 1.0;
+    var rect: f64 = 4.0 * h * r;
+    var circ: f64 = pi * r * r;
+    var lc: f64 = 4.0 * r / (3.0 * pi);
+    var num: f64 = rect * (4.0 * r * r + 4.0 * h * h) / 12.0 + circ * (0.5 * r * r + h * h + 2.0 * h * lc);
+    var expected: f64 = cm * num / (rect + circ);
+    assert_eq(near(c.compute_inertia(cm), expected, tight), 1, "rect + offset caps");
+    c.free();
+
+    # ── Cyrius-only ──
+    test_group("refresh_inverse_mass");
+    var st: ImRigidBody2d = body(IM_BODY_STATIC, 0);
+    c = coll(ImColliderShape_box(1.0, 1.0, 0.0), 0.0, 0.0);
+    _im_b2_add_collider_mass(&st, &c);
+    var sim: f64 = st.inv_mass;
+    var sii: f64 = st.inv_inertia;
+    var smass: f64 = st.mass;
+    assert_eq(near(smass, 4.0, tight), 1, "a static body keeps its mass");
+    assert_eq(sim == 0.0 && sii == 0.0, 1, "static: no inverses");
+    var kin: ImRigidBody2d = body(IM_BODY_KINEMATIC, 0);
+    _im_b2_add_collider_mass(&kin, &c);
+    var kim: f64 = kin.inv_mass;
+    assert_eq(kim == 0.0, 1, "kinematic: no inverse mass");
+    var fx: ImRigidBody2d = body(IM_BODY_DYNAMIC, 1);
+    _im_b2_add_collider_mass(&fx, &c);
+    var fim: f64 = fx.inv_mass;
+    var fii: f64 = fx.inv_inertia;
+    assert_eq(near(fim, 0.25, tight), 1, "fixed rotation: inverse mass 1/4");
+    assert_eq(fii == 0.0, 1, "fixed rotation: no inverse inertia");
+    c.free();
+    var nb: ImRigidBody2d = body(IM_BODY_DYNAMIC, 0);
+    nb.mass = nan;
+    nb.inertia = 1.0;
+    nb.refresh_inverse_mass();
+    var nim: f64 = nb.inv_mass;
+    assert_eq(nim == 0.0, 1, "NaN mass: no inverse");
+    nb.mass = 2.0;
+    nb.inertia = nan;
+    nb.refresh_inverse_mass();
+    var nim2: f64 = nb.inv_mass;
+    var nii2: f64 = nb.inv_inertia;
+    assert_eq(near(nim2, 0.5, tight), 1, "finite mass");
+    assert_eq(nii2 == 0.0, 1, "NaN inertia: no inverse inertia");
+
+    test_group("mass_floors");
+    c = coll(ImColliderShape_ball(0.0), 0.0, 0.0);
+    var o[32];
+    c.mass_properties(&o);
+    var fm: f64 = load64(&o);
+    var fi: f64 = load64(&o + 8);
+    var min_mass: f64 = _IM_B2_MIN_MASS;
+    var min_inertia: f64 = _IM_B2_MIN_INERTIA;
+    assert_eq(fm == min_mass, 1, "zero radius: MIN_MASS");
+    assert_eq(fi == min_inertia, 1, "zero radius: MIN_INERTIA");
+    c.has_mass = 1;
+    c.mass = nan;
+    var nm: f64 = c.compute_mass();
+    assert_eq(nm == min_mass, 1, "NaN explicit mass: MIN_MASS (Rust's max ignores NaN)");
+    c.free();
+
+    test_group("solver_inv_mass");
+    var sb: ImRigidBody2d = body(IM_BODY_DYNAMIC, 0);
+    c = coll(ImColliderShape_ball(1.0), 0.0, 0.0);
+    _im_b2_add_collider_mass(&sb, &c);
+    c.free();
+    var sim1, sii1 = sb.solver_inv_mass();
+    var sv1: f64 = sim1;
+    var want1: f64 = sb.inv_mass;
+    assert_eq(sv1 == want1 && sv1 > 0.0, 1, "awake: its inverse mass");
+    sb.is_sleeping = 1;
+    var sim2, sii2 = sb.solver_inv_mass();
+    var sv2: f64 = sim2;
+    var si2: f64 = sii2;
+    assert_eq(sv2 == 0.0 && si2 == 0.0, 1, "sleeping: none");
+
+    test_group("integrate");
+    var ib: ImRigidBody2d = body(IM_BODY_DYNAMIC, 0);
+    c = coll(ImColliderShape_ball(1.0), 0.0, 0.0);
+    _im_b2_add_collider_mass(&ib, &c);
+    ib.integrate_velocities(ImVec2_new(0.0, -10.0), 0.5, 1000.0);
+    var vy: f64 = ib.linear_velocity.y;
+    assert_eq(vy == -5.0, 1, "gravity: v = g dt");
+    ib.pseudo_velocity = ImVec2_new(2.0, 0.0);
+    ib.integrate_positions(0.5);
+    var px: f64 = ib.position.x;
+    var py: f64 = ib.position.y;
+    var pvx: f64 = ib.pseudo_velocity.x;
+    assert_eq(px == 1.0 && py == -2.5, 1, "position: (v + pseudo) dt");
+    assert_eq(pvx == 0.0, 1, "pseudo-velocity cleared");
+    ib.linear_velocity = ImVec2_new(300.0, 400.0);
+    ib.integrate_velocities(ImVec2_new(0.0, 0.0), 0.0, 50.0);
+    var cx: f64 = ib.linear_velocity.x;
+    var cy: f64 = ib.linear_velocity.y;
+    assert_eq(cx == 30.0 && cy == 40.0, 1, "speed capped at 50");
+    var sbd: ImRigidBody2d = body(IM_BODY_STATIC, 0);
+    sbd.linear_velocity = ImVec2_new(1.0, 1.0);
+    sbd.integrate_positions(1.0);
+    var spx: f64 = sbd.position.x;
+    assert_eq(spx == 0.0, 1, "static: never moves");
+    var kb: ImRigidBody2d = body(IM_BODY_KINEMATIC, 0);
+    kb.linear_velocity = ImVec2_new(1.0, 0.0);
+    kb.integrate_positions(2.0);
+    var kpx: f64 = kb.position.x;
+    assert_eq(kpx == 2.0, 1, "kinematic: moves at its velocity");
+    var mb: ImRigidBody2d = body(IM_BODY_DYNAMIC, 0);
+    mb.linear_velocity = ImVec2_new(1.0, 0.0);
+    mb.integrate_positions(1.0);
+    var mpx: f64 = mb.position.x;
+    assert_eq(mpx == 0.0, 1, "massless dynamic: stays");
+    ib.force_accumulator = ImVec2_new(1.0, 2.0);
+    ib.torque_accumulator = 3.0;
+    ib.clear_forces();
+    var ffx: f64 = ib.force_accumulator.x;
+    var ttq: f64 = ib.torque_accumulator;
+    assert_eq(ffx == 0.0 && ttq == 0.0, 1, "forces cleared");
+    c.free();
+
+    test_group("world_aabb_shapes");
+    c = coll(ImColliderShape_capsule(1.0, 0.5), 0.0, 0.0);
+    bx = c.world_aabb(ImVec2_new(0.0, 0.0), 0.0);
+    var cpx: f64 = bx.max.x;
+    var cpy: f64 = bx.max.y;
+    assert_eq(cpx == 0.5 && cpy == 1.5, 1, "capsule upright");
+    c.free();
+    c = coll(ImColliderShape_segment(ImVec3_new(3.0, -1.0, 0.0), ImVec3_new(-2.0, 4.0, 0.0)), 1.0, 0.0);
+    bx = c.world_aabb(ImVec2_new(0.0, 0.0), 0.0);
+    var s0: f64 = bx.min.x;
+    var s1: f64 = bx.min.y;
+    var s2: f64 = bx.max.x;
+    var s3: f64 = bx.max.y;
+    assert_eq(s0 == -1.0 && s1 == -1.0 && s2 == 4.0 && s3 == 4.0, 1, "segment extremes, offset");
+    c.free();
+    var tri[48];
+    var t0: f64 = 0.0;
+    var t1: f64 = 3.0;
+    var t2: f64 = -1.0;
+    var t3: f64 = 2.0;
+    store64(&tri, t0); store64(&tri + 8, t0);
+    store64(&tri + 16, t1); store64(&tri + 24, t2);
+    store64(&tri + 32, t2); store64(&tri + 40, t3);
+    var ts: ImColliderShape = hull2(&tri, 3);
+    c = coll(ts, 0.0, 0.0);
+    ts.free();
+    bx = c.world_aabb(ImVec2_new(10.0, 0.0), 0.0);
+    var h0: f64 = bx.min.x;
+    var h1: f64 = bx.min.y;
+    var h2: f64 = bx.max.x;
+    var h3: f64 = bx.max.y;
+    assert_eq(h0 == 9.0 && h1 == -1.0 && h2 == 13.0 && h3 == 2.0, 1, "hull extremes");
+    c.free();
+    var hw[24];
+    var e0: f64 = 0.0;
+    var e1: f64 = 2.0;
+    var e2: f64 = -1.0;
+    store64(&hw, e0); store64(&hw + 8, e1); store64(&hw + 16, e2);
+    var hf: ImColliderShape = ImColliderShape_heightfield(&hw, 3, ImVec3_new(0.5, 2.0, 1.0));
+    c = coll(hf, 0.0, 0.0);
+    bx = c.world_aabb(ImVec2_new(0.0, 0.0), 0.0);
+    var f0: f64 = bx.min.y;
+    var f1: f64 = bx.max.x;
+    var f2: f64 = bx.max.y;
+    assert_eq(f0 == -2.0 && f1 == 1.0 && f2 == 4.0, 1, "heightfield: width 2 cells, height range");
+    c.free();
+    hf.free();
+
+    test_group("collider_owns_its_shape");
+    var hs2: ImColliderShape = hull2(&tri, 3);
+    c = coll(hs2, 0.0, 0.0);
+    assert_eq(c.shape.points != hs2.points, 1, "a copy of the points");
+    hs2.free();
+    var after: f64 = c.compute_mass();
+    assert_eq(near(after, 2.5, tight), 1, "the copy survives the source's free (area 2.5)");
+    c.free();
+
+    test_group("islands");
+    var im: ImIslandManager = ImIslandManager_new(6);
+    for (var i = 0; i < 6; i = i + 1) { assert_eq(im.find(i), i, "singleton"); }
+    im.unite(0, 1);
+    im.unite(2, 3);
+    im.unite(1, 3);
+    assert_eq(im.find(0) == im.find(2), 1, "0 ~ 2 through 1 and 3");
+    assert_eq(im.find(4) == im.find(0), 0, "4 apart");
+    im.unite(3, 0);
+    assert_eq(im.find(5), 5, "5 untouched");
+    im.unite(4, 4);
+    assert_eq(im.find(4), 4, "self-union is a no-op");
+    im.reset(3);
+    assert_eq(im.find(0) == im.find(1), 0, "reset: singletons again");
+    assert_eq(im.parent.len, 3, "reset: count elements");
+    im.free();
+
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

@@ -338,6 +338,41 @@ fails when either drifts from `cyrius.cyml`.
   input tokens.
 - **Result, every target:** 11 modules, 0 failing; **64,531 ok, 0 failed, 0 measured, 7 pending, 103 accepted**.
 
+## 10. M2b: the 2D backend's types (2026-11-09)
+
+- **The module:** `src/b2_types.cyr`, every expression in Rust's operation order:
+  - `RigidBody2d`: `from_desc`, `refresh_inverse_mass`, `solver_inv_mass`, both integrations, `clear_forces`;
+  - `Collider2d`: `world_aabb`, `shape_props`, `polygon_mass_props`, `mass_properties`;
+  - `Aabb2d`, and the `Joint2d`, `Contact`, `ManifoldPoint` and `ContactManifold` records M3 fills;
+  - `IslandManager`, whose `union` is `unite` (`union` is a reserved word).
+
+  `ColliderShape` gained `clone`: a collider keeps its own copy of the shape's arrays, as Rust's does.
+- **Private constants are generated.** `scripts/oracle/src/t_private.rs` reads every `const` in the library part
+  of `aabb_tree.rs`, `spatial_hash.rs` and `backend_2d/types.rs`. It writes `src/constants_private.cyr`: 11 values,
+  named `_IM_*` and `_IM_B2_*`, each literal parsed by Rust's f64 parser and written positionally.
+  - Every const is emitted or excused. Two are excused: `NULL_NODE` (the port's null node is −1) and `FALLBACK`
+    (a tuple local to `shape_props`).
+  - `validate.py` checks each value against Python's own parse of the literal.
+  - The broadphase's 0.1 margin and 4,096-cell cap now come from this file.
+- **`b2_mass.tsv`**, 75 rows from world dumps. Each row builds a `PhysicsWorld` with one body, adds its colliders
+  through the public `add_collider`, and reads mass, inertia and the inverses from `oracle_dump()`. The grid:
+  - every shape kind at zero, negative, NaN, tiny and huge sizes;
+  - hulls in both windings; degenerate hulls (collinear points, two points, none); seeded polygons of 3–16
+    vertices. Their vertices are rational points on an ellipse, so the grid uses no transcendental;
+  - triangle meshes, including one with an out-of-range index and one with no triangles;
+  - offsets (the parallel-axis shift); densities 0, 0.5 and 10⁶;
+  - explicit masses 42, 0, −5, NaN and 10⁻⁹ (the `MIN_MASS` floor);
+  - static, kinematic, fixed-rotation and collider-less bodies;
+  - 13 bodies with several colliders (one fixed set, 12 seeded).
+
+  Class B, and **all 0 ulp** on x86_64 ELF, x86_64 PE and aarch64. `validate.py` recomputes all 75 with its own
+  `shape_props`, `polygon_mass_props`, accumulation and `refresh_inverse_mass`, and they agree.
+- **Not golden yet:**
+  - `world_aabb` is `pub(crate)`, so no hook reaches it. The ported tests cover it now; the M2 `overlap_aabb` rows
+    and M3's step rows go through it.
+  - The integrations and the islands arrive with M3's step rows.
+- **Result, every target:** 12 modules, 0 failing; **64,606 ok, 0 failed, 0 measured, 7 pending, 103 accepted**.
+
 ## How to reproduce
 
 ```sh

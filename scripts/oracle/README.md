@@ -6,8 +6,9 @@
   call, with every float as its IEEE-754 bit pattern. The Cyrius parity harnesses
   (`tests/parity_2d.tcyr`, and `tests/parity_3d.tcyr` from M4) replay every row against the
   port and check it within its tolerance class.
-- **The generated Cyrius sources**, `src/constants.cyr` now and data modules as milestones need
-  them (step 6). No value the port reads is typed by hand.
+- **The generated Cyrius sources**: `src/constants.cyr` (the public constants), `src/constants_private.cyr` (the
+  ported modules' private ones), and data modules as milestones need them (step 6). No value the port reads is
+  typed by hand.
 
 ```sh
 cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml                   # 2D + shared: write
@@ -47,7 +48,13 @@ harness reads the same files. This README records what is specific to impetus.
 | Module | Build | Milestone | Golden rows | Golden emitter | Generated Cyrius |
 |---|---|---|---|---|---|
 | `constants` | b2 | M0 | 3 | `src/m_constants.rs` | `src/constants.cyr` (`src/t_constants.rs`, with the completeness proof) |
-| `math` | b2 | M0 | 18,919 | `src/m_math.rs` | — |
+| `math` | b2 | M0 | 19,165 | `src/m_math.rs` | — |
+| `config`, `material`, `units`, `force` | b2 | M1a | 293, 2,046, 2,236, 1,308 | `src/m_<module>.rs` | — |
+| `fmtf`, `json` | b2 | M1b | 37,576, 937 | `src/m_fmtf.rs`, `src/m_json.rs` | — |
+| `spring`, `types` | b2 | M1b | 1,000, 1 | `src/m_spring.rs`, `src/m_types.rs` | — |
+| `broadphase` | b2 | M2 | 76 | `src/m_broadphase.rs` | — |
+| `b2_mass` | b2 | M2 | 75 | `src/m_b2_mass.rs` | — |
+| (private constants) | b2 | M2 | — | — | `src/constants_private.cyr` (`src/t_private.rs`: every library `const` of `aabb_tree.rs`, `spatial_hash.rs` and `backend_2d/types.rs`, emitted or excused) |
 
 ## Format 1
 
@@ -75,6 +82,10 @@ impetus specifics:
 - Broadphase rows (`broadphase.tsv`) give the boxes in insertion order (`v:N`, then min and max per box; the hash
   rows start with the cell size) and the sorted candidate pair set (`v:P`, then the two input indices per pair).
   The structures are shared by both backends, so the 2D build emits the 3D rows too.
+- Mass rows (`b2_mass.tsv`, the 2D build only) come from a world dump. Each row builds a `PhysicsWorld` with one
+  body (`e:BodyType`, `fixed_rotation`), adds its colliders through the public `add_collider`, and reads the body
+  back from `oracle_dump()`. Inputs: `v:<colliders>`, then per collider its shape (`flat::shape`), offset x and y,
+  density, and `n:` or the explicit mass. Outputs: mass, inertia (about the body origin), inv_mass, inv_inertia.
 - `Spring::step` rows (`spring.tsv`) carry a note `[<regime> S=<n>]`: the regime the transition took
   and its **sensitivity**, the most the two outputs move, in ulps, when one exp, sin or cos result
   on the path moves by one ulp. `m_spring.rs` computes it from a transcription of `transition` and
@@ -132,6 +143,10 @@ Standard-library Python, run with `-I`. It never calls the oracle:
   so the step rows match bit for bit;
 - every `broadphase` row is recomputed: the tree's pairs by brute force on the fattened boxes, the hash's by an
   independent rasterisation, the automatic cell size;
+- every `b2_mass` body is recomputed: its own `shape_props` and `polygon_mass_props` in Rust's operation order,
+  the floors, the parallel-axis sum and `refresh_inverse_mass`;
+- `src/constants_private.cyr` holds every library `const` of the ported modules, each equal to Python's parse of
+  the Rust literal;
 - the corrected oracle and `src/crmath_data.cyr` are current (above).
 
 A tampered row makes it exit 1.

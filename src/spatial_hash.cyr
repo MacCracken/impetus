@@ -144,7 +144,8 @@ impl ImSpatialHashGrid {
                 var span: f64 = hif - lof + 1.0;
                 count = count * span;
             }
-            if (!(count <= 4096.0)) { ok = 0; }
+            var cap: f64 = _IM_MAX_CELLS_PER_ENTRY;
+            if (!(count <= cap)) { ok = 0; }
         }
         if (ok == 0) { return self.over.push(key); }
         var cx = load64(&r);

@@ -310,6 +310,74 @@ fn bench_spatial_hash_row() {
     return 0;
 }
 
+# b2/add_collider_mass_ball: a ball collider from its descriptor, its mass added to a body (the
+# mass half of Rust's bodies/add_body_with_collider, which also times the world's arenas: M3).
+fn bench_b2_add_collider_mass() {
+    var b = bench_new("b2/add_collider_mass_ball");
+    var bd: ImBodyDesc = ImBodyDesc_default();
+    var d: ImColliderDesc = ImColliderDesc_new(ImColliderShape_ball(0.5));
+    var reps = 100000;
+    bench_batch_start(b);
+    for (var r = 0; r < reps; r = r + 1) {
+        var rb: ImRigidBody2d = ImRigidBody2d_from_desc(r, bd);
+        var c: ImCollider2d = ImCollider2d_from_desc(r, r, d);
+        _im_b2_add_collider_mass(&rb, &c);
+        var m: f64 = rb.inv_mass;
+        g_sink = m;
+    }
+    bench_batch_stop(b, reps);
+    bench_report(b);
+    return 0;
+}
+
+# b2/hull16_mass_properties: the mass, inertia and centroid of a 16-vertex convex hull.
+fn bench_b2_hull_mass() {
+    var b = bench_new("b2/hull16_mass_properties");
+    var w = fl_alloc(16 * 24);
+    for (var j = 0; j < 16; j = j + 1) {
+        var t: f64 = -1.0 + f64_from(j) / 8.0;
+        var den: f64 = 1.0 + t * t;
+        var x: f64 = 2.0 * (1.0 - t * t) / den;
+        var y: f64 = 1.5 * (2.0 * t) / den;
+        var z: f64 = 0.0;
+        store64(w + j * 24, x);
+        store64(w + j * 24 + 8, y);
+        store64(w + j * 24 + 16, z);
+    }
+    var s: ImColliderShape = ImColliderShape_convex_hull(w, 16);
+    fl_free(w);
+    var c: ImCollider2d = ImCollider2d_from_desc(0, 0, ImColliderDesc_new(s));
+    var o[32];
+    var reps = 100000;
+    bench_batch_start(b);
+    for (var r = 0; r < reps; r = r + 1) {
+        c.mass_properties(&o);
+        g_sink = load64(&o + 8);
+    }
+    bench_batch_stop(b, reps);
+    bench_report(b);
+    c.free();
+    s.free();
+    return 0;
+}
+
+# b2/world_aabb_box_rotated: a box collider's world AABB at a rotation (one correctly rounded sin_cos).
+fn bench_b2_world_aabb() {
+    var b = bench_new("b2/world_aabb_box_rotated");
+    var c: ImCollider2d = ImCollider2d_from_desc(0, 0, ImColliderDesc_new(ImColliderShape_box(2.0, 1.0, 0.0)));
+    var reps = 100000;
+    bench_batch_start(b);
+    for (var r = 0; r < reps; r = r + 1) {
+        var rot: f64 = f64_from(r) * 0.001;
+        var a: ImAabb2d = c.world_aabb(ImVec2_new(1.0, 2.0), rot);
+        var mx: f64 = a.max.x;
+        g_sink = mx;
+    }
+    bench_batch_stop(b, reps);
+    bench_report(b);
+    return 0;
+}
+
 # Runs every bench.
 fn main(): i64 {
     alloc_init();
@@ -331,6 +399,9 @@ fn main(): i64 {
     bench_sin_cos_cr();
     bench_aabb_tree_row();
     bench_spatial_hash_row();
+    bench_b2_add_collider_mass();
+    bench_b2_hull_mass();
+    bench_b2_world_aabb();
     return 0;
 }
 

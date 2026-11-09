@@ -149,6 +149,25 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     `validate.py` recomputes every row by brute force.
   - The 18 Rust tests are ported, and surface parity is 275/275. The harness takes rows of up to
     8,192 tokens.
+- **Cyrius port, M2 part 2: the 2D backend's types** (`docs/development/port-parity.md` §10):
+  - `src/b2_types.cyr`:
+    - rigid bodies: inverse masses, the solver's view, velocity and position integration;
+    - colliders: world AABBs, and mass properties from `shape_props` and `polygon_mass_props` (either
+      winding, with the `MIN_MASS` / `MIN_INERTIA` floors);
+    - the per-collider accumulation `add_collider` does, shifted by the parallel-axis theorem;
+    - the joint, contact and manifold records, and the island union-find (`union` is `unite`, a
+      reserved word).
+  - `ColliderShape::clone`: a collider owns its copy of the shape's arrays, as Rust's does.
+  - Private constants are generated: `scripts/oracle/src/t_private.rs` writes
+    `src/constants_private.cyr` from the Rust literals (11 values). It proves each module's `const`
+    items are emitted or excused, and `validate.py` checks each value. The broadphase now reads
+    its margin and cell cap from it.
+  - Golden `b2_mass.tsv`: 75 bodies from world dumps (every shape kind and its edge sizes, offsets,
+    densities, explicit and NaN masses, body types, several colliders). All 0 ulp on three targets,
+    and `validate.py` recomputes every body. **64,606 ok, 0 failed, 0 measured, 7 pending,
+    103 accepted.**
+  - The 12 Rust type tests are ported, with Cyrius-only groups (65 assertions). Surface parity is
+    374/374, now counting `pub(super)` items.
 
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
@@ -156,6 +175,13 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
 - **Broadphase, first numbers** (Cyrius only; `docs/benchmarks-rust-v-cyrius.md`): rebuilding and
   querying 1,000 boxes takes 4.7 ms (tree) and 1.95 ms (hash). Rust's whole world step on that layout
   takes 0.51 ms, so this is a finding to profile before M3.
+- **2D backend types, first numbers** (Cyrius only; Rust has no bench for these alone):
+  - a ball's mass, 545 ns; Rust's whole `add_body_with_collider` takes 253 ns;
+  - a 16-vertex hull's mass properties, 578 ns;
+  - a rotated box's world AABB, 261 ns.
+
+  349 ns of the ball's 545 is its shape copy, a 168-byte `memcpy`. The stdlib copies a byte at a
+  time, and a word loop is 4–8× faster (S5, port plan §8, not filed yet).
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

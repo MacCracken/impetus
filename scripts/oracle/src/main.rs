@@ -31,6 +31,8 @@ mod cyr;
 mod flat;
 mod glibc;
 mod grids;
+#[cfg(not(feature = "b3"))]
+mod m_b2_mass;
 mod m_broadphase;
 mod m_config;
 mod m_constants;
@@ -43,6 +45,7 @@ mod m_spring;
 mod m_types;
 mod m_units;
 mod t_constants;
+mod t_private;
 mod tsv;
 
 #[cfg(all(feature = "b2", feature = "b3"))]
@@ -67,6 +70,9 @@ fn golden_modules() -> Vec<tsv::Module> {
         vec![]
     } else {
         vec![
+            // The 2D backend's bodies: the 3D dump's inertia is a tensor.
+            #[cfg(not(feature = "b3"))]
+            m_b2_mass::emit(),
             m_broadphase::emit(),
             m_config::emit(),
             m_constants::emit(),
@@ -98,7 +104,10 @@ fn cyrius_outputs(root: &Path, prov: &str) -> Result<Vec<Output>, String> {
     let files = if cfg!(feature = "b3") {
         vec![]
     } else {
-        vec![("src/constants.cyr", t_constants::emit(root, prov)?)]
+        vec![
+            ("src/constants.cyr", t_constants::emit(root, prov)?),
+            ("src/constants_private.cyr", t_private::emit(root, prov)?),
+        ]
     };
     Ok(files
         .into_iter()
