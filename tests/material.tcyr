@@ -1,7 +1,6 @@
-# material.tcyr — the ported Rust tests of rust-old/src/material.rs (M1a).
+# material.tcyr — the ported Rust tests of rust-old/src/material.rs (M1a, serde in M1b).
 #
-# Not carried over: material_serde, rolling_friction_serde, combine_rule_serde,
-# serde_defaults_for_new_fields (serde).
+# The serde tests round-trip through the serde-compatible JSON codecs (src/json.cyr, ADR 0010).
 
 include "tests/ulp.cyr"
 include "tests/lib_2d.cyr"
@@ -27,6 +26,16 @@ fn close(got: f64, want: f64): i64 {
     var d: f64 = f64_abs(got - want);
     if (d < 0.0000000001) { return 1; }
     return 0;
+}
+
+# Writes m as JSON and reads it back into *out: 1 when the read succeeds.
+fn json_roundtrip(m: ImPhysicsMaterial, out: *ImPhysicsMaterial): i64 {
+    var sb = str_builder_new();
+    m.to_json(sb);
+    var s = str_builder_build(sb);
+    var t, v = ImPhysicsMaterial_from_json(str_data(s), str_len(s), out);
+    if (is_err_result(t) == 1) { return 0; }
+    return 1;
 }
 
 # Runs the ported material tests.
@@ -62,6 +71,11 @@ fn main() {
     assert(icef == 0.05 && icer == 0.1 && iced == 0.9, "ice 0.05 / 0.1 / 0.9");
     assert(rubf == 1.0 && rubr == 0.8, "rubber 1 / 0.8");
 
+    test_group("material_serde");
+    var rb: ImPhysicsMaterial = ImPhysicsMaterial_default();
+    assert(json_roundtrip(rubber, &rb) == 1, "reads back");
+    assert(same(rubber, rb) == 1, "rubber survives the round trip");
+
     test_group("material_equality");
     assert(same(ImPhysicsMaterial_steel(), ImPhysicsMaterial_steel()) == 1, "steel == steel");
     assert(same(ice, rubber) == 0, "ice != rubber");
@@ -82,6 +96,34 @@ fn main() {
     assert(IM_COMBINE_MAX > IM_COMBINE_MULTIPLY, "Max > Multiply");
     assert(IM_COMBINE_MULTIPLY > IM_COMBINE_AVERAGE, "Multiply > Average");
     assert(IM_COMBINE_AVERAGE > IM_COMBINE_MIN, "Average > Min");
+
+    test_group("rolling_friction_serde");
+    var rf: ImPhysicsMaterial = ImPhysicsMaterial_default();
+    rf.rolling_friction = 0.01;
+    var rfb: ImPhysicsMaterial = ImPhysicsMaterial_default();
+    assert(json_roundtrip(rf, &rfb) == 1, "reads back");
+    assert(same(rf, rfb) == 1, "equal after the round trip");
+    var rfv: f64 = rfb.rolling_friction;
+    assert(rfv == 0.01, "rolling friction 0.01");
+
+    test_group("combine_rule_serde");
+    var cr: ImPhysicsMaterial = ImPhysicsMaterial_default();
+    cr.friction_combine = IM_COMBINE_MAX;
+    cr.restitution_combine = IM_COMBINE_MULTIPLY;
+    var crb: ImPhysicsMaterial = ImPhysicsMaterial_default();
+    assert(json_roundtrip(cr, &crb) == 1, "reads back");
+    assert_eq(crb.friction_combine, IM_COMBINE_MAX, "Max");
+    assert_eq(crb.restitution_combine, IM_COMBINE_MULTIPLY, "Multiply");
+
+    test_group("serde_defaults_for_new_fields");
+    var old = "{\"friction\":0.5,\"restitution\":0.0,\"density\":1.0}";
+    var od: ImPhysicsMaterial = ImPhysicsMaterial_ice();
+    var ot, ov = ImPhysicsMaterial_from_json(old, strlen(old), &od);
+    assert(is_err_result(ot) == 0, "an old document reads");
+    var orr: f64 = od.rolling_friction;
+    assert(orr == 0.0, "rolling friction defaults to 0");
+    assert_eq(od.friction_combine, IM_COMBINE_AVERAGE, "friction combine defaults to Average");
+    assert_eq(od.restitution_combine, IM_COMBINE_MIN, "restitution combine defaults to Min");
 
     # Cyrius-only: the static friction override and its fallback.
     test_group("effective_static_friction");

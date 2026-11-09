@@ -17,12 +17,13 @@ output = "build/impetus"
 #   tagged / result — the value-form Option and Result
 #   freelist — fl_alloc / fl_free: world-owned storage that is returned, not leaked
 #   fnptr    — hisab's GJK/EPA support-function callbacks
+#   bayan    — the JSON value tree the serde-compatible codecs read (src/json.cyr, ADR 0010)
 # hisab's own bundle needs math, alloc, vec, ganita, result, str and fmt (dist/hisab.deps).
 # sakshi (logging: tracing → sakshi spans) arrives through hisab's own [deps.sakshi] 2.5.10;
 # listing it here too makes `cyrius deps` refuse one copy.
 [deps]
 stdlib = ["syscalls", "string", "alloc", "str", "fmt", "io", "vec", "math", "ganita",
-    "tagged", "result", "freelist", "fnptr"]
+    "tagged", "result", "freelist", "fnptr", "bayan"]
 
 # hisab 3.4.1, pinned by tag: vectors, quaternions, mat3, ray tests, GJK/EPA, BVH, islands,
 # inertia (ADR 0007, hisab-first). No `path =` override, which would bypass the commit pin that
@@ -47,9 +48,11 @@ modules = [
     "src/error.cyr",
     "src/constants.cyr",
     "src/mathx.cyr",
+    "src/fmtf.cyr",
     "src/vec.cyr",
     "src/config.cyr",
     "src/material.cyr",
     "src/units.cyr",
     "src/force.cyr",
+    "src/json.cyr",
 ]

@@ -76,6 +76,18 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     (100/100).
   - 6 benches against the Rust numbers (4.8–31×, `docs/benchmarks-rust-v-cyrius.md`).
 - S1 filed upstream: `cyrius/docs/development/issues/2026-11-09-no-scoped-allocator-for-alloc.md`.
+- **Cyrius port, M1b part 1** ([ADR 0010](docs/adr/0010-serde-compatible-json.md);
+  `docs/development/port-parity.md` §6): serde-compatible JSON, replacing the plan's
+  "serde not carried over".
+  - `src/fmtf.cyr` prints the shortest round-trip digits (Burger & Dybvig on a bignum) in
+    Rust's Display form and serde_json's. All 37,576 golden rows are exact; the two Rust
+    printers differ only on exact ties (core rounds up, zmij to even).
+  - `src/json.cyr` reads and writes serde_json's documents for WorldConfig, PhysicsMaterial,
+    Quantity, Force, Impulse and Torque, on bayan's value tree with serde's derive semantics.
+    All 545 golden rows are exact, including the edge documents.
+  - The 11 M1a serde tests are ported, and `Quantity`'s Display is complete.
+  - Finding: serde_json's default float parse is 1 ulp off on some long decimals. The oracle
+    uses `float_roundtrip`, which matches the port's correctly rounded parse.
 
 ### Removed
 - Committed fuzz build output (`fuzz/target/`, 208 files). It is now ignored under

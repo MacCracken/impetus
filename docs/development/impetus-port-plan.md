@@ -138,7 +138,7 @@ every `pub fn` and every `pub` method on the re-exported types.
 |---|---|---|
 | `bridge.rs` (17 fns, 27 tests): dravya, sharira, ushma | **deferred** until a Cyrius consumer exists | the same rule as tanmatra's bridges. Each is a thin primitive-value wrapper, so it ports later as a small parity-tested file |
 | `SolverKind::Xpbd` (2D-only, experimental) | **not carried**. `config_validate` returns `Err(IM_ERR_UNSUPPORTED)` | it has known gaps (roadmap: XPBD parity) and no consumer. Demand-gated, as a Cyrius 2.x item |
-| serde derives on every public type | **not carried** | as tanmatra: JSON only for types a Cyrius consumer exchanges, via `#derive(Serialize)` once the derive key-scan issue is fixed |
+| serde derives on every public type | **ported as serde-compatible JSON** ([ADR 0010](../adr/0010-serde-compatible-json.md)) | the same documents serde_json writes and reads, by codecs on bayan's value tree (`src/json.cyr`) and a shortest-digit float printer (`src/fmtf.cyr`); M1b covers the M1a types, each later milestone its own |
 | `Send + Sync` assertions, `#[inline]` | **not carried** | Rust-only mechanics |
 | Heightfield and TriMesh colliders | **carried as in Rust**: accepted, generating no contacts | parity; contacts for them are a roadmap item |
 
@@ -520,11 +520,13 @@ tanmatra filed its findings.
 - (H9 is listed first, above.)
 
 **Cyrius stdlib / ganita / compiler**
-- **S2. Shortest round-trip f64 printing** (Rust's `Display`, JavaScript's `Number#toString`):
-  `fmt_float` prints a fixed number of decimals. `Quantity`'s `Display` needs the shortest digits that
-  round-trip, written positionally (Rust prints 2.2250738585072014e-308 as a 308-digit decimal). Its
-  280 golden rows are pending (`port-parity.md` §5). bayan's Grisu2 printer round-trips but is not
-  always shortest and uses exponents.
+- **S2. Shortest round-trip f64 printing** (Rust's `Display`, serde_json's zmij): **solved locally in
+  M1b** (`src/fmtf.cyr`, ADR 0010), with Burger & Dybvig's free-format digits on a 40-limb bignum,
+  pinned by 37,576 golden rows. The stdlib still lacks it; `fmtf.cyr` can seed an upstream printer
+  (not filed yet).
+- **Derive features for serde-shaped JSON** (not filed yet): variant renaming (`"Average"`, not the member
+  name), `Option` fields as `null`, externally tagged payload enums (`{"Ball":{"radius":0.5}}`). With them,
+  `src/json.cyr`'s hand-written codecs could move to `#derive`.
 - **Stdlib math:**
   - public `f64_is_nan` / `f64_is_finite`, `f64_copysign`, `f64_sin_cos`;
   - `F64_EPSILON` / `F64_INFINITY` / `F64_NAN` as typed constants;
@@ -578,7 +580,7 @@ tanmatra filed its findings.
 |---|---|---|---|---|---|
 | M0 Initialize | ✅ done 2026-11-09 | constants 3 + math 18,919: **14,875 ok, 0 failed, 0 measured, 4,046 pending (M1 helpers), 1 accepted (ADR 0009)**, identical bits on x86_64 ELF, x86_64 PE and aarch64 | — | 1 probe bench | oracle hooks; scaffold and repairs; `cyrius.cyml` with hisab 3.4.1; generator, `validate.py`, `src/constants.cyr`, parity harness; exp and atan2 on the polyfills (cross-target bits), K = 2; ADRs 0008, 0009 and the 0007 amendment (hisab off the step path until S1/H9); six probes ([`port-parity.md`](port-parity.md) §4). Next: M1 |
 | M1a Foundation: math helpers, error, config, material, units, force | ✅ done 2026-11-09 | config 293 + material 2,046 + units 2,236 + force 1,308 + math (0 pending now): **24,431 ok, 0 failed, 281 pending (S2 280, M6 1), 93 accepted** on x86_64 ELF, x86_64 PE and aarch64; every row 0 ulp | 33 of 44 Rust tests ported (2 partial: the Display symbols), 11 serde n/a; 97 assertions | 6 (4.8–31× Rust; [benchmarks](../benchmarks-rust-v-cyrius.md)) | `src/error.cyr`, `mathx.cyr`, `vec.cyr`, `config.cyr`, `material.cyr`, `units.cyr`, `force.cyr`; `[lib]` + `dist/impetus.cyr`; `tests/lib_2d.cyr`; surface parity 100/100 (`scripts/surface_parity.py`); ADR 0008 #6 mapped |
-| M1b Foundation: types, arena, contact tracker, spring | ☐ | | | | body, collider, joint, event, query descriptors; the generational arena; the contact tracker; the exact spring |
+| M1b Foundation: types, arena, contact tracker, spring | ◐ part 1 done 2026-11-09 | fmtf 37,576 + json 545 (+ units' 280 Display rows, now ok): **62,832 ok, 0 failed, 1 pending (M6), 93 accepted** on x86_64 ELF, x86_64 PE and aarch64 | the 11 M1a serde tests ported (no longer n/a), Display tests in full | — | part 1: ADR 0010; `src/fmtf.cyr` (shortest digits, Display and serde_json forms; S2 solved locally); `src/json.cyr` (codecs for WorldConfig, PhysicsMaterial, Quantity, Force, Impulse, Torque); serde_json's `float_roundtrip` finding. Part 2 next: the descriptors (tagged payload enums), arena, contact tracker, spring, each with codecs |
 | M2 2D collision | ☐ | | | | |
 | M3 2D dynamics | ☐ | | | | |
 | M4 3D collision | ☐ | | | | |

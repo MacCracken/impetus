@@ -1,0 +1,481 @@
+# json.cyr — serde-compatible JSON (ADR 0010): the same documents the Rust crate's serde_json writes
+# and reads.
+#
+# Writers append to a `str_builder`, fields in Rust declaration order, f64 through src/fmtf.cyr's
+# serde_json form. Readers parse with bayan's value tree (never the derive scanner, whose open
+# defects malformed input could reach) into one decode arena reset per call, so decoding never grows
+# the heap, and apply serde's derive semantics:
+# - a required field missing, a value of the wrong JSON type, an array of the wrong length, or an enum
+#   name that is no variant is Err(IM_ERR_DESERIALIZE);
+# - a `#[serde(default)]` field may be absent (its default), and so may an `Option` field (None);
+# - unknown fields are ignored; a duplicate key refuses the document (bayan);
+# - an f64 takes a JSON integer or float, never `null` (serde_json writes NaN and ±∞ as `null` and
+#   can't read them back, nor can the port);
+# - a u32 takes a JSON integer in 0..=4294967295 only (`4.0` and `-1` are refused).
+# Not thread-safe: the decode arena is module state.
+
+include "lib/bayan.cyr"
+include "lib/str.cyr"
+
+# ── writer ──────────────────────────────────────────────────────────────────────────
+
+# Appends `"name":`, preceded by a comma unless `first` is 1.
+fn _im_jw_key(sb, name, first) {
+    if (first == 0) { str_builder_putc(sb, 44); }
+    str_builder_putc(sb, 34);
+    str_builder_add_cstr(sb, name);
+    str_builder_putc(sb, 34);
+    str_builder_putc(sb, 58);
+    return 0;
+}
+
+# Appends `true` or `false`.
+fn _im_jw_bool(sb, b) {
+    if (b == 1) { str_builder_add_cstr(sb, "true"); } else { str_builder_add_cstr(sb, "false"); }
+    return 0;
+}
+
+# Appends the quoted string `s` (a C string with no characters that need escaping: variant names).
+fn _im_jw_name(sb, s) {
+    str_builder_putc(sb, 34);
+    str_builder_add_cstr(sb, s);
+    str_builder_putc(sb, 34);
+    return 0;
+}
+
+# Appends `[x,y,z]`.
+fn _im_jw_vec3(sb, v: ImVec3) {
+    var x: f64 = v.x;
+    var y: f64 = v.y;
+    var z: f64 = v.z;
+    str_builder_putc(sb, 91);
+    im_fmt_f64_json(sb, x);
+    str_builder_putc(sb, 44);
+    im_fmt_f64_json(sb, y);
+    str_builder_putc(sb, 44);
+    im_fmt_f64_json(sb, z);
+    str_builder_putc(sb, 93);
+    return 0;
+}
+
+# ── reader ──────────────────────────────────────────────────────────────────────────
+
+var _im_json_arena = 0;
+
+# The parsed tree of [buf, buf + len), on the decode arena (reset first), or 0 when the text is not
+# one JSON value.
+#must_use
+fn _im_jr_parse(buf, len): i64 {
+    if (_im_json_arena == 0) { _im_json_arena = arena_allocator_growable(4096); }
+    if (_im_json_arena == 0) { return 0; }
+    reset_via(_im_json_arena);
+    return bayan_json_v_parse_buf_a(_im_json_arena, buf, len);
+}
+
+# Field `key` of object `obj`, or 0 when absent.
+#must_use
+fn _im_jr_field(obj, key): i64 {
+    return bayan_json_v_obj_get_by_cstr(obj, key);
+}
+
+# A JSON number as an f64 into *out: 1, or 0 for any other value (null included).
+fn _im_jr_f64(v, out): i64 {
+    if (v == 0) { return 0; }
+    var tag = bayan_json_v_tag(v);
+    if (tag != JTAG_INT && tag != JTAG_FLOAT) { return 0; }
+    store64(out, bayan_json_v_float(v));
+    return 1;
+}
+
+# A JSON integer in [lo, hi] into *out: 1, or 0.
+fn _im_jr_int(v, lo, hi, out): i64 {
+    if (v == 0) { return 0; }
+    if (bayan_json_v_tag(v) != JTAG_INT) { return 0; }
+    var n = bayan_json_v_int(v);
+    if (n < lo || n > hi) { return 0; }
+    store64(out, n);
+    return 1;
+}
+
+# A JSON boolean into *out (0 / 1): 1, or 0.
+fn _im_jr_bool(v, out): i64 {
+    if (v == 0) { return 0; }
+    if (bayan_json_v_tag(v) != JTAG_BOOL) { return 0; }
+    store64(out, bayan_json_v_bool(v));
+    return 1;
+}
+
+# A JSON array of exactly 3 numbers into *out (an ImVec3): 1, or 0.
+fn _im_jr_vec3(v, out: *ImVec3): i64 {
+    if (v == 0) { return 0; }
+    if (bayan_json_v_tag(v) != JTAG_ARR || bayan_json_v_arr_len(v) != 3) { return 0; }
+    var w[24];
+    for (var i = 0; i < 3; i = i + 1) {
+        if (_im_jr_f64(bayan_json_v_arr_get(v, i), &w + i * 8) == 0) { return 0; }
+    }
+    var x: f64 = load64(&w);
+    var y: f64 = load64(&w + 8);
+    var z: f64 = load64(&w + 16);
+    out.x = x;
+    out.y = y;
+    out.z = z;
+    return 1;
+}
+
+# A unit variant: the JSON string naming one of the `count` variants (`name_fn(v)`), into *out: 1, or
+# 0 for any other value.
+fn _im_jr_enum(v, name_fn, count, out): i64 {
+    if (v == 0) { return 0; }
+    if (bayan_json_v_tag(v) != JTAG_STR) { return 0; }
+    var s = bayan_json_v_str(v);
+    for (var k = 0; k < count; k = k + 1) {
+        if (str_eq_cstr(s, fncall1(name_fn, k)) == 1) {
+            store64(out, k);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+# ── WorldConfig ─────────────────────────────────────────────────────────────────────
+
+impl ImWorldConfig {
+    # Appends the config as serde_json writes a `WorldConfig`.
+    fn to_json(self, sb) {
+        var ts: f64 = self.timestep;
+        var slop: f64 = self.position_slop;
+        var corr: f64 = self.position_correction;
+        var mv: f64 = self.max_velocity;
+        var fq: f64 = self.constraint_frequency;
+        var dr: f64 = self.constraint_damping_ratio;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "timestep", 1);
+        im_fmt_f64_json(sb, ts);
+        _im_jw_key(sb, "gravity", 0);
+        _im_jw_vec3(sb, self.gravity);
+        _im_jw_key(sb, "velocity_iterations", 0);
+        str_builder_add_int(sb, self.velocity_iterations);
+        _im_jw_key(sb, "position_iterations", 0);
+        str_builder_add_int(sb, self.position_iterations);
+        _im_jw_key(sb, "deterministic", 0);
+        _im_jw_bool(sb, self.deterministic);
+        _im_jw_key(sb, "step", 0);
+        str_builder_add_int(sb, self.step);
+        _im_jw_key(sb, "position_slop", 0);
+        im_fmt_f64_json(sb, slop);
+        _im_jw_key(sb, "position_correction", 0);
+        im_fmt_f64_json(sb, corr);
+        _im_jw_key(sb, "max_velocity", 0);
+        im_fmt_f64_json(sb, mv);
+        _im_jw_key(sb, "sub_steps", 0);
+        str_builder_add_int(sb, self.sub_steps);
+        _im_jw_key(sb, "constraint_frequency", 0);
+        im_fmt_f64_json(sb, fq);
+        _im_jw_key(sb, "constraint_damping_ratio", 0);
+        im_fmt_f64_json(sb, dr);
+        _im_jw_key(sb, "broadphase", 0);
+        _im_jw_name(sb, broadphase_kind_name(self.broadphase));
+        _im_jw_key(sb, "solver", 0);
+        _im_jw_name(sb, solver_kind_name(self.solver));
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `WorldConfig` document from [buf, buf + len) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# timestep, gravity, the iteration counts, deterministic and step are required; the rest default as
+# `WorldConfig::default` (serde's defaults). Mirrors `serde_json::from_str::<WorldConfig>`.
+#must_use
+fn ImWorldConfig_from_json(buf, len, out: *ImWorldConfig): Result {
+    var o = _im_jr_parse(buf, len);
+    if (o == 0 || bayan_json_v_tag(o) != JTAG_OBJ) { return Err(IM_ERR_DESERIALIZE); }
+    var c: ImWorldConfig = ImWorldConfig_default();
+    var w[8];
+    if (_im_jr_f64(_im_jr_field(o, "timestep"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var ts: f64 = load64(&w);
+    c.timestep = ts;
+    var g: ImVec3 = ImVec3_zero();
+    if (_im_jr_vec3(_im_jr_field(o, "gravity"), &g) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    c.gravity = g;
+    if (_im_jr_int(_im_jr_field(o, "velocity_iterations"), 0, 4294967295, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    c.velocity_iterations = load64(&w);
+    if (_im_jr_int(_im_jr_field(o, "position_iterations"), 0, 4294967295, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    c.position_iterations = load64(&w);
+    if (_im_jr_bool(_im_jr_field(o, "deterministic"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    c.deterministic = load64(&w);
+    if (_im_jr_int(_im_jr_field(o, "step"), 0, 0x7FFFFFFFFFFFFFFF, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    c.step = load64(&w);
+    var v = _im_jr_field(o, "position_slop");
+    if (v != 0) {
+        if (_im_jr_f64(v, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+        var a: f64 = load64(&w);
+        c.position_slop = a;
+    }
+    v = _im_jr_field(o, "position_correction");
+    if (v != 0) {
+        if (_im_jr_f64(v, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+        var b: f64 = load64(&w);
+        c.position_correction = b;
+    }
+    v = _im_jr_field(o, "max_velocity");
+    if (v != 0) {
+        if (_im_jr_f64(v, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+        var mv: f64 = load64(&w);
+        c.max_velocity = mv;
+    }
+    v = _im_jr_field(o, "sub_steps");
+    if (v != 0) {
+        if (_im_jr_int(v, 0, 4294967295, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+        c.sub_steps = load64(&w);
+    }
+    v = _im_jr_field(o, "constraint_frequency");
+    if (v != 0) {
+        if (_im_jr_f64(v, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+        var fq: f64 = load64(&w);
+        c.constraint_frequency = fq;
+    }
+    v = _im_jr_field(o, "constraint_damping_ratio");
+    if (v != 0) {
+        if (_im_jr_f64(v, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+        var dr: f64 = load64(&w);
+        c.constraint_damping_ratio = dr;
+    }
+    v = _im_jr_field(o, "broadphase");
+    if (v != 0) {
+        if (_im_jr_enum(v, &broadphase_kind_name, 2, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+        c.broadphase = load64(&w);
+    }
+    v = _im_jr_field(o, "solver");
+    if (v != 0) {
+        if (_im_jr_enum(v, &solver_kind_name, 2, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+        c.solver = load64(&w);
+    }
+    memcpy(out, &c, sizeof(ImWorldConfig));
+    return Ok(0);
+}
+
+# An optional f64 field: 0 when absent (*out untouched), 1 when read, -1 when not a number.
+fn _im_jr_opt_f64(o, key, out): i64 {
+    var v = _im_jr_field(o, key);
+    if (v == 0) { return 0; }
+    if (_im_jr_f64(v, out) == 0) { return 0 - 1; }
+    return 1;
+}
+
+# Appends an `Option<f64>`: the number, or `null` without one.
+fn _im_jw_opt_f64(sb, has, x: f64) {
+    if (has == 1) { im_fmt_f64_json(sb, x); } else { str_builder_add_cstr(sb, "null"); }
+    return 0;
+}
+
+# ── PhysicsMaterial ─────────────────────────────────────────────────────────────────
+
+impl ImPhysicsMaterial {
+    # Appends the material as serde_json writes a `PhysicsMaterial`.
+    fn to_json(self, sb) {
+        var fr: f64 = self.friction;
+        var re: f64 = self.restitution;
+        var de: f64 = self.density;
+        var sf: f64 = self.static_friction;
+        var ro: f64 = self.rolling_friction;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "friction", 1);
+        im_fmt_f64_json(sb, fr);
+        _im_jw_key(sb, "restitution", 0);
+        im_fmt_f64_json(sb, re);
+        _im_jw_key(sb, "density", 0);
+        im_fmt_f64_json(sb, de);
+        _im_jw_key(sb, "static_friction", 0);
+        _im_jw_opt_f64(sb, self.has_static_friction, sf);
+        _im_jw_key(sb, "rolling_friction", 0);
+        im_fmt_f64_json(sb, ro);
+        _im_jw_key(sb, "friction_combine", 0);
+        _im_jw_name(sb, combine_rule_name(self.friction_combine));
+        _im_jw_key(sb, "restitution_combine", 0);
+        _im_jw_name(sb, combine_rule_name(self.restitution_combine));
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads the `PhysicsMaterial` object `o` into *out: 1, or 0 when malformed. friction, restitution and
+# density are required; static_friction may be absent or null (None); rolling_friction defaults to
+# 0, friction_combine to Average, restitution_combine to Min.
+fn _im_jr_material(o, out: *ImPhysicsMaterial): i64 {
+    if (o == 0 || bayan_json_v_tag(o) != JTAG_OBJ) { return 0; }
+    var m: ImPhysicsMaterial = ImPhysicsMaterial_default();
+    var w[8];
+    if (_im_jr_f64(_im_jr_field(o, "friction"), &w) == 0) { return 0; }
+    var fr: f64 = load64(&w);
+    m.friction = fr;
+    if (_im_jr_f64(_im_jr_field(o, "restitution"), &w) == 0) { return 0; }
+    var re: f64 = load64(&w);
+    m.restitution = re;
+    if (_im_jr_f64(_im_jr_field(o, "density"), &w) == 0) { return 0; }
+    var de: f64 = load64(&w);
+    m.density = de;
+    var sv = _im_jr_field(o, "static_friction");
+    if (sv != 0 && bayan_json_v_tag(sv) != JTAG_NULL) {
+        if (_im_jr_f64(sv, &w) == 0) { return 0; }
+        var sf: f64 = load64(&w);
+        m.has_static_friction = 1;
+        m.static_friction = sf;
+    }
+    var r = _im_jr_opt_f64(o, "rolling_friction", &w);
+    if (r < 0) { return 0; }
+    if (r == 1) {
+        var ro: f64 = load64(&w);
+        m.rolling_friction = ro;
+    }
+    var v = _im_jr_field(o, "friction_combine");
+    if (v != 0) {
+        if (_im_jr_enum(v, &combine_rule_name, 4, &w) == 0) { return 0; }
+        m.friction_combine = load64(&w);
+    }
+    v = _im_jr_field(o, "restitution_combine");
+    if (v != 0) {
+        if (_im_jr_enum(v, &combine_rule_name, 4, &w) == 0) { return 0; }
+        m.restitution_combine = load64(&w);
+    }
+    memcpy(out, &m, sizeof(ImPhysicsMaterial));
+    return 1;
+}
+
+# Reads a `PhysicsMaterial` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# Mirrors `serde_json::from_str::<PhysicsMaterial>`.
+#must_use
+fn ImPhysicsMaterial_from_json(buf, len, out: *ImPhysicsMaterial): Result {
+    if (_im_jr_material(_im_jr_parse(buf, len), out) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    return Ok(0);
+}
+
+# ── Quantity ────────────────────────────────────────────────────────────────────────
+
+impl ImQuantity {
+    # Appends the quantity as serde_json writes a `Quantity`.
+    fn to_json(self, sb) {
+        var v: f64 = self.value;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "value", 1);
+        im_fmt_f64_json(sb, v);
+        _im_jw_key(sb, "unit", 0);
+        _im_jw_name(sb, physics_unit_name(self.unit));
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `Quantity` document (value and unit both required) into *out: Ok(0), or
+# Err(IM_ERR_DESERIALIZE). Mirrors `serde_json::from_str::<Quantity>`.
+#must_use
+fn ImQuantity_from_json(buf, len, out: *ImQuantity): Result {
+    var o = _im_jr_parse(buf, len);
+    if (o == 0 || bayan_json_v_tag(o) != JTAG_OBJ) { return Err(IM_ERR_DESERIALIZE); }
+    var w[8];
+    if (_im_jr_f64(_im_jr_field(o, "value"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var v: f64 = load64(&w);
+    if (_im_jr_enum(_im_jr_field(o, "unit"), &physics_unit_name, 14, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var q: ImQuantity = ImQuantity_new(v, load64(&w));
+    memcpy(out, &q, sizeof(ImQuantity));
+    return Ok(0);
+}
+
+# ── Force, Impulse, Torque ──────────────────────────────────────────────────────────
+
+# Appends `{"vector":[..],"point":[..] or null}`.
+fn _im_jw_vector_point(sb, v: ImVec3, has, p: ImVec3) {
+    str_builder_putc(sb, 123);
+    _im_jw_key(sb, "vector", 1);
+    _im_jw_vec3(sb, v);
+    _im_jw_key(sb, "point", 0);
+    if (has == 1) { _im_jw_vec3(sb, p); } else { str_builder_add_cstr(sb, "null"); }
+    str_builder_putc(sb, 125);
+    return 0;
+}
+
+# Reads `{"vector":[..], "point":[..] / null / absent}` from [buf, buf + len) into *v, *has, *p:
+# 1, or 0 when malformed.
+fn _im_jr_vector_point(buf, len, v: *ImVec3, has, p: *ImVec3): i64 {
+    var o = _im_jr_parse(buf, len);
+    if (o == 0 || bayan_json_v_tag(o) != JTAG_OBJ) { return 0; }
+    if (_im_jr_vec3(_im_jr_field(o, "vector"), v) == 0) { return 0; }
+    store64(has, 0);
+    var pv = _im_jr_field(o, "point");
+    if (pv != 0 && bayan_json_v_tag(pv) != JTAG_NULL) {
+        if (_im_jr_vec3(pv, p) == 0) { return 0; }
+        store64(has, 1);
+    }
+    return 1;
+}
+
+impl ImForce {
+    # Appends the force as serde_json writes a `Force`.
+    fn to_json(self, sb) {
+        return _im_jw_vector_point(sb, self.vector, self.has_point, self.point);
+    }
+}
+
+impl ImImpulse {
+    # Appends the impulse as serde_json writes an `Impulse`.
+    fn to_json(self, sb) {
+        return _im_jw_vector_point(sb, self.vector, self.has_point, self.point);
+    }
+}
+
+impl ImTorque {
+    # Appends the torque as serde_json writes a `Torque`.
+    fn to_json(self, sb) {
+        var v: f64 = self.value;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "value", 1);
+        im_fmt_f64_json(sb, v);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `Force` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# Mirrors `serde_json::from_str::<Force>`.
+#must_use
+fn ImForce_from_json(buf, len, out: *ImForce): Result {
+    var f: ImForce = ImForce_new(0.0, 0.0, 0.0);
+    var has[8];
+    var v: ImVec3 = ImVec3_zero();
+    var p: ImVec3 = ImVec3_zero();
+    if (_im_jr_vector_point(buf, len, &v, &has, &p) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    f.vector = v;
+    f.has_point = load64(&has);
+    f.point = p;
+    memcpy(out, &f, sizeof(ImForce));
+    return Ok(0);
+}
+
+# Reads an `Impulse` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# Mirrors `serde_json::from_str::<Impulse>`.
+#must_use
+fn ImImpulse_from_json(buf, len, out: *ImImpulse): Result {
+    var i: ImImpulse = ImImpulse_new(0.0, 0.0, 0.0);
+    var has[8];
+    var v: ImVec3 = ImVec3_zero();
+    var p: ImVec3 = ImVec3_zero();
+    if (_im_jr_vector_point(buf, len, &v, &has, &p) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    i.vector = v;
+    i.has_point = load64(&has);
+    i.point = p;
+    memcpy(out, &i, sizeof(ImImpulse));
+    return Ok(0);
+}
+
+# Reads a `Torque` document (`{"value":..}`) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# Mirrors `serde_json::from_str::<Torque>`.
+#must_use
+fn ImTorque_from_json(buf, len, out: *ImTorque): Result {
+    var o = _im_jr_parse(buf, len);
+    if (o == 0 || bayan_json_v_tag(o) != JTAG_OBJ) { return Err(IM_ERR_DESERIALIZE); }
+    var w[8];
+    if (_im_jr_f64(_im_jr_field(o, "value"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var v: f64 = load64(&w);
+    var t: ImTorque = ImTorque_new(v);
+    memcpy(out, &t, sizeof(ImTorque));
+    return Ok(0);
+}

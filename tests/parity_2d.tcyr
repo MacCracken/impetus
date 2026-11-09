@@ -368,7 +368,15 @@ fn _par_units(fp, fl): i64 {
         _par_got_f(r);
         return 1;
     }
-    # Quantity::fmt: pending until the stdlib has a shortest round-trip f64 printer (S2).
+    if (_par_eq(fp, fl, "Quantity::fmt") == 1) {
+        var u3 = _par_in_enum(1, "PhysicsUnit.", &physics_unit_name, 14);
+        var qf: ImQuantity = ImQuantity_new(v, u3);
+        var sb = str_builder_new();
+        qf.fmt(sb);
+        var txt = str_builder_build(sb);
+        _par_got_text(str_data(txt), str_len(txt));
+        return 1;
+    }
     return 0;
 }
 
@@ -441,12 +449,169 @@ fn _par_force(fp, fl): i64 {
     return 0;
 }
 
+# `f64::fmt_display` and `serde_json::f64` rows: src/fmtf.cyr's two layouts (ADR 0010).
+fn _par_fmtf(fp, fl): i64 {
+    var x: f64 = _par_in(0);
+    var sb = str_builder_new();
+    if (_par_eq(fp, fl, "f64::fmt_display") == 1) {
+        im_fmt_f64_display(sb, x);
+    } elif (_par_eq(fp, fl, "serde_json::f64") == 1) {
+        im_fmt_f64_json(sb, x);
+    } else {
+        return 0;
+    }
+    var txt = str_builder_build(sb);
+    _par_got_text(str_data(txt), str_len(txt));
+    return 1;
+}
+
+# ── json (ADR 0010) ─────────────────────────────────────────────────────────────────
+# `serde_json::to_string::<T>` rows: the flattened value in, the port's document out (compared byte
+# for byte). `serde_json::from_str::<T>` rows: a document in, the port's decoded fields (or
+# E:Deserialize) out.
+
+# A force or impulse's vector and point from the flattened tokens at k: the vector, then `n:` or the
+# point. Writes *has.
+fn _par_in_vector_point(k, v: *ImVec3, has, p: *ImVec3) {
+    var x: f64 = _par_in(k);
+    var y: f64 = _par_in(k + 1);
+    var z: f64 = _par_in(k + 2);
+    v.x = x;
+    v.y = y;
+    v.z = z;
+    store64(has, 0);
+    if (_par_in_is_none(k + 3) == 0) {
+        var px: f64 = _par_in(k + 3);
+        var py: f64 = _par_in(k + 4);
+        var pz: f64 = _par_in(k + 5);
+        p.x = px;
+        p.y = py;
+        p.z = pz;
+        store64(has, 1);
+    }
+    return 0;
+}
+
+# Appends the builder's text as the row's `s:` output.
+fn _par_got_builder(sb) {
+    var txt = str_builder_build(sb);
+    _par_got_text(str_data(txt), str_len(txt));
+    return 0;
+}
+
+fn _par_json_write(fp, fl): i64 {
+    var sb = str_builder_new();
+    if (_par_eq(fp, fl, "serde_json::to_string::<WorldConfig>") == 1) {
+        var c: ImWorldConfig = _par_in_config(0);
+        c.to_json(sb);
+    } elif (_par_eq(fp, fl, "serde_json::to_string::<PhysicsMaterial>") == 1) {
+        var m: ImPhysicsMaterial = _par_in_material(0);
+        m.to_json(sb);
+    } elif (_par_eq(fp, fl, "serde_json::to_string::<Quantity>") == 1) {
+        var v: f64 = _par_in(0);
+        var q: ImQuantity = ImQuantity_new(v, _par_in_enum(1, "PhysicsUnit.", &physics_unit_name, 14));
+        q.to_json(sb);
+    } elif (_par_eq(fp, fl, "serde_json::to_string::<Force>") == 1) {
+        var f: ImForce = ImForce_new(0.0, 0.0, 0.0);
+        var has[8];
+        var vv: ImVec3 = ImVec3_zero();
+        var pp: ImVec3 = ImVec3_zero();
+        _par_in_vector_point(0, &vv, &has, &pp);
+        f.vector = vv;
+        f.has_point = load64(&has);
+        f.point = pp;
+        f.to_json(sb);
+    } elif (_par_eq(fp, fl, "serde_json::to_string::<Impulse>") == 1) {
+        var i: ImImpulse = ImImpulse_new(0.0, 0.0, 0.0);
+        var hi[8];
+        var vi: ImVec3 = ImVec3_zero();
+        var pi: ImVec3 = ImVec3_zero();
+        _par_in_vector_point(0, &vi, &hi, &pi);
+        i.vector = vi;
+        i.has_point = load64(&hi);
+        i.point = pi;
+        i.to_json(sb);
+    } elif (_par_eq(fp, fl, "serde_json::to_string::<Torque>") == 1) {
+        var tv: f64 = _par_in(0);
+        var t: ImTorque = ImTorque_new(tv);
+        t.to_json(sb);
+    } else {
+        return 0;
+    }
+    _par_got_builder(sb);
+    return 1;
+}
+
+fn _par_json_read(fp, fl): i64 {
+    var doc = _par_in_cstr(0);
+    if (doc == 0) { return 0 - 1; }
+    var n = strlen(doc);
+    if (_par_eq(fp, fl, "serde_json::from_str::<WorldConfig>") == 1) {
+        var c: ImWorldConfig = ImWorldConfig_default();
+        var t, v = ImWorldConfig_from_json(doc, n, &c);
+        if (is_err_result(t) == 1) { _par_got_err(v); } else { _par_got_config(c); }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "serde_json::from_str::<PhysicsMaterial>") == 1) {
+        var m: ImPhysicsMaterial = ImPhysicsMaterial_default();
+        var tm, vm = ImPhysicsMaterial_from_json(doc, n, &m);
+        if (is_err_result(tm) == 1) { _par_got_err(vm); } else { _par_got_material(m); }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "serde_json::from_str::<Quantity>") == 1) {
+        var q: ImQuantity = ImQuantity_meters(0.0);
+        var tq, vq = ImQuantity_from_json(doc, n, &q);
+        if (is_err_result(tq) == 1) { _par_got_err(vq); } else { _par_got_quantity(q); }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "serde_json::from_str::<Force>") == 1) {
+        var f: ImForce = ImForce_new(0.0, 0.0, 0.0);
+        var tf, vf = ImForce_from_json(doc, n, &f);
+        if (is_err_result(tf) == 1) {
+            _par_got_err(vf);
+        } else {
+            _par_got_vector_point(f.vector, f.has_point, f.point);
+        }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "serde_json::from_str::<Impulse>") == 1) {
+        var i: ImImpulse = ImImpulse_new(0.0, 0.0, 0.0);
+        var ti, vi = ImImpulse_from_json(doc, n, &i);
+        if (is_err_result(ti) == 1) {
+            _par_got_err(vi);
+        } else {
+            _par_got_vector_point(i.vector, i.has_point, i.point);
+        }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "serde_json::from_str::<Torque>") == 1) {
+        var tq2: ImTorque = ImTorque_new(0.0);
+        var tt, vt = ImTorque_from_json(doc, n, &tq2);
+        if (is_err_result(tt) == 1) {
+            _par_got_err(vt);
+        } else {
+            var val: f64 = tq2.value;
+            _par_got_f(val);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+fn _par_json(fp, fl): i64 {
+    var h = _par_json_write(fp, fl);
+    if (h != 0) { return h; }
+    return _par_json_read(fp, fl);
+}
+
 fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_got_n = 0;
     _par_mapped = 0;
     if (_par_eq(mp, ml, "config") == 1) { return _par_config(fp, fl); }
+    if (_par_eq(mp, ml, "fmtf") == 1) { return _par_fmtf(fp, fl); }
     if (_par_eq(mp, ml, "constants") == 1) { return _par_constants(fp, fl); }
     if (_par_eq(mp, ml, "force") == 1) { return _par_force(fp, fl); }
+    if (_par_eq(mp, ml, "json") == 1) { return _par_json(fp, fl); }
     if (_par_eq(mp, ml, "material") == 1) { return _par_material(fp, fl); }
     if (_par_eq(mp, ml, "math") == 1) { return _par_math(fp, fl); }
     if (_par_eq(mp, ml, "units") == 1) { return _par_units(fp, fl); }

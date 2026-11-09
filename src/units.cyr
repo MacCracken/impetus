@@ -1,10 +1,8 @@
 # units.cyr — unit-tagged quantities (port of rust-old/src/units.rs).
 #
 # A value plus a unit tag; no unit arithmetic or conversion beyond degrees → radians.
-# `ImPhysicsUnit` keeps the Rust variant order. Rust's `Display` prints the value in its shortest
-# round-trip decimal form, which the Cyrius stdlib has no printer for yet (port plan §8, S2): the
-# unit symbols are ported (`physics_unit_symbol`), and the formatted quantity waits for S2. Its
-# golden rows are pending until then.
+# `ImPhysicsUnit` keeps the Rust variant order. `fmt` writes Rust's `Display`: the value in its
+# shortest round-trip form (src/fmtf.cyr, ADR 0010), a space, the unit symbol.
 
 enum ImPhysicsUnit {
     IM_UNIT_METERS = 0;
@@ -127,5 +125,15 @@ impl ImQuantity {
         }
         var v: f64 = self.value;
         return v;
+    }
+
+    # Appends the quantity as Rust's `Display` writes it: "9.81 N", "5 m", "90 °".
+    # Mirrors `<Quantity as Display>::fmt`.
+    fn fmt(self, sb) {
+        var v: f64 = self.value;
+        im_fmt_f64_display(sb, v);
+        str_builder_putc(sb, 32);
+        str_builder_add_cstr(sb, physics_unit_symbol(self.unit));
+        return 0;
     }
 }

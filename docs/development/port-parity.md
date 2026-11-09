@@ -181,6 +181,35 @@ fails when either drifts from `cyrius.cyml`.
   (S2's 280 and the M6 constant), 93 accepted** (ADR 0008 #6 92, ADR 0009 1). The dispatched math
   digests are unchanged and equal on all three targets.
 
+## 6. M1b part 1: float text and serde-compatible JSON (2026-11-09, ADR 0010)
+
+- **The shortest-digit printer** (`src/fmtf.cyr`: Burger & Dybvig on a 40-limb bignum) against both Rust
+  printers, `fmtf.tsv`, 37,576 rows: every binade, every power of ten 1e-323..1e308, their neighbours, the
+  2^53 edge, serde_json's −5/+15 thresholds, short decimals, 6,000 random bit patterns and 300 exact ties.
+  **All exact** on x86_64 ELF, x86_64 PE and aarch64.
+- **The two Rust printers disagree on exact ties.** When a double lies exactly halfway between its two
+  closest shortest candidates, Rust's core (`Display`, `Debug`) rounds up and serde_json's zmij rounds to
+  even: 2^-25 prints 2.9802322387695313e-8 and 2.9802322387695312e-8 respectively. `_im_shortest` takes
+  the tie rule as a parameter. `validate.py` counts 751 such Display rows against Python's (half-even) repr,
+  and every serde_json row equals it.
+- **`Quantity::fmt`**: the 280 rows pending since M1a are ok.
+- **JSON**, `json.tsv`, 545 rows. Every `to_string` document (248) is serde_json's byte for byte, and
+  every `from_str` row (297) decodes to the oracle's fields or its error. The edge documents cover:
+  - missing required fields (refused) and missing defaulted ones (default applied);
+  - `null` for f64, `4.0`, `-1` and 2^32 for u32;
+  - wrong-length arrays and unknown variant names;
+  - unknown fields (ignored) and duplicate keys (refused);
+  - integers for floats, exponent forms, underflow to 0, whitespace, non-objects, and empty and truncated
+    documents.
+- **serde_json's default float parse is not exact.** Without its `float_roundtrip` feature it is
+  "best-effort": 1 ulp off on some long decimals, so it can't always read back what it wrote (0.013716891524587275
+  read as …277). The port's parse is correctly rounded (bayan). impetus itself only implements
+  `Deserialize`, and the parse precision is the consumer's serde_json choice, so the oracle uses
+  `float_roundtrip`: every decode then agrees, and `validate.py` checks each decoded float against
+  Python's correctly rounded parse.
+- **Result, every target:** 8 modules, 0 failing; **62,832 ok, 0 failed, 0 measured, 1 pending (M6), 93
+  accepted**; the math digests are unchanged.
+
 ## How to reproduce
 
 ```sh

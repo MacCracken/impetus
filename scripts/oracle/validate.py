@@ -349,6 +349,101 @@ def check_m1a(name, rows):
     return counted
 
 
+# ── fmtf and json (ADR 0010) ────────────────────────────────────────────────────────
+
+import json as pyjson
+from urllib.parse import unquote
+
+
+def tok_s(t):
+    return unquote(t[2:])
+
+
+def digits_of(text):
+    mant = re.split("[eE]", text)[0].replace("-", "").replace(".", "")
+    return mant.lstrip("0").rstrip("0")
+
+
+def check_fmtf(rows):
+    """Every printed string reads back to its value; serde_json's digits are Python's shortest repr
+    (both round half to even); Rust's Display digits are the same except on exact ties."""
+    ties = 0
+    for fn, cls, ins, outs, note in rows:
+        x = tok_f(ins[0])
+        text = tok_s(outs[0])
+        if math.isnan(x) or math.isinf(x):
+            continue
+        if fn == "serde_json::f64":
+            if not same(float(text), x):
+                fail(f"fmtf: {note}: does not read back")
+            if x != 0 and digits_of(text) != digits_of(repr(abs(x))):
+                fail(f"fmtf: {note}: digits differ from Python's shortest repr {repr(x)}")
+        elif fn == "f64::fmt_display":
+            if not same(float(text), x):
+                fail(f"fmtf: {note}: does not read back")
+            if x != 0 and digits_of(text) != digits_of(repr(abs(x))):
+                ties += 1
+    return ties
+
+
+def json_fields(ty, doc):
+    """Python's reading of a document, flattened like scripts/oracle/src/flat.rs, or None."""
+    try:
+        o = pyjson.loads(doc, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
+    except ValueError:
+        return None
+    if not isinstance(o, dict):
+        return None
+    return o
+
+
+def check_json(rows):
+    """Every document the oracle decodes has fields equal to Python's correctly rounded parse; every
+    document the oracle writes reads back (in Python) to the floats it was written from."""
+    counted = 0
+    for fn, cls, ins, outs, note in rows:
+        if fn.startswith("serde_json::from_str::"):
+            if outs == ["E:Deserialize"]:
+                continue
+            o = json_fields(fn, tok_s(ins[0]))
+            if o is None:
+                fail(f"json: {note}: the oracle decoded a document Python can't read")
+                continue
+            # Every float the oracle decoded must equal Python's float() of the matching number.
+            nums = [v for v in walk_numbers(o)]
+            got = [tok_f(t) for t in outs if t.startswith("f:")]
+            for v in nums:
+                if isinstance(v, float) and not any(same(v, g) for g in got):
+                    fail(f"json: {note}: Python reads {v!r}, which the oracle's fields don't hold")
+            counted += 1
+        elif fn.startswith("serde_json::to_string::"):
+            doc = tok_s(outs[0])
+            o = json_fields(fn, doc)
+            if o is None:
+                fail(f"json: {note}: the oracle wrote a document Python can't read")
+                continue
+            written = [tok_f(t) for t in ins if t.startswith("f:")]
+            back = list(walk_numbers(o))
+            for w in written:
+                if math.isfinite(w) and not any(same(w, b) for b in back):
+                    fail(f"json: {note}: {w!r} doesn't read back from the document")
+            counted += 1
+    return counted
+
+
+def walk_numbers(o):
+    if isinstance(o, dict):
+        for v in o.values():
+            yield from walk_numbers(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from walk_numbers(v)
+    elif isinstance(o, float):
+        # Only JSON floats: integer fields are `i:` tokens, and an integer written for an f64
+        # converts exactly below 2^53.
+        yield o
+
+
 def main():
     root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
     golden = root / "tests/golden"
@@ -365,6 +460,12 @@ def main():
         if name == "constants":
             check_constants(root, rows)
             print(f"constants: {len(rows)} rows checked against rust-old/src")
+        elif name == "fmtf":
+            ties = check_fmtf(rows)
+            print(f"fmtf: {len(rows)} rows read back; serde_json = Python's shortest digits; "
+                  f"{ties} Display rows differ only by Rust's round-half-up on an exact tie")
+        elif name == "json":
+            print(f"json: {check_json(rows)} documents checked against Python's json")
         elif name in ("config", "material", "units", "force"):
             print(f"{name}: {check_m1a(name, rows)} rows recomputed")
         elif name == "math":

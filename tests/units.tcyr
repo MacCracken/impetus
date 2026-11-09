@@ -1,8 +1,4 @@
-# units.tcyr — the ported Rust tests of rust-old/src/units.rs (M1a).
-#
-# quantity_display and quantity_display_all_units are ported for the unit symbols only: the numeric
-# part of Rust's Display waits for a shortest round-trip printer (port plan §8, S2).
-# Not carried over: quantity_serde (serde).
+# units.tcyr — the ported Rust tests of rust-old/src/units.rs (M1a; Display and serde in M1b).
 
 include "tests/ulp.cyr"
 include "tests/lib_2d.cyr"
@@ -14,26 +10,33 @@ fn close(got: f64, want: f64): i64 {
     return 0;
 }
 
+# 1 when q's Display text (`ImQuantity.fmt`) is `want`.
+fn shows(q: ImQuantity, want): i64 {
+    var sb = str_builder_new();
+    q.fmt(sb);
+    return str_eq_cstr(str_builder_build(sb), want);
+}
+
 # Runs the ported units tests.
 fn main() {
     alloc_init();
-    test_group("quantity_display (symbols)");
-    assert(streq(physics_unit_symbol(IM_UNIT_NEWTONS), "N") == 1, "N");
-    assert(streq(physics_unit_symbol(IM_UNIT_METERS), "m") == 1, "m");
-    assert(streq(physics_unit_symbol(IM_UNIT_DEGREES), "°") == 1, "degree sign");
+    test_group("quantity_display");
+    assert(shows(ImQuantity_newtons(9.81), "9.81 N") == 1, "9.81 N");
+    assert(shows(ImQuantity_meters(5.0), "5 m") == 1, "5 m");
+    assert(shows(ImQuantity_degrees(90.0), "90 °") == 1, "90 °");
 
-    test_group("quantity_display_all_units (symbols)");
-    assert(streq(physics_unit_symbol(IM_UNIT_KILOGRAMS), "kg") == 1, "kg");
-    assert(streq(physics_unit_symbol(IM_UNIT_SECONDS), "s") == 1, "s");
-    assert(streq(physics_unit_symbol(IM_UNIT_METERS_PER_SECOND), "m/s") == 1, "m/s");
-    assert(streq(physics_unit_symbol(IM_UNIT_METERS_PER_SECOND_SQUARED), "m/s²") == 1, "m/s²");
-    assert(streq(physics_unit_symbol(IM_UNIT_NEWTON_METERS), "N·m") == 1, "N·m");
-    assert(streq(physics_unit_symbol(IM_UNIT_JOULES), "J") == 1, "J");
-    assert(streq(physics_unit_symbol(IM_UNIT_RADIANS), "rad") == 1, "rad");
-    assert(streq(physics_unit_symbol(IM_UNIT_RADIANS_PER_SECOND), "rad/s") == 1, "rad/s");
-    assert(streq(physics_unit_symbol(IM_UNIT_KG_PER_CUBIC_METER), "kg/m³") == 1, "kg/m³");
-    assert(streq(physics_unit_symbol(IM_UNIT_KG_PER_SQUARE_METER), "kg/m²") == 1, "kg/m²");
-    assert(streq(physics_unit_symbol(IM_UNIT_PASCALS), "Pa") == 1, "Pa");
+    test_group("quantity_display_all_units");
+    assert(shows(ImQuantity_kilograms(1.0), "1 kg") == 1, "1 kg");
+    assert(shows(ImQuantity_seconds(2.5), "2.5 s") == 1, "2.5 s");
+    assert(shows(ImQuantity_meters_per_second(10.0), "10 m/s") == 1, "10 m/s");
+    assert(shows(ImQuantity_new(9.81, IM_UNIT_METERS_PER_SECOND_SQUARED), "9.81 m/s²") == 1, "9.81 m/s²");
+    assert(shows(ImQuantity_new(5.0, IM_UNIT_NEWTON_METERS), "5 N·m") == 1, "5 N·m");
+    assert(shows(ImQuantity_joules(100.0), "100 J") == 1, "100 J");
+    assert(shows(ImQuantity_radians(2.5), "2.5 rad") == 1, "2.5 rad");
+    assert(shows(ImQuantity_new(1.0, IM_UNIT_RADIANS_PER_SECOND), "1 rad/s") == 1, "1 rad/s");
+    assert(shows(ImQuantity_new(1000.0, IM_UNIT_KG_PER_CUBIC_METER), "1000 kg/m³") == 1, "1000 kg/m³");
+    assert(shows(ImQuantity_new(500.0, IM_UNIT_KG_PER_SQUARE_METER), "500 kg/m²") == 1, "500 kg/m²");
+    assert(shows(ImQuantity_pascals(101325.0), "101325 Pa") == 1, "101325 Pa");
 
     test_group("degrees_to_radians");
     var q: ImQuantity = ImQuantity_degrees(180.0);
@@ -57,6 +60,18 @@ fn main() {
     var qm: ImQuantity = ImQuantity_meters(5.0);
     var rm: f64 = qm.to_radians();
     assert(rm == 5.0, "meters unchanged");
+
+    test_group("quantity_serde");
+    var qn: ImQuantity = ImQuantity_newtons(42.0);
+    var sbq = str_builder_new();
+    qn.to_json(sbq);
+    var js = str_builder_build(sbq);
+    var qb: ImQuantity = ImQuantity_meters(0.0);
+    var qt, qv = ImQuantity_from_json(str_data(js), str_len(js), &qb);
+    assert(is_err_result(qt) == 0, "reads back");
+    var qval: f64 = qb.value;
+    assert(qval == 42.0, "value 42");
+    assert_eq(qb.unit, IM_UNIT_NEWTONS, "unit Newtons");
 
     test_group("physics_unit_equality");
     assert(IM_UNIT_METERS == IM_UNIT_METERS, "meters == meters");

@@ -14,6 +14,12 @@ description = "Drives the frozen Rust impetus 1.4.0 in rust-old/ to write the Cy
 # `PhysicsWorld::MAX_SNAPSHOT_INDEX` and the bitcode snapshot (M6 reference).
 [dependencies]
 impetus = { path = "../../rust-old", default-features = false, features = ["oracle", "serialize"] }
+# The oracle's own JSON: the version rust-old's tests use (its Cargo.lock), for the serde rows
+# (ADR 0010). `float_roundtrip` makes its float parsing correctly rounded: the default fast path is
+# off by 1 ulp on some long decimals (it can't read back what it wrote), and the port's parse is
+# correctly rounded. Writing is the same in both modes.
+serde_json = { version = "=1.0.154", features = ["float_roundtrip"] }
+serde = "1"
 
 # The oracle's backends are exclusive, so the generator is one crate run twice
 # (port plan §4 step 5):

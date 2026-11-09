@@ -28,7 +28,8 @@ Decisions about impetus — what we chose, the context, and the consequences we 
 | [0005](0005-velocity-level-joints.md) | Velocity-level joint constraints | Accepted |
 | [0006](0006-manifold-rebuild-per-frame.md) | Rebuild contact manifolds every frame | Accepted |
 | [0007](0007-cyrius-port-hisab-first.md) | Port to Cyrius on hisab, with Rust 1.4.0 frozen as the oracle | Accepted; amended in M0 step 9 (hisab off the step path until S1/H9) |
-| [0008](0008-port-api-divergences.md) | API changes in the Cyrius 2.0 port | Accepted |
+| [0008](0008-port-api-divergences.md) | API changes in the Cyrius 2.0 port | Accepted (serde no longer "not carried": see 0010) |
 | [0009](0009-accept-ganita-pow-minus-one-divergence.md) | Accept ganita's pow(−1, DBL_MAX) divergence | Accepted |
+| [0010](0010-serde-compatible-json.md) | Serde-compatible JSON codecs on bayan, with a shortest-digit float printer | Accepted |
 
 0001–0006 were written for the Rust crate (three-digit numbers until the port).

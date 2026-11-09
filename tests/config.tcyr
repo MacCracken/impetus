@@ -1,6 +1,6 @@
-# config.tcyr — the ported Rust tests of rust-old/src/config.rs (M1a), plus ADR 0008 #6.
+# config.tcyr — the ported Rust tests of rust-old/src/config.rs (M1a, serde in M1b), plus ADR 0008 #6.
 #
-# Not carried over: config_serde_roundtrip, custom_config_serde, solver_kind_serde (serde).
+# The serde tests round-trip through the serde-compatible JSON codecs (src/json.cyr, ADR 0010).
 
 include "tests/ulp.cyr"
 include "tests/lib_2d.cyr"
@@ -17,6 +17,25 @@ fn accepts(c: ImWorldConfig): i64 {
     var t, v = c.validate();
     if (is_err_result(t) == 0) { return 1; }
     return 0;
+}
+
+# Writes c as JSON and reads it back into *out: 1 when the read succeeds.
+fn json_roundtrip(c: ImWorldConfig, out: *ImWorldConfig): i64 {
+    var sb = str_builder_new();
+    c.to_json(sb);
+    var s = str_builder_build(sb);
+    var t, v = ImWorldConfig_from_json(str_data(s), str_len(s), out);
+    if (is_err_result(t) == 1) { return 0; }
+    return 1;
+}
+
+# 1 when every field of a and b is equal (Rust's derived PartialEq).
+fn same_config(a: ImWorldConfig, b: ImWorldConfig): i64 {
+    var sa = str_builder_new();
+    a.to_json(sa);
+    var sb = str_builder_new();
+    b.to_json(sb);
+    return str_eq(str_builder_build(sa), str_builder_build(sb));
 }
 
 # Runs the ported config tests.
@@ -64,6 +83,31 @@ fn main() {
     assert_eq(d.velocity_iterations, 4, "4 velocity iterations");
     assert_eq(d.position_iterations, 1, "1 position iteration");
     assert_eq(d.step, 0, "step 0");
+
+    test_group("config_serde_roundtrip");
+    var back: ImWorldConfig = ImWorldConfig_default();
+    assert(json_roundtrip(d, &back) == 1, "reads back");
+    assert(same_config(d, back) == 1, "equal after the round trip");
+
+    test_group("custom_config_serde");
+    var cu: ImWorldConfig = ImWorldConfig_default();
+    cu.timestep = 1.0 / 120.0;
+    cu.gravity = ImVec3_new(0.0, -10.0, 0.0);
+    cu.velocity_iterations = 8;
+    cu.position_iterations = 3;
+    cu.deterministic = 0;
+    cu.position_slop = 0.02;
+    cu.position_correction = 0.3;
+    var cb: ImWorldConfig = ImWorldConfig_default();
+    assert(json_roundtrip(cu, &cb) == 1, "reads back");
+    assert(same_config(cu, cb) == 1, "equal after the round trip");
+
+    test_group("solver_kind_serde");
+    var xs: ImWorldConfig = ImWorldConfig_default();
+    xs.solver = IM_SOLVER_XPBD;
+    var xb: ImWorldConfig = ImWorldConfig_default();
+    assert(json_roundtrip(xs, &xb) == 1, "reads back");
+    assert_eq(xb.solver, IM_SOLVER_XPBD, "Xpbd survives the round trip");
 
     test_group("solver_kind_default_is_sequential_impulse");
     assert_eq(d.solver, IM_SOLVER_SEQUENTIAL_IMPULSE, "sequential impulse");
