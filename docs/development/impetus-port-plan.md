@@ -538,10 +538,8 @@ tanmatra filed its findings.
   The `_a` variants return -1; moving the writers onto them, with an error return, is impetus-side work.
 - **Correctly rounded transcendentals in ganita** (not filed yet). impetus now owns correctly rounded
   exp, sin and cos (`src/crmath.cyr`, ADR 0011), as kimiya owns its acos, cos, ln and pow. They belong in
-  ganita, once, with a two-phase (Ziv) design like impetus's. impetus's fast paths cost 2.6 µs (exp)
-  and 3.3 µs (sin_cos) against the polyfills' 64 and 83 ns (`benchmarks-rust-v-cyrius.md`). A
-  table-driven reduction and Horner coefficients are the obvious first steps, and they are needed
-  before M3's per-body rotations.
+  ganita, once, with a phased (Ziv) design like impetus's. impetus's costs 97 ns (exp) and 187 ns
+  (sin_cos), about 2× the polyfills (`benchmarks-rust-v-cyrius.md`).
 - **Derive features for serde-shaped JSON** (not filed yet): variant renaming (`"Average"`, not the member
   name), `Option` fields as `null`, externally tagged payload enums (`{"Ball":{"radius":0.5}}`). With them,
   `src/json.cyr`'s hand-written codecs could move to `#derive`.

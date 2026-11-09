@@ -104,12 +104,27 @@ var _IM_CR_PIO2_1: f64 = 0x3FF921FB54400000;  # π/2 cut to 33 significant bits
 var _IM_CR_PIO2_2: f64 = 0x3DD0B4611A626331;  # π/2 − p1, nearest
 var _IM_CR_PIO2_3: f64 = 0x3A71701B839A2520;  # π/2 − p1 − p2, nearest
 var _IM_CR_PIO2_4: f64 = 0x37127044533E63A0;  # π/2 − p1 − p2 − p3, nearest
+var _IM_CR_INV_L64: f64 = 0x40571547652B82FE;  # 64/ln 2, nearest
+var _IM_CR_L64_HI: f64 = 0x3F862E42FEFA0000;  # ln 2/64 cut to 36 significant bits
+var _IM_CR_L64_LO: f64 = 0x3D1CF79ABC9E3B3A;  # ln 2/64 − hi, nearest
+var _IM_CR_PIO2_C1: f64 = 0x3FF921FB54400000;  # π/2 cut to 33 significant bits
+var _IM_CR_PIO2_C2: f64 = 0x3DD0B4611A600000;  # π/2 − c1 cut to 33 significant bits
+var _IM_CR_PIO2_C3: f64 = 0x3BA3198A2E037073;  # π/2 − c1 − c2, nearest
+var _IM_CR_F3: f64 = 0x3FC5555555555555;  # 1/3!, nearest
+var _IM_CR_F4: f64 = 0x3FA5555555555555;  # 1/4!, nearest
+var _IM_CR_F5: f64 = 0x3F81111111111111;  # 1/5!, nearest
+var _IM_CR_F6: f64 = 0x3F56C16C16C16C17;  # 1/6!, nearest
+var _IM_CR_F7: f64 = 0x3F2A01A01A01A01A;  # 1/7!, nearest
 
 # 2/π in 56 chunks of 28 bits: chunk n is bits 28n + 1 … 28n + 28 after the binary point.
 var _im_cr_2opi[448];
 # π/2 and ln 2 in the slow path's fixed point: 14 limbs of 28 bits, limb 0 the integer part.
 var _im_cr_pio2[112];
 var _im_cr_ln2[112];
+# Phase 1 of exp: 2^(j/64) as hi, lo for j = 0 … 63 (16 bytes a row).
+var _im_cr_exp2t[1024];
+# Phase 1 of sin and cos: sin(i/64) hi, lo, cos(i/64) hi, lo for i = 0 … 51 (32 bytes a row).
+var _im_cr_sct[1664];
 var _im_cr_ready = 0;
 
 # Fills the three tables, once.
@@ -199,6 +214,342 @@ fn _im_cr_load() {
     store64(&_im_cr_ln2 + 88, 0x206DEBA);
     store64(&_im_cr_ln2 + 96, 0xC985595);
     store64(&_im_cr_ln2 + 104, 0x52FB4AF);
+    store64(&_im_cr_exp2t + 0, 0x3FF0000000000000);
+    store64(&_im_cr_exp2t + 8, 0x0000000000000000);
+    store64(&_im_cr_exp2t + 16, 0x3FF02C9A3E778061);
+    store64(&_im_cr_exp2t + 24, 0xBC719083535B085D);
+    store64(&_im_cr_exp2t + 32, 0x3FF059B0D3158574);
+    store64(&_im_cr_exp2t + 40, 0x3C8D73E2A475B465);
+    store64(&_im_cr_exp2t + 48, 0x3FF0874518759BC8);
+    store64(&_im_cr_exp2t + 56, 0x3C6186BE4BB284FF);
+    store64(&_im_cr_exp2t + 64, 0x3FF0B5586CF9890F);
+    store64(&_im_cr_exp2t + 72, 0x3C98A62E4ADC610B);
+    store64(&_im_cr_exp2t + 80, 0x3FF0E3EC32D3D1A2);
+    store64(&_im_cr_exp2t + 88, 0x3C403A1727C57B53);
+    store64(&_im_cr_exp2t + 96, 0x3FF11301D0125B51);
+    store64(&_im_cr_exp2t + 104, 0xBC96C51039449B3A);
+    store64(&_im_cr_exp2t + 112, 0x3FF1429AAEA92DE0);
+    store64(&_im_cr_exp2t + 120, 0xBC932FBF9AF1369E);
+    store64(&_im_cr_exp2t + 128, 0x3FF172B83C7D517B);
+    store64(&_im_cr_exp2t + 136, 0xBC819041B9D78A76);
+    store64(&_im_cr_exp2t + 144, 0x3FF1A35BEB6FCB75);
+    store64(&_im_cr_exp2t + 152, 0x3C8E5B4C7B4968E4);
+    store64(&_im_cr_exp2t + 160, 0x3FF1D4873168B9AA);
+    store64(&_im_cr_exp2t + 168, 0x3C9E016E00A2643C);
+    store64(&_im_cr_exp2t + 176, 0x3FF2063B88628CD6);
+    store64(&_im_cr_exp2t + 184, 0x3C8DC775814A8495);
+    store64(&_im_cr_exp2t + 192, 0x3FF2387A6E756238);
+    store64(&_im_cr_exp2t + 200, 0x3C99B07EB6C70573);
+    store64(&_im_cr_exp2t + 208, 0x3FF26B4565E27CDD);
+    store64(&_im_cr_exp2t + 216, 0x3C82BD339940E9D9);
+    store64(&_im_cr_exp2t + 224, 0x3FF29E9DF51FDEE1);
+    store64(&_im_cr_exp2t + 232, 0x3C8612E8AFAD1255);
+    store64(&_im_cr_exp2t + 240, 0x3FF2D285A6E4030B);
+    store64(&_im_cr_exp2t + 248, 0x3C90024754DB41D5);
+    store64(&_im_cr_exp2t + 256, 0x3FF306FE0A31B715);
+    store64(&_im_cr_exp2t + 264, 0x3C86F46AD23182E4);
+    store64(&_im_cr_exp2t + 272, 0x3FF33C08B26416FF);
+    store64(&_im_cr_exp2t + 280, 0x3C932721843659A6);
+    store64(&_im_cr_exp2t + 288, 0x3FF371A7373AA9CB);
+    store64(&_im_cr_exp2t + 296, 0xBC963AEABF42EAE2);
+    store64(&_im_cr_exp2t + 304, 0x3FF3A7DB34E59FF7);
+    store64(&_im_cr_exp2t + 312, 0xBC75E436D661F5E3);
+    store64(&_im_cr_exp2t + 320, 0x3FF3DEA64C123422);
+    store64(&_im_cr_exp2t + 328, 0x3C8ADA0911F09EBC);
+    store64(&_im_cr_exp2t + 336, 0x3FF4160A21F72E2A);
+    store64(&_im_cr_exp2t + 344, 0xBC5EF3691C309278);
+    store64(&_im_cr_exp2t + 352, 0x3FF44E086061892D);
+    store64(&_im_cr_exp2t + 360, 0x3C489B7A04EF80D0);
+    store64(&_im_cr_exp2t + 368, 0x3FF486A2B5C13CD0);
+    store64(&_im_cr_exp2t + 376, 0x3C73C1A3B69062F0);
+    store64(&_im_cr_exp2t + 384, 0x3FF4BFDAD5362A27);
+    store64(&_im_cr_exp2t + 392, 0x3C7D4397AFEC42E2);
+    store64(&_im_cr_exp2t + 400, 0x3FF4F9B2769D2CA7);
+    store64(&_im_cr_exp2t + 408, 0xBC94B309D25957E3);
+    store64(&_im_cr_exp2t + 416, 0x3FF5342B569D4F82);
+    store64(&_im_cr_exp2t + 424, 0xBC807ABE1DB13CAD);
+    store64(&_im_cr_exp2t + 432, 0x3FF56F4736B527DA);
+    store64(&_im_cr_exp2t + 440, 0x3C99BB2C011D93AD);
+    store64(&_im_cr_exp2t + 448, 0x3FF5AB07DD485429);
+    store64(&_im_cr_exp2t + 456, 0x3C96324C054647AD);
+    store64(&_im_cr_exp2t + 464, 0x3FF5E76F15AD2148);
+    store64(&_im_cr_exp2t + 472, 0x3C9BA6F93080E65E);
+    store64(&_im_cr_exp2t + 480, 0x3FF6247EB03A5585);
+    store64(&_im_cr_exp2t + 488, 0xBC9383C17E40B497);
+    store64(&_im_cr_exp2t + 496, 0x3FF6623882552225);
+    store64(&_im_cr_exp2t + 504, 0xBC9BB60987591C34);
+    store64(&_im_cr_exp2t + 512, 0x3FF6A09E667F3BCD);
+    store64(&_im_cr_exp2t + 520, 0xBC9BDD3413B26456);
+    store64(&_im_cr_exp2t + 528, 0x3FF6DFB23C651A2F);
+    store64(&_im_cr_exp2t + 536, 0xBC6BBE3A683C88AB);
+    store64(&_im_cr_exp2t + 544, 0x3FF71F75E8EC5F74);
+    store64(&_im_cr_exp2t + 552, 0xBC816E4786887A99);
+    store64(&_im_cr_exp2t + 560, 0x3FF75FEB564267C9);
+    store64(&_im_cr_exp2t + 568, 0xBC90245957316DD3);
+    store64(&_im_cr_exp2t + 576, 0x3FF7A11473EB0187);
+    store64(&_im_cr_exp2t + 584, 0xBC841577EE04992F);
+    store64(&_im_cr_exp2t + 592, 0x3FF7E2F336CF4E62);
+    store64(&_im_cr_exp2t + 600, 0x3C705D02BA15797E);
+    store64(&_im_cr_exp2t + 608, 0x3FF82589994CCE13);
+    store64(&_im_cr_exp2t + 616, 0xBC9D4C1DD41532D8);
+    store64(&_im_cr_exp2t + 624, 0x3FF868D99B4492ED);
+    store64(&_im_cr_exp2t + 632, 0xBC9FC6F89BD4F6BA);
+    store64(&_im_cr_exp2t + 640, 0x3FF8ACE5422AA0DB);
+    store64(&_im_cr_exp2t + 648, 0x3C96E9F156864B27);
+    store64(&_im_cr_exp2t + 656, 0x3FF8F1AE99157736);
+    store64(&_im_cr_exp2t + 664, 0x3C85CC13A2E3976C);
+    store64(&_im_cr_exp2t + 672, 0x3FF93737B0CDC5E5);
+    store64(&_im_cr_exp2t + 680, 0xBC675FC781B57EBC);
+    store64(&_im_cr_exp2t + 688, 0x3FF97D829FDE4E50);
+    store64(&_im_cr_exp2t + 696, 0xBC9D185B7C1B85D1);
+    store64(&_im_cr_exp2t + 704, 0x3FF9C49182A3F090);
+    store64(&_im_cr_exp2t + 712, 0x3C7C7C46B071F2BE);
+    store64(&_im_cr_exp2t + 720, 0x3FFA0C667B5DE565);
+    store64(&_im_cr_exp2t + 728, 0xBC9359495D1CD533);
+    store64(&_im_cr_exp2t + 736, 0x3FFA5503B23E255D);
+    store64(&_im_cr_exp2t + 744, 0xBC9D2F6EDB8D41E1);
+    store64(&_im_cr_exp2t + 752, 0x3FFA9E6B5579FDBF);
+    store64(&_im_cr_exp2t + 760, 0x3C90FAC90EF7FD31);
+    store64(&_im_cr_exp2t + 768, 0x3FFAE89F995AD3AD);
+    store64(&_im_cr_exp2t + 776, 0x3C97A1CD345DCC81);
+    store64(&_im_cr_exp2t + 784, 0x3FFB33A2B84F15FB);
+    store64(&_im_cr_exp2t + 792, 0xBC62805E3084D708);
+    store64(&_im_cr_exp2t + 800, 0x3FFB7F76F2FB5E47);
+    store64(&_im_cr_exp2t + 808, 0xBC75584F7E54AC3B);
+    store64(&_im_cr_exp2t + 816, 0x3FFBCC1E904BC1D2);
+    store64(&_im_cr_exp2t + 824, 0x3C823DD07A2D9E84);
+    store64(&_im_cr_exp2t + 832, 0x3FFC199BDD85529C);
+    store64(&_im_cr_exp2t + 840, 0x3C811065895048DD);
+    store64(&_im_cr_exp2t + 848, 0x3FFC67F12E57D14B);
+    store64(&_im_cr_exp2t + 856, 0x3C92884DFF483CAD);
+    store64(&_im_cr_exp2t + 864, 0x3FFCB720DCEF9069);
+    store64(&_im_cr_exp2t + 872, 0x3C7503CBD1E949DB);
+    store64(&_im_cr_exp2t + 880, 0x3FFD072D4A07897C);
+    store64(&_im_cr_exp2t + 888, 0xBC9CBC3743797A9C);
+    store64(&_im_cr_exp2t + 896, 0x3FFD5818DCFBA487);
+    store64(&_im_cr_exp2t + 904, 0x3C82ED02D75B3707);
+    store64(&_im_cr_exp2t + 912, 0x3FFDA9E603DB3285);
+    store64(&_im_cr_exp2t + 920, 0x3C9C2300696DB532);
+    store64(&_im_cr_exp2t + 928, 0x3FFDFC97337B9B5F);
+    store64(&_im_cr_exp2t + 936, 0xBC91A5CD4F184B5C);
+    store64(&_im_cr_exp2t + 944, 0x3FFE502EE78B3FF6);
+    store64(&_im_cr_exp2t + 952, 0x3C839E8980A9CC8F);
+    store64(&_im_cr_exp2t + 960, 0x3FFEA4AFA2A490DA);
+    store64(&_im_cr_exp2t + 968, 0xBC9E9C23179C2893);
+    store64(&_im_cr_exp2t + 976, 0x3FFEFA1BEE615A27);
+    store64(&_im_cr_exp2t + 984, 0x3C9DC7F486A4B6B0);
+    store64(&_im_cr_exp2t + 992, 0x3FFF50765B6E4540);
+    store64(&_im_cr_exp2t + 1000, 0x3C99D3E12DD8A18B);
+    store64(&_im_cr_exp2t + 1008, 0x3FFFA7C1819E90D8);
+    store64(&_im_cr_exp2t + 1016, 0x3C874853F3A5931E);
+    store64(&_im_cr_sct + 0, 0x0000000000000000);
+    store64(&_im_cr_sct + 8, 0x0000000000000000);
+    store64(&_im_cr_sct + 16, 0x3FF0000000000000);
+    store64(&_im_cr_sct + 24, 0x0000000000000000);
+    store64(&_im_cr_sct + 32, 0x3F8FFFAAAAEEEED5);
+    store64(&_im_cr_sct + 40, 0xBC02AB639A9F0776);
+    store64(&_im_cr_sct + 48, 0x3FEFFF000155549F);
+    store64(&_im_cr_sct + 56, 0x3C828A28A03A5EF3);
+    store64(&_im_cr_sct + 64, 0x3F9FFEAAAEEEE86F);
+    store64(&_im_cr_sct + 72, 0xBC3CD406FB224AE2);
+    store64(&_im_cr_sct + 80, 0x3FEFFC00155527D3);
+    store64(&_im_cr_sct + 88, 0xBC83B54492D89B5B);
+    store64(&_im_cr_sct + 96, 0x3FA7FDC01032FBA9);
+    store64(&_im_cr_sct + 104, 0xBC4599BDF46E997A);
+    store64(&_im_cr_sct + 112, 0x3FEFF7006BFDF99F);
+    store64(&_im_cr_sct + 120, 0xBC78B3B560648D5F);
+    store64(&_im_cr_sct + 128, 0x3FAFFAAAEEED4EDB);
+    store64(&_im_cr_sct + 136, 0xBC42D16D32684B69);
+    store64(&_im_cr_sct + 144, 0x3FEFF0015549F4D3);
+    store64(&_im_cr_sct + 152, 0x3C8328387B99426F);
+    store64(&_im_cr_sct + 160, 0x3FB3FACB12D1755B);
+    store64(&_im_cr_sct + 168, 0xBC5921915299468B);
+    store64(&_im_cr_sct + 176, 0x3FEFE7034129EF6F);
+    store64(&_im_cr_sct + 184, 0xBC6CBF4337C96F97);
+    store64(&_im_cr_sct + 192, 0x3FB7F701032550E4);
+    store64(&_im_cr_sct + 200, 0x3C3AFC2D1800501A);
+    store64(&_im_cr_sct + 208, 0x3FEFDC06BF7E6B9B);
+    store64(&_im_cr_sct + 216, 0x3C831902B535F8DB);
+    store64(&_im_cr_sct + 224, 0x3FBBF1B78568391D);
+    store64(&_im_cr_sct + 232, 0x3C5E91841DEA4CC8);
+    store64(&_im_cr_sct + 240, 0x3FEFCF0C800E99B1);
+    store64(&_im_cr_sct + 248, 0x3C6EA3D786D186AC);
+    store64(&_im_cr_sct + 256, 0x3FBFEAAEEE86EE36);
+    store64(&_im_cr_sct + 264, 0xBC4AFCB2BCC6F03B);
+    store64(&_im_cr_sct + 272, 0x3FEFC015527D5BD3);
+    store64(&_im_cr_sct + 280, 0x3C8B68F35094EFB8);
+    store64(&_im_cr_sct + 288, 0x3FC1F0D3D7AFCEAF);
+    store64(&_im_cr_sct + 296, 0xBC66EF95099769A5);
+    store64(&_im_cr_sct + 304, 0x3FEFAF22263C4BD3);
+    store64(&_im_cr_sct + 312, 0xBC552ACE133A2769);
+    store64(&_im_cr_sct + 320, 0x3FC3EB312C5D66CB);
+    store64(&_im_cr_sct + 328, 0x3C647D666B66CB91);
+    store64(&_im_cr_sct + 336, 0x3FEF9C340A7CC428);
+    store64(&_im_cr_sct + 344, 0x3C8C5B6B063B7462);
+    store64(&_im_cr_sct + 352, 0x3FC5E44FCFA126F3);
+    store64(&_im_cr_sct + 360, 0xBC66F443063F89B6);
+    store64(&_im_cr_sct + 368, 0x3FEF874C2E1EECF6);
+    store64(&_im_cr_sct + 376, 0xBC8C6514E1332B16);
+    store64(&_im_cr_sct + 384, 0x3FC7DC102FBAF2B5);
+    store64(&_im_cr_sct + 392, 0x3C45AB50E23C97C3);
+    store64(&_im_cr_sct + 400, 0x3FEF706BDF9ECE1C);
+    store64(&_im_cr_sct + 408, 0xBC8698C80C36DCB4);
+    store64(&_im_cr_sct + 416, 0x3FC9D252D0CEC312);
+    store64(&_im_cr_sct + 424, 0x3C59C43D80B1137D);
+    store64(&_im_cr_sct + 432, 0x3FEF57948CFF6797);
+    store64(&_im_cr_sct + 440, 0x3C6E3A0D3E03B1D4);
+    store64(&_im_cr_sct + 448, 0x3FCBC6F84EDC6199);
+    store64(&_im_cr_sct + 456, 0x3C69C1A56A7B0CAB);
+    store64(&_im_cr_sct + 464, 0x3FEF3CC7C3B3D16E);
+    store64(&_im_cr_sct + 472, 0xBC621A3AD28A3494);
+    store64(&_im_cr_sct + 480, 0x3FCDB9E15FB5A5D0);
+    store64(&_im_cr_sct + 488, 0xBC632E20D6CC6FC2);
+    store64(&_im_cr_sct + 496, 0x3FEF20073086649F);
+    store64(&_im_cr_sct + 504, 0x3C7B940416C1984B);
+    store64(&_im_cr_sct + 512, 0x3FCFAAEED4F31577);
+    store64(&_im_cr_sct + 520, 0xBC615D88508E32B8);
+    store64(&_im_cr_sct + 528, 0x3FEF01549F7DEEA1);
+    store64(&_im_cr_sct + 536, 0x3C8D3C1E99E5CAFD);
+    store64(&_im_cr_sct + 544, 0x3FD0CD00CEF36436);
+    store64(&_im_cr_sct + 552, 0xBC79FB0A0C93E2B4);
+    store64(&_im_cr_sct + 560, 0x3FEEE0B1FBC0F11C);
+    store64(&_im_cr_sct + 568, 0xBC4BFD2380BBC3B1);
+    store64(&_im_cr_sct + 576, 0x3FD1C37D64C6B876);
+    store64(&_im_cr_sct + 584, 0x3C746076FE0DCFF4);
+    store64(&_im_cr_sct + 592, 0x3FEEBE214F76EFA8);
+    store64(&_im_cr_sct + 600, 0xBC802F9F12BA543E);
+    store64(&_im_cr_sct + 608, 0x3FD2B8DDC43EB49F);
+    store64(&_im_cr_sct + 616, 0x3C61553899F2D807);
+    store64(&_im_cr_sct + 624, 0x3FEE99A4C3A7CD83);
+    store64(&_im_cr_sct + 632, 0xBC82264B1BC53CE8);
+    store64(&_im_cr_sct + 640, 0x3FD3AD129769D3D8);
+    store64(&_im_cr_sct + 648, 0x3C003D550487839A);
+    store64(&_im_cr_sct + 656, 0x3FEE733EA0193D40);
+    store64(&_im_cr_sct + 664, 0xBC86428B3546CE13);
+    store64(&_im_cr_sct + 672, 0x3FD4A00C9B0F3D20);
+    store64(&_im_cr_sct + 680, 0x3C7823BA6BB08EAD);
+    store64(&_im_cr_sct + 688, 0x3FEE4AF14B2A449C);
+    store64(&_im_cr_sct + 696, 0xBC868CA02E8A6833);
+    store64(&_im_cr_sct + 704, 0x3FD591BC9FA2F597);
+    store64(&_im_cr_sct + 712, 0x3C67C74BAC3FE0CB);
+    store64(&_im_cr_sct + 720, 0x3FEE20BF49ACD6C1);
+    store64(&_im_cr_sct + 728, 0xBC5660AEC7EF636B);
+    store64(&_im_cr_sct + 736, 0x3FD682138A38D7F7);
+    store64(&_im_cr_sct + 744, 0xBC7D889202444AAD);
+    store64(&_im_cr_sct + 752, 0x3FEDF4AB3EBD875E);
+    store64(&_im_cr_sct + 760, 0xBC8E2D8A7E6736C4);
+    store64(&_im_cr_sct + 768, 0x3FD7710255764214);
+    store64(&_im_cr_sct + 776, 0xBC66EAD7314BB6CE);
+    store64(&_im_cr_sct + 784, 0x3FEDC6B7EB995912);
+    store64(&_im_cr_sct + 792, 0x3C54B364776DCD35);
+    store64(&_im_cr_sct + 800, 0x3FD85E7A12826949);
+    store64(&_im_cr_sct + 808, 0x3C78A40E9B5FACE0);
+    store64(&_im_cr_sct + 816, 0x3FED96E82F71A9DC);
+    store64(&_im_cr_sct + 824, 0x3C8FF61BD5D2039D);
+    store64(&_im_cr_sct + 832, 0x3FD94A6BE9F546C5);
+    store64(&_im_cr_sct + 840, 0xBC769CE13E683F58);
+    store64(&_im_cr_sct + 848, 0x3FED653F073E4040);
+    store64(&_im_cr_sct + 856, 0xBC876236434BEC37);
+    store64(&_im_cr_sct + 864, 0x3FDA34C91CC50CCA);
+    store64(&_im_cr_sct + 872, 0xBC5A310E3B50CECD);
+    store64(&_im_cr_sct + 880, 0x3FED31BF8D8D7C06);
+    store64(&_im_cr_sct + 888, 0x3C7E60DD3089CBDD);
+    store64(&_im_cr_sct + 896, 0x3FDB1D8305321617);
+    store64(&_im_cr_sct + 904, 0xBC7AE242CB99F519);
+    store64(&_im_cr_sct + 912, 0x3FECFC6CFA52AD9F);
+    store64(&_im_cr_sct + 920, 0x3C88B5B5508F2A0D);
+    store64(&_im_cr_sct + 928, 0x3FDC048B17B140A3);
+    store64(&_im_cr_sct + 936, 0x3C619FE6757E9FA7);
+    store64(&_im_cr_sct + 944, 0x3FECC54AA2B2972E);
+    store64(&_im_cr_sct + 952, 0x3C64EE162BA83A98);
+    store64(&_im_cr_sct + 960, 0x3FDCE9D2E3D4A51F);
+    store64(&_im_cr_sct + 968, 0xBC62FC8A12DAE298);
+    store64(&_im_cr_sct + 976, 0x3FEC8C5BF8CE1A84);
+    store64(&_im_cr_sct + 984, 0x3C7AB3D1A1590123);
+    store64(&_im_cr_sct + 992, 0x3FDDCD4C15329C9A);
+    store64(&_im_cr_sct + 1000, 0x3C70D4C6E171FD9A);
+    store64(&_im_cr_sct + 1008, 0x3FEC51A48B8B175E);
+    store64(&_im_cr_sct + 1016, 0xBC61BBB43B9AA880);
+    store64(&_im_cr_sct + 1024, 0x3FDEAEE8744B05F0);
+    store64(&_im_cr_sct + 1032, 0xBC5789B43C9B027D);
+    store64(&_im_cr_sct + 1040, 0x3FEC1528065B7D50);
+    store64(&_im_cr_sct + 1048, 0xBC8892111312E828);
+    store64(&_im_cr_sct + 1056, 0x3FDF8E99E76ABC97);
+    store64(&_im_cr_sct + 1064, 0x3C59D950AF2D00A3);
+    store64(&_im_cr_sct + 1072, 0x3FEBD6EA310294F5);
+    store64(&_im_cr_sct + 1080, 0x3C731BBCC88C109D);
+    store64(&_im_cr_sct + 1088, 0x3FE0362939C69955);
+    store64(&_im_cr_sct + 1096, 0xBC82D8CD78397B01);
+    store64(&_im_cr_sct + 1104, 0x3FEB96EEEF58840E);
+    store64(&_im_cr_sct + 1112, 0x3C545A3CC78FADE0);
+    store64(&_im_cr_sct + 1120, 0x3FE0A4021E9E1001);
+    store64(&_im_cr_sct + 1128, 0xBC86F643A13914F6);
+    store64(&_im_cr_sct + 1136, 0x3FEB553A410C104E);
+    store64(&_im_cr_sct + 1144, 0x3C58FF7947027A15);
+    store64(&_im_cr_sct + 1152, 0x3FE110D0C4B69C3B);
+    store64(&_im_cr_sct + 1160, 0x3C8D918998809981);
+    store64(&_im_cr_sct + 1168, 0x3FEB11D04162A4C6);
+    store64(&_im_cr_sct + 1176, 0x3C71DD561EFBC0C2);
+    store64(&_im_cr_sct + 1184, 0x3FE17C8E5F2EEDB0);
+    store64(&_im_cr_sct + 1192, 0x3C635E57102E2488);
+    store64(&_im_cr_sct + 1200, 0x3FEACCB526F69DE5);
+    store64(&_im_cr_sct + 1208, 0x3C88FB6A8DD6B6CC);
+    store64(&_im_cr_sct + 1216, 0x3FE1E7343236574C);
+    store64(&_im_cr_sct + 1224, 0x3C722A3FA4F41D5A);
+    store64(&_im_cr_sct + 1232, 0x3FEA85ED4373E02D);
+    store64(&_im_cr_sct + 1240, 0x3C69BE06385EC792);
+    store64(&_im_cr_sct + 1248, 0x3FE250BB93788BBB);
+    store64(&_im_cr_sct + 1256, 0x3C7EA3D02457BCCE);
+    store64(&_im_cr_sct + 1264, 0x3FEA3D7D0352BDCF);
+    store64(&_im_cr_sct + 1272, 0xBC868DBAECA19669);
+    store64(&_im_cr_sct + 1280, 0x3FE2B91DEA88421E);
+    store64(&_im_cr_sct + 1288, 0xBC8FA371DB216AB0);
+    store64(&_im_cr_sct + 1296, 0x3FE9F368ED912F85);
+    store64(&_im_cr_sct + 1304, 0xBC81D200C5791606);
+    store64(&_im_cr_sct + 1312, 0x3FE32054B148BC4F);
+    store64(&_im_cr_sct + 1320, 0x3C8F6B42095A135B);
+    store64(&_im_cr_sct + 1328, 0x3FE9A7B5A36A6514);
+    store64(&_im_cr_sct + 1336, 0x3C8722CFCC9FA7A9);
+    store64(&_im_cr_sct + 1344, 0x3FE386597456282B);
+    store64(&_im_cr_sct + 1352, 0xBC710FADA93B07A8);
+    store64(&_im_cr_sct + 1360, 0x3FE95A67E00CB1FD);
+    store64(&_im_cr_sct + 1368, 0xBC80BEFDA21F862D);
+    store64(&_im_cr_sct + 1376, 0x3FE3EB25D36CD53A);
+    store64(&_im_cr_sct + 1384, 0xBC5BE570E1570FC0);
+    store64(&_im_cr_sct + 1392, 0x3FE90B84784DDAF7);
+    store64(&_im_cr_sct + 1400, 0xBC70FEB10AB93B87);
+    store64(&_im_cr_sct + 1408, 0x3FE44EB381CF386B);
+    store64(&_im_cr_sct + 1416, 0xBC83ED6C1E6A5505);
+    store64(&_im_cr_sct + 1424, 0x3FE8BB105A5DC900);
+    store64(&_im_cr_sct + 1432, 0x3C8863E03E9474C1);
+    store64(&_im_cr_sct + 1440, 0x3FE4B0FC46AAB761);
+    store64(&_im_cr_sct + 1448, 0x3C20DA05738CC59C);
+    store64(&_im_cr_sct + 1456, 0x3FE869108D77A6C6);
+    store64(&_im_cr_sct + 1464, 0x3C7338FFE2BFE9DD);
+    store64(&_im_cr_sct + 1472, 0x3FE511F9FD7B351C);
+    store64(&_im_cr_sct + 1480, 0xBC85C0E861C48831);
+    store64(&_im_cr_sct + 1488, 0x3FE8158A31916D5D);
+    store64(&_im_cr_sct + 1496, 0xBC6DE8B90B8228DE);
+    store64(&_im_cr_sct + 1504, 0x3FE571A6966D59B3);
+    store64(&_im_cr_sct + 1512, 0x3C5C843B4D0FB197);
+    store64(&_im_cr_sct + 1520, 0x3FE7C0827F09E54F);
+    store64(&_im_cr_sct + 1528, 0xBC6C73D6D72AEE68);
+    store64(&_im_cr_sct + 1536, 0x3FE5CFFC16BF8F0D);
+    store64(&_im_cr_sct + 1544, 0x3C896CB370EB578A);
+    store64(&_im_cr_sct + 1552, 0x3FE769FEC655211F);
+    store64(&_im_cr_sct + 1560, 0xBC6827D5CF8C68C5);
+    store64(&_im_cr_sct + 1568, 0x3FE62CF49921AC79);
+    store64(&_im_cr_sct + 1576, 0xBC8EDD9855B6241A);
+    store64(&_im_cr_sct + 1584, 0x3FE712046FA77678);
+    store64(&_im_cr_sct + 1592, 0x3C8425B0A5029C81);
+    store64(&_im_cr_sct + 1600, 0x3FE6888A4E134B2F);
+    store64(&_im_cr_sct + 1608, 0xBC86B7D37644D5E6);
+    store64(&_im_cr_sct + 1616, 0x3FE6B898FA9EFB5D);
+    store64(&_im_cr_sct + 1624, 0x3C715AC786CCF4B2);
+    store64(&_im_cr_sct + 1632, 0x3FE6E2B77C40BDE1);
+    store64(&_im_cr_sct + 1640, 0xBC70E729857FAD53);
+    store64(&_im_cr_sct + 1648, 0x3FE65DC1FDEB8CBA);
+    store64(&_im_cr_sct + 1656, 0xBC597C1B47337C77);
     _im_cr_ready = 1;
     return 0;
 }
@@ -209,11 +560,14 @@ fn _im_cr_load() {
 #
 # Round-to-nearest-even of the exact mathematical value, on every input, the same bits on every
 # target: only + − × ÷, the f64 rounding builtins and integer operations, no x87 and no polyfill.
-# Each function follows Ziv's strategy:
-# - a fast path in double-double (about 2^-100 relative) whose result is returned only when a
-#   rounding test, with an error bound several bits wider than the evaluation's, shows that every
-#   value within the bound rounds to the same double;
-# - otherwise a slow path in 364-bit fixed point (14 limbs of 28 bits), with Payne–Hanek reduction
+# Each function follows Ziv's strategy, three phases, each result returned only when a rounding test,
+# with an error bound a few bits wider than the evaluation's, shows that every value within the bound
+# rounds to the same double:
+# - phase 1, table-driven in double with a few exact products (2^(j/64) for exp, sin and cos of i/64),
+#   bound 2^-62 (measured worst 2^-66 to 2^-67): decides about 99.7 % of arguments, at about 2× the
+#   polyfills' cost;
+# - phase 2, in double-double (about 2^-100 relative), bounds 2^-88 and 2^-74;
+# - phase 3, the slow path in 364-bit fixed point (14 limbs of 28 bits), with Payne–Hanek reduction
 #   for sin and cos against 1,568 bits of 2/π, whose result is rounded once.
 # The slow path's error is below 2^-290 relative. A double argument is never that close to a
 # rounding boundary of exp, sin or cos: the hardest cases are known to need about 2^-120
@@ -684,28 +1038,72 @@ fn _im_cr_pow2(k): f64 {
 
 # ── exp, sin, cos ───────────────────────────────────────────────────────────────────
 
-# Slow-path calls since start (diagnostics: the tests check the fast path decides most inputs).
+# Calls that phase 1 could not decide, and slow-path calls, since start (diagnostics: the tests
+# check that phase 1 decides almost every input).
+var _im_cr_phase2_calls = 0;
 var _im_cr_slow_calls = 0;
 
-# exp(x), correctly rounded. NaN for NaN, +∞ for +∞ and x above the overflow point, +0 for −∞ and
-# x below the underflow point, subnormal results rounded once. Fast path for −708 ≤ x ≤ 709.7:
+# Phase 1 of exp, for −708 ≤ x ≤ 709.7, into out: h, l (f64 words) and k, with exp(x) = 2^k·(h + l)
+# within 2^-62 relative (the analysis gives about 2^-64.5).
+# - n = round(x·64/ln 2), j = n mod 64, k = (n − j)/64; r = x − n·(ln 2/64) as rh + rl: n·hi is exact
+#   (hi has 36 bits, |n| < 2^17) and so is x − n·hi (Sterbenz); rl from TwoSum, so r is within
+#   2^-77 of exact (the hi + lo split of ln 2/64 times n).
+# - exp(r) = 1 + r + r²·q(r), q = 1/2 + r/3! + … + r⁵/7! by Horner in double (|r| ≤ 2^-7.5:
+#   truncation 2^-75; r²q within about 2^-67 absolute).
+# - exp(x)/2^k = T·(1 + rh + rest), rest = r²q + rl, T = 2^(j/64) as hi + lo: T_hi·rh exactly by
+#   TwoProduct (inline, Veltkamp's split), T_hi + its high part by FastTwoSum, everything else in a low
+#   word whose roundings sum to about 2^-66.
+fn _im_cr_exp_p1(x: f64, out) {
+    _im_cr_load();
+    var qf: f64 = x * _IM_CR_INV_L64;
+    var nf: f64 = f64_round(qf);
+    var n = f64_to(nf);
+    var j = n & 63;
+    var k = (n - j) / 64;
+    var hn: f64 = nf * _IM_CR_L64_HI;
+    var t: f64 = x - hn;
+    var pn: f64 = nf * _IM_CR_L64_LO;
+    var npn: f64 = -pn;
+    # (rh, rl) = TwoSum(t, −n·lo).
+    var rh: f64 = t + npn;
+    var bb: f64 = rh - t;
+    var rl: f64 = (t - (rh - bb)) + (npn - bb);
+    var q: f64 = _IM_CR_F6 + rh * _IM_CR_F7;
+    q = _IM_CR_F5 + rh * q;
+    q = _IM_CR_F4 + rh * q;
+    q = _IM_CR_F3 + rh * q;
+    q = 0.5 + rh * q;
+    var rr: f64 = rh * rh;
+    var w: f64 = rr * q;
+    var rest: f64 = w + rl;
+    var th: f64 = load64(&_im_cr_exp2t + j * 16);
+    var tlo: f64 = load64(&_im_cr_exp2t + j * 16 + 8);
+    # (ah, al) = TwoProduct(th, rh).
+    var ah: f64 = th * rh;
+    var split: f64 = 134217729.0;
+    var ca: f64 = split * th;
+    var t1: f64 = ca - (ca - th);
+    var t2: f64 = th - t1;
+    var cb: f64 = split * rh;
+    var r1: f64 = cb - (cb - rh);
+    var r2: f64 = rh - r1;
+    var al: f64 = (t2 * r2) - (((ah - (t1 * r1)) - (t2 * r1)) - (t1 * r2));
+    # (s, e) = FastTwoSum(th, ah): |th| ≥ |ah|.
+    var s: f64 = th + ah;
+    var e: f64 = ah - (s - th);
+    var low: f64 = ((e + al) + th * rest) + (tlo + tlo * rh);
+    var h: f64 = s + low;
+    var l: f64 = low - (h - s);
+    store64(out, _im_cr_word(h));
+    store64(out + 8, _im_cr_word(l));
+    store64(out + 16, k);
+    return 0;
+}
+
+# Phase 2 of exp, for −708 ≤ x ≤ 709.7, into out: h, l and k as phase 1, within 2^-88 relative:
 # x = k·ln 2 + r (k·hi exact, r in double-double against a three-part ln 2), exp(r) by 27 Taylor
-# terms in double-double, error bound 2^-88 relative; 2^k by exact scaling.
-#must_use
-fn _im_cr_exp(x: f64): f64 {
-    if (x != x) { return x; }
-    if (x > 710.0) {
-        var inf: f64 = _im_cr_from_word(9218868437227405312);
-        return inf;
-    }
-    if (x < 0.0 - 746.0) { return 0.0; }
-    var ax: f64 = f64_abs(x);
-    if (ax < 0.0000000000000000277555756156289135105907917022705078125) { return 1.0; }
-    if (x < 0.0 - 708.0 || x > 709.7) {
-        _im_cr_slow_calls = _im_cr_slow_calls + 1;
-        var rs: f64 = _im_cr_exp_slow(x);
-        return rs;
-    }
+# terms in double-double.
+fn _im_cr_exp_p2(x: f64, out) {
     var qf: f64 = x * _IM_CR_INVLN2;
     var kf: f64 = f64_round(qf);
     var k = f64_to(kf);
@@ -729,19 +1127,56 @@ fn _im_cr_exp(x: f64): f64 {
         sh = ah;
         sl = al;
     }
-    var err: f64 = sh * 0.0000000000000000000000000032311742677852643549664402;
-    if (_im_cr_rounds_to(sh, sl, err) == 0) {
-        _im_cr_slow_calls = _im_cr_slow_calls + 1;
-        var rv: f64 = _im_cr_exp_slow(x);
-        return rv;
-    }
+    store64(out, _im_cr_word(sh));
+    store64(out + 8, _im_cr_word(sl));
+    store64(out + 16, k);
+    return 0;
+}
+
+# h·2^k for a phase result h in [0.5, 2.1) whose product is a normal double (−1022 ≤ k ≤ 1024).
+#must_use
+fn _im_cr_scale(h: f64, k): f64 {
     if (k > 1000) {
-        var big: f64 = sh * _im_cr_pow2(1000);
+        var big: f64 = h * _im_cr_pow2(1000);
         var bk: f64 = big * _im_cr_pow2(k - 1000);
         return bk;
     }
-    var res: f64 = sh * _im_cr_pow2(k);
-    return res;
+    var r: f64 = h * _im_cr_pow2(k);
+    return r;
+}
+
+# exp(x), correctly rounded. NaN for NaN, +∞ for +∞ and x above the overflow point, +0 for −∞ and
+# x below the underflow point, subnormal results rounded once. For −708 ≤ x ≤ 709.7: phase 1 (the
+# 2^(j/64) table, error bound 2^-62), then phase 2 (double-double, 2^-88), each returned only when
+# the rounding test decides it, with 2^k by exact scaling; then, or outside that range, the slow
+# path.
+#must_use
+fn _im_cr_exp(x: f64): f64 {
+    if (x != x) { return x; }
+    if (x > 710.0) {
+        var inf: f64 = _im_cr_from_word(9218868437227405312);
+        return inf;
+    }
+    if (x < 0.0 - 746.0) { return 0.0; }
+    var ax: f64 = f64_abs(x);
+    if (ax < 0.0000000000000000277555756156289135105907917022705078125) { return 1.0; }
+    if (x >= 0.0 - 708.0 && x <= 709.7) {
+        var o[24];
+        _im_cr_exp_p1(x, &o);
+        var h1: f64 = load64(&o);
+        var l1: f64 = load64(&o + 8);
+        var e1: f64 = h1 * 0.00000000000000000021684043449710088680149056017398834228515625;
+        if (_im_cr_rounds_to(h1, l1, e1) == 1) { return _im_cr_scale(h1, load64(&o + 16)); }
+        _im_cr_phase2_calls = _im_cr_phase2_calls + 1;
+        _im_cr_exp_p2(x, &o);
+        var h2: f64 = load64(&o);
+        var l2: f64 = load64(&o + 8);
+        var e2: f64 = h2 * 0.0000000000000000000000000032311742677852643549664402;
+        if (_im_cr_rounds_to(h2, l2, e2) == 1) { return _im_cr_scale(h2, load64(&o + 16)); }
+    }
+    _im_cr_slow_calls = _im_cr_slow_calls + 1;
+    var rs: f64 = _im_cr_exp_slow(x);
+    return rs;
 }
 
 # cos(r) (want_sin 0) or sin(r) (1) of a double-double |r| ≤ π/4 (+ a rounding), by 16 Taylor terms,
@@ -773,11 +1208,233 @@ fn _im_cr_dd_sin_cos(rh: f64, rl: f64, want_sin): (f64, f64) {
     return (sh, sl);
 }
 
+# Phase 1 of sin and cos, for 2^-27 ≤ |x| ≤ 2^20, into out: sin x as hi, lo (words 0, 1) and cos x
+# (words 2, 3), whichever `want` asks for (1 sin, 2 cos, 3 both), each within 2^-62 relative (the
+# analysis gives about 2^-65). 0 when the reduction cancels below 2^-24 (k ≠ 0), else 1.
+# - k = round(|x|·2/π), y = |x| − k·π/2 against c1 + c2 + c3 (c1, c2 of 33 bits, so k·c1 and k·c2 are
+#   exact): |x| − k·c1 exactly (Sterbenz), the next by TwoSum, k·c3 rounded: y = yh + yl within 2^-96.
+# - u = |y| = a + z + ul with a = i/64 (i = round(64u)), |z| ≤ 2^-7, z exact; the table holds sin a and
+#   cos a as hi + lo. sin z = z + z³·p(z²) and cos z − 1 = −z²/2 + z⁴·p(z²) in double, z² by TwoProduct
+#   so the −z²/2 term is exact; ul enters linearly.
+# - sin u = S + C·z + [S·(cos z − 1) + C·(sin z − z + ul) + S_lo + C_lo·z], with C·z by TwoProduct and
+#   S + C_hi·z by TwoSum; cos u likewise with −S·z. Every other term's rounding is below 2^-66 of the
+#   result (the result is at least S/2, or z itself when i = 0).
+fn _im_cr_sc_p1(x: f64, ax: f64, want, out): i64 {
+    _im_cr_load();
+    var qf: f64 = ax * _IM_CR_TWO_OVER_PI;
+    var kf: f64 = f64_round(qf);
+    var k = f64_to(kf);
+    var uh: f64 = ax;
+    var ul: f64 = 0.0;
+    var sg = 1;
+    if (k != 0) {
+        var m1: f64 = kf * _IM_CR_PIO2_C1;
+        var t1: f64 = ax - m1;
+        var m2: f64 = kf * _IM_CR_PIO2_C2;
+        var nm2: f64 = -m2;
+        var t2: f64 = t1 + nm2;
+        var bb: f64 = t2 - t1;
+        var e2: f64 = (t1 - (t2 - bb)) + (nm2 - bb);
+        var p3: f64 = kf * _IM_CR_PIO2_C3;
+        var lo: f64 = e2 - p3;
+        var yh: f64 = t2 + lo;
+        var yl: f64 = lo - (yh - t2);
+        var ay: f64 = f64_abs(yh);
+        if (ay < 0.000000059604644775390625) { return 0; }
+        uh = ay;
+        ul = yl;
+        if (yh < 0.0) {
+            sg = 0 - 1;
+            ul = -yl;
+        }
+    }
+    var q = k & 3;
+    var need_s = 0;
+    var need_c = 0;
+    if ((want & 1) == 1) {
+        if ((q & 1) == 0) { need_s = 1; } else { need_c = 1; }
+    }
+    if ((want & 2) == 2) {
+        if ((q & 1) == 0) { need_c = 1; } else { need_s = 1; }
+    }
+    var i64f: f64 = uh * 64.0;
+    var ri: f64 = f64_round(i64f);
+    var i = f64_to(ri);
+    var a: f64 = ri * 0.015625;
+    var z: f64 = uh - a;
+    var shi: f64 = load64(&_im_cr_sct + i * 32);
+    var slo: f64 = load64(&_im_cr_sct + i * 32 + 8);
+    var chi: f64 = load64(&_im_cr_sct + i * 32 + 16);
+    var clo: f64 = load64(&_im_cr_sct + i * 32 + 24);
+    # (zh, zl) = TwoProduct(z, z).
+    var split: f64 = 134217729.0;
+    var zh: f64 = z * z;
+    var cz: f64 = split * z;
+    var z1: f64 = cz - (cz - z);
+    var z2: f64 = z - z1;
+    var zl: f64 = (z2 * z2) - (((zh - (z1 * z1)) - (z2 * z1)) - (z1 * z2));
+    var clead: f64 = -0.5 * zh;
+    var pc: f64 = _IM_CR_F4 - zh * _IM_CR_F6;
+    var crest: f64 = (-0.5 * zl + (zh * zh) * pc) - ul * z;
+    var ps: f64 = _IM_CR_F5 - zh * _IM_CR_F7;
+    ps = zh * ps - _IM_CR_F3;
+    var sz: f64 = (z * zh) * ps;
+    var szl: f64 = sz + ul;
+    var su_h: f64 = 0.0;
+    var su_l: f64 = 0.0;
+    var cu_h: f64 = 0.0;
+    var cu_l: f64 = 0.0;
+    var cs1: f64 = split * z;
+    var zs1: f64 = cs1 - (cs1 - z);
+    var zs2: f64 = z - zs1;
+    if (need_s == 1) {
+        # (mh, ml) = TwoProduct(C_hi, z); (s0, e0) = TwoSum(S_hi, mh).
+        var mh: f64 = chi * z;
+        var cc: f64 = split * chi;
+        var c1: f64 = cc - (cc - chi);
+        var c2: f64 = chi - c1;
+        var ml: f64 = (c2 * zs2) - (((mh - (c1 * zs1)) - (c2 * zs1)) - (c1 * zs2));
+        var s0: f64 = shi + mh;
+        var b0: f64 = s0 - shi;
+        var e0: f64 = (shi - (s0 - b0)) + (mh - b0);
+        var low: f64 = (((e0 + ml) + shi * clead) + shi * crest) + ((chi * szl + slo) + clo * z);
+        su_h = s0 + low;
+        su_l = low - (su_h - s0);
+    }
+    if (need_c == 1) {
+        # (nh, nl) = TwoProduct(S_hi, z); (c0, f0) = TwoSum(C_hi, −nh).
+        var nh: f64 = shi * z;
+        var sc: f64 = split * shi;
+        var s1: f64 = sc - (sc - shi);
+        var s2: f64 = shi - s1;
+        var nl: f64 = (s2 * zs2) - (((nh - (s1 * zs1)) - (s2 * zs1)) - (s1 * zs2));
+        var nnh: f64 = -nh;
+        var c0: f64 = chi + nnh;
+        var b1: f64 = c0 - chi;
+        var f0: f64 = (chi - (c0 - b1)) + (nnh - b1);
+        var lowc: f64 = (((f0 - nl) + chi * clead) + chi * crest) + ((clo - shi * szl) - slo * z);
+        cu_h = c0 + lowc;
+        cu_l = lowc - (cu_h - c0);
+    }
+    # y = sg·u: sin y = sg·sin u, cos y = cos u. Then by quadrant, then the sign of x for sin.
+    if (sg < 0) {
+        su_h = -su_h;
+        su_l = -su_l;
+    }
+    var sxh: f64 = su_h;
+    var sxl: f64 = su_l;
+    var cxh: f64 = cu_h;
+    var cxl: f64 = cu_l;
+    if ((q & 1) == 1) {
+        sxh = cu_h;
+        sxl = cu_l;
+        cxh = su_h;
+        cxl = su_l;
+    }
+    if (q == 2 || q == 3) {
+        sxh = -sxh;
+        sxl = -sxl;
+    }
+    if (q == 1 || q == 2) {
+        cxh = -cxh;
+        cxl = -cxl;
+    }
+    if (x < 0.0) {
+        sxh = -sxh;
+        sxl = -sxl;
+    }
+    store64(out, _im_cr_word(sxh));
+    store64(out + 8, _im_cr_word(sxl));
+    store64(out + 16, _im_cr_word(cxh));
+    store64(out + 24, _im_cr_word(cxl));
+    return 1;
+}
+
+# Phase 2 of sin and cos, for 2^-27 ≤ |x| ≤ 2^20, into out: sin x as hi, lo (words 0, 1), cos x (2, 3)
+# and their relative error bounds (4, 5), whichever `want` asks for. k = round(|x|·2/π), y = |x| − k·π/2
+# in double-double against a four-part π/2 (k·p1 exact), the 16-term series of y in double-double:
+# 2^-74 for sin y and 2^-88 for cos y, swapped with the quadrant. 0 when the reduction cancels below
+# |y| = 2^-24 (k ≠ 0), else 1.
+fn _im_cr_sc_p2(x: f64, ax: f64, want, out): i64 {
+    var qf: f64 = ax * _IM_CR_TWO_OVER_PI;
+    var kf: f64 = f64_round(qf);
+    var k = f64_to(kf);
+    var h1: f64 = kf * _IM_CR_PIO2_1;
+    var t: f64 = ax - h1;
+    var p2h, p2l = _im_cr_two_prod(kf, _IM_CR_PIO2_2);
+    var ah, al = _im_cr_dd_add(t, 0.0, -p2h, -p2l);
+    var p3h, p3l = _im_cr_two_prod(kf, _IM_CR_PIO2_3);
+    var bh, bl = _im_cr_dd_add(ah, al, -p3h, -p3l);
+    var p4: f64 = kf * _IM_CR_PIO2_4;
+    var yh, yl = _im_cr_dd_add(bh, bl, -p4, 0.0);
+    var ay: f64 = f64_abs(yh);
+    # A reduction that cancels to |y| < 2^-24 loses the error bound; with k = 0 there is none (y = x).
+    if (k != 0 && ay < 0.000000059604644775390625) { return 0; }
+    var q = k & 3;
+    # Series needed: sin y for an even quadrant's sin or an odd one's cos, cos y otherwise.
+    var need_sn = 0;
+    var need_cs = 0;
+    if ((want & 1) == 1) {
+        if ((q & 1) == 0) { need_sn = 1; } else { need_cs = 1; }
+    }
+    if ((want & 2) == 2) {
+        if ((q & 1) == 0) { need_cs = 1; } else { need_sn = 1; }
+    }
+    var snh: f64 = 0.0;
+    var snl: f64 = 0.0;
+    var csh: f64 = 0.0;
+    var csl: f64 = 0.0;
+    if (need_sn == 1) {
+        var a1, a2 = _im_cr_dd_sin_cos(yh, yl, 1);
+        snh = a1;
+        snl = a2;
+    }
+    if (need_cs == 1) {
+        var b1, b2 = _im_cr_dd_sin_cos(yh, yl, 0);
+        csh = b1;
+        csl = b2;
+    }
+    # sin(y + qπ/2): sin y, cos y, −sin y, −cos y; cos(y + qπ/2): cos y, −sin y, −cos y, sin y.
+    var s1h: f64 = snh;
+    var s1l: f64 = snl;
+    var es: f64 = 0.000000000000000000000052939559203393770;
+    var c1h: f64 = csh;
+    var c1l: f64 = csl;
+    var ec: f64 = 0.0000000000000000000000000032311742677852643549664402;
+    if (q == 1 || q == 3) {
+        s1h = csh;
+        s1l = csl;
+        c1h = snh;
+        c1l = snl;
+        var tmp: f64 = es;
+        es = ec;
+        ec = tmp;
+    }
+    if (q == 2 || q == 3) {
+        s1h = -s1h;
+        s1l = -s1l;
+    }
+    if (q == 1 || q == 2) {
+        c1h = -c1h;
+        c1l = -c1l;
+    }
+    if (x < 0.0) {
+        s1h = -s1h;
+        s1l = -s1l;
+    }
+    store64(out, _im_cr_word(s1h));
+    store64(out + 8, _im_cr_word(s1l));
+    store64(out + 16, _im_cr_word(c1h));
+    store64(out + 24, _im_cr_word(c1l));
+    store64(out + 32, _im_cr_word(es));
+    store64(out + 40, _im_cr_word(ec));
+    return 1;
+}
+
 # (sin x, cos x), each correctly rounded. sin(±0) = ±0, cos(±0) = 1; NaN for NaN and ±∞. |x| < 2^-27:
-# (x, 1) exactly. Fast path for |x| ≤ 2^20: k = round(|x|·2/π), y = |x| − k·π/2 in double-double against
-# a four-part π/2 (k·p1 exact), the series of y, error bounds 2^-74 (sin y) and 2^-88 (cos y)
-# relative; a reduction cancelling below |y| = 2^-24 (k ≠ 0) or a failed test goes to the slow path,
-# as does |x| > 2^20.
+# (x, 1) exactly. For |x| ≤ 2^20: phase 1 (the i/64 table, error bound 2^-62), then phase 2
+# (double-double, 2^-74 for a sin y and 2^-88 for a cos y), each value returned only when the rounding
+# test decides it; then, or for |x| > 2^20, the slow path.
 #must_use
 fn _im_cr_sin_cos(x: f64): (f64, f64) {
     var s, c = _im_cr_sc(x, 3);
@@ -796,96 +1453,61 @@ fn _im_cr_sc(x: f64, want): (f64, f64) {
         return (nan, nan);
     }
     if (ax < 0.000000007450580596923828125) { return (x, 1.0); }
-    var s_ok = 0;
-    var c_ok = 0;
     var sv: f64 = 0.0;
     var cv: f64 = 0.0;
+    var wnt = want;
     if (ax <= 1048576.0) {
-        var qf: f64 = ax * _IM_CR_TWO_OVER_PI;
-        var kf: f64 = f64_round(qf);
-        var k = f64_to(kf);
-        var h1: f64 = kf * _IM_CR_PIO2_1;
-        var t: f64 = ax - h1;
-        var p2h, p2l = _im_cr_two_prod(kf, _IM_CR_PIO2_2);
-        var ah, al = _im_cr_dd_add(t, 0.0, -p2h, -p2l);
-        var p3h, p3l = _im_cr_two_prod(kf, _IM_CR_PIO2_3);
-        var bh, bl = _im_cr_dd_add(ah, al, -p3h, -p3l);
-        var p4: f64 = kf * _IM_CR_PIO2_4;
-        var yh, yl = _im_cr_dd_add(bh, bl, -p4, 0.0);
-        var ay: f64 = f64_abs(yh);
-        # A reduction that cancels to |y| < 2^-24 loses the error bound; with k = 0 there is none (y = x).
-        if (k == 0 || ay >= 0.000000059604644775390625) {
-            var q = k & 3;
-            # Series needed: sin y for an even quadrant's sin or an odd one's cos, cos y otherwise.
-            var need_sn = 0;
-            var need_cs = 0;
-            if ((want & 1) == 1) {
-                if ((q & 1) == 0) { need_sn = 1; } else { need_cs = 1; }
+        var o[48];
+        if (_im_cr_sc_p1(x, ax, wnt, &o) == 1) {
+            if ((wnt & 1) == 1) {
+                var h1: f64 = load64(&o);
+                var a1: f64 = f64_abs(h1);
+                var e1: f64 = a1 * 0.00000000000000000021684043449710088680149056017398834228515625;
+                if (_im_cr_rounds_to(h1, load64(&o + 8), e1) == 1) {
+                    sv = h1;
+                    wnt = wnt - 1;
+                }
             }
-            if ((want & 2) == 2) {
-                if ((q & 1) == 0) { need_cs = 1; } else { need_sn = 1; }
+            if ((wnt & 2) == 2) {
+                var h2: f64 = load64(&o + 16);
+                var a2: f64 = f64_abs(h2);
+                var e2: f64 = a2 * 0.00000000000000000021684043449710088680149056017398834228515625;
+                if (_im_cr_rounds_to(h2, load64(&o + 24), e2) == 1) {
+                    cv = h2;
+                    wnt = wnt - 2;
+                }
             }
-            var snh: f64 = 0.0;
-            var snl: f64 = 0.0;
-            var csh: f64 = 0.0;
-            var csl: f64 = 0.0;
-            if (need_sn == 1) {
-                var a1, a2 = _im_cr_dd_sin_cos(yh, yl, 1);
-                snh = a1;
-                snl = a2;
+            if (wnt == 0) { return (sv, cv); }
+        }
+        _im_cr_phase2_calls = _im_cr_phase2_calls + 1;
+        if (_im_cr_sc_p2(x, ax, wnt, &o) == 1) {
+            var es: f64 = load64(&o + 32);
+            var ec: f64 = load64(&o + 40);
+            if ((wnt & 1) == 1) {
+                var h3: f64 = load64(&o);
+                var a3: f64 = f64_abs(h3);
+                var e3: f64 = a3 * es;
+                if (_im_cr_rounds_to(h3, load64(&o + 8), e3) == 1) {
+                    sv = h3;
+                    wnt = wnt - 1;
+                }
             }
-            if (need_cs == 1) {
-                var b1, b2 = _im_cr_dd_sin_cos(yh, yl, 0);
-                csh = b1;
-                csl = b2;
-            }
-            # sin(y + qπ/2): sin y, cos y, −sin y, −cos y; cos(y + qπ/2): cos y, −sin y, −cos y, sin y.
-            var s1h: f64 = snh;
-            var s1l: f64 = snl;
-            var es: f64 = 0.000000000000000000000052939559203393770;
-            var c1h: f64 = csh;
-            var c1l: f64 = csl;
-            var ec: f64 = 0.0000000000000000000000000032311742677852643549664402;
-            if (q == 1 || q == 3) {
-                s1h = csh;
-                s1l = csl;
-                c1h = snh;
-                c1l = snl;
-                var tmp: f64 = es;
-                es = ec;
-                ec = tmp;
-            }
-            if (q == 2 || q == 3) {
-                s1h = -s1h;
-                s1l = -s1l;
-            }
-            if (q == 1 || q == 2) {
-                c1h = -c1h;
-                c1l = -c1l;
-            }
-            if (x < 0.0) {
-                s1h = -s1h;
-                s1l = -s1l;
-            }
-            var as1: f64 = f64_abs(s1h);
-            var ac1: f64 = f64_abs(c1h);
-            var errs: f64 = as1 * es;
-            var errc: f64 = ac1 * ec;
-            if ((want & 1) == 1 && _im_cr_rounds_to(s1h, s1l, errs) == 1) {
-                sv = s1h;
-                s_ok = 1;
-            }
-            if ((want & 2) == 2 && _im_cr_rounds_to(c1h, c1l, errc) == 1) {
-                cv = c1h;
-                c_ok = 1;
+            if ((wnt & 2) == 2) {
+                var h4: f64 = load64(&o + 16);
+                var a4: f64 = f64_abs(h4);
+                var e4: f64 = a4 * ec;
+                if (_im_cr_rounds_to(h4, load64(&o + 24), e4) == 1) {
+                    cv = h4;
+                    wnt = wnt - 2;
+                }
             }
         }
     }
-    if (s_ok == 0 && (want & 1) == 1) {
+    if ((wnt & 1) == 1) {
         _im_cr_slow_calls = _im_cr_slow_calls + 1;
         sv = _im_cr_sin_cos_slow(x, 1);
     }
-    if (c_ok == 0 && (want & 2) == 2) {
+    if ((wnt & 2) == 2) {
         _im_cr_slow_calls = _im_cr_slow_calls + 1;
         cv = _im_cr_sin_cos_slow(x, 0);
     }

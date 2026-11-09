@@ -31,14 +31,22 @@ user: "WE WANT TO BE BETTER THAN glibc"). The user chose the same remedy here ("
 
 1. **exp, sin and cos are correctly rounded** (`src/crmath.cyr`): round-to-nearest-even of the exact value on every
    double argument, subnormal results and overflow included. They use + − × ÷, the f64 rounding builtins and
-   integer operations only, so the bits are the same on every target. They follow Ziv's strategy:
-   - **fast path**, in double-double:
-     - exp is k·ln 2 + r against a three-part ln 2, with 27 Taylor terms, for −708 ≤ x ≤ 709.7;
-     - sin and cos reduce |x| − k·π/2 against a four-part π/2 and take 16 Taylor terms, for |x| ≤ 2^20.
+   integer operations only, so the bits are the same on every target. They follow Ziv's strategy, in three phases.
+   A phase's result is returned only when a rounding test proves that every value within its error bound rounds
+   to the same double.
+   - **Phase 1**, table-driven, in double with a few exact products:
+     - exp is 2^k·2^(j/64)·exp(r), with |r| ≤ 2^-7.5 and seven polynomial terms;
+     - sin and cos reduce against a three-part π/2, then use the sin and cos of i/64 with |z| ≤ 2^-7.
 
-     The result is returned only when a rounding test proves that every value within the error bound (2^-88
-     relative; 2^-74 for sin y) rounds to the same double.
-   - **slow path**, in 364-bit fixed point:
+     Its bound is 2^-62. The analysis gives 2^-64.5 to 2^-65, and the measured worst over 200,000 arguments
+     each is 2^-67 (exp), 2^-66 (sin) and 2^-67 (cos). It decides about 99.7 % of arguments in its range
+     (−708 ≤ x ≤ 709.7; |x| ≤ 2^20).
+   - **Phase 2**, in double-double:
+     - exp is k·ln 2 + r against a three-part ln 2, with 27 Taylor terms;
+     - sin and cos reduce against a four-part π/2 and take 16 Taylor terms.
+
+     Its bounds are 2^-88, and 2^-74 for a sin y.
+   - **Phase 3**, the slow path, in 364-bit fixed point:
      - exp: an exact reduction to 0 ≤ r < ln 2, its Taylor series, then 2^k;
      - sin and cos: Payne–Hanek reduction against 1,568 bits of 2/π, then the series on [0, π/2).
 
@@ -83,14 +91,18 @@ user: "WE WANT TO BE BETTER THAN glibc"). The user chose the same remedy here ("
     - 1,200 arguments where glibc misrounds.
 
     All are equal to MPFR on the slow path alone and through the full functions, the 180,062 on x86_64 and
-    aarch64 alike. On the ordinary set, the fast path decides all 90,000.
+    aarch64 alike. On the ordinary set, phase 1 decides 89,754 of the 90,000 results, phase 2 the other 246, and
+    none needs the slow path.
 - **Negative**
   - impetus owns about 700 lines of correctly rounded math (plus 112 generated) and its error analysis, until ganita provides it (port
     plan §8).
-  - Cost: the fast paths take 2.6 µs (exp) and 3.3 µs (sin_cos) against the polyfills' 64 and 83 ns; the slow
-    path takes 18–27 µs. The spring caches its transition, so a steady step is unchanged (29.5 ns), but a spring's
-    first step pays the primitives: `spring_settle_frames` 1.80 → 4.44 µs (Rust 1.47 µs).
-  - 2D rotation (M2/M3) calls sin_cos per body, so the fast paths need to get faster before then.
+  - Cost:
+    - Phase 1 takes 97 ns (exp) and 187 ns (sin_cos), against the polyfills' 48–64 and 75–83 ns.
+    - Phase 2 takes about 2.6 µs and 3.3 µs, and the slow path 17–25 µs; the probes measured phase 2 on about
+      0.3 % of ordinary arguments.
+    - The spring caches its transition, so a steady step is unchanged (28 ns). A spring's first step pays the
+      primitives once: `spring_settle_frames` is 1.86 µs, against 1.80 µs on the polyfills and Rust's 1.47 µs.
+    - The first version had only phases 2 and 3, and `spring_settle_frames` took 4.44 µs.
   - The tooling needs the system MPFR library (development only).
 - **Neutral**
   - A Rust 1.x user comparing results will see the last bit differ where glibc misrounds (about 0.1–0.2 % of exp,
@@ -112,3 +124,5 @@ user: "WE WANT TO BE BETTER THAN glibc"). The user chose the same remedy here ("
   would copy glibc's errors.
 - **A slow path only** (no double-double): about 20 µs per call, so every cache miss of a spring's transition and
   every future rotation would pay it.
+- **Double-double as the first phase** (this ADR's first version): correct, but 2.6–3.3 µs a call, 30–40× the
+  polyfills. The table-driven phase 1 brought it to about 2×.

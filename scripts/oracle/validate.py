@@ -686,6 +686,13 @@ def check_tables(root):
     for name, fn in (("pi", CRTABLES.pi_bits), ("log2", CRTABLES.ln2_bits)):
         if fn(n) != MPFR.const_bits(name, n):
             fail(f"crtables: {name} to {n} bits differs from MPFR's")
+    t = CRTABLES.tables()
+    for j, (hi, lo) in enumerate(t["exp2"]):
+        if hi != MPFR.bits(MPFR.cr("exp2", j / 64)):
+            fail(f"crtables: 2^({j}/64) hi is not MPFR's correctly rounded value")
+    for i, (sh, sl, ch, cl) in enumerate(t["sincos"]):
+        if sh != MPFR.bits(MPFR.cr("sin", i / 64)) or ch != MPFR.bits(MPFR.cr("cos", i / 64)):
+            fail(f"crtables: sin or cos of {i}/64 hi is not MPFR's correctly rounded value")
     path = root / "src/crmath_data.cyr"
     text = CRTABLES.render()
     if WRITE:
@@ -694,7 +701,7 @@ def check_tables(root):
     elif not path.exists() or path.read_text() != text:
         fail("src/crmath_data.cyr is not crtables.py's output (regenerate with --write)")
     else:
-        print(f"crmath_data: current; π and ln 2 to {n} bits equal MPFR {MPFR.VERSION}'s")
+        print(f"crmath_data: current; π and ln 2 to {n} bits, and every table's hi, equal MPFR {MPFR.VERSION}'s")
 
 
 def main():

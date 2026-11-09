@@ -12,3 +12,6 @@ coverage/
 /rust-old/**/__pycache__/
 /rust-old/benchmarks.md
 /build/
+
+# Python bytecode from the tooling (scripts/oracle loads its helper modules by path)
+__pycache__/

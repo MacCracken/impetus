@@ -2,8 +2,8 @@
 #
 # Against the oracle, the golden math and spring rows gate them at 0 ulp (tests/parity_2d.tcyr, with the
 # corrected oracle where glibc misrounds). These check what the corpus can't say directly: the IEEE special
-# cases, that the fast and slow paths agree wherever both run, and that the fast path decides ordinary
-# arguments (the slow path is ~10× its cost).
+# cases, that the fast and slow paths agree wherever both run, and that phase 1 decides ordinary arguments
+# (phase 2 costs about 25×, the slow path about 250×).
 
 include "tests/lib_2d.cyr"
 
@@ -119,6 +119,7 @@ fn main() {
 
     test_group("fast_path_decides");
     var before = _im_cr_slow_calls;
+    var before2 = _im_cr_phase2_calls;
     for (var i = 0; i < 2000; i = i + 1) {
         var x2: f64 = uniform(-700.0, 700.0);
         var r1: f64 = _im_cr_exp(x2);
@@ -130,6 +131,8 @@ fn main() {
     }
     var slow = _im_cr_slow_calls - before;
     assert(slow < 10, "at most a handful of 6,000 ordinary results need the slow path");
+    var p2 = _im_cr_phase2_calls - before2;
+    assert(p2 < 60, "phase 1 decides over 99% of them (its bound 2^-62 fails about 0.3% of the time)");
 
     test_group("reduction_extremes");
     # The double closest to a multiple of π/2 (6381956970095103·2^797): |cos| or |sin| is about 4.7e-19.

@@ -84,4 +84,4 @@ dependency; the bridge partners dravya, sharira and ushma have no local repo.
 ## Next
 
 M2, 2D collision: the AABB tree, the spatial hash, and 2D narrowphase and raycasts. Open from M1b: filing S3 and S4
-against bayan (port plan §8), and faster fast paths for the correctly rounded sin_cos before M3's per-body rotations.
+against bayan (port plan §8).

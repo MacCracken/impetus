@@ -2,11 +2,14 @@
 #
 # Round-to-nearest-even of the exact mathematical value, on every input, the same bits on every
 # target: only + − × ÷, the f64 rounding builtins and integer operations, no x87 and no polyfill.
-# Each function follows Ziv's strategy:
-# - a fast path in double-double (about 2^-100 relative) whose result is returned only when a
-#   rounding test, with an error bound several bits wider than the evaluation's, shows that every
-#   value within the bound rounds to the same double;
-# - otherwise a slow path in 364-bit fixed point (14 limbs of 28 bits), with Payne–Hanek reduction
+# Each function follows Ziv's strategy, three phases, each result returned only when a rounding test,
+# with an error bound a few bits wider than the evaluation's, shows that every value within the bound
+# rounds to the same double:
+# - phase 1, table-driven in double with a few exact products (2^(j/64) for exp, sin and cos of i/64),
+#   bound 2^-62 (measured worst 2^-66 to 2^-67): decides about 99.7 % of arguments, at about 2× the
+#   polyfills' cost;
+# - phase 2, in double-double (about 2^-100 relative), bounds 2^-88 and 2^-74;
+# - phase 3, the slow path in 364-bit fixed point (14 limbs of 28 bits), with Payne–Hanek reduction
 #   for sin and cos against 1,568 bits of 2/π, whose result is rounded once.
 # The slow path's error is below 2^-290 relative. A double argument is never that close to a
 # rounding boundary of exp, sin or cos: the hardest cases are known to need about 2^-120
@@ -477,28 +480,72 @@ fn _im_cr_pow2(k): f64 {
 
 # ── exp, sin, cos ───────────────────────────────────────────────────────────────────
 
-# Slow-path calls since start (diagnostics: the tests check the fast path decides most inputs).
+# Calls that phase 1 could not decide, and slow-path calls, since start (diagnostics: the tests
+# check that phase 1 decides almost every input).
+var _im_cr_phase2_calls = 0;
 var _im_cr_slow_calls = 0;
 
-# exp(x), correctly rounded. NaN for NaN, +∞ for +∞ and x above the overflow point, +0 for −∞ and
-# x below the underflow point, subnormal results rounded once. Fast path for −708 ≤ x ≤ 709.7:
+# Phase 1 of exp, for −708 ≤ x ≤ 709.7, into out: h, l (f64 words) and k, with exp(x) = 2^k·(h + l)
+# within 2^-62 relative (the analysis gives about 2^-64.5).
+# - n = round(x·64/ln 2), j = n mod 64, k = (n − j)/64; r = x − n·(ln 2/64) as rh + rl: n·hi is exact
+#   (hi has 36 bits, |n| < 2^17) and so is x − n·hi (Sterbenz); rl from TwoSum, so r is within
+#   2^-77 of exact (the hi + lo split of ln 2/64 times n).
+# - exp(r) = 1 + r + r²·q(r), q = 1/2 + r/3! + … + r⁵/7! by Horner in double (|r| ≤ 2^-7.5:
+#   truncation 2^-75; r²q within about 2^-67 absolute).
+# - exp(x)/2^k = T·(1 + rh + rest), rest = r²q + rl, T = 2^(j/64) as hi + lo: T_hi·rh exactly by
+#   TwoProduct (inline, Veltkamp's split), T_hi + its high part by FastTwoSum, everything else in a low
+#   word whose roundings sum to about 2^-66.
+fn _im_cr_exp_p1(x: f64, out) {
+    _im_cr_load();
+    var qf: f64 = x * _IM_CR_INV_L64;
+    var nf: f64 = f64_round(qf);
+    var n = f64_to(nf);
+    var j = n & 63;
+    var k = (n - j) / 64;
+    var hn: f64 = nf * _IM_CR_L64_HI;
+    var t: f64 = x - hn;
+    var pn: f64 = nf * _IM_CR_L64_LO;
+    var npn: f64 = -pn;
+    # (rh, rl) = TwoSum(t, −n·lo).
+    var rh: f64 = t + npn;
+    var bb: f64 = rh - t;
+    var rl: f64 = (t - (rh - bb)) + (npn - bb);
+    var q: f64 = _IM_CR_F6 + rh * _IM_CR_F7;
+    q = _IM_CR_F5 + rh * q;
+    q = _IM_CR_F4 + rh * q;
+    q = _IM_CR_F3 + rh * q;
+    q = 0.5 + rh * q;
+    var rr: f64 = rh * rh;
+    var w: f64 = rr * q;
+    var rest: f64 = w + rl;
+    var th: f64 = load64(&_im_cr_exp2t + j * 16);
+    var tlo: f64 = load64(&_im_cr_exp2t + j * 16 + 8);
+    # (ah, al) = TwoProduct(th, rh).
+    var ah: f64 = th * rh;
+    var split: f64 = 134217729.0;
+    var ca: f64 = split * th;
+    var t1: f64 = ca - (ca - th);
+    var t2: f64 = th - t1;
+    var cb: f64 = split * rh;
+    var r1: f64 = cb - (cb - rh);
+    var r2: f64 = rh - r1;
+    var al: f64 = (t2 * r2) - (((ah - (t1 * r1)) - (t2 * r1)) - (t1 * r2));
+    # (s, e) = FastTwoSum(th, ah): |th| ≥ |ah|.
+    var s: f64 = th + ah;
+    var e: f64 = ah - (s - th);
+    var low: f64 = ((e + al) + th * rest) + (tlo + tlo * rh);
+    var h: f64 = s + low;
+    var l: f64 = low - (h - s);
+    store64(out, _im_cr_word(h));
+    store64(out + 8, _im_cr_word(l));
+    store64(out + 16, k);
+    return 0;
+}
+
+# Phase 2 of exp, for −708 ≤ x ≤ 709.7, into out: h, l and k as phase 1, within 2^-88 relative:
 # x = k·ln 2 + r (k·hi exact, r in double-double against a three-part ln 2), exp(r) by 27 Taylor
-# terms in double-double, error bound 2^-88 relative; 2^k by exact scaling.
-#must_use
-fn _im_cr_exp(x: f64): f64 {
-    if (x != x) { return x; }
-    if (x > 710.0) {
-        var inf: f64 = _im_cr_from_word(9218868437227405312);
-        return inf;
-    }
-    if (x < 0.0 - 746.0) { return 0.0; }
-    var ax: f64 = f64_abs(x);
-    if (ax < 0.0000000000000000277555756156289135105907917022705078125) { return 1.0; }
-    if (x < 0.0 - 708.0 || x > 709.7) {
-        _im_cr_slow_calls = _im_cr_slow_calls + 1;
-        var rs: f64 = _im_cr_exp_slow(x);
-        return rs;
-    }
+# terms in double-double.
+fn _im_cr_exp_p2(x: f64, out) {
     var qf: f64 = x * _IM_CR_INVLN2;
     var kf: f64 = f64_round(qf);
     var k = f64_to(kf);
@@ -522,19 +569,56 @@ fn _im_cr_exp(x: f64): f64 {
         sh = ah;
         sl = al;
     }
-    var err: f64 = sh * 0.0000000000000000000000000032311742677852643549664402;
-    if (_im_cr_rounds_to(sh, sl, err) == 0) {
-        _im_cr_slow_calls = _im_cr_slow_calls + 1;
-        var rv: f64 = _im_cr_exp_slow(x);
-        return rv;
-    }
+    store64(out, _im_cr_word(sh));
+    store64(out + 8, _im_cr_word(sl));
+    store64(out + 16, k);
+    return 0;
+}
+
+# h·2^k for a phase result h in [0.5, 2.1) whose product is a normal double (−1022 ≤ k ≤ 1024).
+#must_use
+fn _im_cr_scale(h: f64, k): f64 {
     if (k > 1000) {
-        var big: f64 = sh * _im_cr_pow2(1000);
+        var big: f64 = h * _im_cr_pow2(1000);
         var bk: f64 = big * _im_cr_pow2(k - 1000);
         return bk;
     }
-    var res: f64 = sh * _im_cr_pow2(k);
-    return res;
+    var r: f64 = h * _im_cr_pow2(k);
+    return r;
+}
+
+# exp(x), correctly rounded. NaN for NaN, +∞ for +∞ and x above the overflow point, +0 for −∞ and
+# x below the underflow point, subnormal results rounded once. For −708 ≤ x ≤ 709.7: phase 1 (the
+# 2^(j/64) table, error bound 2^-62), then phase 2 (double-double, 2^-88), each returned only when
+# the rounding test decides it, with 2^k by exact scaling; then, or outside that range, the slow
+# path.
+#must_use
+fn _im_cr_exp(x: f64): f64 {
+    if (x != x) { return x; }
+    if (x > 710.0) {
+        var inf: f64 = _im_cr_from_word(9218868437227405312);
+        return inf;
+    }
+    if (x < 0.0 - 746.0) { return 0.0; }
+    var ax: f64 = f64_abs(x);
+    if (ax < 0.0000000000000000277555756156289135105907917022705078125) { return 1.0; }
+    if (x >= 0.0 - 708.0 && x <= 709.7) {
+        var o[24];
+        _im_cr_exp_p1(x, &o);
+        var h1: f64 = load64(&o);
+        var l1: f64 = load64(&o + 8);
+        var e1: f64 = h1 * 0.00000000000000000021684043449710088680149056017398834228515625;
+        if (_im_cr_rounds_to(h1, l1, e1) == 1) { return _im_cr_scale(h1, load64(&o + 16)); }
+        _im_cr_phase2_calls = _im_cr_phase2_calls + 1;
+        _im_cr_exp_p2(x, &o);
+        var h2: f64 = load64(&o);
+        var l2: f64 = load64(&o + 8);
+        var e2: f64 = h2 * 0.0000000000000000000000000032311742677852643549664402;
+        if (_im_cr_rounds_to(h2, l2, e2) == 1) { return _im_cr_scale(h2, load64(&o + 16)); }
+    }
+    _im_cr_slow_calls = _im_cr_slow_calls + 1;
+    var rs: f64 = _im_cr_exp_slow(x);
+    return rs;
 }
 
 # cos(r) (want_sin 0) or sin(r) (1) of a double-double |r| ≤ π/4 (+ a rounding), by 16 Taylor terms,
@@ -566,11 +650,233 @@ fn _im_cr_dd_sin_cos(rh: f64, rl: f64, want_sin): (f64, f64) {
     return (sh, sl);
 }
 
+# Phase 1 of sin and cos, for 2^-27 ≤ |x| ≤ 2^20, into out: sin x as hi, lo (words 0, 1) and cos x
+# (words 2, 3), whichever `want` asks for (1 sin, 2 cos, 3 both), each within 2^-62 relative (the
+# analysis gives about 2^-65). 0 when the reduction cancels below 2^-24 (k ≠ 0), else 1.
+# - k = round(|x|·2/π), y = |x| − k·π/2 against c1 + c2 + c3 (c1, c2 of 33 bits, so k·c1 and k·c2 are
+#   exact): |x| − k·c1 exactly (Sterbenz), the next by TwoSum, k·c3 rounded: y = yh + yl within 2^-96.
+# - u = |y| = a + z + ul with a = i/64 (i = round(64u)), |z| ≤ 2^-7, z exact; the table holds sin a and
+#   cos a as hi + lo. sin z = z + z³·p(z²) and cos z − 1 = −z²/2 + z⁴·p(z²) in double, z² by TwoProduct
+#   so the −z²/2 term is exact; ul enters linearly.
+# - sin u = S + C·z + [S·(cos z − 1) + C·(sin z − z + ul) + S_lo + C_lo·z], with C·z by TwoProduct and
+#   S + C_hi·z by TwoSum; cos u likewise with −S·z. Every other term's rounding is below 2^-66 of the
+#   result (the result is at least S/2, or z itself when i = 0).
+fn _im_cr_sc_p1(x: f64, ax: f64, want, out): i64 {
+    _im_cr_load();
+    var qf: f64 = ax * _IM_CR_TWO_OVER_PI;
+    var kf: f64 = f64_round(qf);
+    var k = f64_to(kf);
+    var uh: f64 = ax;
+    var ul: f64 = 0.0;
+    var sg = 1;
+    if (k != 0) {
+        var m1: f64 = kf * _IM_CR_PIO2_C1;
+        var t1: f64 = ax - m1;
+        var m2: f64 = kf * _IM_CR_PIO2_C2;
+        var nm2: f64 = -m2;
+        var t2: f64 = t1 + nm2;
+        var bb: f64 = t2 - t1;
+        var e2: f64 = (t1 - (t2 - bb)) + (nm2 - bb);
+        var p3: f64 = kf * _IM_CR_PIO2_C3;
+        var lo: f64 = e2 - p3;
+        var yh: f64 = t2 + lo;
+        var yl: f64 = lo - (yh - t2);
+        var ay: f64 = f64_abs(yh);
+        if (ay < 0.000000059604644775390625) { return 0; }
+        uh = ay;
+        ul = yl;
+        if (yh < 0.0) {
+            sg = 0 - 1;
+            ul = -yl;
+        }
+    }
+    var q = k & 3;
+    var need_s = 0;
+    var need_c = 0;
+    if ((want & 1) == 1) {
+        if ((q & 1) == 0) { need_s = 1; } else { need_c = 1; }
+    }
+    if ((want & 2) == 2) {
+        if ((q & 1) == 0) { need_c = 1; } else { need_s = 1; }
+    }
+    var i64f: f64 = uh * 64.0;
+    var ri: f64 = f64_round(i64f);
+    var i = f64_to(ri);
+    var a: f64 = ri * 0.015625;
+    var z: f64 = uh - a;
+    var shi: f64 = load64(&_im_cr_sct + i * 32);
+    var slo: f64 = load64(&_im_cr_sct + i * 32 + 8);
+    var chi: f64 = load64(&_im_cr_sct + i * 32 + 16);
+    var clo: f64 = load64(&_im_cr_sct + i * 32 + 24);
+    # (zh, zl) = TwoProduct(z, z).
+    var split: f64 = 134217729.0;
+    var zh: f64 = z * z;
+    var cz: f64 = split * z;
+    var z1: f64 = cz - (cz - z);
+    var z2: f64 = z - z1;
+    var zl: f64 = (z2 * z2) - (((zh - (z1 * z1)) - (z2 * z1)) - (z1 * z2));
+    var clead: f64 = -0.5 * zh;
+    var pc: f64 = _IM_CR_F4 - zh * _IM_CR_F6;
+    var crest: f64 = (-0.5 * zl + (zh * zh) * pc) - ul * z;
+    var ps: f64 = _IM_CR_F5 - zh * _IM_CR_F7;
+    ps = zh * ps - _IM_CR_F3;
+    var sz: f64 = (z * zh) * ps;
+    var szl: f64 = sz + ul;
+    var su_h: f64 = 0.0;
+    var su_l: f64 = 0.0;
+    var cu_h: f64 = 0.0;
+    var cu_l: f64 = 0.0;
+    var cs1: f64 = split * z;
+    var zs1: f64 = cs1 - (cs1 - z);
+    var zs2: f64 = z - zs1;
+    if (need_s == 1) {
+        # (mh, ml) = TwoProduct(C_hi, z); (s0, e0) = TwoSum(S_hi, mh).
+        var mh: f64 = chi * z;
+        var cc: f64 = split * chi;
+        var c1: f64 = cc - (cc - chi);
+        var c2: f64 = chi - c1;
+        var ml: f64 = (c2 * zs2) - (((mh - (c1 * zs1)) - (c2 * zs1)) - (c1 * zs2));
+        var s0: f64 = shi + mh;
+        var b0: f64 = s0 - shi;
+        var e0: f64 = (shi - (s0 - b0)) + (mh - b0);
+        var low: f64 = (((e0 + ml) + shi * clead) + shi * crest) + ((chi * szl + slo) + clo * z);
+        su_h = s0 + low;
+        su_l = low - (su_h - s0);
+    }
+    if (need_c == 1) {
+        # (nh, nl) = TwoProduct(S_hi, z); (c0, f0) = TwoSum(C_hi, −nh).
+        var nh: f64 = shi * z;
+        var sc: f64 = split * shi;
+        var s1: f64 = sc - (sc - shi);
+        var s2: f64 = shi - s1;
+        var nl: f64 = (s2 * zs2) - (((nh - (s1 * zs1)) - (s2 * zs1)) - (s1 * zs2));
+        var nnh: f64 = -nh;
+        var c0: f64 = chi + nnh;
+        var b1: f64 = c0 - chi;
+        var f0: f64 = (chi - (c0 - b1)) + (nnh - b1);
+        var lowc: f64 = (((f0 - nl) + chi * clead) + chi * crest) + ((clo - shi * szl) - slo * z);
+        cu_h = c0 + lowc;
+        cu_l = lowc - (cu_h - c0);
+    }
+    # y = sg·u: sin y = sg·sin u, cos y = cos u. Then by quadrant, then the sign of x for sin.
+    if (sg < 0) {
+        su_h = -su_h;
+        su_l = -su_l;
+    }
+    var sxh: f64 = su_h;
+    var sxl: f64 = su_l;
+    var cxh: f64 = cu_h;
+    var cxl: f64 = cu_l;
+    if ((q & 1) == 1) {
+        sxh = cu_h;
+        sxl = cu_l;
+        cxh = su_h;
+        cxl = su_l;
+    }
+    if (q == 2 || q == 3) {
+        sxh = -sxh;
+        sxl = -sxl;
+    }
+    if (q == 1 || q == 2) {
+        cxh = -cxh;
+        cxl = -cxl;
+    }
+    if (x < 0.0) {
+        sxh = -sxh;
+        sxl = -sxl;
+    }
+    store64(out, _im_cr_word(sxh));
+    store64(out + 8, _im_cr_word(sxl));
+    store64(out + 16, _im_cr_word(cxh));
+    store64(out + 24, _im_cr_word(cxl));
+    return 1;
+}
+
+# Phase 2 of sin and cos, for 2^-27 ≤ |x| ≤ 2^20, into out: sin x as hi, lo (words 0, 1), cos x (2, 3)
+# and their relative error bounds (4, 5), whichever `want` asks for. k = round(|x|·2/π), y = |x| − k·π/2
+# in double-double against a four-part π/2 (k·p1 exact), the 16-term series of y in double-double:
+# 2^-74 for sin y and 2^-88 for cos y, swapped with the quadrant. 0 when the reduction cancels below
+# |y| = 2^-24 (k ≠ 0), else 1.
+fn _im_cr_sc_p2(x: f64, ax: f64, want, out): i64 {
+    var qf: f64 = ax * _IM_CR_TWO_OVER_PI;
+    var kf: f64 = f64_round(qf);
+    var k = f64_to(kf);
+    var h1: f64 = kf * _IM_CR_PIO2_1;
+    var t: f64 = ax - h1;
+    var p2h, p2l = _im_cr_two_prod(kf, _IM_CR_PIO2_2);
+    var ah, al = _im_cr_dd_add(t, 0.0, -p2h, -p2l);
+    var p3h, p3l = _im_cr_two_prod(kf, _IM_CR_PIO2_3);
+    var bh, bl = _im_cr_dd_add(ah, al, -p3h, -p3l);
+    var p4: f64 = kf * _IM_CR_PIO2_4;
+    var yh, yl = _im_cr_dd_add(bh, bl, -p4, 0.0);
+    var ay: f64 = f64_abs(yh);
+    # A reduction that cancels to |y| < 2^-24 loses the error bound; with k = 0 there is none (y = x).
+    if (k != 0 && ay < 0.000000059604644775390625) { return 0; }
+    var q = k & 3;
+    # Series needed: sin y for an even quadrant's sin or an odd one's cos, cos y otherwise.
+    var need_sn = 0;
+    var need_cs = 0;
+    if ((want & 1) == 1) {
+        if ((q & 1) == 0) { need_sn = 1; } else { need_cs = 1; }
+    }
+    if ((want & 2) == 2) {
+        if ((q & 1) == 0) { need_cs = 1; } else { need_sn = 1; }
+    }
+    var snh: f64 = 0.0;
+    var snl: f64 = 0.0;
+    var csh: f64 = 0.0;
+    var csl: f64 = 0.0;
+    if (need_sn == 1) {
+        var a1, a2 = _im_cr_dd_sin_cos(yh, yl, 1);
+        snh = a1;
+        snl = a2;
+    }
+    if (need_cs == 1) {
+        var b1, b2 = _im_cr_dd_sin_cos(yh, yl, 0);
+        csh = b1;
+        csl = b2;
+    }
+    # sin(y + qπ/2): sin y, cos y, −sin y, −cos y; cos(y + qπ/2): cos y, −sin y, −cos y, sin y.
+    var s1h: f64 = snh;
+    var s1l: f64 = snl;
+    var es: f64 = 0.000000000000000000000052939559203393770;
+    var c1h: f64 = csh;
+    var c1l: f64 = csl;
+    var ec: f64 = 0.0000000000000000000000000032311742677852643549664402;
+    if (q == 1 || q == 3) {
+        s1h = csh;
+        s1l = csl;
+        c1h = snh;
+        c1l = snl;
+        var tmp: f64 = es;
+        es = ec;
+        ec = tmp;
+    }
+    if (q == 2 || q == 3) {
+        s1h = -s1h;
+        s1l = -s1l;
+    }
+    if (q == 1 || q == 2) {
+        c1h = -c1h;
+        c1l = -c1l;
+    }
+    if (x < 0.0) {
+        s1h = -s1h;
+        s1l = -s1l;
+    }
+    store64(out, _im_cr_word(s1h));
+    store64(out + 8, _im_cr_word(s1l));
+    store64(out + 16, _im_cr_word(c1h));
+    store64(out + 24, _im_cr_word(c1l));
+    store64(out + 32, _im_cr_word(es));
+    store64(out + 40, _im_cr_word(ec));
+    return 1;
+}
+
 # (sin x, cos x), each correctly rounded. sin(±0) = ±0, cos(±0) = 1; NaN for NaN and ±∞. |x| < 2^-27:
-# (x, 1) exactly. Fast path for |x| ≤ 2^20: k = round(|x|·2/π), y = |x| − k·π/2 in double-double against
-# a four-part π/2 (k·p1 exact), the series of y, error bounds 2^-74 (sin y) and 2^-88 (cos y)
-# relative; a reduction cancelling below |y| = 2^-24 (k ≠ 0) or a failed test goes to the slow path,
-# as does |x| > 2^20.
+# (x, 1) exactly. For |x| ≤ 2^20: phase 1 (the i/64 table, error bound 2^-62), then phase 2
+# (double-double, 2^-74 for a sin y and 2^-88 for a cos y), each value returned only when the rounding
+# test decides it; then, or for |x| > 2^20, the slow path.
 #must_use
 fn _im_cr_sin_cos(x: f64): (f64, f64) {
     var s, c = _im_cr_sc(x, 3);
@@ -589,96 +895,61 @@ fn _im_cr_sc(x: f64, want): (f64, f64) {
         return (nan, nan);
     }
     if (ax < 0.000000007450580596923828125) { return (x, 1.0); }
-    var s_ok = 0;
-    var c_ok = 0;
     var sv: f64 = 0.0;
     var cv: f64 = 0.0;
+    var wnt = want;
     if (ax <= 1048576.0) {
-        var qf: f64 = ax * _IM_CR_TWO_OVER_PI;
-        var kf: f64 = f64_round(qf);
-        var k = f64_to(kf);
-        var h1: f64 = kf * _IM_CR_PIO2_1;
-        var t: f64 = ax - h1;
-        var p2h, p2l = _im_cr_two_prod(kf, _IM_CR_PIO2_2);
-        var ah, al = _im_cr_dd_add(t, 0.0, -p2h, -p2l);
-        var p3h, p3l = _im_cr_two_prod(kf, _IM_CR_PIO2_3);
-        var bh, bl = _im_cr_dd_add(ah, al, -p3h, -p3l);
-        var p4: f64 = kf * _IM_CR_PIO2_4;
-        var yh, yl = _im_cr_dd_add(bh, bl, -p4, 0.0);
-        var ay: f64 = f64_abs(yh);
-        # A reduction that cancels to |y| < 2^-24 loses the error bound; with k = 0 there is none (y = x).
-        if (k == 0 || ay >= 0.000000059604644775390625) {
-            var q = k & 3;
-            # Series needed: sin y for an even quadrant's sin or an odd one's cos, cos y otherwise.
-            var need_sn = 0;
-            var need_cs = 0;
-            if ((want & 1) == 1) {
-                if ((q & 1) == 0) { need_sn = 1; } else { need_cs = 1; }
+        var o[48];
+        if (_im_cr_sc_p1(x, ax, wnt, &o) == 1) {
+            if ((wnt & 1) == 1) {
+                var h1: f64 = load64(&o);
+                var a1: f64 = f64_abs(h1);
+                var e1: f64 = a1 * 0.00000000000000000021684043449710088680149056017398834228515625;
+                if (_im_cr_rounds_to(h1, load64(&o + 8), e1) == 1) {
+                    sv = h1;
+                    wnt = wnt - 1;
+                }
             }
-            if ((want & 2) == 2) {
-                if ((q & 1) == 0) { need_cs = 1; } else { need_sn = 1; }
+            if ((wnt & 2) == 2) {
+                var h2: f64 = load64(&o + 16);
+                var a2: f64 = f64_abs(h2);
+                var e2: f64 = a2 * 0.00000000000000000021684043449710088680149056017398834228515625;
+                if (_im_cr_rounds_to(h2, load64(&o + 24), e2) == 1) {
+                    cv = h2;
+                    wnt = wnt - 2;
+                }
             }
-            var snh: f64 = 0.0;
-            var snl: f64 = 0.0;
-            var csh: f64 = 0.0;
-            var csl: f64 = 0.0;
-            if (need_sn == 1) {
-                var a1, a2 = _im_cr_dd_sin_cos(yh, yl, 1);
-                snh = a1;
-                snl = a2;
+            if (wnt == 0) { return (sv, cv); }
+        }
+        _im_cr_phase2_calls = _im_cr_phase2_calls + 1;
+        if (_im_cr_sc_p2(x, ax, wnt, &o) == 1) {
+            var es: f64 = load64(&o + 32);
+            var ec: f64 = load64(&o + 40);
+            if ((wnt & 1) == 1) {
+                var h3: f64 = load64(&o);
+                var a3: f64 = f64_abs(h3);
+                var e3: f64 = a3 * es;
+                if (_im_cr_rounds_to(h3, load64(&o + 8), e3) == 1) {
+                    sv = h3;
+                    wnt = wnt - 1;
+                }
             }
-            if (need_cs == 1) {
-                var b1, b2 = _im_cr_dd_sin_cos(yh, yl, 0);
-                csh = b1;
-                csl = b2;
-            }
-            # sin(y + qπ/2): sin y, cos y, −sin y, −cos y; cos(y + qπ/2): cos y, −sin y, −cos y, sin y.
-            var s1h: f64 = snh;
-            var s1l: f64 = snl;
-            var es: f64 = 0.000000000000000000000052939559203393770;
-            var c1h: f64 = csh;
-            var c1l: f64 = csl;
-            var ec: f64 = 0.0000000000000000000000000032311742677852643549664402;
-            if (q == 1 || q == 3) {
-                s1h = csh;
-                s1l = csl;
-                c1h = snh;
-                c1l = snl;
-                var tmp: f64 = es;
-                es = ec;
-                ec = tmp;
-            }
-            if (q == 2 || q == 3) {
-                s1h = -s1h;
-                s1l = -s1l;
-            }
-            if (q == 1 || q == 2) {
-                c1h = -c1h;
-                c1l = -c1l;
-            }
-            if (x < 0.0) {
-                s1h = -s1h;
-                s1l = -s1l;
-            }
-            var as1: f64 = f64_abs(s1h);
-            var ac1: f64 = f64_abs(c1h);
-            var errs: f64 = as1 * es;
-            var errc: f64 = ac1 * ec;
-            if ((want & 1) == 1 && _im_cr_rounds_to(s1h, s1l, errs) == 1) {
-                sv = s1h;
-                s_ok = 1;
-            }
-            if ((want & 2) == 2 && _im_cr_rounds_to(c1h, c1l, errc) == 1) {
-                cv = c1h;
-                c_ok = 1;
+            if ((wnt & 2) == 2) {
+                var h4: f64 = load64(&o + 16);
+                var a4: f64 = f64_abs(h4);
+                var e4: f64 = a4 * ec;
+                if (_im_cr_rounds_to(h4, load64(&o + 24), e4) == 1) {
+                    cv = h4;
+                    wnt = wnt - 2;
+                }
             }
         }
     }
-    if (s_ok == 0 && (want & 1) == 1) {
+    if ((wnt & 1) == 1) {
         _im_cr_slow_calls = _im_cr_slow_calls + 1;
         sv = _im_cr_sin_cos_slow(x, 1);
     }
-    if (c_ok == 0 && (want & 2) == 2) {
+    if ((wnt & 2) == 2) {
         _im_cr_slow_calls = _im_cr_slow_calls + 1;
         cv = _im_cr_sin_cos_slow(x, 0);
     }

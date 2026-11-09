@@ -133,12 +133,16 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - For a Rust 1.x user: results differ in the last bit wherever glibc misrounds an exp, sin or cos.
   - `scripts/oracle/mpfr_ref.py` (MPFR through ctypes, from kimiya) and `crtables.py`; the harness core
     takes kimiya's corrected-oracle replay, with its transitional rule off.
+  - A table-driven phase 1 (2^(j/64); sin and cos of i/64) before the double-double one decides about
+    99.7 % of calls. Results are unchanged (same digests, same probes); its measured worst error is
+    2^-66 against a 2^-62 bound. The tables are generated and checked against MPFR.
 
 ### Performance
+- **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
+  sin_cos from 3.3 µs to 187 ns (the polyfills: 48–64 and 75–83 ns).
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
-  `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 4.44 µs (3.0×) once its transition runs the
-  correctly rounded exp (2.6 µs; sin_cos 3.3 µs; the polyfills were 64 and 83 ns); `quantity_display` 81 → 830 ns (10×); serde
+  `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde
   `serialize_body_desc` 252 ns → 3.5 µs (14×), `deserialize_body_desc` 276 ns → 7.2 µs (26×),
   `serialize_config` 422 ns → 8.9 µs (21×), `roundtrip_collider_desc` 892 ns → 16.1 µs (18×).
 

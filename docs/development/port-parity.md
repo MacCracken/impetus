@@ -257,7 +257,7 @@ fails when either drifts from `cyrius.cyml`.
   [−700, 700], 0.14 % of sin and 0.15–0.17 % of cos arguments (in [−10, 10] and [−1000, 1000] alike). On the spring
   grid: 2 of 377 sin calls, none of its 1,154 exp or 377 cos calls.
 - **`src/crmath.cyr`** gives the correctly rounded value on every argument:
-  - a double-double fast path with a proven rounding test;
+  - a table-driven phase 1 and a double-double phase 2, each with a proven rounding test;
   - a 364-bit fixed-point slow path, with Payne–Hanek reduction for sin and cos;
   - its tables generated from π and ln 2, which are computed exactly and equal MPFR's to 2,048 bits.
 
@@ -266,9 +266,16 @@ fails when either drifts from `cyrius.cyml`.
 | Set | Arguments | Equal to MPFR | Slow calls |
 |---|---|---|---|
 | whole range: exp over [−745.2, 709.8] and every binade from 2^-55 up; sin and cos to 1.8·10^308; the edges | 180,062 | all, on the slow path alone and through the full functions, on x86_64 and aarch64 | 39,100 (the sin/cos arguments above 2^20, by design) |
-| the fast paths' ranges | 90,000 | all | 0 |
+| the fast paths' ranges | 90,000 | all | 0 (phase 2: 246) |
 | arguments where glibc misrounds (each within about 0.01 ulp of a rounding boundary) | 1,200 | all | 222 (those above 2^20) |
 
+- **Three phases since the speed-up** (ADR 0011):
+  - Phase 1 is table-driven, in double with exact products, with bound 2^-62.
+  - Its measured worst error over 200,000 arguments each, against phase 2 (2^-100), is 2^-67 for exp, 2^-66 for
+    sin and 2^-67 for cos. That is 4–5 bits inside the bound.
+  - It decides 89,754 of the 90,000 fast-range results. Phase 2 takes the other 246.
+  - Results are unchanged: every probe set and the corpus give the same bits, and the digests below are those
+    from before the speed-up.
 - **The corrected oracle**:
   - `tests/golden/math.cr.tsv` has 9 rows: exp, sin, cos and sin_cos where glibc misrounds; 4 of them (cos and
     sin_cos at 2 arguments) are new threshold rows;
