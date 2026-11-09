@@ -392,8 +392,8 @@ def json_fields(ty, doc):
         o = pyjson.loads(doc, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
     except ValueError:
         return None
-    if not isinstance(o, dict):
-        return None
+    # serde reads a struct from an object or an array, and a unit variant from a bare string, so any
+    # JSON value can be a document.
     return o
 
 
@@ -444,6 +444,91 @@ def walk_numbers(o):
         yield o
 
 
+def _exp(x):
+    try:
+        return math.exp(x)
+    except OverflowError:
+        return math.inf
+
+
+def _sin_cos(x):
+    try:
+        return math.sin(x), math.cos(x)
+    except ValueError:
+        return math.nan, math.nan
+
+
+def _spring_step(p, v, t, k, c, dt, n):
+    """`Spring::step` n times in Rust's expression order. Python's math calls the same libm (glibc)
+    exp, sin and cos as Rust's f64 methods, so the bits must be the oracle's."""
+    if math.isnan(dt) or dt <= 0.0:
+        return p, v
+    if math.isinf(dt):
+        if c > 0.0 and k >= 0.0:
+            return t, 0.0
+        return p, v
+    alpha = 0.5 * c
+    disc = alpha * alpha - k
+    scale = alpha * alpha + abs(k)
+    if abs(disc) <= 1e-9 * scale or scale == 0.0:
+        e = _exp(-alpha * dt)
+        m = [e * (1.0 + alpha * dt), e * dt, -e * alpha * alpha * dt, e * (1.0 - alpha * dt)]
+    elif disc < 0.0:
+        wd = math.sqrt(-disc)
+        e = _exp(-alpha * dt)
+        sn, cs = _sin_cos(wd * dt)
+        m = [e * (cs + alpha / wd * sn), e * sn / wd, -e * k / wd * sn, e * (cs - alpha / wd * sn)]
+    else:
+        beta = math.sqrt(disc)
+        r1, r2 = -alpha + beta, -alpha - beta
+        d = r1 - r2
+        e1, e2 = _exp(r1 * dt), _exp(r2 * dt)
+        m = [(r1 * e2 - r2 * e1) / d, (e1 - e2) / d, r1 * r2 * (e2 - e1) / d, (r1 * e1 - r2 * e2) / d]
+    for _ in range(n):
+        y0 = p - t
+        v0 = v
+        y = m[0] * y0 + m[1] * v0
+        vv = m[2] * y0 + m[3] * v0
+        if math.isfinite(y) and math.isfinite(vv):
+            p = t + y
+            v = vv
+    return p, v
+
+
+def check_spring(rows):
+    """Recomputes every spring row: the constructors, `is_settled`, and `step` through a Python
+    transcription on the same libm."""
+    presets = {
+        "Spring::critically_damped": 2.0,
+        "Spring::over_damped": 3.0,
+        "Spring::under_damped": 0.5,
+    }
+    counted = 0
+    for fn, cls, ins, outs, note in rows:
+        x = [tok_f(t) if t.startswith("f:") else int(t[2:]) for t in ins]
+        if fn == "Spring::new":
+            want = [x[0], 0.0, x[1], x[2], x[3], 0.01]
+        elif fn in presets:
+            k = abs(x[2])
+            want = [x[0], 0.0, x[1], k, presets[fn] * math.sqrt(k), 0.01]
+        elif fn == "Spring::is_settled":
+            p, v, t, thr = x
+            if outs != [f"i:{int(abs(p - t) < thr and abs(v) < thr)}"]:
+                fail(f"spring: {note}: Python's is_settled differs")
+            counted += 1
+            continue
+        elif fn == "Spring::step":
+            want = list(_spring_step(*x))
+        else:
+            fail(f"spring: unknown function {fn}")
+            continue
+        got = [tok_f(t) for t in outs]
+        if len(got) != len(want) or not all(same(a, b) for a, b in zip(got, want)):
+            fail(f"spring: {note}: Python computes {want}")
+        counted += 1
+    return counted
+
+
 def main():
     root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
     golden = root / "tests/golden"
@@ -466,6 +551,8 @@ def main():
                   f"{ties} Display rows differ only by Rust's round-half-up on an exact tie")
         elif name == "json":
             print(f"json: {check_json(rows)} documents checked against Python's json")
+        elif name == "spring":
+            print(f"spring: {check_spring(rows)} rows recomputed (step on Python's libm)")
         elif name in ("config", "material", "units", "force"):
             print(f"{name}: {check_m1a(name, rows)} rows recomputed")
         elif name == "math":

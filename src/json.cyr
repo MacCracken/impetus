@@ -2,17 +2,26 @@
 # and reads.
 #
 # Writers append to a `str_builder`, fields in Rust declaration order, f64 through src/fmtf.cyr's
-# serde_json form. Readers parse with bayan's value tree (never the derive scanner, whose open
-# defects malformed input could reach) into one decode arena reset per call, so decoding never grows
-# the heap, and apply serde's derive semantics:
+# serde_json form, handles as unsigned decimals. Readers parse with bayan's value tree (never the
+# derive scanner, whose open defects malformed input could reach) into one decode arena reset per
+# call, so decoding never grows the heap, and apply serde's derive semantics, as serde_json 1.0.154
+# was probed to (port-parity.md §7):
+# - a struct reads from an object (by field name) or from an array (by position, serde's sequence
+#   form). In an array, trailing `#[serde(default)]` fields may be left off; an `Option` field
+#   without a default may not, nor may there be extra elements;
 # - a required field missing, a value of the wrong JSON type, an array of the wrong length, or an enum
 #   name that is no variant is Err(IM_ERR_DESERIALIZE);
 # - a `#[serde(default)]` field may be absent (its default), and so may an `Option` field (None);
-# - unknown fields are ignored; a duplicate key refuses the document (bayan);
+# - unknown fields are ignored; a duplicate key refuses the document (bayan; see S4 below);
+# - an enum is externally tagged: a unit variant is `"Name"` or `{"Name":null}`, a struct variant
+#   `{"Name":{..}}` or `{"Name":[..]}`, one key only;
 # - an f64 takes a JSON integer or float, never `null` (serde_json writes NaN and ±∞ as `null` and
 #   can't read them back, nor can the port);
-# - a u32 takes a JSON integer in 0..=4294967295 only (`4.0` and `-1` are refused).
-# Not thread-safe: the decode arena is module state.
+# - a u32 takes a JSON integer in 0..=4294967295 only (`4.0` and `-1` are refused), a handle (u64) a
+#   non-negative integer.
+# Two bayan policies are stricter than serde_json (port plan §8): an integer above i64::MAX refuses
+# the document (S3: a handle at generation ≥ 2^31, which serde_json writes), and so does any
+# duplicate key, even one serde would ignore (S4). Not thread-safe: the decode arena is module state.
 
 include "lib/bayan.cyr"
 include "lib/str.cyr"
@@ -43,6 +52,32 @@ fn _im_jw_name(sb, s) {
     return 0;
 }
 
+# Appends the word x as an unsigned decimal (a u64: handles, `step`).
+fn _im_jw_u64(sb, x) {
+    if (x >= 0) {
+        str_builder_add_int(sb, x);
+        return 0;
+    }
+    # x ≥ 2^63 unsigned: x = 10·q + r with q = (x >>> 1) / 5 (logical shift).
+    var q = (x >> 1) / 5;
+    var r = x - q * 10;
+    str_builder_add_int(sb, q);
+    str_builder_putc(sb, 48 + r);
+    return 0;
+}
+
+# Appends `[x,y]`.
+fn _im_jw_vec2(sb, v: ImVec2) {
+    var x: f64 = v.x;
+    var y: f64 = v.y;
+    str_builder_putc(sb, 91);
+    im_fmt_f64_json(sb, x);
+    str_builder_putc(sb, 44);
+    im_fmt_f64_json(sb, y);
+    str_builder_putc(sb, 93);
+    return 0;
+}
+
 # Appends `[x,y,z]`.
 fn _im_jw_vec3(sb, v: ImVec3) {
     var x: f64 = v.x;
@@ -55,6 +90,54 @@ fn _im_jw_vec3(sb, v: ImVec3) {
     str_builder_putc(sb, 44);
     im_fmt_f64_json(sb, z);
     str_builder_putc(sb, 93);
+    return 0;
+}
+
+# Appends the `n` f64 words at p as `[a,b,..]`.
+fn _im_jw_f64_list(sb, p, n) {
+    str_builder_putc(sb, 91);
+    for (var i = 0; i < n; i = i + 1) {
+        if (i > 0) { str_builder_putc(sb, 44); }
+        var x: f64 = load64(p + i * 8);
+        im_fmt_f64_json(sb, x);
+    }
+    str_builder_putc(sb, 93);
+    return 0;
+}
+
+# Appends the `n` triples of words at p as `[[a,b,c],..]`: f64 when `is_f64` is 1, else integers.
+fn _im_jw_triples(sb, p, n, is_f64) {
+    str_builder_putc(sb, 91);
+    for (var i = 0; i < n; i = i + 1) {
+        if (i > 0) { str_builder_putc(sb, 44); }
+        str_builder_putc(sb, 91);
+        for (var j = 0; j < 3; j = j + 1) {
+            if (j > 0) { str_builder_putc(sb, 44); }
+            var w = load64(p + (i * 3 + j) * 8);
+            if (is_f64 == 1) {
+                var x: f64 = w;
+                im_fmt_f64_json(sb, x);
+            } else {
+                str_builder_add_int(sb, w);
+            }
+        }
+        str_builder_putc(sb, 93);
+    }
+    str_builder_putc(sb, 93);
+    return 0;
+}
+
+# Appends an `Option<f64>`: the number, or `null` without one.
+fn _im_jw_opt_f64(sb, has, x: f64) {
+    if (has == 1) { im_fmt_f64_json(sb, x); } else { str_builder_add_cstr(sb, "null"); }
+    return 0;
+}
+
+# Appends `{"Name":` for a struct variant (closed by the caller's two `}`).
+fn _im_jw_variant(sb, name) {
+    str_builder_putc(sb, 123);
+    _im_jw_name(sb, name);
+    str_builder_putc(sb, 58);
     return 0;
 }
 
@@ -72,10 +155,30 @@ fn _im_jr_parse(buf, len): i64 {
     return bayan_json_v_parse_buf_a(_im_json_arena, buf, len);
 }
 
-# Field `key` of object `obj`, or 0 when absent.
+# The form of struct node v with `n` fields: 1 an object, 2 an array of at most n elements (serde's
+# sequence form), 0 anything else.
 #must_use
-fn _im_jr_field(obj, key): i64 {
-    return bayan_json_v_obj_get_by_cstr(obj, key);
+fn _im_jr_form(v, n): i64 {
+    if (v == 0) { return 0; }
+    var tag = bayan_json_v_tag(v);
+    if (tag == JTAG_OBJ) { return 1; }
+    if (tag == JTAG_ARR && bayan_json_v_arr_len(v) <= n) { return 2; }
+    return 0;
+}
+
+# Field i, named `name`, of struct node v in `form`: its value, or 0 when absent.
+#must_use
+fn _im_jr_at(v, form, i, name): i64 {
+    if (form == 1) { return bayan_json_v_obj_get_by_cstr(v, name); }
+    if (i < bayan_json_v_arr_len(v)) { return bayan_json_v_arr_get(v, i); }
+    return 0;
+}
+
+# 1 when v is JSON null.
+#must_use
+fn _im_jr_is_null(v): i64 {
+    if (v != 0 && bayan_json_v_tag(v) == JTAG_NULL) { return 1; }
+    return 0;
 }
 
 # A JSON number as an f64 into *out: 1, or 0 for any other value (null included).
@@ -97,6 +200,16 @@ fn _im_jr_int(v, lo, hi, out): i64 {
     return 1;
 }
 
+# A handle (u64) into *out: 1, or 0. bayan has no integer above i64::MAX (S3).
+fn _im_jr_u64(v, out): i64 {
+    return _im_jr_int(v, 0, 0x7FFFFFFFFFFFFFFF, out);
+}
+
+# A u32 into *out: 1, or 0.
+fn _im_jr_u32(v, out): i64 {
+    return _im_jr_int(v, 0, 4294967295, out);
+}
+
 # A JSON boolean into *out (0 / 1): 1, or 0.
 fn _im_jr_bool(v, out): i64 {
     if (v == 0) { return 0; }
@@ -105,14 +218,31 @@ fn _im_jr_bool(v, out): i64 {
     return 1;
 }
 
+# A JSON array of exactly n numbers into the n words at out: 1, or 0.
+fn _im_jr_f64s(v, n, out): i64 {
+    if (v == 0) { return 0; }
+    if (bayan_json_v_tag(v) != JTAG_ARR || bayan_json_v_arr_len(v) != n) { return 0; }
+    for (var i = 0; i < n; i = i + 1) {
+        if (_im_jr_f64(bayan_json_v_arr_get(v, i), out + i * 8) == 0) { return 0; }
+    }
+    return 1;
+}
+
+# A JSON array of exactly 2 numbers into *out (an ImVec2): 1, or 0.
+fn _im_jr_vec2(v, out: *ImVec2): i64 {
+    var w[16];
+    if (_im_jr_f64s(v, 2, &w) == 0) { return 0; }
+    var x: f64 = load64(&w);
+    var y: f64 = load64(&w + 8);
+    out.x = x;
+    out.y = y;
+    return 1;
+}
+
 # A JSON array of exactly 3 numbers into *out (an ImVec3): 1, or 0.
 fn _im_jr_vec3(v, out: *ImVec3): i64 {
-    if (v == 0) { return 0; }
-    if (bayan_json_v_tag(v) != JTAG_ARR || bayan_json_v_arr_len(v) != 3) { return 0; }
     var w[24];
-    for (var i = 0; i < 3; i = i + 1) {
-        if (_im_jr_f64(bayan_json_v_arr_get(v, i), &w + i * 8) == 0) { return 0; }
-    }
+    if (_im_jr_f64s(v, 3, &w) == 0) { return 0; }
     var x: f64 = load64(&w);
     var y: f64 = load64(&w + 8);
     var z: f64 = load64(&w + 16);
@@ -122,12 +252,20 @@ fn _im_jr_vec3(v, out: *ImVec3): i64 {
     return 1;
 }
 
-# A unit variant: the JSON string naming one of the `count` variants (`name_fn(v)`), into *out: 1, or
-# 0 for any other value.
+# A unit variant into *out: the JSON string naming one of the `count` variants (`name_fn(k)`), or the
+# one-key object `{"Name":null}`. 1, or 0 for any other value.
 fn _im_jr_enum(v, name_fn, count, out): i64 {
     if (v == 0) { return 0; }
-    if (bayan_json_v_tag(v) != JTAG_STR) { return 0; }
-    var s = bayan_json_v_str(v);
+    var tag = bayan_json_v_tag(v);
+    var s = 0;
+    if (tag == JTAG_STR) {
+        s = bayan_json_v_str(v);
+    } elif (tag == JTAG_OBJ && bayan_json_v_obj_len(v) == 1) {
+        if (_im_jr_is_null(bayan_json_v_obj_val(v, 0)) == 0) { return 0; }
+        s = bayan_json_v_obj_key(v, 0);
+    } else {
+        return 0;
+    }
     for (var k = 0; k < count; k = k + 1) {
         if (str_eq_cstr(s, fncall1(name_fn, k)) == 1) {
             store64(out, k);
@@ -135,6 +273,123 @@ fn _im_jr_enum(v, name_fn, count, out): i64 {
         }
     }
     return 0;
+}
+
+# An externally tagged payload enum: the variant (one of `count`, named by `name_fn`) into *kind and
+# its payload node into *payload, 0 for the bare-string form. 1, or 0 when v is neither a string nor
+# a one-key object, or names no variant.
+fn _im_jr_tagged(v, name_fn, count, kind, payload): i64 {
+    if (v == 0) { return 0; }
+    var tag = bayan_json_v_tag(v);
+    var s = 0;
+    store64(payload, 0);
+    if (tag == JTAG_STR) {
+        s = bayan_json_v_str(v);
+    } elif (tag == JTAG_OBJ && bayan_json_v_obj_len(v) == 1) {
+        s = bayan_json_v_obj_key(v, 0);
+        store64(payload, bayan_json_v_obj_val(v, 0));
+    } else {
+        return 0;
+    }
+    for (var k = 0; k < count; k = k + 1) {
+        if (str_eq_cstr(s, fncall1(name_fn, k)) == 1) {
+            store64(kind, k);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+# A unit variant's payload: the bare-string form (0) or `null`. 1 when valid.
+#must_use
+fn _im_jr_unit_ok(p): i64 {
+    if (p == 0 || _im_jr_is_null(p) == 1) { return 1; }
+    return 0;
+}
+
+# A field with a serde default, read by `fn_read(v, out)`: 1 read, 2 absent (keep the default), 0
+# malformed.
+fn _im_jr_def(v, fn_read, out): i64 {
+    if (v == 0) { return 2; }
+    return fncall2(fn_read, v, out);
+}
+
+# An `Option` field with a serde default: 1 read, 2 absent or null (None), 0 malformed.
+fn _im_jr_opt_def(v, fn_read, out): i64 {
+    if (v == 0 || _im_jr_is_null(v) == 1) { return 2; }
+    return fncall2(fn_read, v, out);
+}
+
+# An `Option` field without a default, in `form`: as `_im_jr_opt_def`, except that a sequence-form
+# struct must carry it (an absent element is too short an array).
+fn _im_jr_opt(v, form, fn_read, out): i64 {
+    if (v == 0 && form == 2) { return 0; }
+    return _im_jr_opt_def(v, fn_read, out);
+}
+
+# A JSON array of f64 into a freelist buffer: *words and *count. 1, or 0 (nothing allocated).
+fn _im_jr_f64_list(v, words, count): i64 {
+    store64(words, 0);
+    store64(count, 0);
+    if (v == 0 || bayan_json_v_tag(v) != JTAG_ARR) { return 0; }
+    var n = bayan_json_v_arr_len(v);
+    if (n == 0) { return 1; }
+    var p = fl_alloc(n * 8);
+    if (p == 0) { return 0; }
+    for (var i = 0; i < n; i = i + 1) {
+        if (_im_jr_f64(bayan_json_v_arr_get(v, i), p + i * 8) == 0) {
+            fl_free(p);
+            return 0;
+        }
+    }
+    store64(words, p);
+    store64(count, n);
+    return 1;
+}
+
+# A JSON array of triples into a freelist buffer of 3·n words: f64 triples when `is_f64` is 1, else
+# u32 triples. *words and *count. 1, or 0 (nothing allocated).
+fn _im_jr_triples(v, is_f64, words, count): i64 {
+    store64(words, 0);
+    store64(count, 0);
+    if (v == 0 || bayan_json_v_tag(v) != JTAG_ARR) { return 0; }
+    var n = bayan_json_v_arr_len(v);
+    if (n == 0) { return 1; }
+    var p = fl_alloc(n * 24);
+    if (p == 0) { return 0; }
+    for (var i = 0; i < n; i = i + 1) {
+        var e = bayan_json_v_arr_get(v, i);
+        var ok = 0;
+        if (is_f64 == 1) {
+            ok = _im_jr_f64s(e, 3, p + i * 24);
+        } elif (e != 0 && bayan_json_v_tag(e) == JTAG_ARR && bayan_json_v_arr_len(e) == 3) {
+            ok = 1;
+            for (var j = 0; j < 3; j = j + 1) {
+                if (_im_jr_u32(bayan_json_v_arr_get(e, j), p + i * 24 + j * 8) == 0) { ok = 0; }
+            }
+        }
+        if (ok == 0) {
+            fl_free(p);
+            return 0;
+        }
+    }
+    store64(words, p);
+    store64(count, n);
+    return 1;
+}
+
+# The enum readers `_im_jr_def` can call (one word out).
+fn _im_jr_broadphase(v, out): i64 { return _im_jr_enum(v, &broadphase_kind_name, 2, out); }
+fn _im_jr_solver(v, out): i64 { return _im_jr_enum(v, &solver_kind_name, 2, out); }
+fn _im_jr_combine(v, out): i64 { return _im_jr_enum(v, &combine_rule_name, 4, out); }
+fn _im_jr_body_type(v, out): i64 { return _im_jr_enum(v, &body_type_name, 3, out); }
+fn _im_jr_unit(v, out): i64 { return _im_jr_enum(v, &physics_unit_name, 14, out); }
+
+# Ok(0) when ok is 1, else Err(IM_ERR_DESERIALIZE).
+#must_use
+fn _im_jr_result(ok): Result {
+    if (ok == 1) { return Ok(0); }
+    return Err(IM_ERR_DESERIALIZE);
 }
 
 # ── WorldConfig ─────────────────────────────────────────────────────────────────────
@@ -160,7 +415,7 @@ impl ImWorldConfig {
         _im_jw_key(sb, "deterministic", 0);
         _im_jw_bool(sb, self.deterministic);
         _im_jw_key(sb, "step", 0);
-        str_builder_add_int(sb, self.step);
+        _im_jw_u64(sb, self.step);
         _im_jw_key(sb, "position_slop", 0);
         im_fmt_f64_json(sb, slop);
         _im_jw_key(sb, "position_correction", 0);
@@ -182,90 +437,75 @@ impl ImWorldConfig {
     }
 }
 
-# Reads a `WorldConfig` document from [buf, buf + len) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
-# timestep, gravity, the iteration counts, deterministic and step are required; the rest default as
-# `WorldConfig::default` (serde's defaults). Mirrors `serde_json::from_str::<WorldConfig>`.
-#must_use
-fn ImWorldConfig_from_json(buf, len, out: *ImWorldConfig): Result {
-    var o = _im_jr_parse(buf, len);
-    if (o == 0 || bayan_json_v_tag(o) != JTAG_OBJ) { return Err(IM_ERR_DESERIALIZE); }
+# Reads the `WorldConfig` node o into *out: 1, or 0 when malformed. timestep, gravity, the iteration
+# counts, deterministic and step are required; the rest default as `WorldConfig::default`.
+fn _im_jr_config(o, out: *ImWorldConfig): i64 {
+    var f = _im_jr_form(o, 14);
+    if (f == 0) { return 0; }
     var c: ImWorldConfig = ImWorldConfig_default();
     var w[8];
-    if (_im_jr_f64(_im_jr_field(o, "timestep"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_f64(_im_jr_at(o, f, 0, "timestep"), &w) == 0) { return 0; }
     var ts: f64 = load64(&w);
     c.timestep = ts;
     var g: ImVec3 = ImVec3_zero();
-    if (_im_jr_vec3(_im_jr_field(o, "gravity"), &g) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_vec3(_im_jr_at(o, f, 1, "gravity"), &g) == 0) { return 0; }
     c.gravity = g;
-    if (_im_jr_int(_im_jr_field(o, "velocity_iterations"), 0, 4294967295, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_u32(_im_jr_at(o, f, 2, "velocity_iterations"), &w) == 0) { return 0; }
     c.velocity_iterations = load64(&w);
-    if (_im_jr_int(_im_jr_field(o, "position_iterations"), 0, 4294967295, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_u32(_im_jr_at(o, f, 3, "position_iterations"), &w) == 0) { return 0; }
     c.position_iterations = load64(&w);
-    if (_im_jr_bool(_im_jr_field(o, "deterministic"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_bool(_im_jr_at(o, f, 4, "deterministic"), &w) == 0) { return 0; }
     c.deterministic = load64(&w);
-    if (_im_jr_int(_im_jr_field(o, "step"), 0, 0x7FFFFFFFFFFFFFFF, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_u64(_im_jr_at(o, f, 5, "step"), &w) == 0) { return 0; }
     c.step = load64(&w);
-    var v = _im_jr_field(o, "position_slop");
-    if (v != 0) {
-        if (_im_jr_f64(v, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var r = _im_jr_def(_im_jr_at(o, f, 6, "position_slop"), &_im_jr_f64, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) {
         var a: f64 = load64(&w);
         c.position_slop = a;
     }
-    v = _im_jr_field(o, "position_correction");
-    if (v != 0) {
-        if (_im_jr_f64(v, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    r = _im_jr_def(_im_jr_at(o, f, 7, "position_correction"), &_im_jr_f64, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) {
         var b: f64 = load64(&w);
         c.position_correction = b;
     }
-    v = _im_jr_field(o, "max_velocity");
-    if (v != 0) {
-        if (_im_jr_f64(v, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    r = _im_jr_def(_im_jr_at(o, f, 8, "max_velocity"), &_im_jr_f64, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) {
         var mv: f64 = load64(&w);
         c.max_velocity = mv;
     }
-    v = _im_jr_field(o, "sub_steps");
-    if (v != 0) {
-        if (_im_jr_int(v, 0, 4294967295, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
-        c.sub_steps = load64(&w);
-    }
-    v = _im_jr_field(o, "constraint_frequency");
-    if (v != 0) {
-        if (_im_jr_f64(v, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    r = _im_jr_def(_im_jr_at(o, f, 9, "sub_steps"), &_im_jr_u32, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) { c.sub_steps = load64(&w); }
+    r = _im_jr_def(_im_jr_at(o, f, 10, "constraint_frequency"), &_im_jr_f64, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) {
         var fq: f64 = load64(&w);
         c.constraint_frequency = fq;
     }
-    v = _im_jr_field(o, "constraint_damping_ratio");
-    if (v != 0) {
-        if (_im_jr_f64(v, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    r = _im_jr_def(_im_jr_at(o, f, 11, "constraint_damping_ratio"), &_im_jr_f64, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) {
         var dr: f64 = load64(&w);
         c.constraint_damping_ratio = dr;
     }
-    v = _im_jr_field(o, "broadphase");
-    if (v != 0) {
-        if (_im_jr_enum(v, &broadphase_kind_name, 2, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
-        c.broadphase = load64(&w);
-    }
-    v = _im_jr_field(o, "solver");
-    if (v != 0) {
-        if (_im_jr_enum(v, &solver_kind_name, 2, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
-        c.solver = load64(&w);
-    }
+    r = _im_jr_def(_im_jr_at(o, f, 12, "broadphase"), &_im_jr_broadphase, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) { c.broadphase = load64(&w); }
+    r = _im_jr_def(_im_jr_at(o, f, 13, "solver"), &_im_jr_solver, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) { c.solver = load64(&w); }
     memcpy(out, &c, sizeof(ImWorldConfig));
-    return Ok(0);
-}
-
-# An optional f64 field: 0 when absent (*out untouched), 1 when read, -1 when not a number.
-fn _im_jr_opt_f64(o, key, out): i64 {
-    var v = _im_jr_field(o, key);
-    if (v == 0) { return 0; }
-    if (_im_jr_f64(v, out) == 0) { return 0 - 1; }
     return 1;
 }
 
-# Appends an `Option<f64>`: the number, or `null` without one.
-fn _im_jw_opt_f64(sb, has, x: f64) {
-    if (has == 1) { im_fmt_f64_json(sb, x); } else { str_builder_add_cstr(sb, "null"); }
-    return 0;
+# Reads a `WorldConfig` document from [buf, buf + len) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# Mirrors `serde_json::from_str::<WorldConfig>`.
+#must_use
+fn ImWorldConfig_from_json(buf, len, out: *ImWorldConfig): Result {
+    return _im_jr_result(_im_jr_config(_im_jr_parse(buf, len), out));
 }
 
 # ── PhysicsMaterial ─────────────────────────────────────────────────────────────────
@@ -298,45 +538,42 @@ impl ImPhysicsMaterial {
     }
 }
 
-# Reads the `PhysicsMaterial` object `o` into *out: 1, or 0 when malformed. friction, restitution and
+# Reads the `PhysicsMaterial` node o into *out: 1, or 0 when malformed. friction, restitution and
 # density are required; static_friction may be absent or null (None); rolling_friction defaults to
 # 0, friction_combine to Average, restitution_combine to Min.
 fn _im_jr_material(o, out: *ImPhysicsMaterial): i64 {
-    if (o == 0 || bayan_json_v_tag(o) != JTAG_OBJ) { return 0; }
+    var f = _im_jr_form(o, 7);
+    if (f == 0) { return 0; }
     var m: ImPhysicsMaterial = ImPhysicsMaterial_default();
     var w[8];
-    if (_im_jr_f64(_im_jr_field(o, "friction"), &w) == 0) { return 0; }
+    if (_im_jr_f64(_im_jr_at(o, f, 0, "friction"), &w) == 0) { return 0; }
     var fr: f64 = load64(&w);
     m.friction = fr;
-    if (_im_jr_f64(_im_jr_field(o, "restitution"), &w) == 0) { return 0; }
+    if (_im_jr_f64(_im_jr_at(o, f, 1, "restitution"), &w) == 0) { return 0; }
     var re: f64 = load64(&w);
     m.restitution = re;
-    if (_im_jr_f64(_im_jr_field(o, "density"), &w) == 0) { return 0; }
+    if (_im_jr_f64(_im_jr_at(o, f, 2, "density"), &w) == 0) { return 0; }
     var de: f64 = load64(&w);
     m.density = de;
-    var sv = _im_jr_field(o, "static_friction");
-    if (sv != 0 && bayan_json_v_tag(sv) != JTAG_NULL) {
-        if (_im_jr_f64(sv, &w) == 0) { return 0; }
+    var r = _im_jr_opt_def(_im_jr_at(o, f, 3, "static_friction"), &_im_jr_f64, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) {
         var sf: f64 = load64(&w);
         m.has_static_friction = 1;
         m.static_friction = sf;
     }
-    var r = _im_jr_opt_f64(o, "rolling_friction", &w);
-    if (r < 0) { return 0; }
+    r = _im_jr_def(_im_jr_at(o, f, 4, "rolling_friction"), &_im_jr_f64, &w);
+    if (r == 0) { return 0; }
     if (r == 1) {
         var ro: f64 = load64(&w);
         m.rolling_friction = ro;
     }
-    var v = _im_jr_field(o, "friction_combine");
-    if (v != 0) {
-        if (_im_jr_enum(v, &combine_rule_name, 4, &w) == 0) { return 0; }
-        m.friction_combine = load64(&w);
-    }
-    v = _im_jr_field(o, "restitution_combine");
-    if (v != 0) {
-        if (_im_jr_enum(v, &combine_rule_name, 4, &w) == 0) { return 0; }
-        m.restitution_combine = load64(&w);
-    }
+    r = _im_jr_def(_im_jr_at(o, f, 5, "friction_combine"), &_im_jr_combine, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) { m.friction_combine = load64(&w); }
+    r = _im_jr_def(_im_jr_at(o, f, 6, "restitution_combine"), &_im_jr_combine, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) { m.restitution_combine = load64(&w); }
     memcpy(out, &m, sizeof(ImPhysicsMaterial));
     return 1;
 }
@@ -345,8 +582,7 @@ fn _im_jr_material(o, out: *ImPhysicsMaterial): i64 {
 # Mirrors `serde_json::from_str::<PhysicsMaterial>`.
 #must_use
 fn ImPhysicsMaterial_from_json(buf, len, out: *ImPhysicsMaterial): Result {
-    if (_im_jr_material(_im_jr_parse(buf, len), out) == 0) { return Err(IM_ERR_DESERIALIZE); }
-    return Ok(0);
+    return _im_jr_result(_im_jr_material(_im_jr_parse(buf, len), out));
 }
 
 # ── Quantity ────────────────────────────────────────────────────────────────────────
@@ -370,11 +606,12 @@ impl ImQuantity {
 #must_use
 fn ImQuantity_from_json(buf, len, out: *ImQuantity): Result {
     var o = _im_jr_parse(buf, len);
-    if (o == 0 || bayan_json_v_tag(o) != JTAG_OBJ) { return Err(IM_ERR_DESERIALIZE); }
+    var f = _im_jr_form(o, 2);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
     var w[8];
-    if (_im_jr_f64(_im_jr_field(o, "value"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_f64(_im_jr_at(o, f, 0, "value"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
     var v: f64 = load64(&w);
-    if (_im_jr_enum(_im_jr_field(o, "unit"), &physics_unit_name, 14, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_unit(_im_jr_at(o, f, 1, "unit"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
     var q: ImQuantity = ImQuantity_new(v, load64(&w));
     memcpy(out, &q, sizeof(ImQuantity));
     return Ok(0);
@@ -393,18 +630,17 @@ fn _im_jw_vector_point(sb, v: ImVec3, has, p: ImVec3) {
     return 0;
 }
 
-# Reads `{"vector":[..], "point":[..] / null / absent}` from [buf, buf + len) into *v, *has, *p:
-# 1, or 0 when malformed.
+# Reads `{"vector":[..], "point":[..] / null / absent}` (or `[vector, point]`) from [buf, buf + len)
+# into *v, *has, *p: 1, or 0 when malformed. `point` has no serde default.
 fn _im_jr_vector_point(buf, len, v: *ImVec3, has, p: *ImVec3): i64 {
     var o = _im_jr_parse(buf, len);
-    if (o == 0 || bayan_json_v_tag(o) != JTAG_OBJ) { return 0; }
-    if (_im_jr_vec3(_im_jr_field(o, "vector"), v) == 0) { return 0; }
+    var f = _im_jr_form(o, 2);
+    if (f == 0) { return 0; }
+    if (_im_jr_vec3(_im_jr_at(o, f, 0, "vector"), v) == 0) { return 0; }
+    var r = _im_jr_opt(_im_jr_at(o, f, 1, "point"), f, &_im_jr_vec3, p);
+    if (r == 0) { return 0; }
     store64(has, 0);
-    var pv = _im_jr_field(o, "point");
-    if (pv != 0 && bayan_json_v_tag(pv) != JTAG_NULL) {
-        if (_im_jr_vec3(pv, p) == 0) { return 0; }
-        store64(has, 1);
-    }
+    if (r == 1) { store64(has, 1); }
     return 1;
 }
 
@@ -466,16 +702,992 @@ fn ImImpulse_from_json(buf, len, out: *ImImpulse): Result {
     return Ok(0);
 }
 
-# Reads a `Torque` document (`{"value":..}`) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# Reads a `Torque` document (`{"value":..}` or `[..]`) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
 # Mirrors `serde_json::from_str::<Torque>`.
 #must_use
 fn ImTorque_from_json(buf, len, out: *ImTorque): Result {
     var o = _im_jr_parse(buf, len);
-    if (o == 0 || bayan_json_v_tag(o) != JTAG_OBJ) { return Err(IM_ERR_DESERIALIZE); }
+    var f = _im_jr_form(o, 1);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
     var w[8];
-    if (_im_jr_f64(_im_jr_field(o, "value"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_f64(_im_jr_at(o, f, 0, "value"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
     var v: f64 = load64(&w);
     var t: ImTorque = ImTorque_new(v);
     memcpy(out, &t, sizeof(ImTorque));
+    return Ok(0);
+}
+
+# ── BodyDesc, BodyState ─────────────────────────────────────────────────────────────
+
+impl ImBodyDesc {
+    # Appends the descriptor as serde_json writes a `BodyDesc`.
+    fn to_json(self, sb) {
+        var rot: f64 = self.rotation;
+        var av: f64 = self.angular_velocity;
+        var ld: f64 = self.linear_damping;
+        var ad: f64 = self.angular_damping;
+        var gs: f64 = self.gravity_scale;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "body_type", 1);
+        _im_jw_name(sb, body_type_name(self.body_type));
+        _im_jw_key(sb, "position", 0);
+        _im_jw_vec3(sb, self.position);
+        _im_jw_key(sb, "rotation", 0);
+        im_fmt_f64_json(sb, rot);
+        _im_jw_key(sb, "linear_velocity", 0);
+        _im_jw_vec3(sb, self.linear_velocity);
+        _im_jw_key(sb, "angular_velocity", 0);
+        im_fmt_f64_json(sb, av);
+        _im_jw_key(sb, "linear_damping", 0);
+        im_fmt_f64_json(sb, ld);
+        _im_jw_key(sb, "angular_damping", 0);
+        im_fmt_f64_json(sb, ad);
+        _im_jw_key(sb, "fixed_rotation", 0);
+        _im_jw_bool(sb, self.fixed_rotation);
+        _im_jw_key(sb, "gravity_scale", 0);
+        _im_jw_opt_f64(sb, self.has_gravity_scale, gs);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `BodyDesc` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE). body_type, position and
+# rotation are required; the rest default as `BodyDesc::default`. Mirrors
+# `serde_json::from_str::<BodyDesc>`.
+#must_use
+fn ImBodyDesc_from_json(buf, len, out: *ImBodyDesc): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 9);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var d: ImBodyDesc = ImBodyDesc_default();
+    var w[8];
+    if (_im_jr_body_type(_im_jr_at(o, f, 0, "body_type"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    d.body_type = load64(&w);
+    var pos: ImVec3 = ImVec3_zero();
+    if (_im_jr_vec3(_im_jr_at(o, f, 1, "position"), &pos) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    d.position = pos;
+    if (_im_jr_f64(_im_jr_at(o, f, 2, "rotation"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var rot: f64 = load64(&w);
+    d.rotation = rot;
+    var lv: ImVec3 = ImVec3_zero();
+    var r = _im_jr_def(_im_jr_at(o, f, 3, "linear_velocity"), &_im_jr_vec3, &lv);
+    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    d.linear_velocity = lv;
+    r = _im_jr_def(_im_jr_at(o, f, 4, "angular_velocity"), &_im_jr_f64, &w);
+    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (r == 1) {
+        var av: f64 = load64(&w);
+        d.angular_velocity = av;
+    }
+    r = _im_jr_def(_im_jr_at(o, f, 5, "linear_damping"), &_im_jr_f64, &w);
+    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (r == 1) {
+        var ld: f64 = load64(&w);
+        d.linear_damping = ld;
+    }
+    r = _im_jr_def(_im_jr_at(o, f, 6, "angular_damping"), &_im_jr_f64, &w);
+    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (r == 1) {
+        var ad: f64 = load64(&w);
+        d.angular_damping = ad;
+    }
+    r = _im_jr_def(_im_jr_at(o, f, 7, "fixed_rotation"), &_im_jr_bool, &w);
+    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (r == 1) { d.fixed_rotation = load64(&w); }
+    r = _im_jr_opt_def(_im_jr_at(o, f, 8, "gravity_scale"), &_im_jr_f64, &w);
+    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (r == 1) {
+        var gs: f64 = load64(&w);
+        d.has_gravity_scale = 1;
+        d.gravity_scale = gs;
+    }
+    memcpy(out, &d, sizeof(ImBodyDesc));
+    return Ok(0);
+}
+
+impl ImBodyState {
+    # Appends the state as serde_json writes a `BodyState`.
+    fn to_json(self, sb) {
+        var rot: f64 = self.rotation;
+        var av: f64 = self.angular_velocity;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "handle", 1);
+        _im_jw_u64(sb, self.handle);
+        _im_jw_key(sb, "body_type", 0);
+        _im_jw_name(sb, body_type_name(self.body_type));
+        _im_jw_key(sb, "position", 0);
+        _im_jw_vec3(sb, self.position);
+        _im_jw_key(sb, "rotation", 0);
+        im_fmt_f64_json(sb, rot);
+        _im_jw_key(sb, "linear_velocity", 0);
+        _im_jw_vec3(sb, self.linear_velocity);
+        _im_jw_key(sb, "angular_velocity", 0);
+        im_fmt_f64_json(sb, av);
+        _im_jw_key(sb, "is_sleeping", 0);
+        _im_jw_bool(sb, self.is_sleeping);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `BodyState` document (every field required) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# Mirrors `serde_json::from_str::<BodyState>`.
+#must_use
+fn ImBodyState_from_json(buf, len, out: *ImBodyState): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 7);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var s: ImBodyState;
+    var w[8];
+    if (_im_jr_u64(_im_jr_at(o, f, 0, "handle"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.handle = load64(&w);
+    if (_im_jr_body_type(_im_jr_at(o, f, 1, "body_type"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.body_type = load64(&w);
+    var pos: ImVec3 = ImVec3_zero();
+    if (_im_jr_vec3(_im_jr_at(o, f, 2, "position"), &pos) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.position = pos;
+    if (_im_jr_f64(_im_jr_at(o, f, 3, "rotation"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var rot: f64 = load64(&w);
+    s.rotation = rot;
+    var lv: ImVec3 = ImVec3_zero();
+    if (_im_jr_vec3(_im_jr_at(o, f, 4, "linear_velocity"), &lv) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.linear_velocity = lv;
+    if (_im_jr_f64(_im_jr_at(o, f, 5, "angular_velocity"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var av: f64 = load64(&w);
+    s.angular_velocity = av;
+    if (_im_jr_bool(_im_jr_at(o, f, 6, "is_sleeping"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.is_sleeping = load64(&w);
+    memcpy(out, &s, sizeof(ImBodyState));
+    return Ok(0);
+}
+
+# ── ColliderShape, ColliderDesc ─────────────────────────────────────────────────────
+
+impl ImColliderShape {
+    # Appends the shape as serde_json writes a `ColliderShape` (externally tagged).
+    fn to_json(self, sb) {
+        var k = self.kind;
+        _im_jw_variant(sb, shape_kind_name(k));
+        str_builder_putc(sb, 123);
+        if (k == IM_SHAPE_BOX) {
+            _im_jw_key(sb, "half_extents", 1);
+            _im_jw_vec3(sb, self.half_extents);
+        } elif (k == IM_SHAPE_BALL) {
+            var r: f64 = self.radius;
+            _im_jw_key(sb, "radius", 1);
+            im_fmt_f64_json(sb, r);
+        } elif (k == IM_SHAPE_CAPSULE) {
+            var hh: f64 = self.half_height;
+            var cr: f64 = self.radius;
+            _im_jw_key(sb, "half_height", 1);
+            im_fmt_f64_json(sb, hh);
+            _im_jw_key(sb, "radius", 0);
+            im_fmt_f64_json(sb, cr);
+        } elif (k == IM_SHAPE_CONVEX_HULL) {
+            _im_jw_key(sb, "points", 1);
+            _im_jw_triples(sb, self.points, self.point_count, 1);
+        } elif (k == IM_SHAPE_TRI_MESH) {
+            _im_jw_key(sb, "vertices", 1);
+            _im_jw_triples(sb, self.vertices, self.vertex_count, 1);
+            _im_jw_key(sb, "indices", 0);
+            _im_jw_triples(sb, self.indices, self.index_count, 0);
+        } elif (k == IM_SHAPE_HEIGHTFIELD) {
+            _im_jw_key(sb, "heights", 1);
+            _im_jw_f64_list(sb, self.heights, self.height_count);
+            _im_jw_key(sb, "scale", 0);
+            _im_jw_vec3(sb, self.scale);
+        } elif (k == IM_SHAPE_SEGMENT) {
+            _im_jw_key(sb, "a", 1);
+            _im_jw_vec3(sb, self.a);
+            _im_jw_key(sb, "b", 0);
+            _im_jw_vec3(sb, self.b);
+        }
+        str_builder_putc(sb, 125);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads the `ColliderShape` node v into *out (its arrays on freelist): 1, or 0 when malformed (nothing
+# left allocated).
+fn _im_jr_shape(v, out: *ImColliderShape): i64 {
+    var kw[8];
+    var pw[8];
+    if (_im_jr_tagged(v, &shape_kind_name, 7, &kw, &pw) == 0) { return 0; }
+    var k = load64(&kw);
+    var p = load64(&pw);
+    var s: ImColliderShape = _im_shape(k);
+    var n = 1;
+    if (k == IM_SHAPE_CAPSULE || k == IM_SHAPE_TRI_MESH || k == IM_SHAPE_HEIGHTFIELD || k == IM_SHAPE_SEGMENT) {
+        n = 2;
+    }
+    var f = _im_jr_form(p, n);
+    if (f == 0) { return 0; }
+    var w[8];
+    var a[8];
+    var c[8];
+    var ok = 1;
+    if (k == IM_SHAPE_BOX) {
+        var he: ImVec3 = ImVec3_zero();
+        ok = _im_jr_vec3(_im_jr_at(p, f, 0, "half_extents"), &he);
+        s.half_extents = he;
+    } elif (k == IM_SHAPE_BALL) {
+        ok = _im_jr_f64(_im_jr_at(p, f, 0, "radius"), &w);
+        var r: f64 = load64(&w);
+        s.radius = r;
+    } elif (k == IM_SHAPE_CAPSULE) {
+        ok = _im_jr_f64(_im_jr_at(p, f, 0, "half_height"), &w);
+        var hh: f64 = load64(&w);
+        s.half_height = hh;
+        if (ok == 1) { ok = _im_jr_f64(_im_jr_at(p, f, 1, "radius"), &w); }
+        var cr: f64 = load64(&w);
+        s.radius = cr;
+    } elif (k == IM_SHAPE_CONVEX_HULL) {
+        ok = _im_jr_triples(_im_jr_at(p, f, 0, "points"), 1, &a, &c);
+        s.points = load64(&a);
+        s.point_count = load64(&c);
+    } elif (k == IM_SHAPE_TRI_MESH) {
+        ok = _im_jr_triples(_im_jr_at(p, f, 0, "vertices"), 1, &a, &c);
+        s.vertices = load64(&a);
+        s.vertex_count = load64(&c);
+        if (ok == 1) {
+            ok = _im_jr_triples(_im_jr_at(p, f, 1, "indices"), 0, &a, &c);
+            s.indices = load64(&a);
+            s.index_count = load64(&c);
+        }
+    } elif (k == IM_SHAPE_HEIGHTFIELD) {
+        ok = _im_jr_f64_list(_im_jr_at(p, f, 0, "heights"), &a, &c);
+        s.heights = load64(&a);
+        s.height_count = load64(&c);
+        var sc: ImVec3 = ImVec3_zero();
+        if (ok == 1) { ok = _im_jr_vec3(_im_jr_at(p, f, 1, "scale"), &sc); }
+        s.scale = sc;
+    } elif (k == IM_SHAPE_SEGMENT) {
+        var sa: ImVec3 = ImVec3_zero();
+        var sbv: ImVec3 = ImVec3_zero();
+        ok = _im_jr_vec3(_im_jr_at(p, f, 0, "a"), &sa);
+        if (ok == 1) { ok = _im_jr_vec3(_im_jr_at(p, f, 1, "b"), &sbv); }
+        s.a = sa;
+        s.b = sbv;
+    }
+    if (ok == 0) {
+        s.free();
+        return 0;
+    }
+    memcpy(out, &s, sizeof(ImColliderShape));
+    return 1;
+}
+
+# Reads a `ColliderShape` document into *out (its arrays on freelist; release with `free`): Ok(0), or
+# Err(IM_ERR_DESERIALIZE). Mirrors `serde_json::from_str::<ColliderShape>`.
+#must_use
+fn ImColliderShape_from_json(buf, len, out: *ImColliderShape): Result {
+    return _im_jr_result(_im_jr_shape(_im_jr_parse(buf, len), out));
+}
+
+impl ImColliderDesc {
+    # Appends the descriptor as serde_json writes a `ColliderDesc`.
+    fn to_json(self, sb) {
+        var mass: f64 = self.mass;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "shape", 1);
+        self.shape.to_json(sb);
+        _im_jw_key(sb, "offset", 0);
+        _im_jw_vec3(sb, self.offset);
+        _im_jw_key(sb, "material", 0);
+        self.material.to_json(sb);
+        _im_jw_key(sb, "is_sensor", 0);
+        _im_jw_bool(sb, self.is_sensor);
+        _im_jw_key(sb, "mass", 0);
+        _im_jw_opt_f64(sb, self.has_mass, mass);
+        _im_jw_key(sb, "collision_layer", 0);
+        str_builder_add_int(sb, self.collision_layer);
+        _im_jw_key(sb, "collision_mask", 0);
+        str_builder_add_int(sb, self.collision_mask);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `ColliderDesc` document into *out (the shape's arrays on freelist): Ok(0), or
+# Err(IM_ERR_DESERIALIZE). shape is required; the rest default as `ImColliderDesc_new`. Mirrors
+# `serde_json::from_str::<ColliderDesc>`.
+#must_use
+fn ImColliderDesc_from_json(buf, len, out: *ImColliderDesc): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 7);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var sh: ImColliderShape = _im_shape(IM_SHAPE_BALL);
+    if (_im_jr_shape(_im_jr_at(o, f, 0, "shape"), &sh) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var d: ImColliderDesc = ImColliderDesc_new(sh);
+    var w[8];
+    var ok = 1;
+    var off: ImVec3 = ImVec3_zero();
+    if (_im_jr_def(_im_jr_at(o, f, 1, "offset"), &_im_jr_vec3, &off) == 0) { ok = 0; }
+    d.offset = off;
+    var m: ImPhysicsMaterial = ImPhysicsMaterial_default();
+    if (ok == 1 && _im_jr_def(_im_jr_at(o, f, 2, "material"), &_im_jr_material, &m) == 0) { ok = 0; }
+    d.material = m;
+    var r = 2;
+    if (ok == 1) { r = _im_jr_def(_im_jr_at(o, f, 3, "is_sensor"), &_im_jr_bool, &w); }
+    if (r == 0) { ok = 0; }
+    if (r == 1) { d.is_sensor = load64(&w); }
+    r = 2;
+    if (ok == 1) { r = _im_jr_opt_def(_im_jr_at(o, f, 4, "mass"), &_im_jr_f64, &w); }
+    if (r == 0) { ok = 0; }
+    if (r == 1) {
+        var mass: f64 = load64(&w);
+        d.has_mass = 1;
+        d.mass = mass;
+    }
+    r = 2;
+    if (ok == 1) { r = _im_jr_def(_im_jr_at(o, f, 5, "collision_layer"), &_im_jr_u32, &w); }
+    if (r == 0) { ok = 0; }
+    if (r == 1) { d.collision_layer = load64(&w); }
+    r = 2;
+    if (ok == 1) { r = _im_jr_def(_im_jr_at(o, f, 6, "collision_mask"), &_im_jr_u32, &w); }
+    if (r == 0) { ok = 0; }
+    if (r == 1) { d.collision_mask = load64(&w); }
+    if (ok == 0) {
+        sh.free();
+        return Err(IM_ERR_DESERIALIZE);
+    }
+    memcpy(out, &d, sizeof(ImColliderDesc));
+    return Ok(0);
+}
+
+# ── JointType, JointMotor, JointDesc ────────────────────────────────────────────────
+
+# Appends `"limits":[lo,hi]` or `"limits":null`.
+fn _im_jw_limits(sb, has, l: ImVec2) {
+    _im_jw_key(sb, "limits", 0);
+    if (has == 1) { _im_jw_vec2(sb, l); } else { str_builder_add_cstr(sb, "null"); }
+    return 0;
+}
+
+impl ImJointType {
+    # Appends the joint type as serde_json writes a `JointType`: `"Fixed"`, or externally tagged.
+    fn to_json(self, sb) {
+        var k = self.kind;
+        if (k == IM_JOINT_FIXED) {
+            _im_jw_name(sb, "Fixed");
+            return 0;
+        }
+        var st: f64 = self.stiffness;
+        var dm: f64 = self.damping;
+        _im_jw_variant(sb, joint_kind_name(k));
+        str_builder_putc(sb, 123);
+        if (k == IM_JOINT_REVOLUTE) {
+            _im_jw_key(sb, "anchor", 1);
+            _im_jw_vec2(sb, self.anchor);
+            _im_jw_limits(sb, self.has_limits, self.limits);
+        } elif (k == IM_JOINT_PRISMATIC) {
+            _im_jw_key(sb, "axis", 1);
+            _im_jw_vec2(sb, self.axis);
+            _im_jw_limits(sb, self.has_limits, self.limits);
+        } elif (k == IM_JOINT_SPRING) {
+            var rl: f64 = self.rest_length;
+            _im_jw_key(sb, "rest_length", 1);
+            im_fmt_f64_json(sb, rl);
+            _im_jw_key(sb, "stiffness", 0);
+            im_fmt_f64_json(sb, st);
+            _im_jw_key(sb, "damping", 0);
+            im_fmt_f64_json(sb, dm);
+        } elif (k == IM_JOINT_DISTANCE) {
+            var ln: f64 = self.length;
+            _im_jw_key(sb, "length", 1);
+            im_fmt_f64_json(sb, ln);
+        } elif (k == IM_JOINT_WHEEL) {
+            _im_jw_key(sb, "axis", 1);
+            _im_jw_vec2(sb, self.axis);
+            _im_jw_key(sb, "stiffness", 0);
+            im_fmt_f64_json(sb, st);
+            _im_jw_key(sb, "damping", 0);
+            im_fmt_f64_json(sb, dm);
+        } elif (k == IM_JOINT_ROPE) {
+            var ml: f64 = self.max_length;
+            _im_jw_key(sb, "max_length", 1);
+            im_fmt_f64_json(sb, ml);
+        } elif (k == IM_JOINT_MOUSE) {
+            var mf: f64 = self.max_force;
+            _im_jw_key(sb, "target", 1);
+            _im_jw_vec3(sb, self.target);
+            _im_jw_key(sb, "stiffness", 0);
+            im_fmt_f64_json(sb, st);
+            _im_jw_key(sb, "damping", 0);
+            im_fmt_f64_json(sb, dm);
+            _im_jw_key(sb, "max_force", 0);
+            im_fmt_f64_json(sb, mf);
+        }
+        str_builder_putc(sb, 125);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads `count` required f64 fields named by `names` (a C-string array) of struct node p in form f
+# into the words at out: 1, or 0.
+fn _im_jr_f64_fields(p, f, names, count, out): i64 {
+    for (var i = 0; i < count; i = i + 1) {
+        if (_im_jr_f64(_im_jr_at(p, f, i, load64(names + i * 8)), out + i * 8) == 0) { return 0; }
+    }
+    return 1;
+}
+
+# Reads the `JointType` node v into *out: 1, or 0 when malformed.
+fn _im_jr_joint_type(v, out: *ImJointType): i64 {
+    var kw[8];
+    var pw[8];
+    if (_im_jr_tagged(v, &joint_kind_name, 8, &kw, &pw) == 0) { return 0; }
+    var k = load64(&kw);
+    var p = load64(&pw);
+    var j: ImJointType = _im_joint(k);
+    if (k == IM_JOINT_FIXED) {
+        if (_im_jr_unit_ok(p) == 0) { return 0; }
+        memcpy(out, &j, sizeof(ImJointType));
+        return 1;
+    }
+    var n = 1;
+    if (k == IM_JOINT_REVOLUTE || k == IM_JOINT_PRISMATIC) { n = 2; }
+    if (k == IM_JOINT_SPRING || k == IM_JOINT_WHEEL) { n = 3; }
+    if (k == IM_JOINT_MOUSE) { n = 4; }
+    var f = _im_jr_form(p, n);
+    if (f == 0) { return 0; }
+    var w[32];
+    var names[32];
+    if (k == IM_JOINT_REVOLUTE || k == IM_JOINT_PRISMATIC) {
+        var first = "axis";
+        if (k == IM_JOINT_REVOLUTE) { first = "anchor"; }
+        var av: ImVec2 = ImVec2_new(0.0, 0.0);
+        if (_im_jr_vec2(_im_jr_at(p, f, 0, first), &av) == 0) { return 0; }
+        if (k == IM_JOINT_REVOLUTE) { j.anchor = av; } else { j.axis = av; }
+        var lim: ImVec2 = ImVec2_new(0.0, 0.0);
+        var r = _im_jr_opt(_im_jr_at(p, f, 1, "limits"), f, &_im_jr_vec2, &lim);
+        if (r == 0) { return 0; }
+        if (r == 1) {
+            j.has_limits = 1;
+            j.limits = lim;
+        }
+    } elif (k == IM_JOINT_SPRING) {
+        store64(&names, "rest_length");
+        store64(&names + 8, "stiffness");
+        store64(&names + 16, "damping");
+        if (_im_jr_f64_fields(p, f, &names, 3, &w) == 0) { return 0; }
+        var rl: f64 = load64(&w);
+        var st: f64 = load64(&w + 8);
+        var dm: f64 = load64(&w + 16);
+        j.rest_length = rl;
+        j.stiffness = st;
+        j.damping = dm;
+    } elif (k == IM_JOINT_DISTANCE) {
+        if (_im_jr_f64(_im_jr_at(p, f, 0, "length"), &w) == 0) { return 0; }
+        var ln: f64 = load64(&w);
+        j.length = ln;
+    } elif (k == IM_JOINT_WHEEL) {
+        var ax: ImVec2 = ImVec2_new(0.0, 0.0);
+        if (_im_jr_vec2(_im_jr_at(p, f, 0, "axis"), &ax) == 0) { return 0; }
+        j.axis = ax;
+        if (_im_jr_f64(_im_jr_at(p, f, 1, "stiffness"), &w) == 0) { return 0; }
+        if (_im_jr_f64(_im_jr_at(p, f, 2, "damping"), &w + 8) == 0) { return 0; }
+        var ws: f64 = load64(&w);
+        var wd: f64 = load64(&w + 8);
+        j.stiffness = ws;
+        j.damping = wd;
+    } elif (k == IM_JOINT_ROPE) {
+        if (_im_jr_f64(_im_jr_at(p, f, 0, "max_length"), &w) == 0) { return 0; }
+        var ml: f64 = load64(&w);
+        j.max_length = ml;
+    } elif (k == IM_JOINT_MOUSE) {
+        var tg: ImVec3 = ImVec3_zero();
+        if (_im_jr_vec3(_im_jr_at(p, f, 0, "target"), &tg) == 0) { return 0; }
+        j.target = tg;
+        if (_im_jr_f64(_im_jr_at(p, f, 1, "stiffness"), &w) == 0) { return 0; }
+        if (_im_jr_f64(_im_jr_at(p, f, 2, "damping"), &w + 8) == 0) { return 0; }
+        if (_im_jr_f64(_im_jr_at(p, f, 3, "max_force"), &w + 16) == 0) { return 0; }
+        var ms: f64 = load64(&w);
+        var md: f64 = load64(&w + 8);
+        var mf: f64 = load64(&w + 16);
+        j.stiffness = ms;
+        j.damping = md;
+        j.max_force = mf;
+    }
+    memcpy(out, &j, sizeof(ImJointType));
+    return 1;
+}
+
+# Reads a `JointType` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE). Mirrors
+# `serde_json::from_str::<JointType>`.
+#must_use
+fn ImJointType_from_json(buf, len, out: *ImJointType): Result {
+    return _im_jr_result(_im_jr_joint_type(_im_jr_parse(buf, len), out));
+}
+
+impl ImJointMotor {
+    # Appends the motor as serde_json writes a `JointMotor`.
+    fn to_json(self, sb) {
+        var tv: f64 = self.target_velocity;
+        var mf: f64 = self.max_force;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "target_velocity", 1);
+        im_fmt_f64_json(sb, tv);
+        _im_jw_key(sb, "max_force", 0);
+        im_fmt_f64_json(sb, mf);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads the `JointMotor` node v (both fields required) into *out: 1, or 0.
+fn _im_jr_motor(v, out: *ImJointMotor): i64 {
+    var f = _im_jr_form(v, 2);
+    if (f == 0) { return 0; }
+    var w[16];
+    if (_im_jr_f64(_im_jr_at(v, f, 0, "target_velocity"), &w) == 0) { return 0; }
+    if (_im_jr_f64(_im_jr_at(v, f, 1, "max_force"), &w + 8) == 0) { return 0; }
+    var tv: f64 = load64(&w);
+    var mf: f64 = load64(&w + 8);
+    out.target_velocity = tv;
+    out.max_force = mf;
+    return 1;
+}
+
+# Reads a `JointMotor` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE). Mirrors
+# `serde_json::from_str::<JointMotor>`.
+#must_use
+fn ImJointMotor_from_json(buf, len, out: *ImJointMotor): Result {
+    return _im_jr_result(_im_jr_motor(_im_jr_parse(buf, len), out));
+}
+
+impl ImJointDesc {
+    # Appends the descriptor as serde_json writes a `JointDesc`.
+    fn to_json(self, sb) {
+        var dm: f64 = self.damping;
+        var bf: f64 = self.break_force;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "body_a", 1);
+        _im_jw_u64(sb, self.body_a);
+        _im_jw_key(sb, "body_b", 0);
+        _im_jw_u64(sb, self.body_b);
+        _im_jw_key(sb, "joint_type", 0);
+        self.joint_type.to_json(sb);
+        _im_jw_key(sb, "local_anchor_a", 0);
+        _im_jw_vec2(sb, self.local_anchor_a);
+        _im_jw_key(sb, "local_anchor_b", 0);
+        _im_jw_vec2(sb, self.local_anchor_b);
+        _im_jw_key(sb, "motor", 0);
+        if (self.has_motor == 1) { self.motor.to_json(sb); } else { str_builder_add_cstr(sb, "null"); }
+        _im_jw_key(sb, "damping", 0);
+        im_fmt_f64_json(sb, dm);
+        _im_jw_key(sb, "break_force", 0);
+        _im_jw_opt_f64(sb, self.has_break_force, bf);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `JointDesc` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE). The bodies, joint type
+# and anchors are required; motor and break_force may be absent or null, damping defaults to 0.
+# Mirrors `serde_json::from_str::<JointDesc>`.
+#must_use
+fn ImJointDesc_from_json(buf, len, out: *ImJointDesc): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 8);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var w[16];
+    if (_im_jr_u64(_im_jr_at(o, f, 0, "body_a"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_u64(_im_jr_at(o, f, 1, "body_b"), &w + 8) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var jt: ImJointType = ImJointType_fixed();
+    if (_im_jr_joint_type(_im_jr_at(o, f, 2, "joint_type"), &jt) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var aa: ImVec2 = ImVec2_new(0.0, 0.0);
+    var ab: ImVec2 = ImVec2_new(0.0, 0.0);
+    if (_im_jr_vec2(_im_jr_at(o, f, 3, "local_anchor_a"), &aa) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_vec2(_im_jr_at(o, f, 4, "local_anchor_b"), &ab) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var d: ImJointDesc = ImJointDesc_new(load64(&w), load64(&w + 8), jt, aa, ab);
+    var mo: ImJointMotor = ImJointMotor_new(0.0, 0.0);
+    var r = _im_jr_opt_def(_im_jr_at(o, f, 5, "motor"), &_im_jr_motor, &mo);
+    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (r == 1) {
+        d.has_motor = 1;
+        d.motor = mo;
+    }
+    r = _im_jr_def(_im_jr_at(o, f, 6, "damping"), &_im_jr_f64, &w);
+    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (r == 1) {
+        var dm: f64 = load64(&w);
+        d.damping = dm;
+    }
+    r = _im_jr_opt_def(_im_jr_at(o, f, 7, "break_force"), &_im_jr_f64, &w);
+    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (r == 1) {
+        var bf: f64 = load64(&w);
+        d.has_break_force = 1;
+        d.break_force = bf;
+    }
+    memcpy(out, &d, sizeof(ImJointDesc));
+    return Ok(0);
+}
+
+# ── CollisionEvent, ContactPoint, ContactData ───────────────────────────────────────
+
+# A typed view of a word.
+#must_use
+fn _im_as_contact_point(p): *ImContactPoint {
+    return p;
+}
+
+impl ImCollisionEvent {
+    # Appends the event as serde_json writes a `CollisionEvent` (externally tagged).
+    fn to_json(self, sb) {
+        _im_jw_variant(sb, event_kind_name(self.kind));
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "collider_a", 1);
+        _im_jw_u64(sb, self.collider_a);
+        _im_jw_key(sb, "collider_b", 0);
+        _im_jw_u64(sb, self.collider_b);
+        str_builder_putc(sb, 125);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `CollisionEvent` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE). Mirrors
+# `serde_json::from_str::<CollisionEvent>`.
+#must_use
+fn ImCollisionEvent_from_json(buf, len, out: *ImCollisionEvent): Result {
+    var o = _im_jr_parse(buf, len);
+    var kw[8];
+    var pw[8];
+    if (_im_jr_tagged(o, &event_kind_name, 3, &kw, &pw) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var p = load64(&pw);
+    var f = _im_jr_form(p, 2);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var w[16];
+    if (_im_jr_u64(_im_jr_at(p, f, 0, "collider_a"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_u64(_im_jr_at(p, f, 1, "collider_b"), &w + 8) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var e: ImCollisionEvent = ImCollisionEvent_new(load64(&kw), load64(&w), load64(&w + 8));
+    memcpy(out, &e, sizeof(ImCollisionEvent));
+    return Ok(0);
+}
+
+impl ImContactPoint {
+    # Appends the point as serde_json writes a `ContactPoint`.
+    fn to_json(self, sb) {
+        var im: f64 = self.impulse;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "local_a", 1);
+        _im_jw_vec3(sb, self.local_a);
+        _im_jw_key(sb, "local_b", 0);
+        _im_jw_vec3(sb, self.local_b);
+        _im_jw_key(sb, "impulse", 0);
+        im_fmt_f64_json(sb, im);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads the `ContactPoint` node v (every field required) into *out: 1, or 0.
+fn _im_jr_contact_point(v, out: *ImContactPoint): i64 {
+    var f = _im_jr_form(v, 3);
+    if (f == 0) { return 0; }
+    var la: ImVec3 = ImVec3_zero();
+    var lb: ImVec3 = ImVec3_zero();
+    var w[8];
+    if (_im_jr_vec3(_im_jr_at(v, f, 0, "local_a"), &la) == 0) { return 0; }
+    if (_im_jr_vec3(_im_jr_at(v, f, 1, "local_b"), &lb) == 0) { return 0; }
+    if (_im_jr_f64(_im_jr_at(v, f, 2, "impulse"), &w) == 0) { return 0; }
+    var im: f64 = load64(&w);
+    out.local_a = la;
+    out.local_b = lb;
+    out.impulse = im;
+    return 1;
+}
+
+# Reads a `ContactPoint` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE). Mirrors
+# `serde_json::from_str::<ContactPoint>`.
+#must_use
+fn ImContactPoint_from_json(buf, len, out: *ImContactPoint): Result {
+    return _im_jr_result(_im_jr_contact_point(_im_jr_parse(buf, len), out));
+}
+
+impl ImContactData {
+    # Appends the contact as serde_json writes a `ContactData`.
+    fn to_json(self, sb) {
+        var dp: f64 = self.depth;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "collider_a", 1);
+        _im_jw_u64(sb, self.collider_a);
+        _im_jw_key(sb, "collider_b", 0);
+        _im_jw_u64(sb, self.collider_b);
+        _im_jw_key(sb, "normal", 0);
+        _im_jw_vec3(sb, self.normal);
+        _im_jw_key(sb, "depth", 0);
+        im_fmt_f64_json(sb, dp);
+        _im_jw_key(sb, "points", 0);
+        str_builder_putc(sb, 91);
+        for (var i = 0; i < self.point_count; i = i + 1) {
+            if (i > 0) { str_builder_putc(sb, 44); }
+            var cp: *ImContactPoint = _im_as_contact_point(self.points + i * sizeof(ImContactPoint));
+            cp.to_json(sb);
+        }
+        str_builder_putc(sb, 93);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+
+    # Releases the points.
+    fn free(self) {
+        if (self.points != 0) { fl_free(self.points); }
+        self.points = 0;
+        self.point_count = 0;
+        return 0;
+    }
+}
+
+# Reads a `ContactData` document (every field required) into *out, its points on freelist (release
+# with `free`): Ok(0), or Err(IM_ERR_DESERIALIZE). Mirrors `serde_json::from_str::<ContactData>`.
+#must_use
+fn ImContactData_from_json(buf, len, out: *ImContactData): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 5);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var w[16];
+    if (_im_jr_u64(_im_jr_at(o, f, 0, "collider_a"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_u64(_im_jr_at(o, f, 1, "collider_b"), &w + 8) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var nrm: ImVec3 = ImVec3_zero();
+    if (_im_jr_vec3(_im_jr_at(o, f, 2, "normal"), &nrm) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var dw[8];
+    if (_im_jr_f64(_im_jr_at(o, f, 3, "depth"), &dw) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var pv = _im_jr_at(o, f, 4, "points");
+    if (pv == 0 || bayan_json_v_tag(pv) != JTAG_ARR) { return Err(IM_ERR_DESERIALIZE); }
+    var n = bayan_json_v_arr_len(pv);
+    var pts = 0;
+    if (n > 0) {
+        pts = fl_alloc(n * sizeof(ImContactPoint));
+        if (pts == 0) { return Err(IM_ERR_DESERIALIZE); }
+        for (var i = 0; i < n; i = i + 1) {
+            if (_im_jr_contact_point(bayan_json_v_arr_get(pv, i), pts + i * sizeof(ImContactPoint)) == 0) {
+                fl_free(pts);
+                return Err(IM_ERR_DESERIALIZE);
+            }
+        }
+    }
+    var dp: f64 = load64(&dw);
+    var c: ImContactData;
+    c.collider_a = load64(&w);
+    c.collider_b = load64(&w + 8);
+    c.normal = nrm;
+    c.depth = dp;
+    c.points = pts;
+    c.point_count = n;
+    memcpy(out, &c, sizeof(ImContactData));
+    return Ok(0);
+}
+
+# ── RayHit, PointQuery ──────────────────────────────────────────────────────────────
+
+impl ImRayHit {
+    # Appends the hit as serde_json writes a `RayHit`.
+    fn to_json(self, sb) {
+        var dist: f64 = self.distance;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "collider", 1);
+        _im_jw_u64(sb, self.collider);
+        _im_jw_key(sb, "point", 0);
+        _im_jw_vec3(sb, self.point);
+        _im_jw_key(sb, "normal", 0);
+        _im_jw_vec3(sb, self.normal);
+        _im_jw_key(sb, "distance", 0);
+        im_fmt_f64_json(sb, dist);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `RayHit` document (every field required) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# Mirrors `serde_json::from_str::<RayHit>`.
+#must_use
+fn ImRayHit_from_json(buf, len, out: *ImRayHit): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 4);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var w[16];
+    if (_im_jr_u64(_im_jr_at(o, f, 0, "collider"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var pt: ImVec3 = ImVec3_zero();
+    var nm: ImVec3 = ImVec3_zero();
+    if (_im_jr_vec3(_im_jr_at(o, f, 1, "point"), &pt) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_vec3(_im_jr_at(o, f, 2, "normal"), &nm) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_f64(_im_jr_at(o, f, 3, "distance"), &w + 8) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var dist: f64 = load64(&w + 8);
+    var h: ImRayHit;
+    h.collider = load64(&w);
+    h.point = pt;
+    h.normal = nm;
+    h.distance = dist;
+    memcpy(out, &h, sizeof(ImRayHit));
+    return Ok(0);
+}
+
+impl ImPointQuery {
+    # Appends the result as serde_json writes a `PointQuery`.
+    fn to_json(self, sb) {
+        var dist: f64 = self.distance;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "collider", 1);
+        _im_jw_u64(sb, self.collider);
+        _im_jw_key(sb, "distance", 0);
+        im_fmt_f64_json(sb, dist);
+        _im_jw_key(sb, "is_inside", 0);
+        _im_jw_bool(sb, self.is_inside);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `PointQuery` document (every field required) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# Mirrors `serde_json::from_str::<PointQuery>`.
+#must_use
+fn ImPointQuery_from_json(buf, len, out: *ImPointQuery): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 3);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var w[24];
+    if (_im_jr_u64(_im_jr_at(o, f, 0, "collider"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_f64(_im_jr_at(o, f, 1, "distance"), &w + 8) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_bool(_im_jr_at(o, f, 2, "is_inside"), &w + 16) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var dist: f64 = load64(&w + 8);
+    var q: ImPointQuery;
+    q.collider = load64(&w);
+    q.distance = dist;
+    q.is_inside = load64(&w + 16);
+    memcpy(out, &q, sizeof(ImPointQuery));
+    return Ok(0);
+}
+
+# ── Spring, Spring2d, Spring3d ──────────────────────────────────────────────────────
+
+impl ImSpring {
+    # Appends the spring as serde_json writes a `Spring` (the cache is `#[serde(skip)]`).
+    fn to_json(self, sb) {
+        var p: f64 = self.position;
+        var v: f64 = self.velocity;
+        var t: f64 = self.target;
+        var k: f64 = self.stiffness;
+        var c: f64 = self.damping;
+        var s: f64 = self.settle_threshold;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "position", 1);
+        im_fmt_f64_json(sb, p);
+        _im_jw_key(sb, "velocity", 0);
+        im_fmt_f64_json(sb, v);
+        _im_jw_key(sb, "target", 0);
+        im_fmt_f64_json(sb, t);
+        _im_jw_key(sb, "stiffness", 0);
+        im_fmt_f64_json(sb, k);
+        _im_jw_key(sb, "damping", 0);
+        im_fmt_f64_json(sb, c);
+        _im_jw_key(sb, "settle_threshold", 0);
+        im_fmt_f64_json(sb, s);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads the `Spring` node v (all six fields required; the cache starts empty) into *out: 1, or 0.
+fn _im_jr_spring(v, out: *ImSpring): i64 {
+    var f = _im_jr_form(v, 6);
+    if (f == 0) { return 0; }
+    var names[48];
+    store64(&names, "position");
+    store64(&names + 8, "velocity");
+    store64(&names + 16, "target");
+    store64(&names + 24, "stiffness");
+    store64(&names + 32, "damping");
+    store64(&names + 40, "settle_threshold");
+    var w[48];
+    if (_im_jr_f64_fields(v, f, &names, 6, &w) == 0) { return 0; }
+    var p: f64 = load64(&w);
+    var vel: f64 = load64(&w + 8);
+    var t: f64 = load64(&w + 16);
+    var k: f64 = load64(&w + 24);
+    var c: f64 = load64(&w + 32);
+    var s: f64 = load64(&w + 40);
+    var sp: ImSpring = ImSpring_new(p, t, k, c);
+    sp.velocity = vel;
+    sp.settle_threshold = s;
+    memcpy(out, &sp, sizeof(ImSpring));
+    return 1;
+}
+
+# Reads a `Spring` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE). Mirrors
+# `serde_json::from_str::<Spring>`.
+#must_use
+fn ImSpring_from_json(buf, len, out: *ImSpring): Result {
+    return _im_jr_result(_im_jr_spring(_im_jr_parse(buf, len), out));
+}
+
+impl ImSpring2d {
+    # Appends the spring as serde_json writes a `Spring2d`.
+    fn to_json(self, sb) {
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "x", 1);
+        self.x.to_json(sb);
+        _im_jw_key(sb, "y", 0);
+        self.y.to_json(sb);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `Spring2d` document (x and y required) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# Mirrors `serde_json::from_str::<Spring2d>`.
+#must_use
+fn ImSpring2d_from_json(buf, len, out: *ImSpring2d): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 2);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var x: ImSpring = ImSpring_new(0.0, 0.0, 0.0, 0.0);
+    var y: ImSpring = ImSpring_new(0.0, 0.0, 0.0, 0.0);
+    if (_im_jr_spring(_im_jr_at(o, f, 0, "x"), &x) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_spring(_im_jr_at(o, f, 1, "y"), &y) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var s: ImSpring2d;
+    s.x = x;
+    s.y = y;
+    memcpy(out, &s, sizeof(ImSpring2d));
+    return Ok(0);
+}
+
+impl ImSpring3d {
+    # Appends the spring as serde_json writes a `Spring3d`.
+    fn to_json(self, sb) {
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "x", 1);
+        self.x.to_json(sb);
+        _im_jw_key(sb, "y", 0);
+        self.y.to_json(sb);
+        _im_jw_key(sb, "z", 0);
+        self.z.to_json(sb);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `Spring3d` document (x, y and z required) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# Mirrors `serde_json::from_str::<Spring3d>`.
+#must_use
+fn ImSpring3d_from_json(buf, len, out: *ImSpring3d): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 3);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var x: ImSpring = ImSpring_new(0.0, 0.0, 0.0, 0.0);
+    var y: ImSpring = ImSpring_new(0.0, 0.0, 0.0, 0.0);
+    var z: ImSpring = ImSpring_new(0.0, 0.0, 0.0, 0.0);
+    if (_im_jr_spring(_im_jr_at(o, f, 0, "x"), &x) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_spring(_im_jr_at(o, f, 1, "y"), &y) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_spring(_im_jr_at(o, f, 2, "z"), &z) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var s: ImSpring3d;
+    s.x = x;
+    s.y = y;
+    s.z = z;
+    memcpy(out, &s, sizeof(ImSpring3d));
     return Ok(0);
 }

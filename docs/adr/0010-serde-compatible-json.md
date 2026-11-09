@@ -73,6 +73,29 @@ codecs:
   uses its `float_roundtrip` feature, which matches the port's correctly rounded parse. Writing is the same
   in both modes.
 
+### M1b part 2 (2026-11-09): serde_json probed for the descriptor types
+
+- **A struct also reads from an array.** serde_json hands a derived struct a sequence when the
+  document has `[` where `{` was expected, so `[0.016,[0,-9.81,0],4,1,true,0]` is a `WorldConfig`.
+  Fields go by position. Trailing `#[serde(default)]` fields may be left off; an `Option` field without
+  a default (`Force::point`, `JointType::Revolute::limits`) may not; extra elements are refused. The
+  readers take both forms (`_im_jr_form` / `_im_jr_at`), the part-1 types included.
+- **A unit variant also reads as a one-key object with a null value** (`{"Average":null}`,
+  `{"Fixed":null}`), and a struct variant's payload in either struct form (`{"Ball":[0.5]}`).
+- **Handles are u64.** serde_json writes and reads `BodyHandle(18446744073709551615)`. The writers
+  print the word unsigned.
+- **Two bayan policies are stricter than serde_json**, so a few documents serde_json reads, the port
+  refuses. The golden rows are *pending* until the gaps close (port plan §8):
+  - **S3:** an integer above `i64::MAX` is a parse error. That covers a handle at generation ≥ 2^31,
+    which serde_json writes, `step` ≥ 2^63, and an integer beyond u64 that serde_json reads as an
+    f64 (`1e20` written `100000000000000000000`).
+  - **S4:** any duplicate key refuses the document, including one serde ignores: a repeated unknown
+    field, or a duplicate inside an ignored value. A duplicate known field is refused by both.
+- **The writers can abort on out-of-memory.** They use `str_builder`'s back-compat calls, which exit
+  the process when a grow fails (the `_a` variants return -1). A malformed document never reaches
+  that path; only a failed allocation does. Moving the writers to the `_a` calls, with an error
+  return, is open (port plan §8).
+
 ## Alternatives considered
 
 - **`#derive` now, file the gaps**: less code today, but no Rust-written document would load until

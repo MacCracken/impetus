@@ -1,0 +1,440 @@
+# types.tcyr — the ported Rust tests of rust-old/src/{body,collider,joint,event,query}.rs (M1b).
+#
+# Rust's serde tests assert `back == value` after a serde_json round trip. Here a round trip is
+# write → read → write, and the two documents must be the same text: every field is in the
+# document, f64 in its shortest round-trip form, so equal text is equal fields (-0.0 included).
+
+include "tests/lib_2d.cyr"
+
+# Each type's text, written fresh: `to_json` into a new builder.
+fn text_of_builder(sb): i64 {
+    return str_builder_build(sb);
+}
+
+# 1 when the Str documents a and b are the same text.
+fn same(a, b): i64 {
+    if (str_eq(a, b) == 1) { return 1; }
+    return 0;
+}
+
+fn body_desc_text(d: ImBodyDesc): i64 {
+    var sb = str_builder_new();
+    d.to_json(sb);
+    return text_of_builder(sb);
+}
+
+fn body_state_text(s: ImBodyState): i64 {
+    var sb = str_builder_new();
+    s.to_json(sb);
+    return text_of_builder(sb);
+}
+
+fn shape_text(s: ImColliderShape): i64 {
+    var sb = str_builder_new();
+    s.to_json(sb);
+    return text_of_builder(sb);
+}
+
+fn collider_desc_text(d: ImColliderDesc): i64 {
+    var sb = str_builder_new();
+    d.to_json(sb);
+    return text_of_builder(sb);
+}
+
+fn joint_type_text(j: ImJointType): i64 {
+    var sb = str_builder_new();
+    j.to_json(sb);
+    return text_of_builder(sb);
+}
+
+fn joint_desc_text(d: ImJointDesc): i64 {
+    var sb = str_builder_new();
+    d.to_json(sb);
+    return text_of_builder(sb);
+}
+
+fn event_text(e: ImCollisionEvent): i64 {
+    var sb = str_builder_new();
+    e.to_json(sb);
+    return text_of_builder(sb);
+}
+
+# 1 when a body descriptor survives write → read → write.
+fn body_desc_round_trips(d: ImBodyDesc): i64 {
+    var t1 = body_desc_text(d);
+    var back: ImBodyDesc = ImBodyDesc_default();
+    var tag, v = ImBodyDesc_from_json(str_data(t1), str_len(t1), &back);
+    if (is_err_result(tag) == 1) { return 0; }
+    return same(t1, body_desc_text(back));
+}
+
+# 1 when a shape survives write → read → write (the read copy is freed).
+fn shape_round_trips(s: ImColliderShape): i64 {
+    var t1 = shape_text(s);
+    var back: ImColliderShape = _im_shape(IM_SHAPE_BALL);
+    var tag, v = ImColliderShape_from_json(str_data(t1), str_len(t1), &back);
+    if (is_err_result(tag) == 1) { return 0; }
+    var r = same(t1, shape_text(back));
+    back.free();
+    return r;
+}
+
+# 1 when a joint type survives write → read → write.
+fn joint_type_round_trips(j: ImJointType): i64 {
+    var t1 = joint_type_text(j);
+    var back: ImJointType = ImJointType_fixed();
+    var tag, v = ImJointType_from_json(str_data(t1), str_len(t1), &back);
+    if (is_err_result(tag) == 1) { return 0; }
+    return same(t1, joint_type_text(back));
+}
+
+# 1 when a joint descriptor survives write → read → write; the copy read lands in *back.
+fn joint_desc_round_trips(d: ImJointDesc, back: *ImJointDesc): i64 {
+    var t1 = joint_desc_text(d);
+    var tag, v = ImJointDesc_from_json(str_data(t1), str_len(t1), back);
+    if (is_err_result(tag) == 1) { return 0; }
+    var b: ImJointDesc;
+    memcpy(&b, back, sizeof(ImJointDesc));
+    return same(t1, joint_desc_text(b));
+}
+
+# 1 when an event survives write → read → write.
+fn event_round_trips(e: ImCollisionEvent): i64 {
+    var t1 = event_text(e);
+    var back: ImCollisionEvent = ImCollisionEvent_new(0, 0, 0);
+    var tag, v = ImCollisionEvent_from_json(str_data(t1), str_len(t1), &back);
+    if (is_err_result(tag) == 1) { return 0; }
+    return same(t1, event_text(back));
+}
+
+# A joint descriptor between bodies 0 and 1 with no motor, damping or break force.
+fn joint_01(jt: ImJointType, ax: f64, ay: f64, bx: f64, by: f64): ImJointDesc {
+    return ImJointDesc_new(0, 1, jt, ImVec2_new(ax, ay), ImVec2_new(bx, by));
+}
+
+# Runs the ported descriptor-type tests.
+fn main() {
+    alloc_init();
+
+    # ── body.rs ──
+    test_group("default_body_desc");
+    var d: ImBodyDesc = ImBodyDesc_default();
+    assert_eq(d.body_type, IM_BODY_DYNAMIC, "dynamic");
+    var px: f64 = d.position.x;
+    var py: f64 = d.position.y;
+    var pz: f64 = d.position.z;
+    assert(px == 0.0 && py == 0.0 && pz == 0.0, "at the origin");
+    var rot: f64 = d.rotation;
+    var ld: f64 = d.linear_damping;
+    var ad: f64 = d.angular_damping;
+    assert(rot == 0.0 && ld == 0.0 && ad == 0.0, "no rotation or damping");
+    assert_eq(d.fixed_rotation, 0, "rotation free");
+    assert_eq(d.has_gravity_scale, 0, "gravity_scale None");
+
+    test_group("body_desc_serde");
+    d = ImBodyDesc_default();
+    d.body_type = IM_BODY_STATIC;
+    d.position = ImVec3_new(5.0, 3.0, 0.0);
+    d.rotation = 1.57;
+    assert_eq(body_desc_round_trips(d), 1, "round trip");
+
+    test_group("body_desc_kinematic_serde");
+    d = ImBodyDesc_default();
+    d.body_type = IM_BODY_KINEMATIC;
+    d.position = ImVec3_new(1.0, 2.0, 0.0);
+    d.linear_velocity = ImVec3_new(3.0, 4.0, 0.0);
+    d.angular_velocity = 0.5;
+    d.fixed_rotation = 1;
+    d.has_gravity_scale = 1;
+    d.gravity_scale = 0.5;
+    assert_eq(body_desc_round_trips(d), 1, "round trip");
+
+    test_group("body_handle_eq");
+    var h1 = _im_arena_handle(1, 0);
+    assert_eq(h1, _im_arena_handle(1, 0), "equal");
+    assert_neq(h1, _im_arena_handle(2, 0), "different");
+
+    test_group("body_state_serde");
+    var s: ImBodyState;
+    s.handle = 42;
+    s.body_type = IM_BODY_DYNAMIC;
+    s.position = ImVec3_new(1.0, 2.0, 0.0);
+    s.rotation = 0.5;
+    s.linear_velocity = ImVec3_new(3.0, 4.0, 0.0);
+    s.angular_velocity = 1.0;
+    s.is_sleeping = 0;
+    var st = body_state_text(s);
+    var sback: ImBodyState;
+    var stag, sv = ImBodyState_from_json(str_data(st), str_len(st), &sback);
+    assert(is_err_result(stag) == 0, "reads back");
+    assert_eq(same(st, body_state_text(sback)), 1, "round trip");
+    assert_eq(sback.handle, 42, "handle 42");
+
+    test_group("body_state_sleeping");
+    s.handle = 0;
+    s.body_type = IM_BODY_STATIC;
+    s.is_sleeping = 1;
+    assert_eq(s.is_sleeping, 1, "sleeping");
+
+    # ── collider.rs ──
+    test_group("collider_shapes_serde");
+    assert_eq(shape_round_trips(ImColliderShape_box(1.0, 1.0, 0.0)), 1, "box");
+    assert_eq(shape_round_trips(ImColliderShape_ball(0.5)), 1, "ball");
+    assert_eq(shape_round_trips(ImColliderShape_capsule(1.0, 0.3)), 1, "capsule");
+
+    test_group("convex_hull_serde");
+    var pts = fl_alloc(9 * 8);
+    var w: f64 = 0.0;
+    for (var i = 0; i < 9; i = i + 1) { store64(pts + i * 8, w); }
+    w = 1.0;
+    store64(pts + 3 * 8, w);
+    w = 0.5;
+    store64(pts + 6 * 8, w);
+    w = 1.0;
+    store64(pts + 7 * 8, w);
+    var hull: ImColliderShape = ImColliderShape_convex_hull(pts, 3);
+    assert_eq(hull.point_count, 3, "three points");
+    assert_eq(shape_round_trips(hull), 1, "round trip");
+    hull.free();
+
+    test_group("trimesh_serde");
+    var verts = fl_alloc(9 * 8);
+    w = 0.0;
+    for (var i = 0; i < 9; i = i + 1) { store64(verts + i * 8, w); }
+    w = 1.0;
+    store64(verts + 3 * 8, w);
+    store64(verts + 7 * 8, w);
+    var idx = fl_alloc(3 * 8);
+    store64(idx, 0);
+    store64(idx + 8, 1);
+    store64(idx + 16, 2);
+    var mesh: ImColliderShape = ImColliderShape_tri_mesh(verts, 3, idx, 1);
+    assert_eq(shape_round_trips(mesh), 1, "round trip");
+    mesh.free();
+
+    test_group("heightfield_serde");
+    var hts = fl_alloc(4 * 8);
+    w = 0.0;
+    store64(hts, w);
+    w = 1.0;
+    store64(hts + 8, w);
+    w = 0.5;
+    store64(hts + 16, w);
+    w = 2.0;
+    store64(hts + 24, w);
+    var hf: ImColliderShape = ImColliderShape_heightfield(hts, 4, ImVec3_new(1.0, 1.0, 0.0));
+    assert_eq(shape_round_trips(hf), 1, "round trip");
+    hf.free();
+
+    test_group("segment_serde");
+    var seg: ImColliderShape = ImColliderShape_segment(ImVec3_zero(), ImVec3_new(5.0, 5.0, 0.0));
+    assert_eq(shape_round_trips(seg), 1, "round trip");
+
+    test_group("sensor_collider");
+    var sensor: ImColliderDesc = ImColliderDesc_new(ImColliderShape_ball(5.0));
+    sensor.is_sensor = 1;
+    assert_eq(sensor.is_sensor, 1, "sensor");
+    assert_eq(sensor.collision_layer, 4294967295, "every layer");
+    assert_eq(sensor.collision_mask, 4294967295, "every mask bit");
+
+    test_group("collider_desc_serde");
+    var cd: ImColliderDesc = ImColliderDesc_new(ImColliderShape_box(2.0, 3.0, 0.0));
+    cd.offset = ImVec3_new(1.0, 1.0, 0.0);
+    cd.material = ImPhysicsMaterial_steel();
+    cd.has_mass = 1;
+    cd.mass = 10.0;
+    var ct = collider_desc_text(cd);
+    var cback: ImColliderDesc = ImColliderDesc_new(ImColliderShape_ball(1.0));
+    var ctag, cv = ImColliderDesc_from_json(str_data(ct), str_len(ct), &cback);
+    assert(is_err_result(ctag) == 0, "reads back");
+    assert_eq(same(ct, collider_desc_text(cback)), 1, "round trip");
+    cback.shape.free();
+
+    # ── joint.rs ──
+    test_group("fixed_joint_serde");
+    var jd: ImJointDesc = joint_01(ImJointType_fixed(), 0.0, 0.0, 1.0, 0.0);
+    var jb: ImJointDesc = jd;
+    assert_eq(joint_desc_round_trips(jd, &jb), 1, "round trip");
+
+    test_group("spring_joint_serde");
+    jd = joint_01(ImJointType_spring(2.0, 100.0, 5.0), 0.0, 0.0, 0.0, 0.0);
+    assert_eq(joint_desc_round_trips(jd, &jb), 1, "round trip");
+
+    test_group("revolute_with_limits");
+    assert_eq(joint_type_round_trips(ImJointType_revolute(ImVec2_new(1.0, 0.0), 1, -1.57, 1.57)), 1, "round trip");
+
+    test_group("revolute_without_limits");
+    var rev: ImJointType = ImJointType_revolute(ImVec2_new(0.0, 0.0), 0, 0.0, 0.0);
+    assert_eq(joint_type_round_trips(rev), 1, "round trip");
+    var rt = joint_type_text(rev);
+    assert_eq(str_eq_cstr(rt, "{\"Revolute\":{\"anchor\":[0.0,0.0],\"limits\":null}}"), 1, "limits null");
+
+    test_group("prismatic_joint_serde");
+    assert_eq(joint_type_round_trips(ImJointType_prismatic(ImVec2_new(1.0, 0.0), 1, -5.0, 5.0)), 1, "round trip");
+
+    test_group("distance_joint_serde");
+    assert_eq(joint_type_round_trips(ImJointType_distance(3.0)), 1, "round trip");
+
+    test_group("joint_handle_eq");
+    assert_eq(_im_arena_handle(0, 0), _im_arena_handle(0, 0), "equal");
+    assert_neq(_im_arena_handle(0, 0), _im_arena_handle(1, 0), "different");
+
+    test_group("wheel_joint_serde");
+    assert_eq(joint_type_round_trips(ImJointType_wheel(ImVec2_new(0.0, 1.0), 500.0, 10.0)), 1, "round trip");
+
+    test_group("rope_joint_serde");
+    assert_eq(joint_type_round_trips(ImJointType_rope(5.0)), 1, "round trip");
+
+    test_group("mouse_joint_serde");
+    var mouse: ImJointType = ImJointType_mouse(ImVec3_new(10.0, 20.0, 0.0), 1000.0, 50.0, 500.0);
+    assert_eq(joint_type_round_trips(mouse), 1, "round trip");
+
+    test_group("break_force_serde");
+    jd = joint_01(ImJointType_fixed(), 0.0, 0.0, 0.0, 0.0);
+    jd.has_break_force = 1;
+    jd.break_force = 100.0;
+    assert_eq(joint_desc_round_trips(jd, &jb), 1, "round trip");
+    var bf: f64 = jb.break_force;
+    assert(jb.has_break_force == 1 && bf == 100.0, "break force Some(100)");
+
+    test_group("break_force_default");
+    var ob = str_builder_new();
+    str_builder_add_cstr(ob, "{\"body_a\":0,\"body_b\":1,\"joint_type\":\"Fixed\",");
+    str_builder_add_cstr(ob, "\"local_anchor_a\":[0.0,0.0],\"local_anchor_b\":[0.0,0.0]}");
+    var old = str_builder_build(ob);
+    var otag, ov = ImJointDesc_from_json(str_data(old), str_len(old), &jb);
+    assert(is_err_result(otag) == 0, "an old document reads");
+    assert_eq(jb.has_break_force, 0, "break force None");
+    assert_eq(jb.has_motor, 0, "motor None");
+
+    # ── event.rs ──
+    test_group("collision_started_serde");
+    assert_eq(event_round_trips(ImCollisionEvent_new(IM_EVENT_STARTED, 0, 1)), 1, "round trip");
+
+    test_group("collision_stopped_serde");
+    assert_eq(event_round_trips(ImCollisionEvent_new(IM_EVENT_STOPPED, 3, 7)), 1, "round trip");
+
+    test_group("collision_ongoing_serde");
+    var on: ImCollisionEvent = ImCollisionEvent_new(IM_EVENT_ONGOING, 2, 5);
+    assert_eq(event_round_trips(on), 1, "round trip");
+    var et = event_text(on);
+    assert_eq(str_eq_cstr(et, "{\"Ongoing\":{\"collider_a\":2,\"collider_b\":5}}"), 1, "externally tagged");
+
+    test_group("contact_data_serde");
+    var cdata: ImContactData;
+    cdata.collider_a = 0;
+    cdata.collider_b = 1;
+    cdata.normal = ImVec3_new(0.0, 1.0, 0.0);
+    cdata.depth = 0.01;
+    cdata.point_count = 1;
+    cdata.points = fl_alloc(sizeof(ImContactPoint));
+    var cp: ImContactPoint;
+    cp.local_a = ImVec3_new(0.5, 0.0, 0.0);
+    cp.local_b = ImVec3_new(0.5, 1.0, 0.0);
+    cp.impulse = 42.0;
+    memcpy(cdata.points, &cp, sizeof(ImContactPoint));
+    var sbd = str_builder_new();
+    cdata.to_json(sbd);
+    var dt1 = str_builder_build(sbd);
+    var dback: ImContactData;
+    var dtag, dv = ImContactData_from_json(str_data(dt1), str_len(dt1), &dback);
+    assert(is_err_result(dtag) == 0, "reads back");
+    assert_eq(dback.point_count, 1, "one point");
+    var sbd2 = str_builder_new();
+    dback.to_json(sbd2);
+    assert_eq(same(dt1, str_builder_build(sbd2)), 1, "round trip");
+    dback.free();
+    cdata.free();
+
+    test_group("contact_data_empty_points");
+    cdata.collider_a = 0;
+    cdata.collider_b = 1;
+    cdata.normal = ImVec3_new(1.0, 0.0, 0.0);
+    cdata.depth = 0.0;
+    cdata.points = 0;
+    cdata.point_count = 0;
+    assert_eq(cdata.point_count, 0, "no points");
+    var sbe = str_builder_new();
+    cdata.to_json(sbe);
+    var et2 = str_builder_build(sbe);
+    var eback: ImContactData;
+    var etag, ev = ImContactData_from_json(str_data(et2), str_len(et2), &eback);
+    assert(is_err_result(etag) == 0 && eback.point_count == 0, "empty points read back");
+
+    test_group("contact_point_serde");
+    cp.local_a = ImVec3_new(1.0, 2.0, 0.0);
+    cp.local_b = ImVec3_new(3.0, 4.0, 0.0);
+    cp.impulse = 10.5;
+    var sbp = str_builder_new();
+    cp.to_json(sbp);
+    var pt1 = str_builder_build(sbp);
+    var pback: ImContactPoint;
+    var ptag, pv = ImContactPoint_from_json(str_data(pt1), str_len(pt1), &pback);
+    assert(is_err_result(ptag) == 0, "reads back");
+    var sbp2 = str_builder_new();
+    pback.to_json(sbp2);
+    assert_eq(same(pt1, str_builder_build(sbp2)), 1, "round trip");
+
+    # ── query.rs ──
+    test_group("ray_hit_serde");
+    var hit: ImRayHit;
+    hit.collider = 5;
+    hit.point = ImVec3_new(1.0, 2.0, 0.0);
+    hit.normal = ImVec3_new(0.0, 1.0, 0.0);
+    hit.distance = 3.5;
+    var sbh = str_builder_new();
+    hit.to_json(sbh);
+    var ht = str_builder_build(sbh);
+    var hback: ImRayHit;
+    var htag, hv = ImRayHit_from_json(str_data(ht), str_len(ht), &hback);
+    assert(is_err_result(htag) == 0, "reads back");
+    var sbh2 = str_builder_new();
+    hback.to_json(sbh2);
+    assert_eq(same(ht, str_builder_build(sbh2)), 1, "round trip");
+
+    test_group("point_query_inside");
+    var pq: ImPointQuery;
+    pq.collider = 2;
+    pq.distance = 0.0;
+    pq.is_inside = 1;
+    var sbq = str_builder_new();
+    pq.to_json(sbq);
+    var qt = str_builder_build(sbq);
+    var qback: ImPointQuery;
+    var qtag, qv = ImPointQuery_from_json(str_data(qt), str_len(qt), &qback);
+    assert(is_err_result(qtag) == 0 && qback.is_inside == 1, "inside");
+    var sbq2 = str_builder_new();
+    qback.to_json(sbq2);
+    assert_eq(same(qt, str_builder_build(sbq2)), 1, "round trip");
+
+    test_group("point_query_outside");
+    pq.collider = 3;
+    pq.distance = 1.5;
+    pq.is_inside = 0;
+    var sbo = str_builder_new();
+    pq.to_json(sbo);
+    var ot = str_builder_build(sbo);
+    var otback: ImPointQuery;
+    var oqtag, oqv = ImPointQuery_from_json(str_data(ot), str_len(ot), &otback);
+    assert(is_err_result(oqtag) == 0 && otback.is_inside == 0, "outside");
+    var sbo2 = str_builder_new();
+    otback.to_json(sbo2);
+    assert_eq(same(ot, str_builder_build(sbo2)), 1, "round trip");
+
+    # Cyrius-only: a handle at generation ≥ 2^31 writes as serde_json's unsigned decimal.
+    test_group("handle_writes_unsigned");
+    var big: ImCollisionEvent = ImCollisionEvent_new(IM_EVENT_STARTED, _im_arena_handle(0, 4294967295), 0 - 1);
+    var bt = event_text(big);
+    var want = "{\"Started\":{\"collider_a\":18446744069414584320,\"collider_b\":18446744073709551615}}";
+    assert_eq(str_eq_cstr(bt, want), 1, "u64 text");
+
+    fl_free(pts);
+    fl_free(verts);
+    fl_free(idx);
+    fl_free(hts);
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

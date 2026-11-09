@@ -38,3 +38,37 @@ call, and the rows that build struct values pay most:
 That is the cost probe 2 measured (`port-parity.md` §4.2: struct values 2.5× the same arithmetic on
 `f64` locals), filed as a compiler finding in the port plan §8. The pure-arithmetic rows (magnitude,
 to_radians) are 5–6×.
+
+## M1b Foundation: springs, Display, serde (2026-11-09)
+
+Two runs each; the Cyrius column is their mean. The serde and Display bodies build a fresh document per
+iteration, as Rust's `to_string` and `format!` allocate a fresh `String`, and run 10,000 iterations (the
+builder grows the global heap).
+
+| Bench | Body | Rust | Cyrius | Cyrius / Rust |
+|---|---|---|---|---|
+| `springs/spring_1d_step` | one cached step at 60 fps | 4.98 ns | 28.5 ns | 5.7× |
+| `springs/spring_2d_step` | both axes, cached | 6.04 ns | 59.5 ns | 9.9× |
+| `springs/spring_settle_frames` | a critically damped spring from rest until settled | 1.47 µs | 1.80 µs | 1.2× |
+| `materials/quantity_display` | format 9.81 N | 81.3 ns | 830 ns | 10× |
+| `serde/serialize_body_desc` | a dynamic body to JSON | 252 ns | 3.48 µs | 14× |
+| `serde/deserialize_body_desc` | the default body from JSON | 276 ns | 7.19 µs | 26× |
+| `serde/serialize_config` | the default world config to JSON | 422 ns | 8.94 µs | 21× |
+| `serde/roundtrip_collider_desc` | a rubber ball to JSON and back | 892 ns | 16.1 µs | 18× |
+
+**Reading the gap.**
+- **The spring step** is six f64 loads, four multiplies, four adds and two `is_finite` checks. Rust keeps
+  them in registers; Cyrius moves every operand through memory and xmm0/xmm1 (the compiler finding in port
+  plan §8). The 2D step is two 1D steps through nested struct fields.
+- **`spring_settle_frames` is the near-tie (1.2×)**: one transition (exp, sqrt), then 52 cached steps and
+  53 `is_settled` checks, a fresh spring per iteration. Per frame that is 28 ns in Rust and 35 ns in
+  Cyrius. Rust's frame here costs over five times its tight `spring_1d_step` iteration; why is not
+  measured yet.
+- **The float text is the cost in Display and serde.** `src/fmtf.cyr` finds the shortest digits with
+  Burger & Dybvig's algorithm on a 40-limb bignum (ADR 0010 chose it for size and provability, not speed),
+  about 0.8 µs per number, against Rust's table-driven Ryu/zmij at tens of nanoseconds. A body descriptor
+  has 10 floats and a config 9, which is most of their time. A stdlib Ryu or Schubfach (S2, port plan §8)
+  would close most of it.
+- **Decoding** builds bayan's value tree on the decode arena, then looks each field up by name; serde_json
+  streams into the struct. The tree costs allocation and a second pass.
+

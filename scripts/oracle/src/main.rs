@@ -35,6 +35,8 @@ mod m_force;
 mod m_json;
 mod m_material;
 mod m_math;
+mod m_spring;
+mod m_types;
 mod m_units;
 mod t_constants;
 mod tsv;
@@ -68,6 +70,8 @@ fn golden_modules() -> Vec<tsv::Module> {
             m_json::emit(),
             m_material::emit(),
             m_math::emit(),
+            m_spring::emit(),
+            m_types::emit(),
             m_units::emit(),
         ]
     }

@@ -1,0 +1,477 @@
+# types.cyr — bodies, colliders, joints, events and queries (port of rust-old/src/{body,collider,joint,
+# event,query}.rs).
+#
+# Handles (`BodyHandle(u64)`, `ColliderHandle`, `JointHandle`) are plain words: index in the low 32
+# bits, generation in the high 32 (src/arena.cyr). Each Rust struct keeps its fields in declaration
+# order; an `Option<T>` field is a presence flag plus the value, an `[f64; 2]` / `[f64; 3]` an ImVec2 /
+# ImVec3. Rust's payload enums (`ColliderShape`, `JointType`, `CollisionEvent`) become a kind enum,
+# values in Rust variant order and append-only, plus one struct carrying every variant's fields.
+#
+# A shape's `Vec` payloads (hull points, mesh vertices and indices, heights) live on freelist storage
+# the shape owns: the constructors copy the caller's data, and `free` releases it.
+
+enum ImBodyType {
+    IM_BODY_STATIC = 0;
+    IM_BODY_DYNAMIC = 1;
+    IM_BODY_KINEMATIC = 2;
+}
+
+struct ImBodyDesc {
+    body_type;
+    position: ImVec3;
+    rotation: f64;
+    linear_velocity: ImVec3;
+    angular_velocity: f64;
+    linear_damping: f64;
+    angular_damping: f64;
+    fixed_rotation;
+    has_gravity_scale;
+    gravity_scale: f64;
+}
+
+struct ImBodyState {
+    handle;
+    body_type;
+    position: ImVec3;
+    rotation: f64;
+    linear_velocity: ImVec3;
+    angular_velocity: f64;
+    is_sleeping;
+}
+
+# The Rust variant name of a body type (`"Dynamic"`), or "Unknown".
+#must_use
+fn body_type_name(t): i64 {
+    if (t == IM_BODY_STATIC) { return "Static"; }
+    if (t == IM_BODY_DYNAMIC) { return "Dynamic"; }
+    if (t == IM_BODY_KINEMATIC) { return "Kinematic"; }
+    return "Unknown";
+}
+
+# A dynamic body at rest at the origin: no rotation, velocity or damping, rotation free, the world's
+# gravity scale. Mirrors `BodyDesc::default`.
+#must_use
+fn ImBodyDesc_default(): ImBodyDesc {
+    var d: ImBodyDesc;
+    d.body_type = IM_BODY_DYNAMIC;
+    d.position = ImVec3_zero();
+    d.rotation = 0.0;
+    d.linear_velocity = ImVec3_zero();
+    d.angular_velocity = 0.0;
+    d.linear_damping = 0.0;
+    d.angular_damping = 0.0;
+    d.fixed_rotation = 0;
+    d.has_gravity_scale = 0;
+    d.gravity_scale = 0.0;
+    return d;
+}
+
+# ── colliders ───────────────────────────────────────────────────────────────────────
+
+enum ImShapeKind {
+    IM_SHAPE_BOX = 0;
+    IM_SHAPE_BALL = 1;
+    IM_SHAPE_CAPSULE = 2;
+    IM_SHAPE_CONVEX_HULL = 3;
+    IM_SHAPE_TRI_MESH = 4;
+    IM_SHAPE_HEIGHTFIELD = 5;
+    IM_SHAPE_SEGMENT = 6;
+}
+
+# Every variant's fields. `points` (hull) and `vertices` (mesh) are `count` f64 triples, `indices`
+# `index_count` triples of words (u32 values), `heights` `height_count` f64s.
+struct ImColliderShape {
+    kind;
+    half_extents: ImVec3;
+    radius: f64;
+    half_height: f64;
+    points;
+    point_count;
+    vertices;
+    vertex_count;
+    indices;
+    index_count;
+    heights;
+    height_count;
+    scale: ImVec3;
+    a: ImVec3;
+    b: ImVec3;
+}
+
+struct ImColliderDesc {
+    shape: ImColliderShape;
+    offset: ImVec3;
+    material: ImPhysicsMaterial;
+    is_sensor;
+    has_mass;
+    mass: f64;
+    collision_layer;
+    collision_mask;
+}
+
+# The Rust variant name of a shape kind (`"ConvexHull"`), or "Unknown".
+#must_use
+fn shape_kind_name(k): i64 {
+    if (k == IM_SHAPE_BOX) { return "Box"; }
+    if (k == IM_SHAPE_BALL) { return "Ball"; }
+    if (k == IM_SHAPE_CAPSULE) { return "Capsule"; }
+    if (k == IM_SHAPE_CONVEX_HULL) { return "ConvexHull"; }
+    if (k == IM_SHAPE_TRI_MESH) { return "TriMesh"; }
+    if (k == IM_SHAPE_HEIGHTFIELD) { return "Heightfield"; }
+    if (k == IM_SHAPE_SEGMENT) { return "Segment"; }
+    return "Unknown";
+}
+
+# A shape of `kind` with every field zero and no arrays.
+#must_use
+fn _im_shape(kind): ImColliderShape {
+    var s: ImColliderShape;
+    s.kind = kind;
+    s.half_extents = ImVec3_zero();
+    s.radius = 0.0;
+    s.half_height = 0.0;
+    s.points = 0;
+    s.point_count = 0;
+    s.vertices = 0;
+    s.vertex_count = 0;
+    s.indices = 0;
+    s.index_count = 0;
+    s.heights = 0;
+    s.height_count = 0;
+    s.scale = ImVec3_zero();
+    s.a = ImVec3_zero();
+    s.b = ImVec3_zero();
+    return s;
+}
+
+# A freelist copy of `words` 8-byte words from `src`, or 0 (none to copy, or no memory).
+#must_use
+fn _im_copy_words(src, words): i64 {
+    if (words <= 0 || src == 0) { return 0; }
+    var p = fl_alloc(words * 8);
+    if (p == 0) { return 0; }
+    memcpy(p, src, words * 8);
+    return p;
+}
+
+# A box with the given half extents. Mirrors `ColliderShape::Box`.
+#must_use
+fn ImColliderShape_box(hx: f64, hy: f64, hz: f64): ImColliderShape {
+    var s: ImColliderShape = _im_shape(IM_SHAPE_BOX);
+    s.half_extents = ImVec3_new(hx, hy, hz);
+    return s;
+}
+
+# A circle (2D) or sphere (3D). Mirrors `ColliderShape::Ball`.
+#must_use
+fn ImColliderShape_ball(radius: f64): ImColliderShape {
+    var s: ImColliderShape = _im_shape(IM_SHAPE_BALL);
+    s.radius = radius;
+    return s;
+}
+
+# A capsule of the given half height and radius. Mirrors `ColliderShape::Capsule`.
+#must_use
+fn ImColliderShape_capsule(half_height: f64, radius: f64): ImColliderShape {
+    var s: ImColliderShape = _im_shape(IM_SHAPE_CAPSULE);
+    s.half_height = half_height;
+    s.radius = radius;
+    return s;
+}
+
+# A convex hull of `count` points (f64 triples at `points`, copied). Mirrors `ColliderShape::ConvexHull`.
+#must_use
+fn ImColliderShape_convex_hull(points, count): ImColliderShape {
+    var s: ImColliderShape = _im_shape(IM_SHAPE_CONVEX_HULL);
+    s.points = _im_copy_words(points, count * 3);
+    if (s.points != 0) { s.point_count = count; }
+    return s;
+}
+
+# A triangle mesh: `vertex_count` f64 triples and `index_count` index triples (words), both copied.
+# Mirrors `ColliderShape::TriMesh`.
+#must_use
+fn ImColliderShape_tri_mesh(vertices, vertex_count, indices, index_count): ImColliderShape {
+    var s: ImColliderShape = _im_shape(IM_SHAPE_TRI_MESH);
+    s.vertices = _im_copy_words(vertices, vertex_count * 3);
+    if (s.vertices != 0) { s.vertex_count = vertex_count; }
+    s.indices = _im_copy_words(indices, index_count * 3);
+    if (s.indices != 0) { s.index_count = index_count; }
+    return s;
+}
+
+# A heightfield of `count` heights (copied) and a scale. Mirrors `ColliderShape::Heightfield`.
+#must_use
+fn ImColliderShape_heightfield(heights, count, scale: ImVec3): ImColliderShape {
+    var s: ImColliderShape = _im_shape(IM_SHAPE_HEIGHTFIELD);
+    s.heights = _im_copy_words(heights, count);
+    if (s.heights != 0) { s.height_count = count; }
+    s.scale = scale;
+    return s;
+}
+
+# A segment from a to b. Mirrors `ColliderShape::Segment`.
+#must_use
+fn ImColliderShape_segment(a: ImVec3, b: ImVec3): ImColliderShape {
+    var s: ImColliderShape = _im_shape(IM_SHAPE_SEGMENT);
+    s.a = a;
+    s.b = b;
+    return s;
+}
+
+impl ImColliderShape {
+    # Releases the shape's arrays (none for the fixed-size kinds) and clears them.
+    fn free(self) {
+        if (self.points != 0) { fl_free(self.points); }
+        if (self.vertices != 0) { fl_free(self.vertices); }
+        if (self.indices != 0) { fl_free(self.indices); }
+        if (self.heights != 0) { fl_free(self.heights); }
+        self.points = 0;
+        self.point_count = 0;
+        self.vertices = 0;
+        self.vertex_count = 0;
+        self.indices = 0;
+        self.index_count = 0;
+        self.heights = 0;
+        self.height_count = 0;
+        return 0;
+    }
+}
+
+# A collider of `shape` with Rust's serde defaults for the rest: no offset, the default material, not
+# a sensor, mass from density, every collision layer and mask bit set.
+#must_use
+fn ImColliderDesc_new(shape: ImColliderShape): ImColliderDesc {
+    var d: ImColliderDesc;
+    d.shape = shape;
+    d.offset = ImVec3_zero();
+    d.material = ImPhysicsMaterial_default();
+    d.is_sensor = 0;
+    d.has_mass = 0;
+    d.mass = 0.0;
+    d.collision_layer = 4294967295;
+    d.collision_mask = 4294967295;
+    return d;
+}
+
+# ── joints ──────────────────────────────────────────────────────────────────────────
+
+enum ImJointKind {
+    IM_JOINT_FIXED = 0;
+    IM_JOINT_REVOLUTE = 1;
+    IM_JOINT_PRISMATIC = 2;
+    IM_JOINT_SPRING = 3;
+    IM_JOINT_DISTANCE = 4;
+    IM_JOINT_WHEEL = 5;
+    IM_JOINT_ROPE = 6;
+    IM_JOINT_MOUSE = 7;
+}
+
+# Every variant's fields: Revolute's anchor and limits, Prismatic's and Wheel's axis, the spring
+# terms (Spring, Wheel, Mouse), Distance's length, Rope's max_length, Mouse's target and max_force.
+struct ImJointType {
+    kind;
+    anchor: ImVec2;
+    axis: ImVec2;
+    has_limits;
+    limits: ImVec2;
+    rest_length: f64;
+    stiffness: f64;
+    damping: f64;
+    length: f64;
+    max_length: f64;
+    target: ImVec3;
+    max_force: f64;
+}
+
+struct ImJointMotor { target_velocity: f64; max_force: f64; }
+
+struct ImJointDesc {
+    body_a;
+    body_b;
+    joint_type: ImJointType;
+    local_anchor_a: ImVec2;
+    local_anchor_b: ImVec2;
+    has_motor;
+    motor: ImJointMotor;
+    damping: f64;
+    has_break_force;
+    break_force: f64;
+}
+
+# The Rust variant name of a joint kind (`"Revolute"`), or "Unknown".
+#must_use
+fn joint_kind_name(k): i64 {
+    if (k == IM_JOINT_FIXED) { return "Fixed"; }
+    if (k == IM_JOINT_REVOLUTE) { return "Revolute"; }
+    if (k == IM_JOINT_PRISMATIC) { return "Prismatic"; }
+    if (k == IM_JOINT_SPRING) { return "Spring"; }
+    if (k == IM_JOINT_DISTANCE) { return "Distance"; }
+    if (k == IM_JOINT_WHEEL) { return "Wheel"; }
+    if (k == IM_JOINT_ROPE) { return "Rope"; }
+    if (k == IM_JOINT_MOUSE) { return "Mouse"; }
+    return "Unknown";
+}
+
+# A joint type of `kind` with every field zero and no limits.
+#must_use
+fn _im_joint(kind): ImJointType {
+    var j: ImJointType;
+    j.kind = kind;
+    j.anchor = ImVec2_new(0.0, 0.0);
+    j.axis = ImVec2_new(0.0, 0.0);
+    j.has_limits = 0;
+    j.limits = ImVec2_new(0.0, 0.0);
+    j.rest_length = 0.0;
+    j.stiffness = 0.0;
+    j.damping = 0.0;
+    j.length = 0.0;
+    j.max_length = 0.0;
+    j.target = ImVec3_zero();
+    j.max_force = 0.0;
+    return j;
+}
+
+# Bodies keep their relative position and rotation. Mirrors `JointType::Fixed`.
+#must_use
+fn ImJointType_fixed(): ImJointType { return _im_joint(IM_JOINT_FIXED); }
+
+# Rotation about a shared anchor, with optional [lo, hi] limits (`has_limits` 0 for none).
+# Mirrors `JointType::Revolute`.
+#must_use
+fn ImJointType_revolute(anchor: ImVec2, has_limits, lo: f64, hi: f64): ImJointType {
+    var j: ImJointType = _im_joint(IM_JOINT_REVOLUTE);
+    j.anchor = anchor;
+    j.has_limits = has_limits;
+    if (has_limits == 1) { j.limits = ImVec2_new(lo, hi); }
+    return j;
+}
+
+# Sliding along an axis, with optional [lo, hi] limits. Mirrors `JointType::Prismatic`.
+#must_use
+fn ImJointType_prismatic(axis: ImVec2, has_limits, lo: f64, hi: f64): ImJointType {
+    var j: ImJointType = _im_joint(IM_JOINT_PRISMATIC);
+    j.axis = axis;
+    j.has_limits = has_limits;
+    if (has_limits == 1) { j.limits = ImVec2_new(lo, hi); }
+    return j;
+}
+
+# A damped spring between the anchors. Mirrors `JointType::Spring`.
+#must_use
+fn ImJointType_spring(rest_length: f64, stiffness: f64, damping: f64): ImJointType {
+    var j: ImJointType = _im_joint(IM_JOINT_SPRING);
+    j.rest_length = rest_length;
+    j.stiffness = stiffness;
+    j.damping = damping;
+    return j;
+}
+
+# A fixed distance between the anchors. Mirrors `JointType::Distance`.
+#must_use
+fn ImJointType_distance(length: f64): ImJointType {
+    var j: ImJointType = _im_joint(IM_JOINT_DISTANCE);
+    j.length = length;
+    return j;
+}
+
+# Suspension along an axis plus free spin. Mirrors `JointType::Wheel`.
+#must_use
+fn ImJointType_wheel(axis: ImVec2, stiffness: f64, damping: f64): ImJointType {
+    var j: ImJointType = _im_joint(IM_JOINT_WHEEL);
+    j.axis = axis;
+    j.stiffness = stiffness;
+    j.damping = damping;
+    return j;
+}
+
+# At most `max_length` apart. Mirrors `JointType::Rope`.
+#must_use
+fn ImJointType_rope(max_length: f64): ImJointType {
+    var j: ImJointType = _im_joint(IM_JOINT_ROPE);
+    j.max_length = max_length;
+    return j;
+}
+
+# Drags body A toward a world-space target. Mirrors `JointType::Mouse`.
+#must_use
+fn ImJointType_mouse(target: ImVec3, stiffness: f64, damping: f64, max_force: f64): ImJointType {
+    var j: ImJointType = _im_joint(IM_JOINT_MOUSE);
+    j.target = target;
+    j.stiffness = stiffness;
+    j.damping = damping;
+    j.max_force = max_force;
+    return j;
+}
+
+# A motor driving toward `target_velocity` with up to `max_force`. Mirrors `JointMotor`.
+#must_use
+fn ImJointMotor_new(target_velocity: f64, max_force: f64): ImJointMotor {
+    var m: ImJointMotor;
+    m.target_velocity = target_velocity;
+    m.max_force = max_force;
+    return m;
+}
+
+# A joint between bodies a and b with Rust's serde defaults for the rest: no motor, no damping,
+# unbreakable.
+#must_use
+fn ImJointDesc_new(body_a, body_b, joint_type: ImJointType, anchor_a: ImVec2, anchor_b: ImVec2): ImJointDesc {
+    var d: ImJointDesc;
+    d.body_a = body_a;
+    d.body_b = body_b;
+    d.joint_type = joint_type;
+    d.local_anchor_a = anchor_a;
+    d.local_anchor_b = anchor_b;
+    d.has_motor = 0;
+    d.motor = ImJointMotor_new(0.0, 0.0);
+    d.damping = 0.0;
+    d.has_break_force = 0;
+    d.break_force = 0.0;
+    return d;
+}
+
+# ── events and queries ──────────────────────────────────────────────────────────────
+
+enum ImEventKind {
+    IM_EVENT_STARTED = 0;
+    IM_EVENT_STOPPED = 1;
+    IM_EVENT_ONGOING = 2;
+}
+
+struct ImCollisionEvent { kind; collider_a; collider_b; }
+
+struct ImContactPoint { local_a: ImVec3; local_b: ImVec3; impulse: f64; }
+
+# `points` is `point_count` ImContactPoint records on freelist storage the data owns.
+struct ImContactData {
+    collider_a;
+    collider_b;
+    normal: ImVec3;
+    depth: f64;
+    points;
+    point_count;
+}
+
+struct ImRayHit { collider; point: ImVec3; normal: ImVec3; distance: f64; }
+
+struct ImPointQuery { collider; distance: f64; is_inside; }
+
+# The Rust variant name of an event kind (`"Started"`), or "Unknown".
+#must_use
+fn event_kind_name(k): i64 {
+    if (k == IM_EVENT_STARTED) { return "Started"; }
+    if (k == IM_EVENT_STOPPED) { return "Stopped"; }
+    if (k == IM_EVENT_ONGOING) { return "Ongoing"; }
+    return "Unknown";
+}
+
+# An event of `kind` for the pair (a, b).
+#must_use
+fn ImCollisionEvent_new(kind, a, b): ImCollisionEvent {
+    var e: ImCollisionEvent;
+    e.kind = kind;
+    e.collider_a = a;
+    e.collider_b = b;
+    return e;
+}

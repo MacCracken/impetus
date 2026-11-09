@@ -1,0 +1,410 @@
+# contact_tracker.cyr — frame-level contact bookkeeping for collision events (port of
+# rust-old/src/contact_tracker.rs).
+#
+# Backends record the touching collider pairs after every sub-step; `finish` diffs the frame
+# against the previous one, so events come once per world step however many sub-steps ran, and
+# a contact that begins and ends inside one frame still reports `Started` then `Stopped`.
+#
+# A pair key is two collider handle words, the smaller first. Handles are u64 in Rust, and Cyrius
+# compares words signed, so every comparison here goes through `_im_ult` (flip the sign bit, then
+# compare signed): a handle at generation ≥ 2^31 sorts after the others exactly as in Rust.
+# Pair lists are sorted and unique, in freelist buffers the tracker owns and reuses across frames,
+# so a steady state allocates nothing (port-parity.md §4.1). The events of the last `finish` live
+# in the tracker until the next one.
+
+# A sorted, de-duplicated list of pair keys: `len` pairs of two words at `data`.
+struct ImPairList { data; len; cap; }
+
+# 1 when a < b as unsigned 64-bit words.
+#must_use
+fn _im_ult(a, b): i64 {
+    if ((a ^ 0x8000000000000000) < (b ^ 0x8000000000000000)) { return 1; }
+    return 0;
+}
+
+# Orders pair (a0, a1) against (b0, b1), unsigned and lexicographic: −1, 0 or 1. Rust's
+# `PairKey::cmp`.
+#must_use
+fn _im_pair_cmp(a0, a1, b0, b1): i64 {
+    if (a0 != b0) {
+        if (_im_ult(a0, b0) == 1) { return 0 - 1; }
+        return 1;
+    }
+    if (a1 == b1) { return 0; }
+    if (_im_ult(a1, b1) == 1) { return 0 - 1; }
+    return 1;
+}
+
+# The pair key of colliders a and b, the smaller handle first: `var lo, hi = _im_pair_key(a, b);`.
+# Mirrors `pair_key`.
+#must_use
+fn _im_pair_key(a, b) {
+    if (a == b || _im_ult(a, b) == 1) { return (a, b); }
+    return (b, a);
+}
+
+# An empty pair list.
+#must_use
+fn ImPairList_new(): ImPairList {
+    var l: ImPairList;
+    l.data = 0;
+    l.len = 0;
+    l.cap = 0;
+    return l;
+}
+
+impl ImPairList {
+    # Room for at least `need` pairs: 1, or 0 when there is no memory (the list is unchanged).
+    fn reserve(self, need): i64 {
+        if (need <= self.cap) { return 1; }
+        var cap = self.cap * 2;
+        if (cap < 8) { cap = 8; }
+        while (cap < need) { cap = cap * 2; }
+        var d = fl_alloc(cap * 16);
+        if (d == 0) { return 0; }
+        if (self.len > 0) { memcpy(d, self.data, self.len * 16); }
+        if (self.data != 0) { fl_free(self.data); }
+        self.data = d;
+        self.cap = cap;
+        return 1;
+    }
+
+    # Appends pair (a, b): 1, or 0 when there is no memory.
+    fn push(self, a, b): i64 {
+        if (self.len == self.cap) {
+            if (self.reserve(self.len + 1) == 0) { return 0; }
+        }
+        var p = self.data + self.len * 16;
+        store64(p, a);
+        store64(p + 8, b);
+        self.len = self.len + 1;
+        return 1;
+    }
+
+    # The first word of pair i.
+    #must_use
+    fn first(self, i): i64 {
+        return load64(self.data + i * 16);
+    }
+
+    # The second word of pair i.
+    #must_use
+    fn second(self, i): i64 {
+        return load64(self.data + i * 16 + 8);
+    }
+
+    # Empties the list, keeping its buffer.
+    fn clear(self) {
+        self.len = 0;
+        return 0;
+    }
+
+    # 1 when the sorted list holds pair (a, b). Binary search, as Rust's `binary_search(..).is_ok()`.
+    #must_use
+    fn contains(self, a, b): i64 {
+        var lo = 0;
+        var hi = self.len;
+        while (lo < hi) {
+            var mid = lo + (hi - lo) / 2;
+            var c = _im_pair_cmp(self.first(mid), self.second(mid), a, b);
+            if (c == 0) { return 1; }
+            if (c < 0) { lo = mid + 1; } else { hi = mid; }
+        }
+        return 0;
+    }
+
+    # 1 when the pairs are in strictly or non-strictly ascending order. Rust's `is_sorted`.
+    #must_use
+    fn is_sorted(self): i64 {
+        for (var i = 1; i < self.len; i = i + 1) {
+            var c = _im_pair_cmp(self.first(i - 1), self.second(i - 1), self.first(i), self.second(i));
+            if (c > 0) { return 0; }
+        }
+        return 1;
+    }
+
+    # Drops adjacent duplicates. Rust's `dedup`.
+    fn dedup(self) {
+        if (self.len < 2) { return 0; }
+        var w = 1;
+        for (var r = 1; r < self.len; r = r + 1) {
+            var a = self.first(r);
+            var b = self.second(r);
+            if (a != self.first(w - 1) || b != self.second(w - 1)) {
+                var p = self.data + w * 16;
+                store64(p, a);
+                store64(p + 8, b);
+                w = w + 1;
+            }
+        }
+        self.len = w;
+        return 0;
+    }
+
+    # Drops every pair with a word among the `n` handles at `handles`.
+    fn forget(self, handles, n) {
+        var w = 0;
+        for (var r = 0; r < self.len; r = r + 1) {
+            var a = self.first(r);
+            var b = self.second(r);
+            var drop = 0;
+            for (var j = 0; j < n; j = j + 1) {
+                var h = load64(handles + j * 8);
+                if (a == h || b == h) { drop = 1; }
+            }
+            if (drop == 0) {
+                var p = self.data + w * 16;
+                store64(p, a);
+                store64(p + 8, b);
+                w = w + 1;
+            }
+        }
+        self.len = w;
+        return 0;
+    }
+
+    # Makes this list the union of sorted, unique lists a and b (neither may be this list): 1, or 0
+    # when there is no memory. Mirrors `merge_union`.
+    fn set_union(self, a: ImPairList, b: ImPairList): i64 {
+        self.len = 0;
+        if (self.reserve(a.len + b.len) == 0) { return 0; }
+        var i = 0;
+        var j = 0;
+        while (i < a.len && j < b.len) {
+            var c = _im_pair_cmp(a.first(i), a.second(i), b.first(j), b.second(j));
+            if (c < 0) {
+                self.push(a.first(i), a.second(i));
+                i = i + 1;
+            } elif (c > 0) {
+                self.push(b.first(j), b.second(j));
+                j = j + 1;
+            } else {
+                self.push(a.first(i), a.second(i));
+                i = i + 1;
+                j = j + 1;
+            }
+        }
+        while (i < a.len) {
+            self.push(a.first(i), a.second(i));
+            i = i + 1;
+        }
+        while (j < b.len) {
+            self.push(b.first(j), b.second(j));
+            j = j + 1;
+        }
+        return 1;
+    }
+
+    # Releases the buffer.
+    fn free(self) {
+        if (self.data != 0) { fl_free(self.data); }
+        self.data = 0;
+        self.len = 0;
+        self.cap = 0;
+        return 0;
+    }
+}
+
+# Sorts the `n` pairs at `data` ascending (unsigned, lexicographic), using `tmp` (room for n pairs).
+# A bottom-up merge sort; keys are total and the caller de-duplicates, so the result is the one
+# Rust's `sort_unstable` gives.
+fn _im_pairs_sort(data, n, tmp) {
+    var src = data;
+    var dst = tmp;
+    var width = 1;
+    while (width < n) {
+        var lo = 0;
+        while (lo < n) {
+            var mid = lo + width;
+            if (mid > n) { mid = n; }
+            var hi = lo + 2 * width;
+            if (hi > n) { hi = n; }
+            var i = lo;
+            var j = mid;
+            var k = lo;
+            while (k < hi) {
+                var take_i = 0;
+                if (i < mid) {
+                    if (j >= hi) {
+                        take_i = 1;
+                    } else {
+                        var pi = src + i * 16;
+                        var pj = src + j * 16;
+                        if (_im_pair_cmp(load64(pi), load64(pi + 8), load64(pj), load64(pj + 8)) <= 0) {
+                            take_i = 1;
+                        }
+                    }
+                }
+                var from = src + j * 16;
+                if (take_i == 1) {
+                    from = src + i * 16;
+                    i = i + 1;
+                } else {
+                    j = j + 1;
+                }
+                store64(dst + k * 16, load64(from));
+                store64(dst + k * 16 + 8, load64(from + 8));
+                k = k + 1;
+            }
+            lo = hi;
+        }
+        var t = src;
+        src = dst;
+        dst = t;
+        width = width * 2;
+    }
+    if (src != data) { memcpy(data, src, n * 16); }
+    return 0;
+}
+
+# Pair bookkeeping across one frame's sub-steps. `prev`: pairs touching at the end of the previous
+# frame; `current`: at the end of the latest sub-step; `seen`: at the end of an earlier sub-step this
+# frame (empty with one sub-step); `recorded`: `current` holds a sub-step of this frame. `scratch`
+# backs the unions and the sort; `events` holds the last `finish`'s `event_count` events.
+struct ImContactTracker {
+    prev: ImPairList;
+    current: ImPairList;
+    seen: ImPairList;
+    scratch: ImPairList;
+    recorded;
+    events;
+    event_count;
+    event_cap;
+}
+
+# An empty tracker. Mirrors `ContactTracker::default`.
+#must_use
+fn ImContactTracker_new(): ImContactTracker {
+    var t: ImContactTracker;
+    t.prev = ImPairList_new();
+    t.current = ImPairList_new();
+    t.seen = ImPairList_new();
+    t.scratch = ImPairList_new();
+    t.recorded = 0;
+    t.events = 0;
+    t.event_count = 0;
+    t.event_cap = 0;
+    return t;
+}
+
+impl ImContactTracker {
+    # Records the `n` pair keys at `pairs` (two words each, smaller handle first; any order,
+    # duplicates fine) touching at the end of a sub-step: 1, or 0 when there is no memory. Mirrors
+    # `record_substep`.
+    fn record_substep(self, pairs, n): i64 {
+        if (self.recorded == 1 && self.current.len > 0) {
+            if (self.scratch.set_union(self.seen, self.current) == 0) { return 0; }
+            var t: ImPairList = self.seen;
+            self.seen = self.scratch;
+            self.scratch = t;
+        }
+        self.current.clear();
+        if (self.current.reserve(n) == 0) { return 0; }
+        if (n > 0) { memcpy(self.current.data, pairs, n * 16); }
+        self.current.len = n;
+        # Manifold keys arrive sorted already; this is then a linear check.
+        if (self.current.is_sorted() == 0) {
+            if (self.scratch.reserve(n) == 0) { return 0; }
+            _im_pairs_sort(self.current.data, n, self.scratch.data);
+        }
+        self.current.dedup();
+        self.recorded = 1;
+        return 1;
+    }
+
+    # Appends event (kind, a, b): 1, or 0 when there is no memory.
+    fn _emit(self, kind, a, b): i64 {
+        if (self.event_count == self.event_cap) {
+            var cap = self.event_cap * 2;
+            if (cap < 8) { cap = 8; }
+            var e = fl_alloc(cap * sizeof(ImCollisionEvent));
+            if (e == 0) { return 0; }
+            if (self.event_count > 0) {
+                memcpy(e, self.events, self.event_count * sizeof(ImCollisionEvent));
+            }
+            if (self.events != 0) { fl_free(self.events); }
+            self.events = e;
+            self.event_cap = cap;
+        }
+        var p = self.events + self.event_count * sizeof(ImCollisionEvent);
+        store64(p, kind);
+        store64(p + 8, a);
+        store64(p + 16, b);
+        self.event_count = self.event_count + 1;
+        return 1;
+    }
+
+    # Closes the frame and returns its event count, or -1 when there is no memory; read them with
+    # `event(i)`. Order: pairs touching now (`Started`/`Ongoing`), then pairs that stopped
+    # (`Stopped`, after a `Started` for contacts that began this frame). Mirrors `finish`.
+    fn finish(self): i64 {
+        self.event_count = 0;
+        for (var i = 0; i < self.current.len; i = i + 1) {
+            var a = self.current.first(i);
+            var b = self.current.second(i);
+            var kind = IM_EVENT_STARTED;
+            if (self.prev.contains(a, b) == 1) { kind = IM_EVENT_ONGOING; }
+            if (self._emit(kind, a, b) == 0) { return 0 - 1; }
+        }
+        var cand: ImPairList = self.prev;
+        if (self.seen.len > 0) {
+            if (self.scratch.set_union(self.prev, self.seen) == 0) { return 0 - 1; }
+            cand = self.scratch;
+        }
+        for (var i = 0; i < cand.len; i = i + 1) {
+            var a = cand.first(i);
+            var b = cand.second(i);
+            if (self.current.contains(a, b) == 0) {
+                if (self.prev.contains(a, b) == 0) {
+                    # Touched only within this frame.
+                    if (self._emit(IM_EVENT_STARTED, a, b) == 0) { return 0 - 1; }
+                }
+                if (self._emit(IM_EVENT_STOPPED, a, b) == 0) { return 0 - 1; }
+            }
+        }
+        var t: ImPairList = self.prev;
+        self.prev = self.current;
+        self.current = t;
+        self.current.clear();
+        self.seen.clear();
+        self.recorded = 0;
+        return self.event_count;
+    }
+
+    # Event i of the last `finish`, valid until the next one.
+    #must_use
+    fn event(self, i): *ImCollisionEvent {
+        return self.events + i * sizeof(ImCollisionEvent);
+    }
+
+    # 1 when any pair was touching at the end of the previous frame. Mirrors
+    # `has_previous_contacts`.
+    #must_use
+    fn has_previous_contacts(self): i64 {
+        if (self.prev.len > 0) { return 1; }
+        return 0;
+    }
+
+    # Forgets every pair involving one of the `n` collider handles at `colliders`, so no `Stopped`
+    # is reported for them (backends call it when colliders are removed). Mirrors
+    # `forget_colliders`.
+    fn forget_colliders(self, colliders, n) {
+        self.prev.forget(colliders, n);
+        self.current.forget(colliders, n);
+        self.seen.forget(colliders, n);
+        return 0;
+    }
+
+    # Releases the tracker's buffers.
+    fn free(self) {
+        self.prev.free();
+        self.current.free();
+        self.seen.free();
+        self.scratch.free();
+        if (self.events != 0) { fl_free(self.events); }
+        self.events = 0;
+        self.event_count = 0;
+        self.event_cap = 0;
+        return 0;
+    }
+}

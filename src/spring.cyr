@@ -1,0 +1,433 @@
+# spring.cyr — standalone damped springs for animation: no world, bodies or colliders (port of
+# rust-old/src/spring.rs).
+#
+# The step is the exact solution of x'' = −k·(x − target) − c·x', linear in (displacement, velocity):
+# [y; v] = M·[y0; v0], with M a function of (dt, k, c) alone, cached for the fixed-timestep case.
+# Every expression keeps Rust's operation order, so a cached step (× and + only) is class B and the
+# transition (exp, sin, cos) class C (port plan §5). exp and sin/cos go through `_im_exp` and
+# `_im_sin_cos`, the polyfills, so the bits are the same on every target (ADR 0008 #7).
+#
+#     var s: ImSpring = ImSpring_new(0.0, 100.0, 300.0, 15.0);
+#     while (s.is_settled() == 0) { s.step(dt); draw_at(s.position()); }
+
+# A 1D spring that animates a value toward a target. `cache_*` hold the last transition and its key
+# (dt, stiffness, damping); the cache is not part of equality or serialization, as in Rust.
+struct ImSpring {
+    position: f64;
+    velocity: f64;
+    target: f64;
+    stiffness: f64;
+    damping: f64;
+    settle_threshold: f64;
+    cache_valid;
+    cache_dt: f64;
+    cache_k: f64;
+    cache_c: f64;
+    m0: f64;
+    m1: f64;
+    m2: f64;
+    m3: f64;
+}
+
+# A spring from `from` toward `to`. Stiffness: force per unit displacement (try 100–500 for UI).
+# Damping: critical is 2·√stiffness (try 10–30 for UI). Settles within 0.01. Mirrors `Spring::new`.
+#must_use
+fn ImSpring_new(from: f64, to: f64, stiffness: f64, damping: f64): ImSpring {
+    var s: ImSpring;
+    s.position = from;
+    s.velocity = 0.0;
+    s.target = to;
+    s.stiffness = stiffness;
+    s.damping = damping;
+    s.settle_threshold = 0.01;
+    s.cache_valid = 0;
+    s.cache_dt = 0.0;
+    s.cache_k = 0.0;
+    s.cache_c = 0.0;
+    s.m0 = 0.0;
+    s.m1 = 0.0;
+    s.m2 = 0.0;
+    s.m3 = 0.0;
+    return s;
+}
+
+# A critically damped spring (no overshoot); a negative stiffness counts as its magnitude. Mirrors
+# `Spring::critically_damped`.
+#must_use
+fn ImSpring_critically_damped(from: f64, to: f64, stiffness: f64): ImSpring {
+    var k: f64 = f64_abs(stiffness);
+    var r: f64 = f64_sqrt(k);
+    var c: f64 = 2.0 * r;
+    return ImSpring_new(from, to, k, c);
+}
+
+# An over-damped spring (slow approach, no overshoot). Mirrors `Spring::over_damped`.
+#must_use
+fn ImSpring_over_damped(from: f64, to: f64, stiffness: f64): ImSpring {
+    var k: f64 = f64_abs(stiffness);
+    var r: f64 = f64_sqrt(k);
+    var c: f64 = 3.0 * r;
+    return ImSpring_new(from, to, k, c);
+}
+
+# An under-damped spring (bouncy overshoot). Mirrors `Spring::under_damped`.
+#must_use
+fn ImSpring_under_damped(from: f64, to: f64, stiffness: f64): ImSpring {
+    var k: f64 = f64_abs(stiffness);
+    var r: f64 = f64_sqrt(k);
+    var c: f64 = 0.5 * r;
+    return ImSpring_new(from, to, k, c);
+}
+
+impl ImSpring {
+    # Sets m0..m3 to the transition `[m00, m01, m10, m11]` of y'' = −k·y − c·y' over dt. Mirrors
+    # `transition`.
+    fn _transition(self, k: f64, c: f64, dt: f64) {
+        var alpha: f64 = 0.5 * c;
+        var disc: f64 = alpha * alpha - k;
+        var ak: f64 = f64_abs(k);
+        var scale: f64 = alpha * alpha + ak;
+        var ad: f64 = f64_abs(disc);
+        var na: f64 = -alpha;
+        if (ad <= 0.000000001 * scale || scale == 0.0) {
+            # Critically damped (or free motion when k = c = 0).
+            var e: f64 = _im_exp(na * dt);
+            var ne: f64 = -e;
+            self.m0 = e * (1.0 + alpha * dt);
+            self.m1 = e * dt;
+            self.m2 = ((ne * alpha) * alpha) * dt;
+            self.m3 = e * (1.0 - alpha * dt);
+        } elif (disc < 0.0) {
+            # Under-damped.
+            var nd: f64 = -disc;
+            var wd: f64 = f64_sqrt(nd);
+            var e: f64 = _im_exp(na * dt);
+            var ne: f64 = -e;
+            var sn, cs = _im_sin_cos(wd * dt);
+            var sin: f64 = sn;
+            var cos: f64 = cs;
+            var aw: f64 = alpha / wd;
+            self.m0 = e * (cos + aw * sin);
+            self.m1 = (e * sin) / wd;
+            self.m2 = ((ne * k) / wd) * sin;
+            self.m3 = e * (cos - aw * sin);
+        } else {
+            # Over-damped: two real roots.
+            var beta: f64 = f64_sqrt(disc);
+            var r1: f64 = na + beta;
+            var r2: f64 = na - beta;
+            var d: f64 = r1 - r2;
+            var e1: f64 = _im_exp(r1 * dt);
+            var e2: f64 = _im_exp(r2 * dt);
+            self.m0 = (r1 * e2 - r2 * e1) / d;
+            self.m1 = (e1 - e2) / d;
+            self.m2 = ((r1 * r2) * (e2 - e1)) / d;
+            self.m3 = (r1 * e1 - r2 * e2) / d;
+        }
+        return 0;
+    }
+
+    # Advances the spring by dt seconds, exactly: one step of a second lands where many smaller ones
+    # do, and no dt or stiffness can make it explode. A non-positive or NaN dt does nothing; an
+    # infinite one snaps a damped spring. Mirrors `Spring::step`.
+    fn step(self, dt: f64) {
+        if (_im_is_nan(dt) == 1 || dt <= 0.0) { return 0; }
+        var k: f64 = self.stiffness;
+        var c: f64 = self.damping;
+        if (_im_is_finite(dt) == 0) {
+            if (c > 0.0 && k >= 0.0) { self.snap(); }
+            return 0;
+        }
+        var hit = 0;
+        if (self.cache_valid == 1) {
+            var cdt: f64 = self.cache_dt;
+            var ck: f64 = self.cache_k;
+            var cc: f64 = self.cache_c;
+            if (cdt == dt && ck == k && cc == c) { hit = 1; }
+        }
+        if (hit == 0) {
+            self._transition(k, c, dt);
+            self.cache_valid = 1;
+            self.cache_dt = dt;
+            self.cache_k = k;
+            self.cache_c = c;
+        }
+        var m0: f64 = self.m0;
+        var m1: f64 = self.m1;
+        var m2: f64 = self.m2;
+        var m3: f64 = self.m3;
+        var p: f64 = self.position;
+        var t: f64 = self.target;
+        var y0: f64 = p - t;
+        var v0: f64 = self.velocity;
+        var y: f64 = m0 * y0 + m1 * v0;
+        var v: f64 = m2 * y0 + m3 * v0;
+        if (_im_is_finite(y) == 1 && _im_is_finite(v) == 1) {
+            self.position = t + y;
+            self.velocity = v;
+        }
+        return 0;
+    }
+
+    # Current position. Mirrors `Spring::position`.
+    #must_use
+    fn position(self): f64 {
+        var r: f64 = self.position;
+        return r;
+    }
+
+    # Current velocity. Mirrors `Spring::velocity`.
+    #must_use
+    fn velocity(self): f64 {
+        var r: f64 = self.velocity;
+        return r;
+    }
+
+    # Target position. Mirrors `Spring::target`.
+    #must_use
+    fn target(self): f64 {
+        var r: f64 = self.target;
+        return r;
+    }
+
+    # Sets a new target (the user dragged the window). Mirrors `Spring::set_target`.
+    fn set_target(self, target: f64) {
+        self.target = target;
+        return 0;
+    }
+
+    # Sets the position directly (teleport). Mirrors `Spring::set_position`.
+    fn set_position(self, position: f64) {
+        self.position = position;
+        return 0;
+    }
+
+    # Adds velocity (a fling). Mirrors `Spring::add_velocity`.
+    fn add_velocity(self, v: f64) {
+        var cur: f64 = self.velocity;
+        self.velocity = cur + v;
+        return 0;
+    }
+
+    # Sets the velocity directly. Mirrors `Spring::set_velocity`.
+    fn set_velocity(self, v: f64) {
+        self.velocity = v;
+        return 0;
+    }
+
+    # 1 when |position − target| and |velocity| are both below the settle threshold. Mirrors
+    # `Spring::is_settled`.
+    #must_use
+    fn is_settled(self): i64 {
+        var p: f64 = self.position;
+        var t: f64 = self.target;
+        var d: f64 = p - t;
+        var ad: f64 = f64_abs(d);
+        var v: f64 = self.velocity;
+        var av: f64 = f64_abs(v);
+        var thr: f64 = self.settle_threshold;
+        if (ad < thr && av < thr) { return 1; }
+        return 0;
+    }
+
+    # Sets the settle threshold. Mirrors `Spring::set_settle_threshold`.
+    fn set_settle_threshold(self, threshold: f64) {
+        self.settle_threshold = threshold;
+        return 0;
+    }
+
+    # Snaps to the target with no velocity. Mirrors `Spring::snap`.
+    fn snap(self) {
+        var t: f64 = self.target;
+        self.position = t;
+        self.velocity = 0.0;
+        return 0;
+    }
+
+    # Stiffness. Mirrors `Spring::stiffness`.
+    #must_use
+    fn stiffness(self): f64 {
+        var r: f64 = self.stiffness;
+        return r;
+    }
+
+    # Damping. Mirrors `Spring::damping`.
+    #must_use
+    fn damping(self): f64 {
+        var r: f64 = self.damping;
+        return r;
+    }
+
+    # Sets the stiffness. Mirrors `Spring::set_stiffness`.
+    fn set_stiffness(self, stiffness: f64) {
+        self.stiffness = stiffness;
+        return 0;
+    }
+
+    # Sets the damping. Mirrors `Spring::set_damping`.
+    fn set_damping(self, damping: f64) {
+        self.damping = damping;
+        return 0;
+    }
+
+    # 1 when the six serialized fields are equal (f64 ==, so NaN is unequal); the cache is ignored.
+    # Mirrors `PartialEq for Spring`.
+    #must_use
+    fn eq(self, o: *ImSpring): i64 {
+        var a0: f64 = self.position;
+        var b0: f64 = o.position;
+        var a1: f64 = self.velocity;
+        var b1: f64 = o.velocity;
+        var a2: f64 = self.target;
+        var b2: f64 = o.target;
+        var a3: f64 = self.stiffness;
+        var b3: f64 = o.stiffness;
+        var a4: f64 = self.damping;
+        var b4: f64 = o.damping;
+        var a5: f64 = self.settle_threshold;
+        var b5: f64 = o.settle_threshold;
+        if (a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5) { return 1; }
+        return 0;
+    }
+}
+
+# A 2D spring: two independent axes. Mirrors `Spring2d`.
+struct ImSpring2d { x: ImSpring; y: ImSpring; }
+
+# A 2D spring from `from` toward `to`. Mirrors `Spring2d::new`.
+#must_use
+fn ImSpring2d_new(from: ImVec2, to: ImVec2, stiffness: f64, damping: f64): ImSpring2d {
+    var s: ImSpring2d;
+    s.x = ImSpring_new(from.x, to.x, stiffness, damping);
+    s.y = ImSpring_new(from.y, to.y, stiffness, damping);
+    return s;
+}
+
+# A critically damped 2D spring. Mirrors `Spring2d::critically_damped`.
+#must_use
+fn ImSpring2d_critically_damped(from: ImVec2, to: ImVec2, stiffness: f64): ImSpring2d {
+    var s: ImSpring2d;
+    s.x = ImSpring_critically_damped(from.x, to.x, stiffness);
+    s.y = ImSpring_critically_damped(from.y, to.y, stiffness);
+    return s;
+}
+
+impl ImSpring2d {
+    # Steps both axes. Mirrors `Spring2d::step`.
+    fn step(self, dt: f64) {
+        self.x.step(dt);
+        self.y.step(dt);
+        return 0;
+    }
+
+    # The position (x, y). Mirrors `Spring2d::position`.
+    #must_use
+    fn position(self): ImVec2 {
+        var px: f64 = self.x.position;
+        var py: f64 = self.y.position;
+        return ImVec2_new(px, py);
+    }
+
+    # Sets the target. Mirrors `Spring2d::set_target`.
+    fn set_target(self, target: ImVec2) {
+        self.x.set_target(target.x);
+        self.y.set_target(target.y);
+        return 0;
+    }
+
+    # 1 when both axes have settled. Mirrors `Spring2d::is_settled`.
+    #must_use
+    fn is_settled(self): i64 {
+        if (self.x.is_settled() == 1 && self.y.is_settled() == 1) { return 1; }
+        return 0;
+    }
+
+    # Snaps to the target. Mirrors `Spring2d::snap`.
+    fn snap(self) {
+        self.x.snap();
+        self.y.snap();
+        return 0;
+    }
+
+    # Adds velocity. Mirrors `Spring2d::add_velocity`.
+    fn add_velocity(self, v: ImVec2) {
+        self.x.add_velocity(v.x);
+        self.y.add_velocity(v.y);
+        return 0;
+    }
+}
+
+# A 3D spring: three independent axes. Mirrors `Spring3d`.
+struct ImSpring3d { x: ImSpring; y: ImSpring; z: ImSpring; }
+
+# A 3D spring from `from` toward `to`. Mirrors `Spring3d::new`.
+#must_use
+fn ImSpring3d_new(from: ImVec3, to: ImVec3, stiffness: f64, damping: f64): ImSpring3d {
+    var s: ImSpring3d;
+    s.x = ImSpring_new(from.x, to.x, stiffness, damping);
+    s.y = ImSpring_new(from.y, to.y, stiffness, damping);
+    s.z = ImSpring_new(from.z, to.z, stiffness, damping);
+    return s;
+}
+
+# A critically damped 3D spring. Mirrors `Spring3d::critically_damped`.
+#must_use
+fn ImSpring3d_critically_damped(from: ImVec3, to: ImVec3, stiffness: f64): ImSpring3d {
+    var s: ImSpring3d;
+    s.x = ImSpring_critically_damped(from.x, to.x, stiffness);
+    s.y = ImSpring_critically_damped(from.y, to.y, stiffness);
+    s.z = ImSpring_critically_damped(from.z, to.z, stiffness);
+    return s;
+}
+
+impl ImSpring3d {
+    # Steps all axes. Mirrors `Spring3d::step`.
+    fn step(self, dt: f64) {
+        self.x.step(dt);
+        self.y.step(dt);
+        self.z.step(dt);
+        return 0;
+    }
+
+    # The position (x, y, z). Mirrors `Spring3d::position`.
+    #must_use
+    fn position(self): ImVec3 {
+        var px: f64 = self.x.position;
+        var py: f64 = self.y.position;
+        var pz: f64 = self.z.position;
+        return ImVec3_new(px, py, pz);
+    }
+
+    # Sets the target. Mirrors `Spring3d::set_target`.
+    fn set_target(self, target: ImVec3) {
+        self.x.set_target(target.x);
+        self.y.set_target(target.y);
+        self.z.set_target(target.z);
+        return 0;
+    }
+
+    # 1 when all axes have settled. Mirrors `Spring3d::is_settled`.
+    #must_use
+    fn is_settled(self): i64 {
+        if (self.x.is_settled() == 1 && self.y.is_settled() == 1 && self.z.is_settled() == 1) {
+            return 1;
+        }
+        return 0;
+    }
+
+    # Snaps to the target. Mirrors `Spring3d::snap`.
+    fn snap(self) {
+        self.x.snap();
+        self.y.snap();
+        self.z.snap();
+        return 0;
+    }
+
+    # Adds velocity. Mirrors `Spring3d::add_velocity`.
+    fn add_velocity(self, v: ImVec3) {
+        self.x.add_velocity(v.x);
+        self.y.add_velocity(v.y);
+        self.z.add_velocity(v.z);
+        return 0;
+    }
+}

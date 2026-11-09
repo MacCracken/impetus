@@ -6,6 +6,7 @@
 # Requires (compile-verified; the leaves of dist/impetus.deps):
 include "lib/str.cyr"
 include "lib/bayan.cyr"
+include "lib/freelist.cyr"
 
 # --- error.cyr ---
 
@@ -1148,23 +1149,1628 @@ fn ImTorque_new(value: f64): ImTorque {
     return t;
 }
 
+# --- types.cyr ---
+
+# types.cyr — bodies, colliders, joints, events and queries (port of rust-old/src/{body,collider,joint,
+# event,query}.rs).
+#
+# Handles (`BodyHandle(u64)`, `ColliderHandle`, `JointHandle`) are plain words: index in the low 32
+# bits, generation in the high 32 (src/arena.cyr). Each Rust struct keeps its fields in declaration
+# order; an `Option<T>` field is a presence flag plus the value, an `[f64; 2]` / `[f64; 3]` an ImVec2 /
+# ImVec3. Rust's payload enums (`ColliderShape`, `JointType`, `CollisionEvent`) become a kind enum,
+# values in Rust variant order and append-only, plus one struct carrying every variant's fields.
+#
+# A shape's `Vec` payloads (hull points, mesh vertices and indices, heights) live on freelist storage
+# the shape owns: the constructors copy the caller's data, and `free` releases it.
+
+enum ImBodyType {
+    IM_BODY_STATIC = 0;
+    IM_BODY_DYNAMIC = 1;
+    IM_BODY_KINEMATIC = 2;
+}
+
+struct ImBodyDesc {
+    body_type;
+    position: ImVec3;
+    rotation: f64;
+    linear_velocity: ImVec3;
+    angular_velocity: f64;
+    linear_damping: f64;
+    angular_damping: f64;
+    fixed_rotation;
+    has_gravity_scale;
+    gravity_scale: f64;
+}
+
+struct ImBodyState {
+    handle;
+    body_type;
+    position: ImVec3;
+    rotation: f64;
+    linear_velocity: ImVec3;
+    angular_velocity: f64;
+    is_sleeping;
+}
+
+# The Rust variant name of a body type (`"Dynamic"`), or "Unknown".
+#must_use
+fn body_type_name(t): i64 {
+    if (t == IM_BODY_STATIC) { return "Static"; }
+    if (t == IM_BODY_DYNAMIC) { return "Dynamic"; }
+    if (t == IM_BODY_KINEMATIC) { return "Kinematic"; }
+    return "Unknown";
+}
+
+# A dynamic body at rest at the origin: no rotation, velocity or damping, rotation free, the world's
+# gravity scale. Mirrors `BodyDesc::default`.
+#must_use
+fn ImBodyDesc_default(): ImBodyDesc {
+    var d: ImBodyDesc;
+    d.body_type = IM_BODY_DYNAMIC;
+    d.position = ImVec3_zero();
+    d.rotation = 0.0;
+    d.linear_velocity = ImVec3_zero();
+    d.angular_velocity = 0.0;
+    d.linear_damping = 0.0;
+    d.angular_damping = 0.0;
+    d.fixed_rotation = 0;
+    d.has_gravity_scale = 0;
+    d.gravity_scale = 0.0;
+    return d;
+}
+
+# ── colliders ───────────────────────────────────────────────────────────────────────
+
+enum ImShapeKind {
+    IM_SHAPE_BOX = 0;
+    IM_SHAPE_BALL = 1;
+    IM_SHAPE_CAPSULE = 2;
+    IM_SHAPE_CONVEX_HULL = 3;
+    IM_SHAPE_TRI_MESH = 4;
+    IM_SHAPE_HEIGHTFIELD = 5;
+    IM_SHAPE_SEGMENT = 6;
+}
+
+# Every variant's fields. `points` (hull) and `vertices` (mesh) are `count` f64 triples, `indices`
+# `index_count` triples of words (u32 values), `heights` `height_count` f64s.
+struct ImColliderShape {
+    kind;
+    half_extents: ImVec3;
+    radius: f64;
+    half_height: f64;
+    points;
+    point_count;
+    vertices;
+    vertex_count;
+    indices;
+    index_count;
+    heights;
+    height_count;
+    scale: ImVec3;
+    a: ImVec3;
+    b: ImVec3;
+}
+
+struct ImColliderDesc {
+    shape: ImColliderShape;
+    offset: ImVec3;
+    material: ImPhysicsMaterial;
+    is_sensor;
+    has_mass;
+    mass: f64;
+    collision_layer;
+    collision_mask;
+}
+
+# The Rust variant name of a shape kind (`"ConvexHull"`), or "Unknown".
+#must_use
+fn shape_kind_name(k): i64 {
+    if (k == IM_SHAPE_BOX) { return "Box"; }
+    if (k == IM_SHAPE_BALL) { return "Ball"; }
+    if (k == IM_SHAPE_CAPSULE) { return "Capsule"; }
+    if (k == IM_SHAPE_CONVEX_HULL) { return "ConvexHull"; }
+    if (k == IM_SHAPE_TRI_MESH) { return "TriMesh"; }
+    if (k == IM_SHAPE_HEIGHTFIELD) { return "Heightfield"; }
+    if (k == IM_SHAPE_SEGMENT) { return "Segment"; }
+    return "Unknown";
+}
+
+# A shape of `kind` with every field zero and no arrays.
+#must_use
+fn _im_shape(kind): ImColliderShape {
+    var s: ImColliderShape;
+    s.kind = kind;
+    s.half_extents = ImVec3_zero();
+    s.radius = 0.0;
+    s.half_height = 0.0;
+    s.points = 0;
+    s.point_count = 0;
+    s.vertices = 0;
+    s.vertex_count = 0;
+    s.indices = 0;
+    s.index_count = 0;
+    s.heights = 0;
+    s.height_count = 0;
+    s.scale = ImVec3_zero();
+    s.a = ImVec3_zero();
+    s.b = ImVec3_zero();
+    return s;
+}
+
+# A freelist copy of `words` 8-byte words from `src`, or 0 (none to copy, or no memory).
+#must_use
+fn _im_copy_words(src, words): i64 {
+    if (words <= 0 || src == 0) { return 0; }
+    var p = fl_alloc(words * 8);
+    if (p == 0) { return 0; }
+    memcpy(p, src, words * 8);
+    return p;
+}
+
+# A box with the given half extents. Mirrors `ColliderShape::Box`.
+#must_use
+fn ImColliderShape_box(hx: f64, hy: f64, hz: f64): ImColliderShape {
+    var s: ImColliderShape = _im_shape(IM_SHAPE_BOX);
+    s.half_extents = ImVec3_new(hx, hy, hz);
+    return s;
+}
+
+# A circle (2D) or sphere (3D). Mirrors `ColliderShape::Ball`.
+#must_use
+fn ImColliderShape_ball(radius: f64): ImColliderShape {
+    var s: ImColliderShape = _im_shape(IM_SHAPE_BALL);
+    s.radius = radius;
+    return s;
+}
+
+# A capsule of the given half height and radius. Mirrors `ColliderShape::Capsule`.
+#must_use
+fn ImColliderShape_capsule(half_height: f64, radius: f64): ImColliderShape {
+    var s: ImColliderShape = _im_shape(IM_SHAPE_CAPSULE);
+    s.half_height = half_height;
+    s.radius = radius;
+    return s;
+}
+
+# A convex hull of `count` points (f64 triples at `points`, copied). Mirrors `ColliderShape::ConvexHull`.
+#must_use
+fn ImColliderShape_convex_hull(points, count): ImColliderShape {
+    var s: ImColliderShape = _im_shape(IM_SHAPE_CONVEX_HULL);
+    s.points = _im_copy_words(points, count * 3);
+    if (s.points != 0) { s.point_count = count; }
+    return s;
+}
+
+# A triangle mesh: `vertex_count` f64 triples and `index_count` index triples (words), both copied.
+# Mirrors `ColliderShape::TriMesh`.
+#must_use
+fn ImColliderShape_tri_mesh(vertices, vertex_count, indices, index_count): ImColliderShape {
+    var s: ImColliderShape = _im_shape(IM_SHAPE_TRI_MESH);
+    s.vertices = _im_copy_words(vertices, vertex_count * 3);
+    if (s.vertices != 0) { s.vertex_count = vertex_count; }
+    s.indices = _im_copy_words(indices, index_count * 3);
+    if (s.indices != 0) { s.index_count = index_count; }
+    return s;
+}
+
+# A heightfield of `count` heights (copied) and a scale. Mirrors `ColliderShape::Heightfield`.
+#must_use
+fn ImColliderShape_heightfield(heights, count, scale: ImVec3): ImColliderShape {
+    var s: ImColliderShape = _im_shape(IM_SHAPE_HEIGHTFIELD);
+    s.heights = _im_copy_words(heights, count);
+    if (s.heights != 0) { s.height_count = count; }
+    s.scale = scale;
+    return s;
+}
+
+# A segment from a to b. Mirrors `ColliderShape::Segment`.
+#must_use
+fn ImColliderShape_segment(a: ImVec3, b: ImVec3): ImColliderShape {
+    var s: ImColliderShape = _im_shape(IM_SHAPE_SEGMENT);
+    s.a = a;
+    s.b = b;
+    return s;
+}
+
+impl ImColliderShape {
+    # Releases the shape's arrays (none for the fixed-size kinds) and clears them.
+    fn free(self) {
+        if (self.points != 0) { fl_free(self.points); }
+        if (self.vertices != 0) { fl_free(self.vertices); }
+        if (self.indices != 0) { fl_free(self.indices); }
+        if (self.heights != 0) { fl_free(self.heights); }
+        self.points = 0;
+        self.point_count = 0;
+        self.vertices = 0;
+        self.vertex_count = 0;
+        self.indices = 0;
+        self.index_count = 0;
+        self.heights = 0;
+        self.height_count = 0;
+        return 0;
+    }
+}
+
+# A collider of `shape` with Rust's serde defaults for the rest: no offset, the default material, not
+# a sensor, mass from density, every collision layer and mask bit set.
+#must_use
+fn ImColliderDesc_new(shape: ImColliderShape): ImColliderDesc {
+    var d: ImColliderDesc;
+    d.shape = shape;
+    d.offset = ImVec3_zero();
+    d.material = ImPhysicsMaterial_default();
+    d.is_sensor = 0;
+    d.has_mass = 0;
+    d.mass = 0.0;
+    d.collision_layer = 4294967295;
+    d.collision_mask = 4294967295;
+    return d;
+}
+
+# ── joints ──────────────────────────────────────────────────────────────────────────
+
+enum ImJointKind {
+    IM_JOINT_FIXED = 0;
+    IM_JOINT_REVOLUTE = 1;
+    IM_JOINT_PRISMATIC = 2;
+    IM_JOINT_SPRING = 3;
+    IM_JOINT_DISTANCE = 4;
+    IM_JOINT_WHEEL = 5;
+    IM_JOINT_ROPE = 6;
+    IM_JOINT_MOUSE = 7;
+}
+
+# Every variant's fields: Revolute's anchor and limits, Prismatic's and Wheel's axis, the spring
+# terms (Spring, Wheel, Mouse), Distance's length, Rope's max_length, Mouse's target and max_force.
+struct ImJointType {
+    kind;
+    anchor: ImVec2;
+    axis: ImVec2;
+    has_limits;
+    limits: ImVec2;
+    rest_length: f64;
+    stiffness: f64;
+    damping: f64;
+    length: f64;
+    max_length: f64;
+    target: ImVec3;
+    max_force: f64;
+}
+
+struct ImJointMotor { target_velocity: f64; max_force: f64; }
+
+struct ImJointDesc {
+    body_a;
+    body_b;
+    joint_type: ImJointType;
+    local_anchor_a: ImVec2;
+    local_anchor_b: ImVec2;
+    has_motor;
+    motor: ImJointMotor;
+    damping: f64;
+    has_break_force;
+    break_force: f64;
+}
+
+# The Rust variant name of a joint kind (`"Revolute"`), or "Unknown".
+#must_use
+fn joint_kind_name(k): i64 {
+    if (k == IM_JOINT_FIXED) { return "Fixed"; }
+    if (k == IM_JOINT_REVOLUTE) { return "Revolute"; }
+    if (k == IM_JOINT_PRISMATIC) { return "Prismatic"; }
+    if (k == IM_JOINT_SPRING) { return "Spring"; }
+    if (k == IM_JOINT_DISTANCE) { return "Distance"; }
+    if (k == IM_JOINT_WHEEL) { return "Wheel"; }
+    if (k == IM_JOINT_ROPE) { return "Rope"; }
+    if (k == IM_JOINT_MOUSE) { return "Mouse"; }
+    return "Unknown";
+}
+
+# A joint type of `kind` with every field zero and no limits.
+#must_use
+fn _im_joint(kind): ImJointType {
+    var j: ImJointType;
+    j.kind = kind;
+    j.anchor = ImVec2_new(0.0, 0.0);
+    j.axis = ImVec2_new(0.0, 0.0);
+    j.has_limits = 0;
+    j.limits = ImVec2_new(0.0, 0.0);
+    j.rest_length = 0.0;
+    j.stiffness = 0.0;
+    j.damping = 0.0;
+    j.length = 0.0;
+    j.max_length = 0.0;
+    j.target = ImVec3_zero();
+    j.max_force = 0.0;
+    return j;
+}
+
+# Bodies keep their relative position and rotation. Mirrors `JointType::Fixed`.
+#must_use
+fn ImJointType_fixed(): ImJointType { return _im_joint(IM_JOINT_FIXED); }
+
+# Rotation about a shared anchor, with optional [lo, hi] limits (`has_limits` 0 for none).
+# Mirrors `JointType::Revolute`.
+#must_use
+fn ImJointType_revolute(anchor: ImVec2, has_limits, lo: f64, hi: f64): ImJointType {
+    var j: ImJointType = _im_joint(IM_JOINT_REVOLUTE);
+    j.anchor = anchor;
+    j.has_limits = has_limits;
+    if (has_limits == 1) { j.limits = ImVec2_new(lo, hi); }
+    return j;
+}
+
+# Sliding along an axis, with optional [lo, hi] limits. Mirrors `JointType::Prismatic`.
+#must_use
+fn ImJointType_prismatic(axis: ImVec2, has_limits, lo: f64, hi: f64): ImJointType {
+    var j: ImJointType = _im_joint(IM_JOINT_PRISMATIC);
+    j.axis = axis;
+    j.has_limits = has_limits;
+    if (has_limits == 1) { j.limits = ImVec2_new(lo, hi); }
+    return j;
+}
+
+# A damped spring between the anchors. Mirrors `JointType::Spring`.
+#must_use
+fn ImJointType_spring(rest_length: f64, stiffness: f64, damping: f64): ImJointType {
+    var j: ImJointType = _im_joint(IM_JOINT_SPRING);
+    j.rest_length = rest_length;
+    j.stiffness = stiffness;
+    j.damping = damping;
+    return j;
+}
+
+# A fixed distance between the anchors. Mirrors `JointType::Distance`.
+#must_use
+fn ImJointType_distance(length: f64): ImJointType {
+    var j: ImJointType = _im_joint(IM_JOINT_DISTANCE);
+    j.length = length;
+    return j;
+}
+
+# Suspension along an axis plus free spin. Mirrors `JointType::Wheel`.
+#must_use
+fn ImJointType_wheel(axis: ImVec2, stiffness: f64, damping: f64): ImJointType {
+    var j: ImJointType = _im_joint(IM_JOINT_WHEEL);
+    j.axis = axis;
+    j.stiffness = stiffness;
+    j.damping = damping;
+    return j;
+}
+
+# At most `max_length` apart. Mirrors `JointType::Rope`.
+#must_use
+fn ImJointType_rope(max_length: f64): ImJointType {
+    var j: ImJointType = _im_joint(IM_JOINT_ROPE);
+    j.max_length = max_length;
+    return j;
+}
+
+# Drags body A toward a world-space target. Mirrors `JointType::Mouse`.
+#must_use
+fn ImJointType_mouse(target: ImVec3, stiffness: f64, damping: f64, max_force: f64): ImJointType {
+    var j: ImJointType = _im_joint(IM_JOINT_MOUSE);
+    j.target = target;
+    j.stiffness = stiffness;
+    j.damping = damping;
+    j.max_force = max_force;
+    return j;
+}
+
+# A motor driving toward `target_velocity` with up to `max_force`. Mirrors `JointMotor`.
+#must_use
+fn ImJointMotor_new(target_velocity: f64, max_force: f64): ImJointMotor {
+    var m: ImJointMotor;
+    m.target_velocity = target_velocity;
+    m.max_force = max_force;
+    return m;
+}
+
+# A joint between bodies a and b with Rust's serde defaults for the rest: no motor, no damping,
+# unbreakable.
+#must_use
+fn ImJointDesc_new(body_a, body_b, joint_type: ImJointType, anchor_a: ImVec2, anchor_b: ImVec2): ImJointDesc {
+    var d: ImJointDesc;
+    d.body_a = body_a;
+    d.body_b = body_b;
+    d.joint_type = joint_type;
+    d.local_anchor_a = anchor_a;
+    d.local_anchor_b = anchor_b;
+    d.has_motor = 0;
+    d.motor = ImJointMotor_new(0.0, 0.0);
+    d.damping = 0.0;
+    d.has_break_force = 0;
+    d.break_force = 0.0;
+    return d;
+}
+
+# ── events and queries ──────────────────────────────────────────────────────────────
+
+enum ImEventKind {
+    IM_EVENT_STARTED = 0;
+    IM_EVENT_STOPPED = 1;
+    IM_EVENT_ONGOING = 2;
+}
+
+struct ImCollisionEvent { kind; collider_a; collider_b; }
+
+struct ImContactPoint { local_a: ImVec3; local_b: ImVec3; impulse: f64; }
+
+# `points` is `point_count` ImContactPoint records on freelist storage the data owns.
+struct ImContactData {
+    collider_a;
+    collider_b;
+    normal: ImVec3;
+    depth: f64;
+    points;
+    point_count;
+}
+
+struct ImRayHit { collider; point: ImVec3; normal: ImVec3; distance: f64; }
+
+struct ImPointQuery { collider; distance: f64; is_inside; }
+
+# The Rust variant name of an event kind (`"Started"`), or "Unknown".
+#must_use
+fn event_kind_name(k): i64 {
+    if (k == IM_EVENT_STARTED) { return "Started"; }
+    if (k == IM_EVENT_STOPPED) { return "Stopped"; }
+    if (k == IM_EVENT_ONGOING) { return "Ongoing"; }
+    return "Unknown";
+}
+
+# An event of `kind` for the pair (a, b).
+#must_use
+fn ImCollisionEvent_new(kind, a, b): ImCollisionEvent {
+    var e: ImCollisionEvent;
+    e.kind = kind;
+    e.collider_a = a;
+    e.collider_b = b;
+    return e;
+}
+
+# --- arena.cyr ---
+
+# arena.cyr — generational arena: O(1) insert, remove and lookup by handle (port of
+# rust-old/src/arena.rs).
+#
+# Values are fixed-size records (`elem_size` bytes) in one freelist buffer; a handle is a word with the
+# slot index in the low 32 bits and the slot's generation in the high 32, exactly the Rust
+# `ArenaHandle`, so the port hands out the same handles in the same order (M3's dump rows check it).
+# Slot semantics follow Rust's:
+# - `insert` reuses the free-list head, else appends a slot at generation 0;
+# - `remove` bumps the slot's generation (wrapping at 2^32) and pushes it on the free-list head;
+# - `insert_at` places a value at a given handle, growing with free generation-0 slots, and marks the
+#   free list stale; the next `insert` rebuilds it, lowest index first;
+# - `retain` frees, in index order, every value its callback rejects.
+# `get` returns the value's address, valid until the next insert (which may move the buffer); view it
+# through a typed pointer (`*ImBody`). Storage is freelist, released by `free`, so a world's arenas
+# never grow the global heap (port-parity.md §4.1). An allocation failure makes `insert` return -1 and
+# `insert_at` 0; nothing aborts. (-1 is also the handle of slot 2^32 − 1 at generation 2^32 − 1, which
+# no arena reaches.)
+
+struct ImArena {
+    elem_size;
+    cap;
+    count;
+    len;
+    free_head;
+    free_list_stale;
+    values;
+    meta;
+}
+
+# Each slot's metadata: three words — occupied (0/1), generation (u32), next free slot (-1 for none).
+const _IM_ARENA_META = 24;
+
+# The handle word for slot `index` at `generation`. Mirrors `ArenaHandle::new`.
+#must_use
+fn _im_arena_handle(index, generation): i64 {
+    return ((generation & 0xFFFFFFFF) << 32) | (index & 0xFFFFFFFF);
+}
+
+# A handle's slot index (low 32 bits). Mirrors `ArenaHandle::index`.
+#must_use
+fn _im_handle_index(h): i64 {
+    return h & 0xFFFFFFFF;
+}
+
+# A handle's generation (high 32 bits). Mirrors `ArenaHandle::generation`.
+#must_use
+fn _im_handle_generation(h): i64 {
+    return (h >> 32) & 0xFFFFFFFF;
+}
+
+# A typed view of a word (what fl_alloc returns).
+#must_use
+fn _im_as_arena(p): *ImArena {
+    return p;
+}
+
+# An empty arena for records of `elem_size` bytes, or 0 when there is no memory. Mirrors `Arena::new`.
+#must_use
+fn ImArena_new(elem_size): *ImArena {
+    var a: *ImArena = _im_as_arena(fl_alloc(sizeof(ImArena)));
+    if (a == 0) { return a; }
+    a.elem_size = elem_size;
+    a.cap = 0;
+    a.count = 0;
+    a.len = 0;
+    a.free_head = 0 - 1;
+    a.free_list_stale = 0;
+    a.values = 0;
+    a.meta = 0;
+    return a;
+}
+
+impl ImArena {
+    # The address of slot i's metadata.
+    #must_use
+    fn _meta(self, i): i64 {
+        return self.meta + i * _IM_ARENA_META;
+    }
+
+    # Room for at least `need` slots: 1, or 0 when there is no memory (the arena is unchanged).
+    fn _reserve(self, need): i64 {
+        if (need <= self.cap) { return 1; }
+        var cap = self.cap * 2;
+        if (cap < 8) { cap = 8; }
+        while (cap < need) { cap = cap * 2; }
+        var v = fl_alloc(cap * self.elem_size);
+        var m = fl_alloc(cap * _IM_ARENA_META);
+        if (v == 0 || m == 0) {
+            if (v != 0) { fl_free(v); }
+            if (m != 0) { fl_free(m); }
+            return 0;
+        }
+        if (self.count > 0) {
+            memcpy(v, self.values, self.count * self.elem_size);
+            memcpy(m, self.meta, self.count * _IM_ARENA_META);
+        }
+        if (self.values != 0) { fl_free(self.values); }
+        if (self.meta != 0) { fl_free(self.meta); }
+        self.values = v;
+        self.meta = m;
+        self.cap = cap;
+        return 1;
+    }
+
+    # Rebuilds the free list from the slots, lowest index first. Mirrors `rebuild_free_list`.
+    fn _rebuild_free_list(self) {
+        self.free_head = 0 - 1;
+        var i = self.count - 1;
+        while (i >= 0) {
+            var m = self._meta(i);
+            if (load64(m) == 0) {
+                store64(m + 16, self.free_head);
+                self.free_head = i;
+            }
+            i = i - 1;
+        }
+        self.free_list_stale = 0;
+        return 0;
+    }
+
+    # Copies `elem_size` bytes from `value` into a slot and returns its handle, or -1 when there is no
+    # memory. Mirrors `Arena::insert`.
+    fn insert(self, value): i64 {
+        if (self.free_list_stale == 1) { self._rebuild_free_list(); }
+        if (self.free_head >= 0) {
+            var idx = self.free_head;
+            var m = self._meta(idx);
+            self.free_head = load64(m + 16);
+            store64(m, 1);
+            store64(m + 16, 0 - 1);
+            memcpy(self.values + idx * self.elem_size, value, self.elem_size);
+            self.len = self.len + 1;
+            return _im_arena_handle(idx, load64(m + 8));
+        }
+        if (self._reserve(self.count + 1) == 0) { return 0 - 1; }
+        var i = self.count;
+        var mi = self._meta(i);
+        store64(mi, 1);
+        store64(mi + 8, 0);
+        store64(mi + 16, 0 - 1);
+        memcpy(self.values + i * self.elem_size, value, self.elem_size);
+        self.count = self.count + 1;
+        self.len = self.len + 1;
+        return _im_arena_handle(i, 0);
+    }
+
+    # The slot index of a live handle, or -1 (out of range, free, or another generation).
+    #must_use
+    fn _live(self, h): i64 {
+        var idx = _im_handle_index(h);
+        if (idx >= self.count) { return 0 - 1; }
+        var m = self._meta(idx);
+        if (load64(m) != 1 || load64(m + 8) != _im_handle_generation(h)) { return 0 - 1; }
+        return idx;
+    }
+
+    # Removes the value at handle h, copying it to `out` (when not 0): 1, or 0 when the handle is not
+    # live. Mirrors `Arena::remove`.
+    fn remove(self, h, out): i64 {
+        var idx = self._live(h);
+        if (idx < 0) { return 0; }
+        if (out != 0) { memcpy(out, self.values + idx * self.elem_size, self.elem_size); }
+        var m = self._meta(idx);
+        store64(m, 0);
+        store64(m + 8, (_im_handle_generation(h) + 1) & 0xFFFFFFFF);
+        store64(m + 16, self.free_head);
+        self.free_head = idx;
+        self.len = self.len - 1;
+        return 1;
+    }
+
+    # The address of the value at handle h, or 0 when the handle is not live. Mirrors `Arena::get` and
+    # `get_mut`.
+    #must_use
+    fn get(self, h): i64 {
+        var idx = self._live(h);
+        if (idx < 0) { return 0; }
+        return self.values + idx * self.elem_size;
+    }
+
+    # 1 when handle h is live. Mirrors `Arena::contains`.
+    #must_use
+    fn contains(self, h): i64 {
+        if (self._live(h) < 0) { return 0; }
+        return 1;
+    }
+
+    # The number of live values. Mirrors `Arena::len`.
+    #must_use
+    fn len(self): i64 {
+        return self.len;
+    }
+
+    # The number of slots, live or free (iteration bound).
+    #must_use
+    fn slot_count(self): i64 {
+        return self.count;
+    }
+
+    # The handle of slot i, or -1 when the slot is free or out of range. Iterating i over
+    # 0..slot_count() and skipping -1 visits the live values in Rust's `iter` order.
+    #must_use
+    fn slot_handle(self, i): i64 {
+        if (i < 0 || i >= self.count) { return 0 - 1; }
+        var m = self._meta(i);
+        if (load64(m) != 1) { return 0 - 1; }
+        return _im_arena_handle(i, load64(m + 8));
+    }
+
+    # Places a copy of `value` at handle h (its index and generation), growing with free generation-0
+    # slots; marks the free list stale. 1, or 0 when the slot is occupied or there is no memory. The
+    # caller bounds the index (it allocates up to index + 1 slots). Mirrors `Arena::insert_at`.
+    fn insert_at(self, h, value): i64 {
+        var idx = _im_handle_index(h);
+        if (idx >= self.count) {
+            if (self._reserve(idx + 1) == 0) { return 0; }
+            for (var i = self.count; i <= idx; i = i + 1) {
+                var mf = self._meta(i);
+                store64(mf, 0);
+                store64(mf + 8, 0);
+                store64(mf + 16, 0 - 1);
+            }
+            self.count = idx + 1;
+        } elif (load64(self._meta(idx)) == 1) {
+            return 0;
+        }
+        var m = self._meta(idx);
+        store64(m, 1);
+        store64(m + 8, _im_handle_generation(h));
+        store64(m + 16, 0 - 1);
+        memcpy(self.values + idx * self.elem_size, value, self.elem_size);
+        self.len = self.len + 1;
+        self.free_list_stale = 1;
+        return 1;
+    }
+
+    # Removes, in index order, every value for which `keep(handle, value_address, ctx)` returns 0.
+    # Mirrors `Arena::retain`.
+    fn retain(self, keep, ctx) {
+        for (var i = 0; i < self.count; i = i + 1) {
+            var m = self._meta(i);
+            if (load64(m) == 1) {
+                var g = load64(m + 8);
+                var h = _im_arena_handle(i, g);
+                if (fncall3(keep, h, self.values + i * self.elem_size, ctx) == 0) {
+                    store64(m, 0);
+                    store64(m + 8, (g + 1) & 0xFFFFFFFF);
+                    store64(m + 16, self.free_head);
+                    self.free_head = i;
+                    self.len = self.len - 1;
+                }
+            }
+        }
+        return 0;
+    }
+
+    # Releases the arena's storage and the arena itself.
+    fn free(self) {
+        if (self.values != 0) { fl_free(self.values); }
+        if (self.meta != 0) { fl_free(self.meta); }
+        fl_free(self);
+        return 0;
+    }
+}
+
+# --- contact_tracker.cyr ---
+
+# contact_tracker.cyr — frame-level contact bookkeeping for collision events (port of
+# rust-old/src/contact_tracker.rs).
+#
+# Backends record the touching collider pairs after every sub-step; `finish` diffs the frame
+# against the previous one, so events come once per world step however many sub-steps ran, and
+# a contact that begins and ends inside one frame still reports `Started` then `Stopped`.
+#
+# A pair key is two collider handle words, the smaller first. Handles are u64 in Rust, and Cyrius
+# compares words signed, so every comparison here goes through `_im_ult` (flip the sign bit, then
+# compare signed): a handle at generation ≥ 2^31 sorts after the others exactly as in Rust.
+# Pair lists are sorted and unique, in freelist buffers the tracker owns and reuses across frames,
+# so a steady state allocates nothing (port-parity.md §4.1). The events of the last `finish` live
+# in the tracker until the next one.
+
+# A sorted, de-duplicated list of pair keys: `len` pairs of two words at `data`.
+struct ImPairList { data; len; cap; }
+
+# 1 when a < b as unsigned 64-bit words.
+#must_use
+fn _im_ult(a, b): i64 {
+    if ((a ^ 0x8000000000000000) < (b ^ 0x8000000000000000)) { return 1; }
+    return 0;
+}
+
+# Orders pair (a0, a1) against (b0, b1), unsigned and lexicographic: −1, 0 or 1. Rust's
+# `PairKey::cmp`.
+#must_use
+fn _im_pair_cmp(a0, a1, b0, b1): i64 {
+    if (a0 != b0) {
+        if (_im_ult(a0, b0) == 1) { return 0 - 1; }
+        return 1;
+    }
+    if (a1 == b1) { return 0; }
+    if (_im_ult(a1, b1) == 1) { return 0 - 1; }
+    return 1;
+}
+
+# The pair key of colliders a and b, the smaller handle first: `var lo, hi = _im_pair_key(a, b);`.
+# Mirrors `pair_key`.
+#must_use
+fn _im_pair_key(a, b) {
+    if (a == b || _im_ult(a, b) == 1) { return (a, b); }
+    return (b, a);
+}
+
+# An empty pair list.
+#must_use
+fn ImPairList_new(): ImPairList {
+    var l: ImPairList;
+    l.data = 0;
+    l.len = 0;
+    l.cap = 0;
+    return l;
+}
+
+impl ImPairList {
+    # Room for at least `need` pairs: 1, or 0 when there is no memory (the list is unchanged).
+    fn reserve(self, need): i64 {
+        if (need <= self.cap) { return 1; }
+        var cap = self.cap * 2;
+        if (cap < 8) { cap = 8; }
+        while (cap < need) { cap = cap * 2; }
+        var d = fl_alloc(cap * 16);
+        if (d == 0) { return 0; }
+        if (self.len > 0) { memcpy(d, self.data, self.len * 16); }
+        if (self.data != 0) { fl_free(self.data); }
+        self.data = d;
+        self.cap = cap;
+        return 1;
+    }
+
+    # Appends pair (a, b): 1, or 0 when there is no memory.
+    fn push(self, a, b): i64 {
+        if (self.len == self.cap) {
+            if (self.reserve(self.len + 1) == 0) { return 0; }
+        }
+        var p = self.data + self.len * 16;
+        store64(p, a);
+        store64(p + 8, b);
+        self.len = self.len + 1;
+        return 1;
+    }
+
+    # The first word of pair i.
+    #must_use
+    fn first(self, i): i64 {
+        return load64(self.data + i * 16);
+    }
+
+    # The second word of pair i.
+    #must_use
+    fn second(self, i): i64 {
+        return load64(self.data + i * 16 + 8);
+    }
+
+    # Empties the list, keeping its buffer.
+    fn clear(self) {
+        self.len = 0;
+        return 0;
+    }
+
+    # 1 when the sorted list holds pair (a, b). Binary search, as Rust's `binary_search(..).is_ok()`.
+    #must_use
+    fn contains(self, a, b): i64 {
+        var lo = 0;
+        var hi = self.len;
+        while (lo < hi) {
+            var mid = lo + (hi - lo) / 2;
+            var c = _im_pair_cmp(self.first(mid), self.second(mid), a, b);
+            if (c == 0) { return 1; }
+            if (c < 0) { lo = mid + 1; } else { hi = mid; }
+        }
+        return 0;
+    }
+
+    # 1 when the pairs are in strictly or non-strictly ascending order. Rust's `is_sorted`.
+    #must_use
+    fn is_sorted(self): i64 {
+        for (var i = 1; i < self.len; i = i + 1) {
+            var c = _im_pair_cmp(self.first(i - 1), self.second(i - 1), self.first(i), self.second(i));
+            if (c > 0) { return 0; }
+        }
+        return 1;
+    }
+
+    # Drops adjacent duplicates. Rust's `dedup`.
+    fn dedup(self) {
+        if (self.len < 2) { return 0; }
+        var w = 1;
+        for (var r = 1; r < self.len; r = r + 1) {
+            var a = self.first(r);
+            var b = self.second(r);
+            if (a != self.first(w - 1) || b != self.second(w - 1)) {
+                var p = self.data + w * 16;
+                store64(p, a);
+                store64(p + 8, b);
+                w = w + 1;
+            }
+        }
+        self.len = w;
+        return 0;
+    }
+
+    # Drops every pair with a word among the `n` handles at `handles`.
+    fn forget(self, handles, n) {
+        var w = 0;
+        for (var r = 0; r < self.len; r = r + 1) {
+            var a = self.first(r);
+            var b = self.second(r);
+            var drop = 0;
+            for (var j = 0; j < n; j = j + 1) {
+                var h = load64(handles + j * 8);
+                if (a == h || b == h) { drop = 1; }
+            }
+            if (drop == 0) {
+                var p = self.data + w * 16;
+                store64(p, a);
+                store64(p + 8, b);
+                w = w + 1;
+            }
+        }
+        self.len = w;
+        return 0;
+    }
+
+    # Makes this list the union of sorted, unique lists a and b (neither may be this list): 1, or 0
+    # when there is no memory. Mirrors `merge_union`.
+    fn set_union(self, a: ImPairList, b: ImPairList): i64 {
+        self.len = 0;
+        if (self.reserve(a.len + b.len) == 0) { return 0; }
+        var i = 0;
+        var j = 0;
+        while (i < a.len && j < b.len) {
+            var c = _im_pair_cmp(a.first(i), a.second(i), b.first(j), b.second(j));
+            if (c < 0) {
+                self.push(a.first(i), a.second(i));
+                i = i + 1;
+            } elif (c > 0) {
+                self.push(b.first(j), b.second(j));
+                j = j + 1;
+            } else {
+                self.push(a.first(i), a.second(i));
+                i = i + 1;
+                j = j + 1;
+            }
+        }
+        while (i < a.len) {
+            self.push(a.first(i), a.second(i));
+            i = i + 1;
+        }
+        while (j < b.len) {
+            self.push(b.first(j), b.second(j));
+            j = j + 1;
+        }
+        return 1;
+    }
+
+    # Releases the buffer.
+    fn free(self) {
+        if (self.data != 0) { fl_free(self.data); }
+        self.data = 0;
+        self.len = 0;
+        self.cap = 0;
+        return 0;
+    }
+}
+
+# Sorts the `n` pairs at `data` ascending (unsigned, lexicographic), using `tmp` (room for n pairs).
+# A bottom-up merge sort; keys are total and the caller de-duplicates, so the result is the one
+# Rust's `sort_unstable` gives.
+fn _im_pairs_sort(data, n, tmp) {
+    var src = data;
+    var dst = tmp;
+    var width = 1;
+    while (width < n) {
+        var lo = 0;
+        while (lo < n) {
+            var mid = lo + width;
+            if (mid > n) { mid = n; }
+            var hi = lo + 2 * width;
+            if (hi > n) { hi = n; }
+            var i = lo;
+            var j = mid;
+            var k = lo;
+            while (k < hi) {
+                var take_i = 0;
+                if (i < mid) {
+                    if (j >= hi) {
+                        take_i = 1;
+                    } else {
+                        var pi = src + i * 16;
+                        var pj = src + j * 16;
+                        if (_im_pair_cmp(load64(pi), load64(pi + 8), load64(pj), load64(pj + 8)) <= 0) {
+                            take_i = 1;
+                        }
+                    }
+                }
+                var from = src + j * 16;
+                if (take_i == 1) {
+                    from = src + i * 16;
+                    i = i + 1;
+                } else {
+                    j = j + 1;
+                }
+                store64(dst + k * 16, load64(from));
+                store64(dst + k * 16 + 8, load64(from + 8));
+                k = k + 1;
+            }
+            lo = hi;
+        }
+        var t = src;
+        src = dst;
+        dst = t;
+        width = width * 2;
+    }
+    if (src != data) { memcpy(data, src, n * 16); }
+    return 0;
+}
+
+# Pair bookkeeping across one frame's sub-steps. `prev`: pairs touching at the end of the previous
+# frame; `current`: at the end of the latest sub-step; `seen`: at the end of an earlier sub-step this
+# frame (empty with one sub-step); `recorded`: `current` holds a sub-step of this frame. `scratch`
+# backs the unions and the sort; `events` holds the last `finish`'s `event_count` events.
+struct ImContactTracker {
+    prev: ImPairList;
+    current: ImPairList;
+    seen: ImPairList;
+    scratch: ImPairList;
+    recorded;
+    events;
+    event_count;
+    event_cap;
+}
+
+# An empty tracker. Mirrors `ContactTracker::default`.
+#must_use
+fn ImContactTracker_new(): ImContactTracker {
+    var t: ImContactTracker;
+    t.prev = ImPairList_new();
+    t.current = ImPairList_new();
+    t.seen = ImPairList_new();
+    t.scratch = ImPairList_new();
+    t.recorded = 0;
+    t.events = 0;
+    t.event_count = 0;
+    t.event_cap = 0;
+    return t;
+}
+
+impl ImContactTracker {
+    # Records the `n` pair keys at `pairs` (two words each, smaller handle first; any order,
+    # duplicates fine) touching at the end of a sub-step: 1, or 0 when there is no memory. Mirrors
+    # `record_substep`.
+    fn record_substep(self, pairs, n): i64 {
+        if (self.recorded == 1 && self.current.len > 0) {
+            if (self.scratch.set_union(self.seen, self.current) == 0) { return 0; }
+            var t: ImPairList = self.seen;
+            self.seen = self.scratch;
+            self.scratch = t;
+        }
+        self.current.clear();
+        if (self.current.reserve(n) == 0) { return 0; }
+        if (n > 0) { memcpy(self.current.data, pairs, n * 16); }
+        self.current.len = n;
+        # Manifold keys arrive sorted already; this is then a linear check.
+        if (self.current.is_sorted() == 0) {
+            if (self.scratch.reserve(n) == 0) { return 0; }
+            _im_pairs_sort(self.current.data, n, self.scratch.data);
+        }
+        self.current.dedup();
+        self.recorded = 1;
+        return 1;
+    }
+
+    # Appends event (kind, a, b): 1, or 0 when there is no memory.
+    fn _emit(self, kind, a, b): i64 {
+        if (self.event_count == self.event_cap) {
+            var cap = self.event_cap * 2;
+            if (cap < 8) { cap = 8; }
+            var e = fl_alloc(cap * sizeof(ImCollisionEvent));
+            if (e == 0) { return 0; }
+            if (self.event_count > 0) {
+                memcpy(e, self.events, self.event_count * sizeof(ImCollisionEvent));
+            }
+            if (self.events != 0) { fl_free(self.events); }
+            self.events = e;
+            self.event_cap = cap;
+        }
+        var p = self.events + self.event_count * sizeof(ImCollisionEvent);
+        store64(p, kind);
+        store64(p + 8, a);
+        store64(p + 16, b);
+        self.event_count = self.event_count + 1;
+        return 1;
+    }
+
+    # Closes the frame and returns its event count, or -1 when there is no memory; read them with
+    # `event(i)`. Order: pairs touching now (`Started`/`Ongoing`), then pairs that stopped
+    # (`Stopped`, after a `Started` for contacts that began this frame). Mirrors `finish`.
+    fn finish(self): i64 {
+        self.event_count = 0;
+        for (var i = 0; i < self.current.len; i = i + 1) {
+            var a = self.current.first(i);
+            var b = self.current.second(i);
+            var kind = IM_EVENT_STARTED;
+            if (self.prev.contains(a, b) == 1) { kind = IM_EVENT_ONGOING; }
+            if (self._emit(kind, a, b) == 0) { return 0 - 1; }
+        }
+        var cand: ImPairList = self.prev;
+        if (self.seen.len > 0) {
+            if (self.scratch.set_union(self.prev, self.seen) == 0) { return 0 - 1; }
+            cand = self.scratch;
+        }
+        for (var i = 0; i < cand.len; i = i + 1) {
+            var a = cand.first(i);
+            var b = cand.second(i);
+            if (self.current.contains(a, b) == 0) {
+                if (self.prev.contains(a, b) == 0) {
+                    # Touched only within this frame.
+                    if (self._emit(IM_EVENT_STARTED, a, b) == 0) { return 0 - 1; }
+                }
+                if (self._emit(IM_EVENT_STOPPED, a, b) == 0) { return 0 - 1; }
+            }
+        }
+        var t: ImPairList = self.prev;
+        self.prev = self.current;
+        self.current = t;
+        self.current.clear();
+        self.seen.clear();
+        self.recorded = 0;
+        return self.event_count;
+    }
+
+    # Event i of the last `finish`, valid until the next one.
+    #must_use
+    fn event(self, i): *ImCollisionEvent {
+        return self.events + i * sizeof(ImCollisionEvent);
+    }
+
+    # 1 when any pair was touching at the end of the previous frame. Mirrors
+    # `has_previous_contacts`.
+    #must_use
+    fn has_previous_contacts(self): i64 {
+        if (self.prev.len > 0) { return 1; }
+        return 0;
+    }
+
+    # Forgets every pair involving one of the `n` collider handles at `colliders`, so no `Stopped`
+    # is reported for them (backends call it when colliders are removed). Mirrors
+    # `forget_colliders`.
+    fn forget_colliders(self, colliders, n) {
+        self.prev.forget(colliders, n);
+        self.current.forget(colliders, n);
+        self.seen.forget(colliders, n);
+        return 0;
+    }
+
+    # Releases the tracker's buffers.
+    fn free(self) {
+        self.prev.free();
+        self.current.free();
+        self.seen.free();
+        self.scratch.free();
+        if (self.events != 0) { fl_free(self.events); }
+        self.events = 0;
+        self.event_count = 0;
+        self.event_cap = 0;
+        return 0;
+    }
+}
+
+# --- spring.cyr ---
+
+# spring.cyr — standalone damped springs for animation: no world, bodies or colliders (port of
+# rust-old/src/spring.rs).
+#
+# The step is the exact solution of x'' = −k·(x − target) − c·x', linear in (displacement, velocity):
+# [y; v] = M·[y0; v0], with M a function of (dt, k, c) alone, cached for the fixed-timestep case.
+# Every expression keeps Rust's operation order, so a cached step (× and + only) is class B and the
+# transition (exp, sin, cos) class C (port plan §5). exp and sin/cos go through `_im_exp` and
+# `_im_sin_cos`, the polyfills, so the bits are the same on every target (ADR 0008 #7).
+#
+#     var s: ImSpring = ImSpring_new(0.0, 100.0, 300.0, 15.0);
+#     while (s.is_settled() == 0) { s.step(dt); draw_at(s.position()); }
+
+# A 1D spring that animates a value toward a target. `cache_*` hold the last transition and its key
+# (dt, stiffness, damping); the cache is not part of equality or serialization, as in Rust.
+struct ImSpring {
+    position: f64;
+    velocity: f64;
+    target: f64;
+    stiffness: f64;
+    damping: f64;
+    settle_threshold: f64;
+    cache_valid;
+    cache_dt: f64;
+    cache_k: f64;
+    cache_c: f64;
+    m0: f64;
+    m1: f64;
+    m2: f64;
+    m3: f64;
+}
+
+# A spring from `from` toward `to`. Stiffness: force per unit displacement (try 100–500 for UI).
+# Damping: critical is 2·√stiffness (try 10–30 for UI). Settles within 0.01. Mirrors `Spring::new`.
+#must_use
+fn ImSpring_new(from: f64, to: f64, stiffness: f64, damping: f64): ImSpring {
+    var s: ImSpring;
+    s.position = from;
+    s.velocity = 0.0;
+    s.target = to;
+    s.stiffness = stiffness;
+    s.damping = damping;
+    s.settle_threshold = 0.01;
+    s.cache_valid = 0;
+    s.cache_dt = 0.0;
+    s.cache_k = 0.0;
+    s.cache_c = 0.0;
+    s.m0 = 0.0;
+    s.m1 = 0.0;
+    s.m2 = 0.0;
+    s.m3 = 0.0;
+    return s;
+}
+
+# A critically damped spring (no overshoot); a negative stiffness counts as its magnitude. Mirrors
+# `Spring::critically_damped`.
+#must_use
+fn ImSpring_critically_damped(from: f64, to: f64, stiffness: f64): ImSpring {
+    var k: f64 = f64_abs(stiffness);
+    var r: f64 = f64_sqrt(k);
+    var c: f64 = 2.0 * r;
+    return ImSpring_new(from, to, k, c);
+}
+
+# An over-damped spring (slow approach, no overshoot). Mirrors `Spring::over_damped`.
+#must_use
+fn ImSpring_over_damped(from: f64, to: f64, stiffness: f64): ImSpring {
+    var k: f64 = f64_abs(stiffness);
+    var r: f64 = f64_sqrt(k);
+    var c: f64 = 3.0 * r;
+    return ImSpring_new(from, to, k, c);
+}
+
+# An under-damped spring (bouncy overshoot). Mirrors `Spring::under_damped`.
+#must_use
+fn ImSpring_under_damped(from: f64, to: f64, stiffness: f64): ImSpring {
+    var k: f64 = f64_abs(stiffness);
+    var r: f64 = f64_sqrt(k);
+    var c: f64 = 0.5 * r;
+    return ImSpring_new(from, to, k, c);
+}
+
+impl ImSpring {
+    # Sets m0..m3 to the transition `[m00, m01, m10, m11]` of y'' = −k·y − c·y' over dt. Mirrors
+    # `transition`.
+    fn _transition(self, k: f64, c: f64, dt: f64) {
+        var alpha: f64 = 0.5 * c;
+        var disc: f64 = alpha * alpha - k;
+        var ak: f64 = f64_abs(k);
+        var scale: f64 = alpha * alpha + ak;
+        var ad: f64 = f64_abs(disc);
+        var na: f64 = -alpha;
+        if (ad <= 0.000000001 * scale || scale == 0.0) {
+            # Critically damped (or free motion when k = c = 0).
+            var e: f64 = _im_exp(na * dt);
+            var ne: f64 = -e;
+            self.m0 = e * (1.0 + alpha * dt);
+            self.m1 = e * dt;
+            self.m2 = ((ne * alpha) * alpha) * dt;
+            self.m3 = e * (1.0 - alpha * dt);
+        } elif (disc < 0.0) {
+            # Under-damped.
+            var nd: f64 = -disc;
+            var wd: f64 = f64_sqrt(nd);
+            var e: f64 = _im_exp(na * dt);
+            var ne: f64 = -e;
+            var sn, cs = _im_sin_cos(wd * dt);
+            var sin: f64 = sn;
+            var cos: f64 = cs;
+            var aw: f64 = alpha / wd;
+            self.m0 = e * (cos + aw * sin);
+            self.m1 = (e * sin) / wd;
+            self.m2 = ((ne * k) / wd) * sin;
+            self.m3 = e * (cos - aw * sin);
+        } else {
+            # Over-damped: two real roots.
+            var beta: f64 = f64_sqrt(disc);
+            var r1: f64 = na + beta;
+            var r2: f64 = na - beta;
+            var d: f64 = r1 - r2;
+            var e1: f64 = _im_exp(r1 * dt);
+            var e2: f64 = _im_exp(r2 * dt);
+            self.m0 = (r1 * e2 - r2 * e1) / d;
+            self.m1 = (e1 - e2) / d;
+            self.m2 = ((r1 * r2) * (e2 - e1)) / d;
+            self.m3 = (r1 * e1 - r2 * e2) / d;
+        }
+        return 0;
+    }
+
+    # Advances the spring by dt seconds, exactly: one step of a second lands where many smaller ones
+    # do, and no dt or stiffness can make it explode. A non-positive or NaN dt does nothing; an
+    # infinite one snaps a damped spring. Mirrors `Spring::step`.
+    fn step(self, dt: f64) {
+        if (_im_is_nan(dt) == 1 || dt <= 0.0) { return 0; }
+        var k: f64 = self.stiffness;
+        var c: f64 = self.damping;
+        if (_im_is_finite(dt) == 0) {
+            if (c > 0.0 && k >= 0.0) { self.snap(); }
+            return 0;
+        }
+        var hit = 0;
+        if (self.cache_valid == 1) {
+            var cdt: f64 = self.cache_dt;
+            var ck: f64 = self.cache_k;
+            var cc: f64 = self.cache_c;
+            if (cdt == dt && ck == k && cc == c) { hit = 1; }
+        }
+        if (hit == 0) {
+            self._transition(k, c, dt);
+            self.cache_valid = 1;
+            self.cache_dt = dt;
+            self.cache_k = k;
+            self.cache_c = c;
+        }
+        var m0: f64 = self.m0;
+        var m1: f64 = self.m1;
+        var m2: f64 = self.m2;
+        var m3: f64 = self.m3;
+        var p: f64 = self.position;
+        var t: f64 = self.target;
+        var y0: f64 = p - t;
+        var v0: f64 = self.velocity;
+        var y: f64 = m0 * y0 + m1 * v0;
+        var v: f64 = m2 * y0 + m3 * v0;
+        if (_im_is_finite(y) == 1 && _im_is_finite(v) == 1) {
+            self.position = t + y;
+            self.velocity = v;
+        }
+        return 0;
+    }
+
+    # Current position. Mirrors `Spring::position`.
+    #must_use
+    fn position(self): f64 {
+        var r: f64 = self.position;
+        return r;
+    }
+
+    # Current velocity. Mirrors `Spring::velocity`.
+    #must_use
+    fn velocity(self): f64 {
+        var r: f64 = self.velocity;
+        return r;
+    }
+
+    # Target position. Mirrors `Spring::target`.
+    #must_use
+    fn target(self): f64 {
+        var r: f64 = self.target;
+        return r;
+    }
+
+    # Sets a new target (the user dragged the window). Mirrors `Spring::set_target`.
+    fn set_target(self, target: f64) {
+        self.target = target;
+        return 0;
+    }
+
+    # Sets the position directly (teleport). Mirrors `Spring::set_position`.
+    fn set_position(self, position: f64) {
+        self.position = position;
+        return 0;
+    }
+
+    # Adds velocity (a fling). Mirrors `Spring::add_velocity`.
+    fn add_velocity(self, v: f64) {
+        var cur: f64 = self.velocity;
+        self.velocity = cur + v;
+        return 0;
+    }
+
+    # Sets the velocity directly. Mirrors `Spring::set_velocity`.
+    fn set_velocity(self, v: f64) {
+        self.velocity = v;
+        return 0;
+    }
+
+    # 1 when |position − target| and |velocity| are both below the settle threshold. Mirrors
+    # `Spring::is_settled`.
+    #must_use
+    fn is_settled(self): i64 {
+        var p: f64 = self.position;
+        var t: f64 = self.target;
+        var d: f64 = p - t;
+        var ad: f64 = f64_abs(d);
+        var v: f64 = self.velocity;
+        var av: f64 = f64_abs(v);
+        var thr: f64 = self.settle_threshold;
+        if (ad < thr && av < thr) { return 1; }
+        return 0;
+    }
+
+    # Sets the settle threshold. Mirrors `Spring::set_settle_threshold`.
+    fn set_settle_threshold(self, threshold: f64) {
+        self.settle_threshold = threshold;
+        return 0;
+    }
+
+    # Snaps to the target with no velocity. Mirrors `Spring::snap`.
+    fn snap(self) {
+        var t: f64 = self.target;
+        self.position = t;
+        self.velocity = 0.0;
+        return 0;
+    }
+
+    # Stiffness. Mirrors `Spring::stiffness`.
+    #must_use
+    fn stiffness(self): f64 {
+        var r: f64 = self.stiffness;
+        return r;
+    }
+
+    # Damping. Mirrors `Spring::damping`.
+    #must_use
+    fn damping(self): f64 {
+        var r: f64 = self.damping;
+        return r;
+    }
+
+    # Sets the stiffness. Mirrors `Spring::set_stiffness`.
+    fn set_stiffness(self, stiffness: f64) {
+        self.stiffness = stiffness;
+        return 0;
+    }
+
+    # Sets the damping. Mirrors `Spring::set_damping`.
+    fn set_damping(self, damping: f64) {
+        self.damping = damping;
+        return 0;
+    }
+
+    # 1 when the six serialized fields are equal (f64 ==, so NaN is unequal); the cache is ignored.
+    # Mirrors `PartialEq for Spring`.
+    #must_use
+    fn eq(self, o: *ImSpring): i64 {
+        var a0: f64 = self.position;
+        var b0: f64 = o.position;
+        var a1: f64 = self.velocity;
+        var b1: f64 = o.velocity;
+        var a2: f64 = self.target;
+        var b2: f64 = o.target;
+        var a3: f64 = self.stiffness;
+        var b3: f64 = o.stiffness;
+        var a4: f64 = self.damping;
+        var b4: f64 = o.damping;
+        var a5: f64 = self.settle_threshold;
+        var b5: f64 = o.settle_threshold;
+        if (a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5) { return 1; }
+        return 0;
+    }
+}
+
+# A 2D spring: two independent axes. Mirrors `Spring2d`.
+struct ImSpring2d { x: ImSpring; y: ImSpring; }
+
+# A 2D spring from `from` toward `to`. Mirrors `Spring2d::new`.
+#must_use
+fn ImSpring2d_new(from: ImVec2, to: ImVec2, stiffness: f64, damping: f64): ImSpring2d {
+    var s: ImSpring2d;
+    s.x = ImSpring_new(from.x, to.x, stiffness, damping);
+    s.y = ImSpring_new(from.y, to.y, stiffness, damping);
+    return s;
+}
+
+# A critically damped 2D spring. Mirrors `Spring2d::critically_damped`.
+#must_use
+fn ImSpring2d_critically_damped(from: ImVec2, to: ImVec2, stiffness: f64): ImSpring2d {
+    var s: ImSpring2d;
+    s.x = ImSpring_critically_damped(from.x, to.x, stiffness);
+    s.y = ImSpring_critically_damped(from.y, to.y, stiffness);
+    return s;
+}
+
+impl ImSpring2d {
+    # Steps both axes. Mirrors `Spring2d::step`.
+    fn step(self, dt: f64) {
+        self.x.step(dt);
+        self.y.step(dt);
+        return 0;
+    }
+
+    # The position (x, y). Mirrors `Spring2d::position`.
+    #must_use
+    fn position(self): ImVec2 {
+        var px: f64 = self.x.position;
+        var py: f64 = self.y.position;
+        return ImVec2_new(px, py);
+    }
+
+    # Sets the target. Mirrors `Spring2d::set_target`.
+    fn set_target(self, target: ImVec2) {
+        self.x.set_target(target.x);
+        self.y.set_target(target.y);
+        return 0;
+    }
+
+    # 1 when both axes have settled. Mirrors `Spring2d::is_settled`.
+    #must_use
+    fn is_settled(self): i64 {
+        if (self.x.is_settled() == 1 && self.y.is_settled() == 1) { return 1; }
+        return 0;
+    }
+
+    # Snaps to the target. Mirrors `Spring2d::snap`.
+    fn snap(self) {
+        self.x.snap();
+        self.y.snap();
+        return 0;
+    }
+
+    # Adds velocity. Mirrors `Spring2d::add_velocity`.
+    fn add_velocity(self, v: ImVec2) {
+        self.x.add_velocity(v.x);
+        self.y.add_velocity(v.y);
+        return 0;
+    }
+}
+
+# A 3D spring: three independent axes. Mirrors `Spring3d`.
+struct ImSpring3d { x: ImSpring; y: ImSpring; z: ImSpring; }
+
+# A 3D spring from `from` toward `to`. Mirrors `Spring3d::new`.
+#must_use
+fn ImSpring3d_new(from: ImVec3, to: ImVec3, stiffness: f64, damping: f64): ImSpring3d {
+    var s: ImSpring3d;
+    s.x = ImSpring_new(from.x, to.x, stiffness, damping);
+    s.y = ImSpring_new(from.y, to.y, stiffness, damping);
+    s.z = ImSpring_new(from.z, to.z, stiffness, damping);
+    return s;
+}
+
+# A critically damped 3D spring. Mirrors `Spring3d::critically_damped`.
+#must_use
+fn ImSpring3d_critically_damped(from: ImVec3, to: ImVec3, stiffness: f64): ImSpring3d {
+    var s: ImSpring3d;
+    s.x = ImSpring_critically_damped(from.x, to.x, stiffness);
+    s.y = ImSpring_critically_damped(from.y, to.y, stiffness);
+    s.z = ImSpring_critically_damped(from.z, to.z, stiffness);
+    return s;
+}
+
+impl ImSpring3d {
+    # Steps all axes. Mirrors `Spring3d::step`.
+    fn step(self, dt: f64) {
+        self.x.step(dt);
+        self.y.step(dt);
+        self.z.step(dt);
+        return 0;
+    }
+
+    # The position (x, y, z). Mirrors `Spring3d::position`.
+    #must_use
+    fn position(self): ImVec3 {
+        var px: f64 = self.x.position;
+        var py: f64 = self.y.position;
+        var pz: f64 = self.z.position;
+        return ImVec3_new(px, py, pz);
+    }
+
+    # Sets the target. Mirrors `Spring3d::set_target`.
+    fn set_target(self, target: ImVec3) {
+        self.x.set_target(target.x);
+        self.y.set_target(target.y);
+        self.z.set_target(target.z);
+        return 0;
+    }
+
+    # 1 when all axes have settled. Mirrors `Spring3d::is_settled`.
+    #must_use
+    fn is_settled(self): i64 {
+        if (self.x.is_settled() == 1 && self.y.is_settled() == 1 && self.z.is_settled() == 1) {
+            return 1;
+        }
+        return 0;
+    }
+
+    # Snaps to the target. Mirrors `Spring3d::snap`.
+    fn snap(self) {
+        self.x.snap();
+        self.y.snap();
+        self.z.snap();
+        return 0;
+    }
+
+    # Adds velocity. Mirrors `Spring3d::add_velocity`.
+    fn add_velocity(self, v: ImVec3) {
+        self.x.add_velocity(v.x);
+        self.y.add_velocity(v.y);
+        self.z.add_velocity(v.z);
+        return 0;
+    }
+}
+
 # --- json.cyr ---
 
 # json.cyr — serde-compatible JSON (ADR 0010): the same documents the Rust crate's serde_json writes
 # and reads.
 #
 # Writers append to a `str_builder`, fields in Rust declaration order, f64 through src/fmtf.cyr's
-# serde_json form. Readers parse with bayan's value tree (never the derive scanner, whose open
-# defects malformed input could reach) into one decode arena reset per call, so decoding never grows
-# the heap, and apply serde's derive semantics:
+# serde_json form, handles as unsigned decimals. Readers parse with bayan's value tree (never the
+# derive scanner, whose open defects malformed input could reach) into one decode arena reset per
+# call, so decoding never grows the heap, and apply serde's derive semantics, as serde_json 1.0.154
+# was probed to (port-parity.md §7):
+# - a struct reads from an object (by field name) or from an array (by position, serde's sequence
+#   form). In an array, trailing `#[serde(default)]` fields may be left off; an `Option` field
+#   without a default may not, nor may there be extra elements;
 # - a required field missing, a value of the wrong JSON type, an array of the wrong length, or an enum
 #   name that is no variant is Err(IM_ERR_DESERIALIZE);
 # - a `#[serde(default)]` field may be absent (its default), and so may an `Option` field (None);
-# - unknown fields are ignored; a duplicate key refuses the document (bayan);
+# - unknown fields are ignored; a duplicate key refuses the document (bayan; see S4 below);
+# - an enum is externally tagged: a unit variant is `"Name"` or `{"Name":null}`, a struct variant
+#   `{"Name":{..}}` or `{"Name":[..]}`, one key only;
 # - an f64 takes a JSON integer or float, never `null` (serde_json writes NaN and ±∞ as `null` and
 #   can't read them back, nor can the port);
-# - a u32 takes a JSON integer in 0..=4294967295 only (`4.0` and `-1` are refused).
-# Not thread-safe: the decode arena is module state.
+# - a u32 takes a JSON integer in 0..=4294967295 only (`4.0` and `-1` are refused), a handle (u64) a
+#   non-negative integer.
+# Two bayan policies are stricter than serde_json (port plan §8): an integer above i64::MAX refuses
+# the document (S3: a handle at generation ≥ 2^31, which serde_json writes), and so does any
+# duplicate key, even one serde would ignore (S4). Not thread-safe: the decode arena is module state.
 
 include "lib/bayan.cyr"
 include "lib/str.cyr"
@@ -1195,6 +2801,32 @@ fn _im_jw_name(sb, s) {
     return 0;
 }
 
+# Appends the word x as an unsigned decimal (a u64: handles, `step`).
+fn _im_jw_u64(sb, x) {
+    if (x >= 0) {
+        str_builder_add_int(sb, x);
+        return 0;
+    }
+    # x ≥ 2^63 unsigned: x = 10·q + r with q = (x >>> 1) / 5 (logical shift).
+    var q = (x >> 1) / 5;
+    var r = x - q * 10;
+    str_builder_add_int(sb, q);
+    str_builder_putc(sb, 48 + r);
+    return 0;
+}
+
+# Appends `[x,y]`.
+fn _im_jw_vec2(sb, v: ImVec2) {
+    var x: f64 = v.x;
+    var y: f64 = v.y;
+    str_builder_putc(sb, 91);
+    im_fmt_f64_json(sb, x);
+    str_builder_putc(sb, 44);
+    im_fmt_f64_json(sb, y);
+    str_builder_putc(sb, 93);
+    return 0;
+}
+
 # Appends `[x,y,z]`.
 fn _im_jw_vec3(sb, v: ImVec3) {
     var x: f64 = v.x;
@@ -1207,6 +2839,54 @@ fn _im_jw_vec3(sb, v: ImVec3) {
     str_builder_putc(sb, 44);
     im_fmt_f64_json(sb, z);
     str_builder_putc(sb, 93);
+    return 0;
+}
+
+# Appends the `n` f64 words at p as `[a,b,..]`.
+fn _im_jw_f64_list(sb, p, n) {
+    str_builder_putc(sb, 91);
+    for (var i = 0; i < n; i = i + 1) {
+        if (i > 0) { str_builder_putc(sb, 44); }
+        var x: f64 = load64(p + i * 8);
+        im_fmt_f64_json(sb, x);
+    }
+    str_builder_putc(sb, 93);
+    return 0;
+}
+
+# Appends the `n` triples of words at p as `[[a,b,c],..]`: f64 when `is_f64` is 1, else integers.
+fn _im_jw_triples(sb, p, n, is_f64) {
+    str_builder_putc(sb, 91);
+    for (var i = 0; i < n; i = i + 1) {
+        if (i > 0) { str_builder_putc(sb, 44); }
+        str_builder_putc(sb, 91);
+        for (var j = 0; j < 3; j = j + 1) {
+            if (j > 0) { str_builder_putc(sb, 44); }
+            var w = load64(p + (i * 3 + j) * 8);
+            if (is_f64 == 1) {
+                var x: f64 = w;
+                im_fmt_f64_json(sb, x);
+            } else {
+                str_builder_add_int(sb, w);
+            }
+        }
+        str_builder_putc(sb, 93);
+    }
+    str_builder_putc(sb, 93);
+    return 0;
+}
+
+# Appends an `Option<f64>`: the number, or `null` without one.
+fn _im_jw_opt_f64(sb, has, x: f64) {
+    if (has == 1) { im_fmt_f64_json(sb, x); } else { str_builder_add_cstr(sb, "null"); }
+    return 0;
+}
+
+# Appends `{"Name":` for a struct variant (closed by the caller's two `}`).
+fn _im_jw_variant(sb, name) {
+    str_builder_putc(sb, 123);
+    _im_jw_name(sb, name);
+    str_builder_putc(sb, 58);
     return 0;
 }
 
@@ -1224,10 +2904,30 @@ fn _im_jr_parse(buf, len): i64 {
     return bayan_json_v_parse_buf_a(_im_json_arena, buf, len);
 }
 
-# Field `key` of object `obj`, or 0 when absent.
+# The form of struct node v with `n` fields: 1 an object, 2 an array of at most n elements (serde's
+# sequence form), 0 anything else.
 #must_use
-fn _im_jr_field(obj, key): i64 {
-    return bayan_json_v_obj_get_by_cstr(obj, key);
+fn _im_jr_form(v, n): i64 {
+    if (v == 0) { return 0; }
+    var tag = bayan_json_v_tag(v);
+    if (tag == JTAG_OBJ) { return 1; }
+    if (tag == JTAG_ARR && bayan_json_v_arr_len(v) <= n) { return 2; }
+    return 0;
+}
+
+# Field i, named `name`, of struct node v in `form`: its value, or 0 when absent.
+#must_use
+fn _im_jr_at(v, form, i, name): i64 {
+    if (form == 1) { return bayan_json_v_obj_get_by_cstr(v, name); }
+    if (i < bayan_json_v_arr_len(v)) { return bayan_json_v_arr_get(v, i); }
+    return 0;
+}
+
+# 1 when v is JSON null.
+#must_use
+fn _im_jr_is_null(v): i64 {
+    if (v != 0 && bayan_json_v_tag(v) == JTAG_NULL) { return 1; }
+    return 0;
 }
 
 # A JSON number as an f64 into *out: 1, or 0 for any other value (null included).
@@ -1249,6 +2949,16 @@ fn _im_jr_int(v, lo, hi, out): i64 {
     return 1;
 }
 
+# A handle (u64) into *out: 1, or 0. bayan has no integer above i64::MAX (S3).
+fn _im_jr_u64(v, out): i64 {
+    return _im_jr_int(v, 0, 0x7FFFFFFFFFFFFFFF, out);
+}
+
+# A u32 into *out: 1, or 0.
+fn _im_jr_u32(v, out): i64 {
+    return _im_jr_int(v, 0, 4294967295, out);
+}
+
 # A JSON boolean into *out (0 / 1): 1, or 0.
 fn _im_jr_bool(v, out): i64 {
     if (v == 0) { return 0; }
@@ -1257,14 +2967,31 @@ fn _im_jr_bool(v, out): i64 {
     return 1;
 }
 
+# A JSON array of exactly n numbers into the n words at out: 1, or 0.
+fn _im_jr_f64s(v, n, out): i64 {
+    if (v == 0) { return 0; }
+    if (bayan_json_v_tag(v) != JTAG_ARR || bayan_json_v_arr_len(v) != n) { return 0; }
+    for (var i = 0; i < n; i = i + 1) {
+        if (_im_jr_f64(bayan_json_v_arr_get(v, i), out + i * 8) == 0) { return 0; }
+    }
+    return 1;
+}
+
+# A JSON array of exactly 2 numbers into *out (an ImVec2): 1, or 0.
+fn _im_jr_vec2(v, out: *ImVec2): i64 {
+    var w[16];
+    if (_im_jr_f64s(v, 2, &w) == 0) { return 0; }
+    var x: f64 = load64(&w);
+    var y: f64 = load64(&w + 8);
+    out.x = x;
+    out.y = y;
+    return 1;
+}
+
 # A JSON array of exactly 3 numbers into *out (an ImVec3): 1, or 0.
 fn _im_jr_vec3(v, out: *ImVec3): i64 {
-    if (v == 0) { return 0; }
-    if (bayan_json_v_tag(v) != JTAG_ARR || bayan_json_v_arr_len(v) != 3) { return 0; }
     var w[24];
-    for (var i = 0; i < 3; i = i + 1) {
-        if (_im_jr_f64(bayan_json_v_arr_get(v, i), &w + i * 8) == 0) { return 0; }
-    }
+    if (_im_jr_f64s(v, 3, &w) == 0) { return 0; }
     var x: f64 = load64(&w);
     var y: f64 = load64(&w + 8);
     var z: f64 = load64(&w + 16);
@@ -1274,12 +3001,20 @@ fn _im_jr_vec3(v, out: *ImVec3): i64 {
     return 1;
 }
 
-# A unit variant: the JSON string naming one of the `count` variants (`name_fn(v)`), into *out: 1, or
-# 0 for any other value.
+# A unit variant into *out: the JSON string naming one of the `count` variants (`name_fn(k)`), or the
+# one-key object `{"Name":null}`. 1, or 0 for any other value.
 fn _im_jr_enum(v, name_fn, count, out): i64 {
     if (v == 0) { return 0; }
-    if (bayan_json_v_tag(v) != JTAG_STR) { return 0; }
-    var s = bayan_json_v_str(v);
+    var tag = bayan_json_v_tag(v);
+    var s = 0;
+    if (tag == JTAG_STR) {
+        s = bayan_json_v_str(v);
+    } elif (tag == JTAG_OBJ && bayan_json_v_obj_len(v) == 1) {
+        if (_im_jr_is_null(bayan_json_v_obj_val(v, 0)) == 0) { return 0; }
+        s = bayan_json_v_obj_key(v, 0);
+    } else {
+        return 0;
+    }
     for (var k = 0; k < count; k = k + 1) {
         if (str_eq_cstr(s, fncall1(name_fn, k)) == 1) {
             store64(out, k);
@@ -1287,6 +3022,123 @@ fn _im_jr_enum(v, name_fn, count, out): i64 {
         }
     }
     return 0;
+}
+
+# An externally tagged payload enum: the variant (one of `count`, named by `name_fn`) into *kind and
+# its payload node into *payload, 0 for the bare-string form. 1, or 0 when v is neither a string nor
+# a one-key object, or names no variant.
+fn _im_jr_tagged(v, name_fn, count, kind, payload): i64 {
+    if (v == 0) { return 0; }
+    var tag = bayan_json_v_tag(v);
+    var s = 0;
+    store64(payload, 0);
+    if (tag == JTAG_STR) {
+        s = bayan_json_v_str(v);
+    } elif (tag == JTAG_OBJ && bayan_json_v_obj_len(v) == 1) {
+        s = bayan_json_v_obj_key(v, 0);
+        store64(payload, bayan_json_v_obj_val(v, 0));
+    } else {
+        return 0;
+    }
+    for (var k = 0; k < count; k = k + 1) {
+        if (str_eq_cstr(s, fncall1(name_fn, k)) == 1) {
+            store64(kind, k);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+# A unit variant's payload: the bare-string form (0) or `null`. 1 when valid.
+#must_use
+fn _im_jr_unit_ok(p): i64 {
+    if (p == 0 || _im_jr_is_null(p) == 1) { return 1; }
+    return 0;
+}
+
+# A field with a serde default, read by `fn_read(v, out)`: 1 read, 2 absent (keep the default), 0
+# malformed.
+fn _im_jr_def(v, fn_read, out): i64 {
+    if (v == 0) { return 2; }
+    return fncall2(fn_read, v, out);
+}
+
+# An `Option` field with a serde default: 1 read, 2 absent or null (None), 0 malformed.
+fn _im_jr_opt_def(v, fn_read, out): i64 {
+    if (v == 0 || _im_jr_is_null(v) == 1) { return 2; }
+    return fncall2(fn_read, v, out);
+}
+
+# An `Option` field without a default, in `form`: as `_im_jr_opt_def`, except that a sequence-form
+# struct must carry it (an absent element is too short an array).
+fn _im_jr_opt(v, form, fn_read, out): i64 {
+    if (v == 0 && form == 2) { return 0; }
+    return _im_jr_opt_def(v, fn_read, out);
+}
+
+# A JSON array of f64 into a freelist buffer: *words and *count. 1, or 0 (nothing allocated).
+fn _im_jr_f64_list(v, words, count): i64 {
+    store64(words, 0);
+    store64(count, 0);
+    if (v == 0 || bayan_json_v_tag(v) != JTAG_ARR) { return 0; }
+    var n = bayan_json_v_arr_len(v);
+    if (n == 0) { return 1; }
+    var p = fl_alloc(n * 8);
+    if (p == 0) { return 0; }
+    for (var i = 0; i < n; i = i + 1) {
+        if (_im_jr_f64(bayan_json_v_arr_get(v, i), p + i * 8) == 0) {
+            fl_free(p);
+            return 0;
+        }
+    }
+    store64(words, p);
+    store64(count, n);
+    return 1;
+}
+
+# A JSON array of triples into a freelist buffer of 3·n words: f64 triples when `is_f64` is 1, else
+# u32 triples. *words and *count. 1, or 0 (nothing allocated).
+fn _im_jr_triples(v, is_f64, words, count): i64 {
+    store64(words, 0);
+    store64(count, 0);
+    if (v == 0 || bayan_json_v_tag(v) != JTAG_ARR) { return 0; }
+    var n = bayan_json_v_arr_len(v);
+    if (n == 0) { return 1; }
+    var p = fl_alloc(n * 24);
+    if (p == 0) { return 0; }
+    for (var i = 0; i < n; i = i + 1) {
+        var e = bayan_json_v_arr_get(v, i);
+        var ok = 0;
+        if (is_f64 == 1) {
+            ok = _im_jr_f64s(e, 3, p + i * 24);
+        } elif (e != 0 && bayan_json_v_tag(e) == JTAG_ARR && bayan_json_v_arr_len(e) == 3) {
+            ok = 1;
+            for (var j = 0; j < 3; j = j + 1) {
+                if (_im_jr_u32(bayan_json_v_arr_get(e, j), p + i * 24 + j * 8) == 0) { ok = 0; }
+            }
+        }
+        if (ok == 0) {
+            fl_free(p);
+            return 0;
+        }
+    }
+    store64(words, p);
+    store64(count, n);
+    return 1;
+}
+
+# The enum readers `_im_jr_def` can call (one word out).
+fn _im_jr_broadphase(v, out): i64 { return _im_jr_enum(v, &broadphase_kind_name, 2, out); }
+fn _im_jr_solver(v, out): i64 { return _im_jr_enum(v, &solver_kind_name, 2, out); }
+fn _im_jr_combine(v, out): i64 { return _im_jr_enum(v, &combine_rule_name, 4, out); }
+fn _im_jr_body_type(v, out): i64 { return _im_jr_enum(v, &body_type_name, 3, out); }
+fn _im_jr_unit(v, out): i64 { return _im_jr_enum(v, &physics_unit_name, 14, out); }
+
+# Ok(0) when ok is 1, else Err(IM_ERR_DESERIALIZE).
+#must_use
+fn _im_jr_result(ok): Result {
+    if (ok == 1) { return Ok(0); }
+    return Err(IM_ERR_DESERIALIZE);
 }
 
 # ── WorldConfig ─────────────────────────────────────────────────────────────────────
@@ -1312,7 +3164,7 @@ impl ImWorldConfig {
         _im_jw_key(sb, "deterministic", 0);
         _im_jw_bool(sb, self.deterministic);
         _im_jw_key(sb, "step", 0);
-        str_builder_add_int(sb, self.step);
+        _im_jw_u64(sb, self.step);
         _im_jw_key(sb, "position_slop", 0);
         im_fmt_f64_json(sb, slop);
         _im_jw_key(sb, "position_correction", 0);
@@ -1334,90 +3186,75 @@ impl ImWorldConfig {
     }
 }
 
-# Reads a `WorldConfig` document from [buf, buf + len) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
-# timestep, gravity, the iteration counts, deterministic and step are required; the rest default as
-# `WorldConfig::default` (serde's defaults). Mirrors `serde_json::from_str::<WorldConfig>`.
-#must_use
-fn ImWorldConfig_from_json(buf, len, out: *ImWorldConfig): Result {
-    var o = _im_jr_parse(buf, len);
-    if (o == 0 || bayan_json_v_tag(o) != JTAG_OBJ) { return Err(IM_ERR_DESERIALIZE); }
+# Reads the `WorldConfig` node o into *out: 1, or 0 when malformed. timestep, gravity, the iteration
+# counts, deterministic and step are required; the rest default as `WorldConfig::default`.
+fn _im_jr_config(o, out: *ImWorldConfig): i64 {
+    var f = _im_jr_form(o, 14);
+    if (f == 0) { return 0; }
     var c: ImWorldConfig = ImWorldConfig_default();
     var w[8];
-    if (_im_jr_f64(_im_jr_field(o, "timestep"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_f64(_im_jr_at(o, f, 0, "timestep"), &w) == 0) { return 0; }
     var ts: f64 = load64(&w);
     c.timestep = ts;
     var g: ImVec3 = ImVec3_zero();
-    if (_im_jr_vec3(_im_jr_field(o, "gravity"), &g) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_vec3(_im_jr_at(o, f, 1, "gravity"), &g) == 0) { return 0; }
     c.gravity = g;
-    if (_im_jr_int(_im_jr_field(o, "velocity_iterations"), 0, 4294967295, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_u32(_im_jr_at(o, f, 2, "velocity_iterations"), &w) == 0) { return 0; }
     c.velocity_iterations = load64(&w);
-    if (_im_jr_int(_im_jr_field(o, "position_iterations"), 0, 4294967295, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_u32(_im_jr_at(o, f, 3, "position_iterations"), &w) == 0) { return 0; }
     c.position_iterations = load64(&w);
-    if (_im_jr_bool(_im_jr_field(o, "deterministic"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_bool(_im_jr_at(o, f, 4, "deterministic"), &w) == 0) { return 0; }
     c.deterministic = load64(&w);
-    if (_im_jr_int(_im_jr_field(o, "step"), 0, 0x7FFFFFFFFFFFFFFF, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_u64(_im_jr_at(o, f, 5, "step"), &w) == 0) { return 0; }
     c.step = load64(&w);
-    var v = _im_jr_field(o, "position_slop");
-    if (v != 0) {
-        if (_im_jr_f64(v, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var r = _im_jr_def(_im_jr_at(o, f, 6, "position_slop"), &_im_jr_f64, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) {
         var a: f64 = load64(&w);
         c.position_slop = a;
     }
-    v = _im_jr_field(o, "position_correction");
-    if (v != 0) {
-        if (_im_jr_f64(v, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    r = _im_jr_def(_im_jr_at(o, f, 7, "position_correction"), &_im_jr_f64, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) {
         var b: f64 = load64(&w);
         c.position_correction = b;
     }
-    v = _im_jr_field(o, "max_velocity");
-    if (v != 0) {
-        if (_im_jr_f64(v, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    r = _im_jr_def(_im_jr_at(o, f, 8, "max_velocity"), &_im_jr_f64, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) {
         var mv: f64 = load64(&w);
         c.max_velocity = mv;
     }
-    v = _im_jr_field(o, "sub_steps");
-    if (v != 0) {
-        if (_im_jr_int(v, 0, 4294967295, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
-        c.sub_steps = load64(&w);
-    }
-    v = _im_jr_field(o, "constraint_frequency");
-    if (v != 0) {
-        if (_im_jr_f64(v, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    r = _im_jr_def(_im_jr_at(o, f, 9, "sub_steps"), &_im_jr_u32, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) { c.sub_steps = load64(&w); }
+    r = _im_jr_def(_im_jr_at(o, f, 10, "constraint_frequency"), &_im_jr_f64, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) {
         var fq: f64 = load64(&w);
         c.constraint_frequency = fq;
     }
-    v = _im_jr_field(o, "constraint_damping_ratio");
-    if (v != 0) {
-        if (_im_jr_f64(v, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    r = _im_jr_def(_im_jr_at(o, f, 11, "constraint_damping_ratio"), &_im_jr_f64, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) {
         var dr: f64 = load64(&w);
         c.constraint_damping_ratio = dr;
     }
-    v = _im_jr_field(o, "broadphase");
-    if (v != 0) {
-        if (_im_jr_enum(v, &broadphase_kind_name, 2, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
-        c.broadphase = load64(&w);
-    }
-    v = _im_jr_field(o, "solver");
-    if (v != 0) {
-        if (_im_jr_enum(v, &solver_kind_name, 2, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
-        c.solver = load64(&w);
-    }
+    r = _im_jr_def(_im_jr_at(o, f, 12, "broadphase"), &_im_jr_broadphase, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) { c.broadphase = load64(&w); }
+    r = _im_jr_def(_im_jr_at(o, f, 13, "solver"), &_im_jr_solver, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) { c.solver = load64(&w); }
     memcpy(out, &c, sizeof(ImWorldConfig));
-    return Ok(0);
-}
-
-# An optional f64 field: 0 when absent (*out untouched), 1 when read, -1 when not a number.
-fn _im_jr_opt_f64(o, key, out): i64 {
-    var v = _im_jr_field(o, key);
-    if (v == 0) { return 0; }
-    if (_im_jr_f64(v, out) == 0) { return 0 - 1; }
     return 1;
 }
 
-# Appends an `Option<f64>`: the number, or `null` without one.
-fn _im_jw_opt_f64(sb, has, x: f64) {
-    if (has == 1) { im_fmt_f64_json(sb, x); } else { str_builder_add_cstr(sb, "null"); }
-    return 0;
+# Reads a `WorldConfig` document from [buf, buf + len) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# Mirrors `serde_json::from_str::<WorldConfig>`.
+#must_use
+fn ImWorldConfig_from_json(buf, len, out: *ImWorldConfig): Result {
+    return _im_jr_result(_im_jr_config(_im_jr_parse(buf, len), out));
 }
 
 # ── PhysicsMaterial ─────────────────────────────────────────────────────────────────
@@ -1450,45 +3287,42 @@ impl ImPhysicsMaterial {
     }
 }
 
-# Reads the `PhysicsMaterial` object `o` into *out: 1, or 0 when malformed. friction, restitution and
+# Reads the `PhysicsMaterial` node o into *out: 1, or 0 when malformed. friction, restitution and
 # density are required; static_friction may be absent or null (None); rolling_friction defaults to
 # 0, friction_combine to Average, restitution_combine to Min.
 fn _im_jr_material(o, out: *ImPhysicsMaterial): i64 {
-    if (o == 0 || bayan_json_v_tag(o) != JTAG_OBJ) { return 0; }
+    var f = _im_jr_form(o, 7);
+    if (f == 0) { return 0; }
     var m: ImPhysicsMaterial = ImPhysicsMaterial_default();
     var w[8];
-    if (_im_jr_f64(_im_jr_field(o, "friction"), &w) == 0) { return 0; }
+    if (_im_jr_f64(_im_jr_at(o, f, 0, "friction"), &w) == 0) { return 0; }
     var fr: f64 = load64(&w);
     m.friction = fr;
-    if (_im_jr_f64(_im_jr_field(o, "restitution"), &w) == 0) { return 0; }
+    if (_im_jr_f64(_im_jr_at(o, f, 1, "restitution"), &w) == 0) { return 0; }
     var re: f64 = load64(&w);
     m.restitution = re;
-    if (_im_jr_f64(_im_jr_field(o, "density"), &w) == 0) { return 0; }
+    if (_im_jr_f64(_im_jr_at(o, f, 2, "density"), &w) == 0) { return 0; }
     var de: f64 = load64(&w);
     m.density = de;
-    var sv = _im_jr_field(o, "static_friction");
-    if (sv != 0 && bayan_json_v_tag(sv) != JTAG_NULL) {
-        if (_im_jr_f64(sv, &w) == 0) { return 0; }
+    var r = _im_jr_opt_def(_im_jr_at(o, f, 3, "static_friction"), &_im_jr_f64, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) {
         var sf: f64 = load64(&w);
         m.has_static_friction = 1;
         m.static_friction = sf;
     }
-    var r = _im_jr_opt_f64(o, "rolling_friction", &w);
-    if (r < 0) { return 0; }
+    r = _im_jr_def(_im_jr_at(o, f, 4, "rolling_friction"), &_im_jr_f64, &w);
+    if (r == 0) { return 0; }
     if (r == 1) {
         var ro: f64 = load64(&w);
         m.rolling_friction = ro;
     }
-    var v = _im_jr_field(o, "friction_combine");
-    if (v != 0) {
-        if (_im_jr_enum(v, &combine_rule_name, 4, &w) == 0) { return 0; }
-        m.friction_combine = load64(&w);
-    }
-    v = _im_jr_field(o, "restitution_combine");
-    if (v != 0) {
-        if (_im_jr_enum(v, &combine_rule_name, 4, &w) == 0) { return 0; }
-        m.restitution_combine = load64(&w);
-    }
+    r = _im_jr_def(_im_jr_at(o, f, 5, "friction_combine"), &_im_jr_combine, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) { m.friction_combine = load64(&w); }
+    r = _im_jr_def(_im_jr_at(o, f, 6, "restitution_combine"), &_im_jr_combine, &w);
+    if (r == 0) { return 0; }
+    if (r == 1) { m.restitution_combine = load64(&w); }
     memcpy(out, &m, sizeof(ImPhysicsMaterial));
     return 1;
 }
@@ -1497,8 +3331,7 @@ fn _im_jr_material(o, out: *ImPhysicsMaterial): i64 {
 # Mirrors `serde_json::from_str::<PhysicsMaterial>`.
 #must_use
 fn ImPhysicsMaterial_from_json(buf, len, out: *ImPhysicsMaterial): Result {
-    if (_im_jr_material(_im_jr_parse(buf, len), out) == 0) { return Err(IM_ERR_DESERIALIZE); }
-    return Ok(0);
+    return _im_jr_result(_im_jr_material(_im_jr_parse(buf, len), out));
 }
 
 # ── Quantity ────────────────────────────────────────────────────────────────────────
@@ -1522,11 +3355,12 @@ impl ImQuantity {
 #must_use
 fn ImQuantity_from_json(buf, len, out: *ImQuantity): Result {
     var o = _im_jr_parse(buf, len);
-    if (o == 0 || bayan_json_v_tag(o) != JTAG_OBJ) { return Err(IM_ERR_DESERIALIZE); }
+    var f = _im_jr_form(o, 2);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
     var w[8];
-    if (_im_jr_f64(_im_jr_field(o, "value"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_f64(_im_jr_at(o, f, 0, "value"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
     var v: f64 = load64(&w);
-    if (_im_jr_enum(_im_jr_field(o, "unit"), &physics_unit_name, 14, &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_unit(_im_jr_at(o, f, 1, "unit"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
     var q: ImQuantity = ImQuantity_new(v, load64(&w));
     memcpy(out, &q, sizeof(ImQuantity));
     return Ok(0);
@@ -1545,18 +3379,17 @@ fn _im_jw_vector_point(sb, v: ImVec3, has, p: ImVec3) {
     return 0;
 }
 
-# Reads `{"vector":[..], "point":[..] / null / absent}` from [buf, buf + len) into *v, *has, *p:
-# 1, or 0 when malformed.
+# Reads `{"vector":[..], "point":[..] / null / absent}` (or `[vector, point]`) from [buf, buf + len)
+# into *v, *has, *p: 1, or 0 when malformed. `point` has no serde default.
 fn _im_jr_vector_point(buf, len, v: *ImVec3, has, p: *ImVec3): i64 {
     var o = _im_jr_parse(buf, len);
-    if (o == 0 || bayan_json_v_tag(o) != JTAG_OBJ) { return 0; }
-    if (_im_jr_vec3(_im_jr_field(o, "vector"), v) == 0) { return 0; }
+    var f = _im_jr_form(o, 2);
+    if (f == 0) { return 0; }
+    if (_im_jr_vec3(_im_jr_at(o, f, 0, "vector"), v) == 0) { return 0; }
+    var r = _im_jr_opt(_im_jr_at(o, f, 1, "point"), f, &_im_jr_vec3, p);
+    if (r == 0) { return 0; }
     store64(has, 0);
-    var pv = _im_jr_field(o, "point");
-    if (pv != 0 && bayan_json_v_tag(pv) != JTAG_NULL) {
-        if (_im_jr_vec3(pv, p) == 0) { return 0; }
-        store64(has, 1);
-    }
+    if (r == 1) { store64(has, 1); }
     return 1;
 }
 
@@ -1618,16 +3451,992 @@ fn ImImpulse_from_json(buf, len, out: *ImImpulse): Result {
     return Ok(0);
 }
 
-# Reads a `Torque` document (`{"value":..}`) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# Reads a `Torque` document (`{"value":..}` or `[..]`) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
 # Mirrors `serde_json::from_str::<Torque>`.
 #must_use
 fn ImTorque_from_json(buf, len, out: *ImTorque): Result {
     var o = _im_jr_parse(buf, len);
-    if (o == 0 || bayan_json_v_tag(o) != JTAG_OBJ) { return Err(IM_ERR_DESERIALIZE); }
+    var f = _im_jr_form(o, 1);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
     var w[8];
-    if (_im_jr_f64(_im_jr_field(o, "value"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_f64(_im_jr_at(o, f, 0, "value"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
     var v: f64 = load64(&w);
     var t: ImTorque = ImTorque_new(v);
     memcpy(out, &t, sizeof(ImTorque));
+    return Ok(0);
+}
+
+# ── BodyDesc, BodyState ─────────────────────────────────────────────────────────────
+
+impl ImBodyDesc {
+    # Appends the descriptor as serde_json writes a `BodyDesc`.
+    fn to_json(self, sb) {
+        var rot: f64 = self.rotation;
+        var av: f64 = self.angular_velocity;
+        var ld: f64 = self.linear_damping;
+        var ad: f64 = self.angular_damping;
+        var gs: f64 = self.gravity_scale;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "body_type", 1);
+        _im_jw_name(sb, body_type_name(self.body_type));
+        _im_jw_key(sb, "position", 0);
+        _im_jw_vec3(sb, self.position);
+        _im_jw_key(sb, "rotation", 0);
+        im_fmt_f64_json(sb, rot);
+        _im_jw_key(sb, "linear_velocity", 0);
+        _im_jw_vec3(sb, self.linear_velocity);
+        _im_jw_key(sb, "angular_velocity", 0);
+        im_fmt_f64_json(sb, av);
+        _im_jw_key(sb, "linear_damping", 0);
+        im_fmt_f64_json(sb, ld);
+        _im_jw_key(sb, "angular_damping", 0);
+        im_fmt_f64_json(sb, ad);
+        _im_jw_key(sb, "fixed_rotation", 0);
+        _im_jw_bool(sb, self.fixed_rotation);
+        _im_jw_key(sb, "gravity_scale", 0);
+        _im_jw_opt_f64(sb, self.has_gravity_scale, gs);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `BodyDesc` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE). body_type, position and
+# rotation are required; the rest default as `BodyDesc::default`. Mirrors
+# `serde_json::from_str::<BodyDesc>`.
+#must_use
+fn ImBodyDesc_from_json(buf, len, out: *ImBodyDesc): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 9);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var d: ImBodyDesc = ImBodyDesc_default();
+    var w[8];
+    if (_im_jr_body_type(_im_jr_at(o, f, 0, "body_type"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    d.body_type = load64(&w);
+    var pos: ImVec3 = ImVec3_zero();
+    if (_im_jr_vec3(_im_jr_at(o, f, 1, "position"), &pos) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    d.position = pos;
+    if (_im_jr_f64(_im_jr_at(o, f, 2, "rotation"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var rot: f64 = load64(&w);
+    d.rotation = rot;
+    var lv: ImVec3 = ImVec3_zero();
+    var r = _im_jr_def(_im_jr_at(o, f, 3, "linear_velocity"), &_im_jr_vec3, &lv);
+    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    d.linear_velocity = lv;
+    r = _im_jr_def(_im_jr_at(o, f, 4, "angular_velocity"), &_im_jr_f64, &w);
+    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (r == 1) {
+        var av: f64 = load64(&w);
+        d.angular_velocity = av;
+    }
+    r = _im_jr_def(_im_jr_at(o, f, 5, "linear_damping"), &_im_jr_f64, &w);
+    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (r == 1) {
+        var ld: f64 = load64(&w);
+        d.linear_damping = ld;
+    }
+    r = _im_jr_def(_im_jr_at(o, f, 6, "angular_damping"), &_im_jr_f64, &w);
+    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (r == 1) {
+        var ad: f64 = load64(&w);
+        d.angular_damping = ad;
+    }
+    r = _im_jr_def(_im_jr_at(o, f, 7, "fixed_rotation"), &_im_jr_bool, &w);
+    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (r == 1) { d.fixed_rotation = load64(&w); }
+    r = _im_jr_opt_def(_im_jr_at(o, f, 8, "gravity_scale"), &_im_jr_f64, &w);
+    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (r == 1) {
+        var gs: f64 = load64(&w);
+        d.has_gravity_scale = 1;
+        d.gravity_scale = gs;
+    }
+    memcpy(out, &d, sizeof(ImBodyDesc));
+    return Ok(0);
+}
+
+impl ImBodyState {
+    # Appends the state as serde_json writes a `BodyState`.
+    fn to_json(self, sb) {
+        var rot: f64 = self.rotation;
+        var av: f64 = self.angular_velocity;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "handle", 1);
+        _im_jw_u64(sb, self.handle);
+        _im_jw_key(sb, "body_type", 0);
+        _im_jw_name(sb, body_type_name(self.body_type));
+        _im_jw_key(sb, "position", 0);
+        _im_jw_vec3(sb, self.position);
+        _im_jw_key(sb, "rotation", 0);
+        im_fmt_f64_json(sb, rot);
+        _im_jw_key(sb, "linear_velocity", 0);
+        _im_jw_vec3(sb, self.linear_velocity);
+        _im_jw_key(sb, "angular_velocity", 0);
+        im_fmt_f64_json(sb, av);
+        _im_jw_key(sb, "is_sleeping", 0);
+        _im_jw_bool(sb, self.is_sleeping);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `BodyState` document (every field required) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# Mirrors `serde_json::from_str::<BodyState>`.
+#must_use
+fn ImBodyState_from_json(buf, len, out: *ImBodyState): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 7);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var s: ImBodyState;
+    var w[8];
+    if (_im_jr_u64(_im_jr_at(o, f, 0, "handle"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.handle = load64(&w);
+    if (_im_jr_body_type(_im_jr_at(o, f, 1, "body_type"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.body_type = load64(&w);
+    var pos: ImVec3 = ImVec3_zero();
+    if (_im_jr_vec3(_im_jr_at(o, f, 2, "position"), &pos) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.position = pos;
+    if (_im_jr_f64(_im_jr_at(o, f, 3, "rotation"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var rot: f64 = load64(&w);
+    s.rotation = rot;
+    var lv: ImVec3 = ImVec3_zero();
+    if (_im_jr_vec3(_im_jr_at(o, f, 4, "linear_velocity"), &lv) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.linear_velocity = lv;
+    if (_im_jr_f64(_im_jr_at(o, f, 5, "angular_velocity"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var av: f64 = load64(&w);
+    s.angular_velocity = av;
+    if (_im_jr_bool(_im_jr_at(o, f, 6, "is_sleeping"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.is_sleeping = load64(&w);
+    memcpy(out, &s, sizeof(ImBodyState));
+    return Ok(0);
+}
+
+# ── ColliderShape, ColliderDesc ─────────────────────────────────────────────────────
+
+impl ImColliderShape {
+    # Appends the shape as serde_json writes a `ColliderShape` (externally tagged).
+    fn to_json(self, sb) {
+        var k = self.kind;
+        _im_jw_variant(sb, shape_kind_name(k));
+        str_builder_putc(sb, 123);
+        if (k == IM_SHAPE_BOX) {
+            _im_jw_key(sb, "half_extents", 1);
+            _im_jw_vec3(sb, self.half_extents);
+        } elif (k == IM_SHAPE_BALL) {
+            var r: f64 = self.radius;
+            _im_jw_key(sb, "radius", 1);
+            im_fmt_f64_json(sb, r);
+        } elif (k == IM_SHAPE_CAPSULE) {
+            var hh: f64 = self.half_height;
+            var cr: f64 = self.radius;
+            _im_jw_key(sb, "half_height", 1);
+            im_fmt_f64_json(sb, hh);
+            _im_jw_key(sb, "radius", 0);
+            im_fmt_f64_json(sb, cr);
+        } elif (k == IM_SHAPE_CONVEX_HULL) {
+            _im_jw_key(sb, "points", 1);
+            _im_jw_triples(sb, self.points, self.point_count, 1);
+        } elif (k == IM_SHAPE_TRI_MESH) {
+            _im_jw_key(sb, "vertices", 1);
+            _im_jw_triples(sb, self.vertices, self.vertex_count, 1);
+            _im_jw_key(sb, "indices", 0);
+            _im_jw_triples(sb, self.indices, self.index_count, 0);
+        } elif (k == IM_SHAPE_HEIGHTFIELD) {
+            _im_jw_key(sb, "heights", 1);
+            _im_jw_f64_list(sb, self.heights, self.height_count);
+            _im_jw_key(sb, "scale", 0);
+            _im_jw_vec3(sb, self.scale);
+        } elif (k == IM_SHAPE_SEGMENT) {
+            _im_jw_key(sb, "a", 1);
+            _im_jw_vec3(sb, self.a);
+            _im_jw_key(sb, "b", 0);
+            _im_jw_vec3(sb, self.b);
+        }
+        str_builder_putc(sb, 125);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads the `ColliderShape` node v into *out (its arrays on freelist): 1, or 0 when malformed (nothing
+# left allocated).
+fn _im_jr_shape(v, out: *ImColliderShape): i64 {
+    var kw[8];
+    var pw[8];
+    if (_im_jr_tagged(v, &shape_kind_name, 7, &kw, &pw) == 0) { return 0; }
+    var k = load64(&kw);
+    var p = load64(&pw);
+    var s: ImColliderShape = _im_shape(k);
+    var n = 1;
+    if (k == IM_SHAPE_CAPSULE || k == IM_SHAPE_TRI_MESH || k == IM_SHAPE_HEIGHTFIELD || k == IM_SHAPE_SEGMENT) {
+        n = 2;
+    }
+    var f = _im_jr_form(p, n);
+    if (f == 0) { return 0; }
+    var w[8];
+    var a[8];
+    var c[8];
+    var ok = 1;
+    if (k == IM_SHAPE_BOX) {
+        var he: ImVec3 = ImVec3_zero();
+        ok = _im_jr_vec3(_im_jr_at(p, f, 0, "half_extents"), &he);
+        s.half_extents = he;
+    } elif (k == IM_SHAPE_BALL) {
+        ok = _im_jr_f64(_im_jr_at(p, f, 0, "radius"), &w);
+        var r: f64 = load64(&w);
+        s.radius = r;
+    } elif (k == IM_SHAPE_CAPSULE) {
+        ok = _im_jr_f64(_im_jr_at(p, f, 0, "half_height"), &w);
+        var hh: f64 = load64(&w);
+        s.half_height = hh;
+        if (ok == 1) { ok = _im_jr_f64(_im_jr_at(p, f, 1, "radius"), &w); }
+        var cr: f64 = load64(&w);
+        s.radius = cr;
+    } elif (k == IM_SHAPE_CONVEX_HULL) {
+        ok = _im_jr_triples(_im_jr_at(p, f, 0, "points"), 1, &a, &c);
+        s.points = load64(&a);
+        s.point_count = load64(&c);
+    } elif (k == IM_SHAPE_TRI_MESH) {
+        ok = _im_jr_triples(_im_jr_at(p, f, 0, "vertices"), 1, &a, &c);
+        s.vertices = load64(&a);
+        s.vertex_count = load64(&c);
+        if (ok == 1) {
+            ok = _im_jr_triples(_im_jr_at(p, f, 1, "indices"), 0, &a, &c);
+            s.indices = load64(&a);
+            s.index_count = load64(&c);
+        }
+    } elif (k == IM_SHAPE_HEIGHTFIELD) {
+        ok = _im_jr_f64_list(_im_jr_at(p, f, 0, "heights"), &a, &c);
+        s.heights = load64(&a);
+        s.height_count = load64(&c);
+        var sc: ImVec3 = ImVec3_zero();
+        if (ok == 1) { ok = _im_jr_vec3(_im_jr_at(p, f, 1, "scale"), &sc); }
+        s.scale = sc;
+    } elif (k == IM_SHAPE_SEGMENT) {
+        var sa: ImVec3 = ImVec3_zero();
+        var sbv: ImVec3 = ImVec3_zero();
+        ok = _im_jr_vec3(_im_jr_at(p, f, 0, "a"), &sa);
+        if (ok == 1) { ok = _im_jr_vec3(_im_jr_at(p, f, 1, "b"), &sbv); }
+        s.a = sa;
+        s.b = sbv;
+    }
+    if (ok == 0) {
+        s.free();
+        return 0;
+    }
+    memcpy(out, &s, sizeof(ImColliderShape));
+    return 1;
+}
+
+# Reads a `ColliderShape` document into *out (its arrays on freelist; release with `free`): Ok(0), or
+# Err(IM_ERR_DESERIALIZE). Mirrors `serde_json::from_str::<ColliderShape>`.
+#must_use
+fn ImColliderShape_from_json(buf, len, out: *ImColliderShape): Result {
+    return _im_jr_result(_im_jr_shape(_im_jr_parse(buf, len), out));
+}
+
+impl ImColliderDesc {
+    # Appends the descriptor as serde_json writes a `ColliderDesc`.
+    fn to_json(self, sb) {
+        var mass: f64 = self.mass;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "shape", 1);
+        self.shape.to_json(sb);
+        _im_jw_key(sb, "offset", 0);
+        _im_jw_vec3(sb, self.offset);
+        _im_jw_key(sb, "material", 0);
+        self.material.to_json(sb);
+        _im_jw_key(sb, "is_sensor", 0);
+        _im_jw_bool(sb, self.is_sensor);
+        _im_jw_key(sb, "mass", 0);
+        _im_jw_opt_f64(sb, self.has_mass, mass);
+        _im_jw_key(sb, "collision_layer", 0);
+        str_builder_add_int(sb, self.collision_layer);
+        _im_jw_key(sb, "collision_mask", 0);
+        str_builder_add_int(sb, self.collision_mask);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `ColliderDesc` document into *out (the shape's arrays on freelist): Ok(0), or
+# Err(IM_ERR_DESERIALIZE). shape is required; the rest default as `ImColliderDesc_new`. Mirrors
+# `serde_json::from_str::<ColliderDesc>`.
+#must_use
+fn ImColliderDesc_from_json(buf, len, out: *ImColliderDesc): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 7);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var sh: ImColliderShape = _im_shape(IM_SHAPE_BALL);
+    if (_im_jr_shape(_im_jr_at(o, f, 0, "shape"), &sh) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var d: ImColliderDesc = ImColliderDesc_new(sh);
+    var w[8];
+    var ok = 1;
+    var off: ImVec3 = ImVec3_zero();
+    if (_im_jr_def(_im_jr_at(o, f, 1, "offset"), &_im_jr_vec3, &off) == 0) { ok = 0; }
+    d.offset = off;
+    var m: ImPhysicsMaterial = ImPhysicsMaterial_default();
+    if (ok == 1 && _im_jr_def(_im_jr_at(o, f, 2, "material"), &_im_jr_material, &m) == 0) { ok = 0; }
+    d.material = m;
+    var r = 2;
+    if (ok == 1) { r = _im_jr_def(_im_jr_at(o, f, 3, "is_sensor"), &_im_jr_bool, &w); }
+    if (r == 0) { ok = 0; }
+    if (r == 1) { d.is_sensor = load64(&w); }
+    r = 2;
+    if (ok == 1) { r = _im_jr_opt_def(_im_jr_at(o, f, 4, "mass"), &_im_jr_f64, &w); }
+    if (r == 0) { ok = 0; }
+    if (r == 1) {
+        var mass: f64 = load64(&w);
+        d.has_mass = 1;
+        d.mass = mass;
+    }
+    r = 2;
+    if (ok == 1) { r = _im_jr_def(_im_jr_at(o, f, 5, "collision_layer"), &_im_jr_u32, &w); }
+    if (r == 0) { ok = 0; }
+    if (r == 1) { d.collision_layer = load64(&w); }
+    r = 2;
+    if (ok == 1) { r = _im_jr_def(_im_jr_at(o, f, 6, "collision_mask"), &_im_jr_u32, &w); }
+    if (r == 0) { ok = 0; }
+    if (r == 1) { d.collision_mask = load64(&w); }
+    if (ok == 0) {
+        sh.free();
+        return Err(IM_ERR_DESERIALIZE);
+    }
+    memcpy(out, &d, sizeof(ImColliderDesc));
+    return Ok(0);
+}
+
+# ── JointType, JointMotor, JointDesc ────────────────────────────────────────────────
+
+# Appends `"limits":[lo,hi]` or `"limits":null`.
+fn _im_jw_limits(sb, has, l: ImVec2) {
+    _im_jw_key(sb, "limits", 0);
+    if (has == 1) { _im_jw_vec2(sb, l); } else { str_builder_add_cstr(sb, "null"); }
+    return 0;
+}
+
+impl ImJointType {
+    # Appends the joint type as serde_json writes a `JointType`: `"Fixed"`, or externally tagged.
+    fn to_json(self, sb) {
+        var k = self.kind;
+        if (k == IM_JOINT_FIXED) {
+            _im_jw_name(sb, "Fixed");
+            return 0;
+        }
+        var st: f64 = self.stiffness;
+        var dm: f64 = self.damping;
+        _im_jw_variant(sb, joint_kind_name(k));
+        str_builder_putc(sb, 123);
+        if (k == IM_JOINT_REVOLUTE) {
+            _im_jw_key(sb, "anchor", 1);
+            _im_jw_vec2(sb, self.anchor);
+            _im_jw_limits(sb, self.has_limits, self.limits);
+        } elif (k == IM_JOINT_PRISMATIC) {
+            _im_jw_key(sb, "axis", 1);
+            _im_jw_vec2(sb, self.axis);
+            _im_jw_limits(sb, self.has_limits, self.limits);
+        } elif (k == IM_JOINT_SPRING) {
+            var rl: f64 = self.rest_length;
+            _im_jw_key(sb, "rest_length", 1);
+            im_fmt_f64_json(sb, rl);
+            _im_jw_key(sb, "stiffness", 0);
+            im_fmt_f64_json(sb, st);
+            _im_jw_key(sb, "damping", 0);
+            im_fmt_f64_json(sb, dm);
+        } elif (k == IM_JOINT_DISTANCE) {
+            var ln: f64 = self.length;
+            _im_jw_key(sb, "length", 1);
+            im_fmt_f64_json(sb, ln);
+        } elif (k == IM_JOINT_WHEEL) {
+            _im_jw_key(sb, "axis", 1);
+            _im_jw_vec2(sb, self.axis);
+            _im_jw_key(sb, "stiffness", 0);
+            im_fmt_f64_json(sb, st);
+            _im_jw_key(sb, "damping", 0);
+            im_fmt_f64_json(sb, dm);
+        } elif (k == IM_JOINT_ROPE) {
+            var ml: f64 = self.max_length;
+            _im_jw_key(sb, "max_length", 1);
+            im_fmt_f64_json(sb, ml);
+        } elif (k == IM_JOINT_MOUSE) {
+            var mf: f64 = self.max_force;
+            _im_jw_key(sb, "target", 1);
+            _im_jw_vec3(sb, self.target);
+            _im_jw_key(sb, "stiffness", 0);
+            im_fmt_f64_json(sb, st);
+            _im_jw_key(sb, "damping", 0);
+            im_fmt_f64_json(sb, dm);
+            _im_jw_key(sb, "max_force", 0);
+            im_fmt_f64_json(sb, mf);
+        }
+        str_builder_putc(sb, 125);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads `count` required f64 fields named by `names` (a C-string array) of struct node p in form f
+# into the words at out: 1, or 0.
+fn _im_jr_f64_fields(p, f, names, count, out): i64 {
+    for (var i = 0; i < count; i = i + 1) {
+        if (_im_jr_f64(_im_jr_at(p, f, i, load64(names + i * 8)), out + i * 8) == 0) { return 0; }
+    }
+    return 1;
+}
+
+# Reads the `JointType` node v into *out: 1, or 0 when malformed.
+fn _im_jr_joint_type(v, out: *ImJointType): i64 {
+    var kw[8];
+    var pw[8];
+    if (_im_jr_tagged(v, &joint_kind_name, 8, &kw, &pw) == 0) { return 0; }
+    var k = load64(&kw);
+    var p = load64(&pw);
+    var j: ImJointType = _im_joint(k);
+    if (k == IM_JOINT_FIXED) {
+        if (_im_jr_unit_ok(p) == 0) { return 0; }
+        memcpy(out, &j, sizeof(ImJointType));
+        return 1;
+    }
+    var n = 1;
+    if (k == IM_JOINT_REVOLUTE || k == IM_JOINT_PRISMATIC) { n = 2; }
+    if (k == IM_JOINT_SPRING || k == IM_JOINT_WHEEL) { n = 3; }
+    if (k == IM_JOINT_MOUSE) { n = 4; }
+    var f = _im_jr_form(p, n);
+    if (f == 0) { return 0; }
+    var w[32];
+    var names[32];
+    if (k == IM_JOINT_REVOLUTE || k == IM_JOINT_PRISMATIC) {
+        var first = "axis";
+        if (k == IM_JOINT_REVOLUTE) { first = "anchor"; }
+        var av: ImVec2 = ImVec2_new(0.0, 0.0);
+        if (_im_jr_vec2(_im_jr_at(p, f, 0, first), &av) == 0) { return 0; }
+        if (k == IM_JOINT_REVOLUTE) { j.anchor = av; } else { j.axis = av; }
+        var lim: ImVec2 = ImVec2_new(0.0, 0.0);
+        var r = _im_jr_opt(_im_jr_at(p, f, 1, "limits"), f, &_im_jr_vec2, &lim);
+        if (r == 0) { return 0; }
+        if (r == 1) {
+            j.has_limits = 1;
+            j.limits = lim;
+        }
+    } elif (k == IM_JOINT_SPRING) {
+        store64(&names, "rest_length");
+        store64(&names + 8, "stiffness");
+        store64(&names + 16, "damping");
+        if (_im_jr_f64_fields(p, f, &names, 3, &w) == 0) { return 0; }
+        var rl: f64 = load64(&w);
+        var st: f64 = load64(&w + 8);
+        var dm: f64 = load64(&w + 16);
+        j.rest_length = rl;
+        j.stiffness = st;
+        j.damping = dm;
+    } elif (k == IM_JOINT_DISTANCE) {
+        if (_im_jr_f64(_im_jr_at(p, f, 0, "length"), &w) == 0) { return 0; }
+        var ln: f64 = load64(&w);
+        j.length = ln;
+    } elif (k == IM_JOINT_WHEEL) {
+        var ax: ImVec2 = ImVec2_new(0.0, 0.0);
+        if (_im_jr_vec2(_im_jr_at(p, f, 0, "axis"), &ax) == 0) { return 0; }
+        j.axis = ax;
+        if (_im_jr_f64(_im_jr_at(p, f, 1, "stiffness"), &w) == 0) { return 0; }
+        if (_im_jr_f64(_im_jr_at(p, f, 2, "damping"), &w + 8) == 0) { return 0; }
+        var ws: f64 = load64(&w);
+        var wd: f64 = load64(&w + 8);
+        j.stiffness = ws;
+        j.damping = wd;
+    } elif (k == IM_JOINT_ROPE) {
+        if (_im_jr_f64(_im_jr_at(p, f, 0, "max_length"), &w) == 0) { return 0; }
+        var ml: f64 = load64(&w);
+        j.max_length = ml;
+    } elif (k == IM_JOINT_MOUSE) {
+        var tg: ImVec3 = ImVec3_zero();
+        if (_im_jr_vec3(_im_jr_at(p, f, 0, "target"), &tg) == 0) { return 0; }
+        j.target = tg;
+        if (_im_jr_f64(_im_jr_at(p, f, 1, "stiffness"), &w) == 0) { return 0; }
+        if (_im_jr_f64(_im_jr_at(p, f, 2, "damping"), &w + 8) == 0) { return 0; }
+        if (_im_jr_f64(_im_jr_at(p, f, 3, "max_force"), &w + 16) == 0) { return 0; }
+        var ms: f64 = load64(&w);
+        var md: f64 = load64(&w + 8);
+        var mf: f64 = load64(&w + 16);
+        j.stiffness = ms;
+        j.damping = md;
+        j.max_force = mf;
+    }
+    memcpy(out, &j, sizeof(ImJointType));
+    return 1;
+}
+
+# Reads a `JointType` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE). Mirrors
+# `serde_json::from_str::<JointType>`.
+#must_use
+fn ImJointType_from_json(buf, len, out: *ImJointType): Result {
+    return _im_jr_result(_im_jr_joint_type(_im_jr_parse(buf, len), out));
+}
+
+impl ImJointMotor {
+    # Appends the motor as serde_json writes a `JointMotor`.
+    fn to_json(self, sb) {
+        var tv: f64 = self.target_velocity;
+        var mf: f64 = self.max_force;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "target_velocity", 1);
+        im_fmt_f64_json(sb, tv);
+        _im_jw_key(sb, "max_force", 0);
+        im_fmt_f64_json(sb, mf);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads the `JointMotor` node v (both fields required) into *out: 1, or 0.
+fn _im_jr_motor(v, out: *ImJointMotor): i64 {
+    var f = _im_jr_form(v, 2);
+    if (f == 0) { return 0; }
+    var w[16];
+    if (_im_jr_f64(_im_jr_at(v, f, 0, "target_velocity"), &w) == 0) { return 0; }
+    if (_im_jr_f64(_im_jr_at(v, f, 1, "max_force"), &w + 8) == 0) { return 0; }
+    var tv: f64 = load64(&w);
+    var mf: f64 = load64(&w + 8);
+    out.target_velocity = tv;
+    out.max_force = mf;
+    return 1;
+}
+
+# Reads a `JointMotor` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE). Mirrors
+# `serde_json::from_str::<JointMotor>`.
+#must_use
+fn ImJointMotor_from_json(buf, len, out: *ImJointMotor): Result {
+    return _im_jr_result(_im_jr_motor(_im_jr_parse(buf, len), out));
+}
+
+impl ImJointDesc {
+    # Appends the descriptor as serde_json writes a `JointDesc`.
+    fn to_json(self, sb) {
+        var dm: f64 = self.damping;
+        var bf: f64 = self.break_force;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "body_a", 1);
+        _im_jw_u64(sb, self.body_a);
+        _im_jw_key(sb, "body_b", 0);
+        _im_jw_u64(sb, self.body_b);
+        _im_jw_key(sb, "joint_type", 0);
+        self.joint_type.to_json(sb);
+        _im_jw_key(sb, "local_anchor_a", 0);
+        _im_jw_vec2(sb, self.local_anchor_a);
+        _im_jw_key(sb, "local_anchor_b", 0);
+        _im_jw_vec2(sb, self.local_anchor_b);
+        _im_jw_key(sb, "motor", 0);
+        if (self.has_motor == 1) { self.motor.to_json(sb); } else { str_builder_add_cstr(sb, "null"); }
+        _im_jw_key(sb, "damping", 0);
+        im_fmt_f64_json(sb, dm);
+        _im_jw_key(sb, "break_force", 0);
+        _im_jw_opt_f64(sb, self.has_break_force, bf);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `JointDesc` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE). The bodies, joint type
+# and anchors are required; motor and break_force may be absent or null, damping defaults to 0.
+# Mirrors `serde_json::from_str::<JointDesc>`.
+#must_use
+fn ImJointDesc_from_json(buf, len, out: *ImJointDesc): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 8);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var w[16];
+    if (_im_jr_u64(_im_jr_at(o, f, 0, "body_a"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_u64(_im_jr_at(o, f, 1, "body_b"), &w + 8) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var jt: ImJointType = ImJointType_fixed();
+    if (_im_jr_joint_type(_im_jr_at(o, f, 2, "joint_type"), &jt) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var aa: ImVec2 = ImVec2_new(0.0, 0.0);
+    var ab: ImVec2 = ImVec2_new(0.0, 0.0);
+    if (_im_jr_vec2(_im_jr_at(o, f, 3, "local_anchor_a"), &aa) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_vec2(_im_jr_at(o, f, 4, "local_anchor_b"), &ab) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var d: ImJointDesc = ImJointDesc_new(load64(&w), load64(&w + 8), jt, aa, ab);
+    var mo: ImJointMotor = ImJointMotor_new(0.0, 0.0);
+    var r = _im_jr_opt_def(_im_jr_at(o, f, 5, "motor"), &_im_jr_motor, &mo);
+    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (r == 1) {
+        d.has_motor = 1;
+        d.motor = mo;
+    }
+    r = _im_jr_def(_im_jr_at(o, f, 6, "damping"), &_im_jr_f64, &w);
+    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (r == 1) {
+        var dm: f64 = load64(&w);
+        d.damping = dm;
+    }
+    r = _im_jr_opt_def(_im_jr_at(o, f, 7, "break_force"), &_im_jr_f64, &w);
+    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (r == 1) {
+        var bf: f64 = load64(&w);
+        d.has_break_force = 1;
+        d.break_force = bf;
+    }
+    memcpy(out, &d, sizeof(ImJointDesc));
+    return Ok(0);
+}
+
+# ── CollisionEvent, ContactPoint, ContactData ───────────────────────────────────────
+
+# A typed view of a word.
+#must_use
+fn _im_as_contact_point(p): *ImContactPoint {
+    return p;
+}
+
+impl ImCollisionEvent {
+    # Appends the event as serde_json writes a `CollisionEvent` (externally tagged).
+    fn to_json(self, sb) {
+        _im_jw_variant(sb, event_kind_name(self.kind));
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "collider_a", 1);
+        _im_jw_u64(sb, self.collider_a);
+        _im_jw_key(sb, "collider_b", 0);
+        _im_jw_u64(sb, self.collider_b);
+        str_builder_putc(sb, 125);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `CollisionEvent` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE). Mirrors
+# `serde_json::from_str::<CollisionEvent>`.
+#must_use
+fn ImCollisionEvent_from_json(buf, len, out: *ImCollisionEvent): Result {
+    var o = _im_jr_parse(buf, len);
+    var kw[8];
+    var pw[8];
+    if (_im_jr_tagged(o, &event_kind_name, 3, &kw, &pw) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var p = load64(&pw);
+    var f = _im_jr_form(p, 2);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var w[16];
+    if (_im_jr_u64(_im_jr_at(p, f, 0, "collider_a"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_u64(_im_jr_at(p, f, 1, "collider_b"), &w + 8) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var e: ImCollisionEvent = ImCollisionEvent_new(load64(&kw), load64(&w), load64(&w + 8));
+    memcpy(out, &e, sizeof(ImCollisionEvent));
+    return Ok(0);
+}
+
+impl ImContactPoint {
+    # Appends the point as serde_json writes a `ContactPoint`.
+    fn to_json(self, sb) {
+        var im: f64 = self.impulse;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "local_a", 1);
+        _im_jw_vec3(sb, self.local_a);
+        _im_jw_key(sb, "local_b", 0);
+        _im_jw_vec3(sb, self.local_b);
+        _im_jw_key(sb, "impulse", 0);
+        im_fmt_f64_json(sb, im);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads the `ContactPoint` node v (every field required) into *out: 1, or 0.
+fn _im_jr_contact_point(v, out: *ImContactPoint): i64 {
+    var f = _im_jr_form(v, 3);
+    if (f == 0) { return 0; }
+    var la: ImVec3 = ImVec3_zero();
+    var lb: ImVec3 = ImVec3_zero();
+    var w[8];
+    if (_im_jr_vec3(_im_jr_at(v, f, 0, "local_a"), &la) == 0) { return 0; }
+    if (_im_jr_vec3(_im_jr_at(v, f, 1, "local_b"), &lb) == 0) { return 0; }
+    if (_im_jr_f64(_im_jr_at(v, f, 2, "impulse"), &w) == 0) { return 0; }
+    var im: f64 = load64(&w);
+    out.local_a = la;
+    out.local_b = lb;
+    out.impulse = im;
+    return 1;
+}
+
+# Reads a `ContactPoint` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE). Mirrors
+# `serde_json::from_str::<ContactPoint>`.
+#must_use
+fn ImContactPoint_from_json(buf, len, out: *ImContactPoint): Result {
+    return _im_jr_result(_im_jr_contact_point(_im_jr_parse(buf, len), out));
+}
+
+impl ImContactData {
+    # Appends the contact as serde_json writes a `ContactData`.
+    fn to_json(self, sb) {
+        var dp: f64 = self.depth;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "collider_a", 1);
+        _im_jw_u64(sb, self.collider_a);
+        _im_jw_key(sb, "collider_b", 0);
+        _im_jw_u64(sb, self.collider_b);
+        _im_jw_key(sb, "normal", 0);
+        _im_jw_vec3(sb, self.normal);
+        _im_jw_key(sb, "depth", 0);
+        im_fmt_f64_json(sb, dp);
+        _im_jw_key(sb, "points", 0);
+        str_builder_putc(sb, 91);
+        for (var i = 0; i < self.point_count; i = i + 1) {
+            if (i > 0) { str_builder_putc(sb, 44); }
+            var cp: *ImContactPoint = _im_as_contact_point(self.points + i * sizeof(ImContactPoint));
+            cp.to_json(sb);
+        }
+        str_builder_putc(sb, 93);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+
+    # Releases the points.
+    fn free(self) {
+        if (self.points != 0) { fl_free(self.points); }
+        self.points = 0;
+        self.point_count = 0;
+        return 0;
+    }
+}
+
+# Reads a `ContactData` document (every field required) into *out, its points on freelist (release
+# with `free`): Ok(0), or Err(IM_ERR_DESERIALIZE). Mirrors `serde_json::from_str::<ContactData>`.
+#must_use
+fn ImContactData_from_json(buf, len, out: *ImContactData): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 5);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var w[16];
+    if (_im_jr_u64(_im_jr_at(o, f, 0, "collider_a"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_u64(_im_jr_at(o, f, 1, "collider_b"), &w + 8) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var nrm: ImVec3 = ImVec3_zero();
+    if (_im_jr_vec3(_im_jr_at(o, f, 2, "normal"), &nrm) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var dw[8];
+    if (_im_jr_f64(_im_jr_at(o, f, 3, "depth"), &dw) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var pv = _im_jr_at(o, f, 4, "points");
+    if (pv == 0 || bayan_json_v_tag(pv) != JTAG_ARR) { return Err(IM_ERR_DESERIALIZE); }
+    var n = bayan_json_v_arr_len(pv);
+    var pts = 0;
+    if (n > 0) {
+        pts = fl_alloc(n * sizeof(ImContactPoint));
+        if (pts == 0) { return Err(IM_ERR_DESERIALIZE); }
+        for (var i = 0; i < n; i = i + 1) {
+            if (_im_jr_contact_point(bayan_json_v_arr_get(pv, i), pts + i * sizeof(ImContactPoint)) == 0) {
+                fl_free(pts);
+                return Err(IM_ERR_DESERIALIZE);
+            }
+        }
+    }
+    var dp: f64 = load64(&dw);
+    var c: ImContactData;
+    c.collider_a = load64(&w);
+    c.collider_b = load64(&w + 8);
+    c.normal = nrm;
+    c.depth = dp;
+    c.points = pts;
+    c.point_count = n;
+    memcpy(out, &c, sizeof(ImContactData));
+    return Ok(0);
+}
+
+# ── RayHit, PointQuery ──────────────────────────────────────────────────────────────
+
+impl ImRayHit {
+    # Appends the hit as serde_json writes a `RayHit`.
+    fn to_json(self, sb) {
+        var dist: f64 = self.distance;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "collider", 1);
+        _im_jw_u64(sb, self.collider);
+        _im_jw_key(sb, "point", 0);
+        _im_jw_vec3(sb, self.point);
+        _im_jw_key(sb, "normal", 0);
+        _im_jw_vec3(sb, self.normal);
+        _im_jw_key(sb, "distance", 0);
+        im_fmt_f64_json(sb, dist);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `RayHit` document (every field required) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# Mirrors `serde_json::from_str::<RayHit>`.
+#must_use
+fn ImRayHit_from_json(buf, len, out: *ImRayHit): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 4);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var w[16];
+    if (_im_jr_u64(_im_jr_at(o, f, 0, "collider"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var pt: ImVec3 = ImVec3_zero();
+    var nm: ImVec3 = ImVec3_zero();
+    if (_im_jr_vec3(_im_jr_at(o, f, 1, "point"), &pt) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_vec3(_im_jr_at(o, f, 2, "normal"), &nm) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_f64(_im_jr_at(o, f, 3, "distance"), &w + 8) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var dist: f64 = load64(&w + 8);
+    var h: ImRayHit;
+    h.collider = load64(&w);
+    h.point = pt;
+    h.normal = nm;
+    h.distance = dist;
+    memcpy(out, &h, sizeof(ImRayHit));
+    return Ok(0);
+}
+
+impl ImPointQuery {
+    # Appends the result as serde_json writes a `PointQuery`.
+    fn to_json(self, sb) {
+        var dist: f64 = self.distance;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "collider", 1);
+        _im_jw_u64(sb, self.collider);
+        _im_jw_key(sb, "distance", 0);
+        im_fmt_f64_json(sb, dist);
+        _im_jw_key(sb, "is_inside", 0);
+        _im_jw_bool(sb, self.is_inside);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `PointQuery` document (every field required) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# Mirrors `serde_json::from_str::<PointQuery>`.
+#must_use
+fn ImPointQuery_from_json(buf, len, out: *ImPointQuery): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 3);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var w[24];
+    if (_im_jr_u64(_im_jr_at(o, f, 0, "collider"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_f64(_im_jr_at(o, f, 1, "distance"), &w + 8) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_bool(_im_jr_at(o, f, 2, "is_inside"), &w + 16) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var dist: f64 = load64(&w + 8);
+    var q: ImPointQuery;
+    q.collider = load64(&w);
+    q.distance = dist;
+    q.is_inside = load64(&w + 16);
+    memcpy(out, &q, sizeof(ImPointQuery));
+    return Ok(0);
+}
+
+# ── Spring, Spring2d, Spring3d ──────────────────────────────────────────────────────
+
+impl ImSpring {
+    # Appends the spring as serde_json writes a `Spring` (the cache is `#[serde(skip)]`).
+    fn to_json(self, sb) {
+        var p: f64 = self.position;
+        var v: f64 = self.velocity;
+        var t: f64 = self.target;
+        var k: f64 = self.stiffness;
+        var c: f64 = self.damping;
+        var s: f64 = self.settle_threshold;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "position", 1);
+        im_fmt_f64_json(sb, p);
+        _im_jw_key(sb, "velocity", 0);
+        im_fmt_f64_json(sb, v);
+        _im_jw_key(sb, "target", 0);
+        im_fmt_f64_json(sb, t);
+        _im_jw_key(sb, "stiffness", 0);
+        im_fmt_f64_json(sb, k);
+        _im_jw_key(sb, "damping", 0);
+        im_fmt_f64_json(sb, c);
+        _im_jw_key(sb, "settle_threshold", 0);
+        im_fmt_f64_json(sb, s);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads the `Spring` node v (all six fields required; the cache starts empty) into *out: 1, or 0.
+fn _im_jr_spring(v, out: *ImSpring): i64 {
+    var f = _im_jr_form(v, 6);
+    if (f == 0) { return 0; }
+    var names[48];
+    store64(&names, "position");
+    store64(&names + 8, "velocity");
+    store64(&names + 16, "target");
+    store64(&names + 24, "stiffness");
+    store64(&names + 32, "damping");
+    store64(&names + 40, "settle_threshold");
+    var w[48];
+    if (_im_jr_f64_fields(v, f, &names, 6, &w) == 0) { return 0; }
+    var p: f64 = load64(&w);
+    var vel: f64 = load64(&w + 8);
+    var t: f64 = load64(&w + 16);
+    var k: f64 = load64(&w + 24);
+    var c: f64 = load64(&w + 32);
+    var s: f64 = load64(&w + 40);
+    var sp: ImSpring = ImSpring_new(p, t, k, c);
+    sp.velocity = vel;
+    sp.settle_threshold = s;
+    memcpy(out, &sp, sizeof(ImSpring));
+    return 1;
+}
+
+# Reads a `Spring` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE). Mirrors
+# `serde_json::from_str::<Spring>`.
+#must_use
+fn ImSpring_from_json(buf, len, out: *ImSpring): Result {
+    return _im_jr_result(_im_jr_spring(_im_jr_parse(buf, len), out));
+}
+
+impl ImSpring2d {
+    # Appends the spring as serde_json writes a `Spring2d`.
+    fn to_json(self, sb) {
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "x", 1);
+        self.x.to_json(sb);
+        _im_jw_key(sb, "y", 0);
+        self.y.to_json(sb);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `Spring2d` document (x and y required) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# Mirrors `serde_json::from_str::<Spring2d>`.
+#must_use
+fn ImSpring2d_from_json(buf, len, out: *ImSpring2d): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 2);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var x: ImSpring = ImSpring_new(0.0, 0.0, 0.0, 0.0);
+    var y: ImSpring = ImSpring_new(0.0, 0.0, 0.0, 0.0);
+    if (_im_jr_spring(_im_jr_at(o, f, 0, "x"), &x) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_spring(_im_jr_at(o, f, 1, "y"), &y) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var s: ImSpring2d;
+    s.x = x;
+    s.y = y;
+    memcpy(out, &s, sizeof(ImSpring2d));
+    return Ok(0);
+}
+
+impl ImSpring3d {
+    # Appends the spring as serde_json writes a `Spring3d`.
+    fn to_json(self, sb) {
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "x", 1);
+        self.x.to_json(sb);
+        _im_jw_key(sb, "y", 0);
+        self.y.to_json(sb);
+        _im_jw_key(sb, "z", 0);
+        self.z.to_json(sb);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `Spring3d` document (x, y and z required) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# Mirrors `serde_json::from_str::<Spring3d>`.
+#must_use
+fn ImSpring3d_from_json(buf, len, out: *ImSpring3d): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 3);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var x: ImSpring = ImSpring_new(0.0, 0.0, 0.0, 0.0);
+    var y: ImSpring = ImSpring_new(0.0, 0.0, 0.0, 0.0);
+    var z: ImSpring = ImSpring_new(0.0, 0.0, 0.0, 0.0);
+    if (_im_jr_spring(_im_jr_at(o, f, 0, "x"), &x) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_spring(_im_jr_at(o, f, 1, "y"), &y) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_spring(_im_jr_at(o, f, 2, "z"), &z) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var s: ImSpring3d;
+    s.x = x;
+    s.y = y;
+    s.z = z;
+    memcpy(out, &s, sizeof(ImSpring3d));
     return Ok(0);
 }

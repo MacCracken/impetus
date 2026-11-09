@@ -210,6 +210,47 @@ fails when either drifts from `cyrius.cyml`.
 - **Result, every target:** 8 modules, 0 failing; **62,832 ok, 0 failed, 0 measured, 1 pending (M6), 93
   accepted**; the math digests are unchanged.
 
+## 7. M1b part 2: descriptors, arena, contact tracker, spring (2026-11-09)
+
+- **The modules**: `src/types.cyr` (bodies, colliders, joints, events, queries; payload enums as a kind
+  enum plus one struct), `src/arena.cyr` (the generational arena on freelist, handles `gen << 32 | idx`),
+  `src/contact_tracker.cyr` (sorted pair lists, unsigned handle order, events once per frame) and
+  `src/spring.cyr` (the exact damped oscillator, transition cached on (dt, k, c)).
+- **Golden rows**, new or grown:
+  - `types.tsv` (1): `BodyDesc::default`, exact.
+  - `spring.tsv` (1,000). The constructors (153) and `is_settled` (47) are exact. The 800 `step` rows
+    (the three regimes and the critical band × dt ∈ {1e-6, 1/60, 1, 100}, 200 random springs, the
+    edges, and the Rust tests' scenarios) are **measured**, not gated; see below.
+  - `json.tsv` (545 → 937): every M1b type both ways, plus serde's sequence form and one-key unit
+    variants for every type (ADR 0010 findings). All exact, except 7 rows pending on S3 and S4 (bayan).
+- **The spring's sensitivity sets no usable bound.** Each step row's note carries S, the most its
+  outputs move per one-ulp change in an exp, sin or cos result (scripts/oracle/README.md):
+
+| Regime | Rows | S ≤ 1 | 2–10 | 11–31 | 32–1,024 | > 1,024 | max S |
+|---|---|---|---|---|---|---|---|
+| under-damped | 377 | 58 | 68 | 27 | 129 | 95 | 6.1·10^9 |
+| critical | 45 | 12 | 8 | 2 | 6 | 17 | 1.0·10^10 |
+| over-damped | 366 | 83 | 32 | 16 | 100 | 135 | 4.5·10^18 |
+
+  Two things drive it: `position = target + y` cancels when the spring is near zero and the target is
+  far (2^26 at dt = 1e-6), and the over-damped branch divides `e1 − e2` by `r1 − r2` near the critical
+  point. By the rule (§2) the bound K = 2·S·c + 2 is far past 64 on most rows, so the rule's answer is
+  exact primitives (correctly rounded exp, sin, cos on the spring path), not a bound. The step rows
+  stay measured until that is decided (port plan §8).
+- **What the port measures meanwhile**, identical on all three targets: of the 1,600 step outputs,
+  **1,531 are bit-identical**, 12 are 1 ulp off, 6 are 2 ulp, 12 are 3–16 ulp, and 39 are over 16 (max
+  2.4·10^7, at S = 2.4·10^7). Every mismatch is where the polyfill exp or the builtin sin/cos is 1 ulp
+  from glibc (§2: 7.5% and 2% of inputs) on a sensitive row. `validate.py` recomputes all 1,000 spring
+  rows in Python on glibc, bit for bit, so the oracle rows and the transcription behind S are right.
+- **Arena, tracker**: no golden rows (both are `pub(crate)`; M3's dump rows compare their state). The 10
+  Rust arena tests and 3 tracker tests are ported, plus Cyrius-only tests: insert_at and the lazy free
+  list (lowest index first), retain order, generation wrap at 2^32, LIFO reuse, records wider than a word;
+  and, for the tracker, event order, unsorted and duplicate input, the seen-union across sub-steps,
+  forget_colliders, and handles at generation ≥ 2^31 sorting after the rest (unsigned).
+- **Result, every target** (x86_64 ELF, x86_64 PE, aarch64): 10 modules, 0 failing; **63,419 ok, 0
+  failed, 800 measured (`Spring::step`), 7 pending (S3 3, S4 3, the M6 constant), 93 accepted**; the
+  math digests are unchanged.
+
 ## How to reproduce
 
 ```sh

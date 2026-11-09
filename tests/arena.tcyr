@@ -1,0 +1,240 @@
+# arena.tcyr — the ported Rust tests of rust-old/src/arena.rs (M1b), plus Cyrius-only tests of
+# insert_at, the stale free list, retain and generation wrap (Rust covers those through the backends'
+# snapshot restore, which arrives in M6).
+
+include "tests/lib_2d.cyr"
+
+# Inserts the word v into arena a and returns its handle.
+fn put(a: *ImArena, v): i64 {
+    var x = v;
+    return a.insert(&x);
+}
+
+# The word stored at handle h, or -999 when h is not live.
+fn at(a: *ImArena, h): i64 {
+    var p = a.get(h);
+    if (p == 0) { return 0 - 999; }
+    return load64(p);
+}
+
+# 1 when some live value equals v.
+fn has_value(a: *ImArena, v): i64 {
+    for (var i = 0; i < a.slot_count(); i = i + 1) {
+        var h = a.slot_handle(i);
+        if (h >= 0 && at(a, h) == v) { return 1; }
+    }
+    return 0;
+}
+
+# The number of live values met by iterating the slots.
+fn live_count(a: *ImArena): i64 {
+    var n = 0;
+    for (var i = 0; i < a.slot_count(); i = i + 1) {
+        if (a.slot_handle(i) >= 0) { n = n + 1; }
+    }
+    return n;
+}
+
+# retain predicate: keeps even values.
+fn keep_even(h, p, ctx): i64 {
+    if ((load64(p) & 1) == 0) { return 1; }
+    return 0;
+}
+
+# retain predicate: counts its calls in ctx, and keeps everything.
+fn keep_all_counting(h, p, ctx): i64 {
+    store64(ctx, load64(ctx) + 1);
+    return 1;
+}
+
+# Runs the ported arena tests.
+fn main() {
+    alloc_init();
+
+    test_group("insert_and_get");
+    var a: *ImArena = ImArena_new(8);
+    var h = put(a, 42);
+    assert_eq(at(a, h), 42, "get 42");
+    assert_eq(a.len(), 1, "len 1");
+    a.free();
+
+    test_group("remove_and_reuse");
+    a = ImArena_new(8);
+    var h1 = put(a, 10);
+    var h2 = put(a, 20);
+    assert_eq(a.len(), 2, "len 2");
+    a.remove(h1, 0);
+    assert_eq(a.len(), 1, "len 1");
+    assert_eq(at(a, h1), 0 - 999, "stale handle");
+    var h3 = put(a, 30);
+    assert_eq(_im_handle_index(h3), _im_handle_index(h1), "same index");
+    assert_neq(_im_handle_generation(h3), _im_handle_generation(h1), "different generation");
+    assert_eq(at(a, h3), 30, "get 30");
+    assert_eq(at(a, h1), 0 - 999, "old handle still invalid");
+    assert_eq(at(a, h2), 20, "get 20");
+    a.free();
+
+    test_group("stale_handle_rejected");
+    a = ImArena_new(8);
+    h = put(a, 99);
+    a.remove(h, 0);
+    assert_eq(a.get(h), 0, "get");
+    assert_eq(a.contains(h), 0, "contains");
+    a.free();
+
+    test_group("values_iteration");
+    a = ImArena_new(8);
+    put(a, 1);
+    put(a, 2);
+    put(a, 3);
+    assert_eq(live_count(a), 3, "3 values");
+    assert_eq(has_value(a, 1) + has_value(a, 2) + has_value(a, 3), 3, "1, 2, 3");
+    a.free();
+
+    test_group("values_after_removal");
+    a = ImArena_new(8);
+    put(a, 1);
+    h2 = put(a, 2);
+    put(a, 3);
+    a.remove(h2, 0);
+    assert_eq(live_count(a), 2, "2 values");
+    assert_eq(has_value(a, 1) + has_value(a, 3), 2, "1, 3");
+    assert_eq(has_value(a, 2), 0, "2 gone");
+    a.free();
+
+    test_group("iter_handles");
+    a = ImArena_new(8);
+    h1 = put(a, 10);
+    h2 = put(a, 20);
+    assert_eq(live_count(a), 2, "2 pairs");
+    assert_eq(a.slot_handle(0), h1, "pair (h1, 10)");
+    assert_eq(at(a, a.slot_handle(0)), 10, "value 10");
+    assert_eq(a.slot_handle(1), h2, "pair (h2, 20)");
+    assert_eq(at(a, a.slot_handle(1)), 20, "value 20");
+    a.free();
+
+    test_group("mut_access");
+    a = ImArena_new(8);
+    h = put(a, 5);
+    store64(a.get(h), 50);
+    assert_eq(at(a, h), 50, "get 50");
+    a.free();
+
+    test_group("out_of_bounds_handle");
+    a = ImArena_new(8);
+    assert_eq(a.get(_im_arena_handle(999, 0)), 0, "bogus handle");
+    a.free();
+
+    test_group("double_remove");
+    a = ImArena_new(8);
+    h = put(a, 1);
+    var out = 0;
+    assert_eq(a.remove(h, &out), 1, "first remove");
+    assert_eq(out, 1, "removed value");
+    assert_eq(a.remove(h, &out), 0, "second remove");
+    a.free();
+
+    test_group("heavy_churn");
+    a = ImArena_new(8);
+    var hs = fl_alloc(100 * 8);
+    for (var i = 0; i < 100; i = i + 1) { store64(hs + i * 8, put(a, i)); }
+    assert_eq(a.len(), 100, "100");
+    for (var i = 1; i < 100; i = i + 2) { a.remove(load64(hs + i * 8), 0); }
+    assert_eq(a.len(), 50, "50");
+    for (var i = 100; i < 150; i = i + 1) { put(a, i); }
+    assert_eq(a.len(), 100, "100 again");
+    assert_eq(a.slot_count(), 100, "slots reused");
+    fl_free(hs);
+    a.free();
+
+    # Cyrius-only from here.
+    test_group("handle_layout");
+    h = _im_arena_handle(7, 3);
+    assert_eq(h, 3 * 4294967296 + 7, "generation high, index low");
+    assert_eq(_im_handle_index(h), 7, "index");
+    assert_eq(_im_handle_generation(h), 3, "generation");
+    h = _im_arena_handle(4294967295, 4294967295);
+    assert_eq(_im_handle_index(h), 4294967295, "max index");
+    assert_eq(_im_handle_generation(h), 4294967295, "max generation (logical shift)");
+
+    test_group("free_list_is_lifo");
+    a = ImArena_new(8);
+    for (var i = 0; i < 4; i = i + 1) { put(a, i); }
+    a.remove(_im_arena_handle(1, 0), 0);
+    a.remove(_im_arena_handle(3, 0), 0);
+    assert_eq(put(a, 30), _im_arena_handle(3, 1), "last freed first");
+    assert_eq(put(a, 10), _im_arena_handle(1, 1), "then the one before");
+    assert_eq(put(a, 4), _im_arena_handle(4, 0), "then append");
+    a.free();
+
+    test_group("insert_at_grows_and_rebuilds");
+    a = ImArena_new(8);
+    var v = 7;
+    assert_eq(a.insert_at(_im_arena_handle(5, 9), &v), 1, "insert at 5/9");
+    assert_eq(a.slot_count(), 6, "grown to 6 slots");
+    assert_eq(a.len(), 1, "len 1");
+    assert_eq(at(a, _im_arena_handle(5, 9)), 7, "get 5/9");
+    assert_eq(a.contains(_im_arena_handle(5, 0)), 0, "other generation");
+    assert_eq(a.insert_at(_im_arena_handle(5, 9), &v), 0, "occupied slot refused");
+    v = 8;
+    assert_eq(a.insert_at(_im_arena_handle(2, 4), &v), 1, "insert at 2/4");
+    assert_eq(a.free_list_stale, 1, "free list stale");
+    assert_eq(put(a, 0), _im_arena_handle(0, 0), "rebuilt: lowest index first");
+    assert_eq(a.free_list_stale, 0, "rebuilt once");
+    assert_eq(put(a, 1), _im_arena_handle(1, 0), "then 1");
+    assert_eq(put(a, 3), _im_arena_handle(3, 0), "skips occupied 2");
+    assert_eq(put(a, 4), _im_arena_handle(4, 0), "then 4");
+    assert_eq(put(a, 6), _im_arena_handle(6, 0), "then append");
+    a.free();
+
+    test_group("insert_at_free_listed_slot");
+    a = ImArena_new(8);
+    put(a, 0);
+    put(a, 1);
+    a.remove(_im_arena_handle(0, 0), 0);
+    v = 5;
+    assert_eq(a.insert_at(_im_arena_handle(0, 6), &v), 1, "into a free-listed slot");
+    assert_eq(put(a, 2), _im_arena_handle(2, 0), "the rebuild drops it from the free list");
+    a.free();
+
+    test_group("retain");
+    a = ImArena_new(8);
+    for (var i = 0; i < 6; i = i + 1) { put(a, i); }
+    a.retain(&keep_even, 0);
+    assert_eq(a.len(), 3, "3 kept");
+    assert_eq(has_value(a, 0) + has_value(a, 2) + has_value(a, 4), 3, "evens kept");
+    assert_eq(has_value(a, 1) + has_value(a, 3) + has_value(a, 5), 0, "odds removed");
+    assert_eq(a.contains(_im_arena_handle(1, 0)), 0, "removed handle stale");
+    assert_eq(put(a, 50), _im_arena_handle(5, 1), "freed in index order: 5 heads the list");
+    var calls = 0;
+    a.retain(&keep_all_counting, &calls);
+    assert_eq(calls, 4, "called once per live value");
+    assert_eq(a.len(), 4, "nothing removed");
+    a.free();
+
+    test_group("generation_wraps");
+    a = ImArena_new(8);
+    v = 1;
+    a.insert_at(_im_arena_handle(0, 4294967295), &v);
+    assert_eq(a.remove(_im_arena_handle(0, 4294967295), 0), 1, "remove at max generation");
+    assert_eq(put(a, 2), _im_arena_handle(0, 0), "wraps to 0");
+    a.free();
+
+    test_group("records_wider_than_a_word");
+    a = ImArena_new(24);
+    var rec = fl_alloc(24);
+    store64(rec, 1);
+    store64(rec + 8, 2);
+    store64(rec + 16, 3);
+    for (var i = 0; i < 20; i = i + 1) { a.insert(rec); }
+    var p = a.get(_im_arena_handle(19, 0));
+    assert_eq(load64(p) + load64(p + 8) + load64(p + 16), 6, "record survives growth");
+    fl_free(rec);
+    a.free();
+
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

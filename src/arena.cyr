@@ -1,0 +1,264 @@
+# arena.cyr — generational arena: O(1) insert, remove and lookup by handle (port of
+# rust-old/src/arena.rs).
+#
+# Values are fixed-size records (`elem_size` bytes) in one freelist buffer; a handle is a word with the
+# slot index in the low 32 bits and the slot's generation in the high 32, exactly the Rust
+# `ArenaHandle`, so the port hands out the same handles in the same order (M3's dump rows check it).
+# Slot semantics follow Rust's:
+# - `insert` reuses the free-list head, else appends a slot at generation 0;
+# - `remove` bumps the slot's generation (wrapping at 2^32) and pushes it on the free-list head;
+# - `insert_at` places a value at a given handle, growing with free generation-0 slots, and marks the
+#   free list stale; the next `insert` rebuilds it, lowest index first;
+# - `retain` frees, in index order, every value its callback rejects.
+# `get` returns the value's address, valid until the next insert (which may move the buffer); view it
+# through a typed pointer (`*ImBody`). Storage is freelist, released by `free`, so a world's arenas
+# never grow the global heap (port-parity.md §4.1). An allocation failure makes `insert` return -1 and
+# `insert_at` 0; nothing aborts. (-1 is also the handle of slot 2^32 − 1 at generation 2^32 − 1, which
+# no arena reaches.)
+
+struct ImArena {
+    elem_size;
+    cap;
+    count;
+    len;
+    free_head;
+    free_list_stale;
+    values;
+    meta;
+}
+
+# Each slot's metadata: three words — occupied (0/1), generation (u32), next free slot (-1 for none).
+const _IM_ARENA_META = 24;
+
+# The handle word for slot `index` at `generation`. Mirrors `ArenaHandle::new`.
+#must_use
+fn _im_arena_handle(index, generation): i64 {
+    return ((generation & 0xFFFFFFFF) << 32) | (index & 0xFFFFFFFF);
+}
+
+# A handle's slot index (low 32 bits). Mirrors `ArenaHandle::index`.
+#must_use
+fn _im_handle_index(h): i64 {
+    return h & 0xFFFFFFFF;
+}
+
+# A handle's generation (high 32 bits). Mirrors `ArenaHandle::generation`.
+#must_use
+fn _im_handle_generation(h): i64 {
+    return (h >> 32) & 0xFFFFFFFF;
+}
+
+# A typed view of a word (what fl_alloc returns).
+#must_use
+fn _im_as_arena(p): *ImArena {
+    return p;
+}
+
+# An empty arena for records of `elem_size` bytes, or 0 when there is no memory. Mirrors `Arena::new`.
+#must_use
+fn ImArena_new(elem_size): *ImArena {
+    var a: *ImArena = _im_as_arena(fl_alloc(sizeof(ImArena)));
+    if (a == 0) { return a; }
+    a.elem_size = elem_size;
+    a.cap = 0;
+    a.count = 0;
+    a.len = 0;
+    a.free_head = 0 - 1;
+    a.free_list_stale = 0;
+    a.values = 0;
+    a.meta = 0;
+    return a;
+}
+
+impl ImArena {
+    # The address of slot i's metadata.
+    #must_use
+    fn _meta(self, i): i64 {
+        return self.meta + i * _IM_ARENA_META;
+    }
+
+    # Room for at least `need` slots: 1, or 0 when there is no memory (the arena is unchanged).
+    fn _reserve(self, need): i64 {
+        if (need <= self.cap) { return 1; }
+        var cap = self.cap * 2;
+        if (cap < 8) { cap = 8; }
+        while (cap < need) { cap = cap * 2; }
+        var v = fl_alloc(cap * self.elem_size);
+        var m = fl_alloc(cap * _IM_ARENA_META);
+        if (v == 0 || m == 0) {
+            if (v != 0) { fl_free(v); }
+            if (m != 0) { fl_free(m); }
+            return 0;
+        }
+        if (self.count > 0) {
+            memcpy(v, self.values, self.count * self.elem_size);
+            memcpy(m, self.meta, self.count * _IM_ARENA_META);
+        }
+        if (self.values != 0) { fl_free(self.values); }
+        if (self.meta != 0) { fl_free(self.meta); }
+        self.values = v;
+        self.meta = m;
+        self.cap = cap;
+        return 1;
+    }
+
+    # Rebuilds the free list from the slots, lowest index first. Mirrors `rebuild_free_list`.
+    fn _rebuild_free_list(self) {
+        self.free_head = 0 - 1;
+        var i = self.count - 1;
+        while (i >= 0) {
+            var m = self._meta(i);
+            if (load64(m) == 0) {
+                store64(m + 16, self.free_head);
+                self.free_head = i;
+            }
+            i = i - 1;
+        }
+        self.free_list_stale = 0;
+        return 0;
+    }
+
+    # Copies `elem_size` bytes from `value` into a slot and returns its handle, or -1 when there is no
+    # memory. Mirrors `Arena::insert`.
+    fn insert(self, value): i64 {
+        if (self.free_list_stale == 1) { self._rebuild_free_list(); }
+        if (self.free_head >= 0) {
+            var idx = self.free_head;
+            var m = self._meta(idx);
+            self.free_head = load64(m + 16);
+            store64(m, 1);
+            store64(m + 16, 0 - 1);
+            memcpy(self.values + idx * self.elem_size, value, self.elem_size);
+            self.len = self.len + 1;
+            return _im_arena_handle(idx, load64(m + 8));
+        }
+        if (self._reserve(self.count + 1) == 0) { return 0 - 1; }
+        var i = self.count;
+        var mi = self._meta(i);
+        store64(mi, 1);
+        store64(mi + 8, 0);
+        store64(mi + 16, 0 - 1);
+        memcpy(self.values + i * self.elem_size, value, self.elem_size);
+        self.count = self.count + 1;
+        self.len = self.len + 1;
+        return _im_arena_handle(i, 0);
+    }
+
+    # The slot index of a live handle, or -1 (out of range, free, or another generation).
+    #must_use
+    fn _live(self, h): i64 {
+        var idx = _im_handle_index(h);
+        if (idx >= self.count) { return 0 - 1; }
+        var m = self._meta(idx);
+        if (load64(m) != 1 || load64(m + 8) != _im_handle_generation(h)) { return 0 - 1; }
+        return idx;
+    }
+
+    # Removes the value at handle h, copying it to `out` (when not 0): 1, or 0 when the handle is not
+    # live. Mirrors `Arena::remove`.
+    fn remove(self, h, out): i64 {
+        var idx = self._live(h);
+        if (idx < 0) { return 0; }
+        if (out != 0) { memcpy(out, self.values + idx * self.elem_size, self.elem_size); }
+        var m = self._meta(idx);
+        store64(m, 0);
+        store64(m + 8, (_im_handle_generation(h) + 1) & 0xFFFFFFFF);
+        store64(m + 16, self.free_head);
+        self.free_head = idx;
+        self.len = self.len - 1;
+        return 1;
+    }
+
+    # The address of the value at handle h, or 0 when the handle is not live. Mirrors `Arena::get` and
+    # `get_mut`.
+    #must_use
+    fn get(self, h): i64 {
+        var idx = self._live(h);
+        if (idx < 0) { return 0; }
+        return self.values + idx * self.elem_size;
+    }
+
+    # 1 when handle h is live. Mirrors `Arena::contains`.
+    #must_use
+    fn contains(self, h): i64 {
+        if (self._live(h) < 0) { return 0; }
+        return 1;
+    }
+
+    # The number of live values. Mirrors `Arena::len`.
+    #must_use
+    fn len(self): i64 {
+        return self.len;
+    }
+
+    # The number of slots, live or free (iteration bound).
+    #must_use
+    fn slot_count(self): i64 {
+        return self.count;
+    }
+
+    # The handle of slot i, or -1 when the slot is free or out of range. Iterating i over
+    # 0..slot_count() and skipping -1 visits the live values in Rust's `iter` order.
+    #must_use
+    fn slot_handle(self, i): i64 {
+        if (i < 0 || i >= self.count) { return 0 - 1; }
+        var m = self._meta(i);
+        if (load64(m) != 1) { return 0 - 1; }
+        return _im_arena_handle(i, load64(m + 8));
+    }
+
+    # Places a copy of `value` at handle h (its index and generation), growing with free generation-0
+    # slots; marks the free list stale. 1, or 0 when the slot is occupied or there is no memory. The
+    # caller bounds the index (it allocates up to index + 1 slots). Mirrors `Arena::insert_at`.
+    fn insert_at(self, h, value): i64 {
+        var idx = _im_handle_index(h);
+        if (idx >= self.count) {
+            if (self._reserve(idx + 1) == 0) { return 0; }
+            for (var i = self.count; i <= idx; i = i + 1) {
+                var mf = self._meta(i);
+                store64(mf, 0);
+                store64(mf + 8, 0);
+                store64(mf + 16, 0 - 1);
+            }
+            self.count = idx + 1;
+        } elif (load64(self._meta(idx)) == 1) {
+            return 0;
+        }
+        var m = self._meta(idx);
+        store64(m, 1);
+        store64(m + 8, _im_handle_generation(h));
+        store64(m + 16, 0 - 1);
+        memcpy(self.values + idx * self.elem_size, value, self.elem_size);
+        self.len = self.len + 1;
+        self.free_list_stale = 1;
+        return 1;
+    }
+
+    # Removes, in index order, every value for which `keep(handle, value_address, ctx)` returns 0.
+    # Mirrors `Arena::retain`.
+    fn retain(self, keep, ctx) {
+        for (var i = 0; i < self.count; i = i + 1) {
+            var m = self._meta(i);
+            if (load64(m) == 1) {
+                var g = load64(m + 8);
+                var h = _im_arena_handle(i, g);
+                if (fncall3(keep, h, self.values + i * self.elem_size, ctx) == 0) {
+                    store64(m, 0);
+                    store64(m + 8, (g + 1) & 0xFFFFFFFF);
+                    store64(m + 16, self.free_head);
+                    self.free_head = i;
+                    self.len = self.len - 1;
+                }
+            }
+        }
+        return 0;
+    }
+
+    # Releases the arena's storage and the arena itself.
+    fn free(self) {
+        if (self.values != 0) { fl_free(self.values); }
+        if (self.meta != 0) { fl_free(self.meta); }
+        fl_free(self);
+        return 0;
+    }
+}

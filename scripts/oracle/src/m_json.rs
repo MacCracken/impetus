@@ -8,8 +8,10 @@
 //! whitespace and non-objects.
 
 use impetus::{
-    BroadphaseKind, CombineRule, Force, Impulse, PhysicsMaterial, PhysicsUnit, Quantity,
-    SolverKind, Torque, WorldConfig,
+    BodyDesc, BodyHandle, BodyState, BodyType, BroadphaseKind, ColliderDesc, ColliderHandle,
+    ColliderShape, CollisionEvent, CombineRule, ContactData, ContactPoint, Force, Impulse,
+    JointDesc, JointMotor, JointType, PhysicsMaterial, PhysicsUnit, PointQuery, Quantity, RayHit,
+    SolverKind, Spring, Spring2d, Spring3d, Torque, WorldConfig,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -150,6 +152,18 @@ pub fn emit() -> Module {
             "null",
             "",
             "{",
+            // serde's sequence form: by position, trailing defaulted fields may be left off.
+            "[0.016,[0,-9.81,0],4,1,true,0]",
+            r#"[0.016,[0,-9.81,0],4,1,true,0,0.01,0.2,500,4,60,0.7,"AabbTree","SequentialImpulse"]"#,
+            r#"[0.016,[0,-9.81,0],4,1,true,0,0.01,0.2,500,4,60,0.7,"AabbTree","SequentialImpulse",1]"#,
+            "[0.016,[0,-9.81,0],4,1,true]",
+            // unit variants as one-key objects.
+            r#"{"timestep":1,"gravity":[0,0,0],"velocity_iterations":4,"position_iterations":1,"deterministic":true,"step":0,"solver":{"Xpbd":null}}"#,
+            r#"{"timestep":1,"gravity":[0,0,0],"velocity_iterations":4,"position_iterations":1,"deterministic":true,"step":0,"solver":{"Xpbd":[]}}"#,
+            // S3: a u64 above i64::MAX (serde_json reads it; bayan refuses the document).
+            r#"{"timestep":1,"gravity":[0,0,0],"velocity_iterations":4,"position_iterations":1,"deterministic":true,"step":9223372036854775808}"#,
+            // S4: a duplicate key serde ignores.
+            r#"{"timestep":1,"gravity":[0,0,0],"velocity_iterations":4,"position_iterations":1,"deterministic":true,"step":0,"x":1,"x":2}"#,
         ],
     ));
     read_rows::<WorldConfig>(&mut m, "WorldConfig", &docs, flat::config);
@@ -198,6 +212,13 @@ pub fn emit() -> Module {
             r#"{"friction":0.5,"restitution":0.0,"density":1.0,"friction_combine":"Max","restitution_combine":"Average"}"#,
             r#"{"friction":0.5,"restitution":0.0,"density":1.0,"rolling_friction":null}"#,
             r#"{"friction":0.5,"restitution":0.0,"density":1.0,"static_friction":"0.3"}"#,
+            "[0.5,0,1]",
+            "[0.5,0,1,null]",
+            r#"[0.5,0,1,0.3,0,"Max","Min"]"#,
+            r#"[0.5,0,1,0.3,0,"Max","Min",0]"#,
+            r#"{"friction":0.5,"restitution":0.0,"density":1.0,"friction_combine":{"Max":null}}"#,
+            r#"{"friction":0.5,"restitution":0.0,"density":1.0,"friction_combine":{"Max":null,"Min":null}}"#,
+            r#"{"friction":0.5,"restitution":0.0,"density":1.0,"friction_combine":{}}"#,
         ],
     ));
     read_rows::<PhysicsMaterial>(&mut m, "PhysicsMaterial", &docs, flat::material);
@@ -235,6 +256,9 @@ pub fn emit() -> Module {
             r#"{"value":42.0,"unit":"newtons"}"#,
             r#"{"value":"42","unit":"Newtons"}"#,
             r#"{"value":null,"unit":"Newtons"}"#,
+            r#"[42,"Newtons"]"#,
+            "[42]",
+            r#"{"value":42,"unit":{"Newtons":null}}"#,
         ],
     ));
     read_rows::<Quantity>(&mut m, "Quantity", &docs, flat::quantity);
@@ -265,6 +289,10 @@ pub fn emit() -> Module {
         r#"{"vector":[1,2,3],"point":[1,2]}"#,
         r#"{"point":[1,2,3]}"#,
         r#"{"vector":[1,2,3],"point":[0.5,0.5,0]}"#,
+        "[[1,2,3]]",
+        "[[1,2,3],null]",
+        "[[1,2,3],[4,5,6]]",
+        "[[1,2,3],null,null]",
     ];
     let mut docs = write_rows(&mut m, "Force", &forces, flat::force);
     docs.extend(vp_edges.iter().map(|e| (*e).to_string()));
@@ -281,7 +309,595 @@ pub fn emit() -> Module {
         "{\"value\":1}".to_string(),
         "{}".to_string(),
         "{\"value\":true}".to_string(),
+        "[5]".to_string(),
+        "[5,6]".to_string(),
+        "[]".to_string(),
+        // S3: an integer beyond u64 reads as an f64 in serde_json; bayan refuses it.
+        "{\"value\":100000000000000000000}".to_string(),
+        // S4: duplicate keys serde ignores (an unknown field; inside an ignored value).
+        "{\"value\":1,\"x\":1,\"x\":2}".to_string(),
+        "{\"value\":1,\"x\":{\"a\":1,\"a\":2}}".to_string(),
     ]);
     read_rows::<Torque>(&mut m, "Torque", &docs, torque);
+    emit_m1b(&mut m, &mut rng);
     m
+}
+
+fn rand3(rng: &mut Rng, lo: f64, hi: f64) -> [f64; 3] {
+    [
+        rng.signed_log_uniform(lo, hi),
+        rng.signed_log_uniform(lo, hi),
+        rng.signed_log_uniform(lo, hi),
+    ]
+}
+
+fn rand2(rng: &mut Rng, lo: f64, hi: f64) -> [f64; 2] {
+    [
+        rng.signed_log_uniform(lo, hi),
+        rng.signed_log_uniform(lo, hi),
+    ]
+}
+
+/// A handle below 2^63 (above it, bayan can't read the document back: S3).
+fn rand_handle(rng: &mut Rng) -> u64 {
+    rng.bits() >> 1
+}
+
+#[allow(clippy::too_many_lines)] // one block per type
+fn emit_m1b(m: &mut Module, rng: &mut Rng) {
+    // ── BodyDesc ──
+    let mut bodies = vec![
+        BodyDesc::default(),
+        BodyDesc {
+            body_type: BodyType::Static,
+            position: [5.0, 3.0, 0.0],
+            rotation: 1.57,
+            ..BodyDesc::default()
+        },
+        BodyDesc {
+            body_type: BodyType::Kinematic,
+            position: [1.0, 2.0, 0.0],
+            linear_velocity: [3.0, 4.0, 0.0],
+            angular_velocity: 0.5,
+            fixed_rotation: true,
+            gravity_scale: Some(0.5),
+            ..BodyDesc::default()
+        },
+        BodyDesc {
+            gravity_scale: Some(f64::NAN),
+            rotation: f64::INFINITY,
+            ..BodyDesc::default()
+        },
+    ];
+    for _ in 0..20 {
+        bodies.push(BodyDesc {
+            body_type: [BodyType::Static, BodyType::Dynamic, BodyType::Kinematic]
+                [usize::try_from(rng.int(0, 2)).unwrap_or(0)],
+            position: rand3(rng, -3.0, 3.0),
+            rotation: rng.uniform(-7.0, 7.0),
+            linear_velocity: rand3(rng, -3.0, 3.0),
+            angular_velocity: rng.signed_log_uniform(-3.0, 3.0),
+            linear_damping: rng.uniform(0.0, 1.0),
+            angular_damping: rng.uniform(0.0, 1.0),
+            fixed_rotation: rng.unit() < 0.5,
+            gravity_scale: if rng.unit() < 0.5 {
+                Some(rng.uniform(-2.0, 2.0))
+            } else {
+                None
+            },
+        });
+    }
+    let mut docs = write_rows(m, "BodyDesc", &bodies, flat::body_desc);
+    docs.extend(
+        [
+            r#"{"body_type":"Static","position":[0,0,0],"rotation":0}"#,
+            r#"{"body_type":"Static","position":[0,0,0]}"#,
+            r#"{"body_type":{"Kinematic":null},"position":[0,0,0],"rotation":0,"gravity_scale":null}"#,
+            r#"{"body_type":"static","position":[0,0,0],"rotation":0}"#,
+            r#"{"body_type":"Static","position":[0,0,0],"rotation":0,"fixed_rotation":1}"#,
+            r#"{"body_type":"Static","position":[0,0,0],"rotation":0,"linear_velocity":[1,2]}"#,
+            r#"["Dynamic",[1,2,3],0.5]"#,
+            r#"["Dynamic",[1,2,3],0.5,[0,0,0],0,0,0,false,2]"#,
+            r#"["Dynamic",[1,2,3],0.5,[0,0,0],0,0,0,false,2,0]"#,
+            r#"["Dynamic",[1,2,3]]"#,
+        ]
+        .iter()
+        .map(|d| (*d).to_string()),
+    );
+    read_rows::<BodyDesc>(m, "BodyDesc", &docs, flat::body_desc);
+
+    // ── BodyState ──
+    let mut states = vec![
+        BodyState {
+            handle: BodyHandle(42),
+            body_type: BodyType::Dynamic,
+            position: [1.0, 2.0, 0.0],
+            rotation: 0.5,
+            linear_velocity: [3.0, 4.0, 0.0],
+            angular_velocity: 1.0,
+            is_sleeping: false,
+        },
+        BodyState {
+            handle: BodyHandle(0),
+            body_type: BodyType::Static,
+            position: [0.0; 3],
+            rotation: 0.0,
+            linear_velocity: [0.0; 3],
+            angular_velocity: 0.0,
+            is_sleeping: true,
+        },
+    ];
+    for _ in 0..10 {
+        states.push(BodyState {
+            handle: BodyHandle(rand_handle(rng)),
+            body_type: BodyType::Dynamic,
+            position: rand3(rng, -3.0, 3.0),
+            rotation: rng.uniform(-3.2, 3.2),
+            linear_velocity: rand3(rng, -3.0, 3.0),
+            angular_velocity: rng.signed_log_uniform(-3.0, 3.0),
+            is_sleeping: rng.unit() < 0.5,
+        });
+    }
+    // Written as serde_json writes it; the read back is S3's (pending).
+    states.push(BodyState {
+        handle: BodyHandle(u64::MAX),
+        ..states[1].clone()
+    });
+    let mut docs = write_rows(m, "BodyState", &states, flat::body_state);
+    docs.extend(
+        [
+            r#"{"handle":1.0,"body_type":"Static","position":[0,0,0],"rotation":0,"linear_velocity":[0,0,0],"angular_velocity":0,"is_sleeping":true}"#,
+            r#"{"handle":-1,"body_type":"Static","position":[0,0,0],"rotation":0,"linear_velocity":[0,0,0],"angular_velocity":0,"is_sleeping":true}"#,
+            r#"{"handle":7,"body_type":"Static","position":[0,0,0],"rotation":0,"linear_velocity":[0,0,0],"angular_velocity":0}"#,
+            r#"[7,"Static",[0,0,0],0,[0,0,0],0,true]"#,
+            r#"[7,"Static",[0,0,0],0,[0,0,0],0]"#,
+            r#"{"handle":9223372036854775807,"body_type":"Static","position":[0,0,0],"rotation":0,"linear_velocity":[0,0,0],"angular_velocity":0,"is_sleeping":true}"#,
+        ]
+        .iter()
+        .map(|d| (*d).to_string()),
+    );
+    read_rows::<BodyState>(m, "BodyState", &docs, flat::body_state);
+
+    // ── ColliderShape ──
+    let mut shapes = vec![
+        ColliderShape::Box {
+            half_extents: [1.0, 2.0, 3.0],
+        },
+        ColliderShape::Ball { radius: 0.5 },
+        ColliderShape::Capsule {
+            half_height: 1.0,
+            radius: 0.25,
+        },
+        ColliderShape::ConvexHull {
+            points: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+        },
+        ColliderShape::ConvexHull { points: vec![] },
+        ColliderShape::TriMesh {
+            vertices: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            indices: vec![[0, 1, 2], [2, 1, u32::MAX]],
+        },
+        ColliderShape::Heightfield {
+            heights: vec![0.0, 1.5, -2.25, 1e-7],
+            scale: [1.0, 2.0, 1.0],
+        },
+        ColliderShape::Segment {
+            a: [0.0, 0.0, 0.0],
+            b: [1.0, -1.0, 0.5],
+        },
+        ColliderShape::Ball { radius: f64::NAN },
+    ];
+    for _ in 0..10 {
+        let n = usize::try_from(rng.int(1, 8)).unwrap_or(1);
+        shapes.push(ColliderShape::ConvexHull {
+            points: (0..n).map(|_| rand3(rng, -3.0, 3.0)).collect(),
+        });
+        shapes.push(ColliderShape::Box {
+            half_extents: rand3(rng, -2.0, 2.0),
+        });
+    }
+    let mut docs = write_rows(m, "ColliderShape", &shapes, flat::shape);
+    docs.extend(
+        [
+            r#"{"Ball":[0.5]}"#,
+            r#"{"Ball":{"radius":0.5},"Box":{"half_extents":[1,1,1]}}"#,
+            r#""Ball""#,
+            r#"{"Sphere":{"radius":1}}"#,
+            r#"{"TriMesh":{"vertices":[],"indices":[[0,1,4294967296]]}}"#,
+            r#"{"TriMesh":{"vertices":[[0,0]],"indices":[]}}"#,
+            r#"{"TriMesh":{"vertices":[[0,0,0]],"indices":[[0,1,2.0]]}}"#,
+            r#"{"Heightfield":{"heights":[1,2,null],"scale":[1,1,1]}}"#,
+            r#"{"Heightfield":[[1,2],[1,1,1]]}"#,
+            r#"{"Ball":{}}"#,
+            r#"{"Ball":null}"#,
+            "{}",
+            "[]",
+            r#"{"Capsule":[1]}"#,
+            r#"{"Capsule":[1,2,3]}"#,
+            r#"{"Capsule":{"radius":2,"half_height":1}}"#,
+            r#"{"Segment":{"a":[0,0,0],"b":[1,1,1],"c":3}}"#,
+        ]
+        .iter()
+        .map(|d| (*d).to_string()),
+    );
+    read_rows::<ColliderShape>(m, "ColliderShape", &docs, flat::shape);
+
+    // ── ColliderDesc ──
+    let mut cdescs = vec![
+        ColliderDesc {
+            shape: ColliderShape::Ball { radius: 0.5 },
+            offset: [0.0; 3],
+            material: PhysicsMaterial::default(),
+            is_sensor: false,
+            mass: None,
+            collision_layer: u32::MAX,
+            collision_mask: u32::MAX,
+        },
+        ColliderDesc {
+            shape: ColliderShape::Box {
+                half_extents: [1.0, 0.5, 0.0],
+            },
+            offset: [0.1, 0.2, 0.0],
+            material: PhysicsMaterial::rubber(),
+            is_sensor: true,
+            mass: Some(2.5),
+            collision_layer: 0b0101,
+            collision_mask: 0,
+        },
+    ];
+    for _ in 0..8 {
+        cdescs.push(ColliderDesc {
+            shape: ColliderShape::Capsule {
+                half_height: rng.uniform(0.1, 3.0),
+                radius: rng.uniform(0.1, 1.0),
+            },
+            offset: rand3(rng, -2.0, 2.0),
+            material: PhysicsMaterial::ice(),
+            is_sensor: rng.unit() < 0.5,
+            mass: if rng.unit() < 0.5 {
+                Some(rng.log_uniform(-2.0, 3.0))
+            } else {
+                None
+            },
+            collision_layer: u32::try_from(rng.int(0, i64::from(u32::MAX))).unwrap_or(0),
+            collision_mask: u32::try_from(rng.int(0, i64::from(u32::MAX))).unwrap_or(0),
+        });
+    }
+    let mut docs = write_rows(m, "ColliderDesc", &cdescs, flat::collider_desc);
+    docs.extend(
+        [
+            r#"{"shape":{"Ball":{"radius":0.5}}}"#,
+            r#"[{"Ball":{"radius":0.5}}]"#,
+            r#"[{"Ball":{"radius":0.5}},[0,0,0],{"friction":1,"restitution":0,"density":1},false,null,1,2]"#,
+            r#"{"shape":{"Ball":{"radius":0.5}},"collision_layer":4294967296}"#,
+            r#"{"shape":{"Ball":{"radius":0.5}},"mass":null,"material":{"friction":1,"restitution":0,"density":1}}"#,
+            r#"{"shape":{"Ball":{"radius":0.5}},"material":{"friction":1,"restitution":0}}"#,
+            r#"{"offset":[0,0,0]}"#,
+            r#"{"shape":{"ConvexHull":{"points":[[1,2,3]]}},"is_sensor":"yes"}"#,
+        ]
+        .iter()
+        .map(|d| (*d).to_string()),
+    );
+    read_rows::<ColliderDesc>(m, "ColliderDesc", &docs, flat::collider_desc);
+
+    // ── JointType ──
+    let mut jtypes = vec![
+        JointType::Fixed,
+        JointType::Revolute {
+            anchor: [0.5, 0.0],
+            limits: None,
+        },
+        JointType::Revolute {
+            anchor: [0.0, 1.0],
+            limits: Some([-1.57, 1.57]),
+        },
+        JointType::Prismatic {
+            axis: [1.0, 0.0],
+            limits: Some([-2.0, 2.0]),
+        },
+        JointType::Prismatic {
+            axis: [0.0, 1.0],
+            limits: None,
+        },
+        JointType::Spring {
+            rest_length: 1.0,
+            stiffness: 100.0,
+            damping: 5.0,
+        },
+        JointType::Distance { length: 2.5 },
+        JointType::Wheel {
+            axis: [0.0, 1.0],
+            stiffness: 50.0,
+            damping: 2.0,
+        },
+        JointType::Rope { max_length: 3.0 },
+        JointType::Mouse {
+            target: [1.0, 2.0, 0.0],
+            stiffness: 1000.0,
+            damping: 10.0,
+            max_force: 1e4,
+        },
+    ];
+    for _ in 0..6 {
+        jtypes.push(JointType::Revolute {
+            anchor: rand2(rng, -2.0, 2.0),
+            limits: Some(rand2(rng, -1.0, 1.0)),
+        });
+        jtypes.push(JointType::Spring {
+            rest_length: rng.log_uniform(-2.0, 2.0),
+            stiffness: rng.log_uniform(0.0, 4.0),
+            damping: rng.log_uniform(-1.0, 2.0),
+        });
+    }
+    let mut docs = write_rows(m, "JointType", &jtypes, flat::joint_type);
+    docs.extend(
+        [
+            r#"{"Fixed":null}"#,
+            r#"{"Fixed":[]}"#,
+            r#""Revolute""#,
+            r#"{"Revolute":{"anchor":[0,0]}}"#,
+            r#"{"Revolute":[[0,0]]}"#,
+            r#"{"Revolute":[[0,0],null]}"#,
+            r#"{"Revolute":{"anchor":[0,0],"limits":[1]}}"#,
+            r#"{"Distance":{"length":1},"Rope":{"max_length":1}}"#,
+            "{}",
+            r#"{"Distance":{"length":1,"length":2}}"#,
+            r#"{"Mouse":{"target":[1,2],"stiffness":1,"damping":1,"max_force":1}}"#,
+            r#"{"Mouse":[[1,2,3],1,1,1]}"#,
+            r#"{"Spring":{"rest_length":1,"stiffness":2}}"#,
+            r#"{"Wheel":{"axis":[0,1],"stiffness":1,"damping":1,"extra":[]}}"#,
+            r#""fixed""#,
+        ]
+        .iter()
+        .map(|d| (*d).to_string()),
+    );
+    read_rows::<JointType>(m, "JointType", &docs, flat::joint_type);
+
+    // ── JointDesc ──
+    let jdescs = vec![
+        JointDesc {
+            body_a: BodyHandle(0),
+            body_b: BodyHandle(1),
+            joint_type: JointType::Fixed,
+            local_anchor_a: [0.0, 0.0],
+            local_anchor_b: [0.0, 0.0],
+            motor: None,
+            damping: 0.0,
+            break_force: None,
+        },
+        JointDesc {
+            body_a: BodyHandle(0),
+            body_b: BodyHandle(1),
+            joint_type: JointType::Spring {
+                rest_length: 1.0,
+                stiffness: 100.0,
+                damping: 5.0,
+            },
+            local_anchor_a: [0.5, 0.0],
+            local_anchor_b: [-0.5, 0.0],
+            motor: None,
+            damping: 0.0,
+            break_force: None,
+        },
+        JointDesc {
+            body_a: BodyHandle(3 << 32 | 7),
+            body_b: BodyHandle(9),
+            joint_type: JointType::Revolute {
+                anchor: [0.0, 0.5],
+                limits: Some([-0.5, 0.5]),
+            },
+            local_anchor_a: [0.0, 0.5],
+            local_anchor_b: [0.0, -0.5],
+            motor: Some(JointMotor {
+                target_velocity: 2.0,
+                max_force: 50.0,
+            }),
+            damping: 0.1,
+            break_force: Some(1000.0),
+        },
+    ];
+    let mut docs = write_rows(m, "JointDesc", &jdescs, flat::joint_desc);
+    docs.extend(
+        [
+            r#"{"body_a":0,"body_b":1,"joint_type":"Fixed","local_anchor_a":[0,0],"local_anchor_b":[0,0]}"#,
+            r#"{"body_a":0,"body_b":1,"joint_type":"Fixed","local_anchor_a":[0,0],"local_anchor_b":[0,0],"motor":null}"#,
+            r#"[0,1,"Fixed",[0,0],[0,0]]"#,
+            r#"[0,1,"Fixed",[0,0],[0,0],[1,2],0.5,null]"#,
+            r#"{"body_a":0,"body_b":1,"joint_type":"Fixed","local_anchor_a":[0,0],"local_anchor_b":[0,0],"motor":{"target_velocity":1}}"#,
+            r#"{"body_a":-1,"body_b":1,"joint_type":"Fixed","local_anchor_a":[0,0],"local_anchor_b":[0,0]}"#,
+            r#"{"body_a":0,"body_b":1,"joint_type":"Fixed","local_anchor_a":[0,0,0],"local_anchor_b":[0,0]}"#,
+            r#"{"body_a":0,"body_b":1,"local_anchor_a":[0,0],"local_anchor_b":[0,0]}"#,
+        ]
+        .iter()
+        .map(|d| (*d).to_string()),
+    );
+    read_rows::<JointDesc>(m, "JointDesc", &docs, flat::joint_desc);
+
+    // ── CollisionEvent ──
+    let mut events = vec![
+        CollisionEvent::Started {
+            collider_a: ColliderHandle(0),
+            collider_b: ColliderHandle(1),
+        },
+        CollisionEvent::Stopped {
+            collider_a: ColliderHandle(3),
+            collider_b: ColliderHandle(7),
+        },
+        CollisionEvent::Ongoing {
+            collider_a: ColliderHandle(2),
+            collider_b: ColliderHandle(5),
+        },
+    ];
+    for _ in 0..6 {
+        events.push(CollisionEvent::Ongoing {
+            collider_a: ColliderHandle(rand_handle(rng)),
+            collider_b: ColliderHandle(rand_handle(rng)),
+        });
+    }
+    let mut docs = write_rows(m, "CollisionEvent", &events, flat::event);
+    docs.extend(
+        [
+            r#"{"Started":[0,1]}"#,
+            r#"{"Started":{"collider_a":0}}"#,
+            r#""Started""#,
+            r#"{"Begun":{"collider_a":0,"collider_b":1}}"#,
+            r#"{"Stopped":{"collider_a":0,"collider_b":1.5}}"#,
+        ]
+        .iter()
+        .map(|d| (*d).to_string()),
+    );
+    read_rows::<CollisionEvent>(m, "CollisionEvent", &docs, flat::event);
+
+    // ── ContactPoint, ContactData ──
+    let pts: Vec<ContactPoint> = (0..6)
+        .map(|_| ContactPoint {
+            local_a: rand3(rng, -2.0, 1.0),
+            local_b: rand3(rng, -2.0, 1.0),
+            impulse: rng.log_uniform(-3.0, 3.0),
+        })
+        .collect();
+    let mut docs = write_rows(m, "ContactPoint", &pts, flat::contact_point);
+    docs.extend(
+        [
+            r#"{"local_a":[0,0,0],"local_b":[1,1,1]}"#,
+            "[[0,0,0],[1,1,1],2]",
+        ]
+        .iter()
+        .map(|d| (*d).to_string()),
+    );
+    read_rows::<ContactPoint>(m, "ContactPoint", &docs, flat::contact_point);
+    let datas = vec![
+        ContactData {
+            collider_a: ColliderHandle(0),
+            collider_b: ColliderHandle(1),
+            normal: [0.0, 1.0, 0.0],
+            depth: 0.05,
+            points: vec![ContactPoint {
+                local_a: [0.0, -0.5, 0.0],
+                local_b: [0.0, 0.5, 0.0],
+                impulse: 9.81,
+            }],
+        },
+        ContactData {
+            collider_a: ColliderHandle(4),
+            collider_b: ColliderHandle(1 << 32 | 2),
+            normal: [0.6, 0.8, 0.0],
+            depth: 0.0,
+            points: vec![],
+        },
+        ContactData {
+            collider_a: ColliderHandle(1),
+            collider_b: ColliderHandle(2),
+            normal: [0.0, 0.0, 1.0],
+            depth: 1e-9,
+            points: pts.clone(),
+        },
+    ];
+    let mut docs = write_rows(m, "ContactData", &datas, flat::contact_data);
+    docs.extend(
+        [
+            r#"{"collider_a":0,"collider_b":1,"normal":[0,1,0],"depth":0}"#,
+            r#"{"collider_a":0,"collider_b":1,"normal":[0,1,0],"depth":0,"points":[[[0,0,0],[1,1,1],2]]}"#,
+            r#"{"collider_a":0,"collider_b":1,"normal":[0,1,0],"depth":0,"points":[{"local_a":[0,0,0]}]}"#,
+            r#"{"collider_a":0,"collider_b":1,"normal":[0,1,0],"depth":0,"points":{}}"#,
+        ]
+        .iter()
+        .map(|d| (*d).to_string()),
+    );
+    read_rows::<ContactData>(m, "ContactData", &docs, flat::contact_data);
+
+    // ── RayHit, PointQuery ──
+    let hits = vec![
+        RayHit {
+            collider: ColliderHandle(5),
+            point: [1.0, 2.0, 0.0],
+            normal: [0.0, 1.0, 0.0],
+            distance: 3.5,
+        },
+        RayHit {
+            collider: ColliderHandle(rand_handle(rng)),
+            point: rand3(rng, -3.0, 3.0),
+            normal: [0.6, -0.8, 0.0],
+            distance: rng.log_uniform(-3.0, 3.0),
+        },
+    ];
+    let mut docs = write_rows(m, "RayHit", &hits, flat::ray_hit);
+    docs.push(r#"{"collider":5,"point":[1,2,0],"normal":[0,1,0]}"#.to_string());
+    docs.push("[5,[1,2,0],[0,1,0],3.5]".to_string());
+    read_rows::<RayHit>(m, "RayHit", &docs, flat::ray_hit);
+    let queries = vec![
+        PointQuery {
+            collider: ColliderHandle(2),
+            distance: 0.0,
+            is_inside: true,
+        },
+        PointQuery {
+            collider: ColliderHandle(3),
+            distance: 1.5,
+            is_inside: false,
+        },
+        PointQuery {
+            collider: ColliderHandle(1),
+            distance: -0.25,
+            is_inside: true,
+        },
+    ];
+    let mut docs = write_rows(m, "PointQuery", &queries, flat::point_query);
+    docs.push(r#"{"collider":2,"distance":0,"is_inside":"true"}"#.to_string());
+    docs.push("[2,0.5,false]".to_string());
+    read_rows::<PointQuery>(m, "PointQuery", &docs, flat::point_query);
+
+    // ── Spring, Spring2d, Spring3d ──
+    let mut springs = vec![
+        Spring::new(10.0, 90.0, 200.0, 12.0),
+        Spring::critically_damped(0.0, 100.0, 300.0),
+        Spring::new(f64::NAN, 1.0, 0.0, 0.0),
+    ];
+    let mut moving = Spring::under_damped(0.0, 1.0, 400.0);
+    moving.step(0.05);
+    springs.push(moving);
+    for _ in 0..6 {
+        let mut s = Spring::new(
+            rng.uniform(-100.0, 100.0),
+            rng.uniform(-100.0, 100.0),
+            rng.log_uniform(0.0, 3.0),
+            rng.log_uniform(-1.0, 2.0),
+        );
+        s.set_velocity(rng.uniform(-50.0, 50.0));
+        s.set_settle_threshold(rng.log_uniform(-4.0, 0.0));
+        springs.push(s);
+    }
+    let mut docs = write_rows(m, "Spring", &springs, flat::spring);
+    docs.extend(
+        [
+            r#"{"position":0,"velocity":0,"target":1,"stiffness":1,"damping":1}"#,
+            r#"{"position":0,"velocity":0,"target":1,"stiffness":1,"damping":1,"settle_threshold":0.01,"cache":1}"#,
+            "[0,0,1,1,1,0.01]",
+            "[0,0,1,1,1]",
+        ]
+        .iter()
+        .map(|d| (*d).to_string()),
+    );
+    read_rows::<Spring>(m, "Spring", &docs, flat::spring);
+    let s2 = vec![
+        Spring2d::new([0.0, 1.0], [2.0, 3.0], 4.0, 5.0),
+        Spring2d::critically_damped([0.0, 0.0], [50.0, 75.0], 300.0),
+    ];
+    let mut docs = write_rows(m, "Spring2d", &s2, flat::spring2d);
+    docs.push("[[0,0,1,1,1,0.01],[0,0,1,1,1,0.01]]".to_string());
+    docs.push(r#"{"x":[0,0,1,1,1,0.01]}"#.to_string());
+    read_rows::<Spring2d>(m, "Spring2d", &docs, flat::spring2d);
+    let s3 = vec![Spring3d::new(
+        [0.0, 0.0, 0.0],
+        [10.0, 20.0, 30.0],
+        300.0,
+        20.0,
+    )];
+    let mut docs = write_rows(m, "Spring3d", &s3, flat::spring3d);
+    docs.push("[[0,0,1,1,1,0.01],[0,0,1,1,1,0.01],[0,0,1,1,1,0.01]]".to_string());
+    read_rows::<Spring3d>(m, "Spring3d", &docs, flat::spring3d);
 }

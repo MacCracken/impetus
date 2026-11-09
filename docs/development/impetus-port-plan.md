@@ -524,6 +524,22 @@ tanmatra filed its findings.
   M1b** (`src/fmtf.cyr`, ADR 0010), with Burger & Dybvig's free-format digits on a 40-limb bignum,
   pinned by 37,576 golden rows. The stdlib still lacks it; `fmtf.cyr` can seed an upstream printer
   (not filed yet).
+- **S3. bayan: JSON integers above `i64::MAX`** (not filed yet). The tree parser refuses any integer that
+  doesn't fit an i64 ("integer is out of range"). serde_json reads u64 up to 2^64 − 1, and an integer
+  beyond u64 as an f64. impetus's handles are u64: one at generation ≥ 2^31 is written by serde_json
+  and can't be read back by the port. 3 golden rows pending (ADR 0010 findings). Ask: keep an
+  out-of-i64 integer as a u64 (a flag or tag) or as its f64, as serde_json does, instead of failing.
+- **S4. bayan: a duplicate-key policy** (not filed yet). Every bayan parser refuses a document with any
+  duplicate key (1.11.1, deliberate). serde refuses only a duplicate *known* field and ignores repeats of
+  unknown fields and anything inside an ignored value. 3 golden rows pending. Ask: an option for
+  last-wins (or keep-all) objects, so a caller with its own field checks can match serde.
+- **`str_builder` aborts on OOM** (not filed yet): the back-compat calls (`putc`, `add_cstr`,
+  `add_int`) exit the process when a grow fails, so `src/fmtf.cyr` and `src/json.cyr`'s writers do too.
+  The `_a` variants return -1; moving the writers onto them, with an error return, is impetus-side work.
+- **Exact transcendentals for the spring** (decision open): `Spring::step`'s sensitivity puts the
+  port-parity rule's bound far past 64 on most rows (`port-parity.md` §7), so the rule asks for
+  correctly rounded exp, sin and cos on the spring path (as kimiya's ADR 0005 did for glibc's
+  ill-conditioned calls), a ganita or impetus task. Until then the 800 step rows are measured, not gated.
 - **Derive features for serde-shaped JSON** (not filed yet): variant renaming (`"Average"`, not the member
   name), `Option` fields as `null`, externally tagged payload enums (`{"Ball":{"radius":0.5}}`). With them,
   `src/json.cyr`'s hand-written codecs could move to `#derive`.
@@ -580,7 +596,7 @@ tanmatra filed its findings.
 |---|---|---|---|---|---|
 | M0 Initialize | ✅ done 2026-11-09 | constants 3 + math 18,919: **14,875 ok, 0 failed, 0 measured, 4,046 pending (M1 helpers), 1 accepted (ADR 0009)**, identical bits on x86_64 ELF, x86_64 PE and aarch64 | — | 1 probe bench | oracle hooks; scaffold and repairs; `cyrius.cyml` with hisab 3.4.1; generator, `validate.py`, `src/constants.cyr`, parity harness; exp and atan2 on the polyfills (cross-target bits), K = 2; ADRs 0008, 0009 and the 0007 amendment (hisab off the step path until S1/H9); six probes ([`port-parity.md`](port-parity.md) §4). Next: M1 |
 | M1a Foundation: math helpers, error, config, material, units, force | ✅ done 2026-11-09 | config 293 + material 2,046 + units 2,236 + force 1,308 + math (0 pending now): **24,431 ok, 0 failed, 281 pending (S2 280, M6 1), 93 accepted** on x86_64 ELF, x86_64 PE and aarch64; every row 0 ulp | 33 of 44 Rust tests ported (2 partial: the Display symbols), 11 serde n/a; 97 assertions | 6 (4.8–31× Rust; [benchmarks](../benchmarks-rust-v-cyrius.md)) | `src/error.cyr`, `mathx.cyr`, `vec.cyr`, `config.cyr`, `material.cyr`, `units.cyr`, `force.cyr`; `[lib]` + `dist/impetus.cyr`; `tests/lib_2d.cyr`; surface parity 100/100 (`scripts/surface_parity.py`); ADR 0008 #6 mapped |
-| M1b Foundation: types, arena, contact tracker, spring | ◐ part 1 done 2026-11-09 | fmtf 37,576 + json 545 (+ units' 280 Display rows, now ok): **62,832 ok, 0 failed, 1 pending (M6), 93 accepted** on x86_64 ELF, x86_64 PE and aarch64 | the 11 M1a serde tests ported (no longer n/a), Display tests in full | — | part 1: ADR 0010; `src/fmtf.cyr` (shortest digits, Display and serde_json forms; S2 solved locally); `src/json.cyr` (codecs for WorldConfig, PhysicsMaterial, Quantity, Force, Impulse, Torque); serde_json's `float_roundtrip` finding. Part 2 next: the descriptors (tagged payload enums), arena, contact tracker, spring, each with codecs |
+| M1b Foundation: types, arena, contact tracker, spring | ◐ parts 1 and 2 done 2026-11-09; the spring's class-C gate waits on a decision | fmtf 37,576 + json 937 + spring 1,000 + types 1: **63,419 ok, 0 failed, 800 measured (`Spring::step`), 7 pending (S3 3, S4 3, M6 1), 93 accepted** on x86_64 ELF, x86_64 PE and aarch64; 1,531 of 1,600 step outputs bit-identical | all 63 Rust tests of the M1b modules ported (body 6, collider 7, joint 12, event 6, query 3, arena 10, tracker 3, spring 16), plus Cyrius-only groups; 226 assertions in 4 files | 3 spring + 4 serde + Display (1.2–26× Rust; [benchmarks](../benchmarks-rust-v-cyrius.md)) | part 1: ADR 0010, `src/fmtf.cyr`, `src/json.cyr` for the M1a types. Part 2: `src/types.cyr`, `arena.cyr`, `contact_tracker.cyr`, `spring.cyr`; codecs for every M1b type, both serde struct forms (arrays too) and one-key unit variants, retrofitted to the part-1 types; the spring's sensitivity measured per row (`port-parity.md` §7); S3, S4 found; surface parity 258/258 |
 | M2 2D collision | ☐ | | | | |
 | M3 2D dynamics | ☐ | | | | |
 | M4 3D collision | ☐ | | | | |

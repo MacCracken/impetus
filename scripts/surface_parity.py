@@ -14,7 +14,8 @@ checks that src/ defines the Cyrius name the naming rules give (port plan §7.4)
 - `pub const X` (also inside an impl)      -> `const IM_X =` (src/constants.cyr), or a PENDING_CONSTS entry
 - `pub enum E` and each variant V          -> `enum <ENUM_NAMES[E]> {` and `<ENUM_PREFIX[E]><SNAKE(V)> =`
 - `pub struct S` and each `pub` field f    -> `struct Im<S> {` with a field f, or FIELD_RENAMES' fields
-Anything else needs an EXCEPTIONS entry with its reason. Every file under rust-old/src must be in
+A function the naming rules would name otherwise is in FN_RENAMES; anything else needs an
+EXCEPTIONS entry with its reason. Every file under rust-old/src must be in
 MODULES, PENDING_MODULES (a later milestone), DEFERRED_MODULES or NOT_APPLICABLE_MODULES. Exits 1
 on a missing item, an EXCEPTIONS entry that names no Rust item, or a file unaccounted for.
 """
@@ -24,10 +25,11 @@ from pathlib import Path
 
 root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 
-MODULES = ["error", "config", "material", "units", "force"]
+MODULES = [
+    "error", "config", "material", "units", "force",
+    "body", "collider", "joint", "event", "query", "arena", "contact_tracker", "spring",
+]
 PENDING_MODULES = {
-    "body": "M1b", "collider": "M1b", "joint": "M1b", "event": "M1b", "query": "M1b",
-    "arena": "M1b", "contact_tracker": "M1b", "spring": "M1b",
     "aabb_tree": "M2", "spatial_hash": "M2", "backend_2d/types": "M2",
     "backend_2d/narrowphase": "M2", "backend_2d/raycast": "M2",
     "backend_2d/solver": "M3", "backend_2d/joints": "M3", "backend_2d/state": "M3",
@@ -45,10 +47,32 @@ NOT_APPLICABLE_MODULES = {
     "backend_2d/oracle": "oracle hooks", "backend_3d/oracle": "oracle hooks",
 }
 
-ENUM_NAMES = {"ImpetusError": "ImError"}
+# A payload enum is a kind enum plus one struct carrying every variant's fields (port plan §7.3):
+# the enum check finds the kind enum, the struct is `Im<Name>`.
+ENUM_NAMES = {
+    "ImpetusError": "ImError", "ColliderShape": "ImShapeKind", "JointType": "ImJointKind",
+    "CollisionEvent": "ImEventKind",
+}
 ENUM_PREFIX = {
     "ImpetusError": "IM_ERR_", "BroadphaseKind": "IM_BROADPHASE_", "SolverKind": "IM_SOLVER_",
-    "CombineRule": "IM_COMBINE_", "PhysicsUnit": "IM_UNIT_",
+    "CombineRule": "IM_COMBINE_", "PhysicsUnit": "IM_UNIT_", "BodyType": "IM_BODY_",
+    "ColliderShape": "IM_SHAPE_", "JointType": "IM_JOINT_", "CollisionEvent": "IM_EVENT_",
+}
+# Rust function -> the Cyrius function that provides it, where the naming rules give another name.
+FN_RENAMES = {
+    # A handle is a bare word (src/arena.cyr), so ArenaHandle's methods are private word helpers.
+    "ArenaHandle::new": "_im_arena_handle",
+    "ArenaHandle::index": "_im_handle_index",
+    "ArenaHandle::generation": "_im_handle_generation",
+    # `get` returns the value's address, for reading and writing alike.
+    "Arena::get_mut": "ImArena::get",
+    # Iteration is i over 0..slot_count(), skipping a slot_handle(i) of -1, then get().
+    "Arena::values": "ImArena::slot_handle",
+    "Arena::values_mut": "ImArena::slot_handle",
+    "Arena::iter": "ImArena::slot_handle",
+    "Arena::iter_mut": "ImArena::slot_handle",
+    # pub(crate) in Rust: a private helper here.
+    "pair_key": "_im_pair_key",
 }
 # Rust field -> the Cyrius fields that carry it (Option<T> is a presence flag plus the value).
 FIELD_RENAMES = {
@@ -58,8 +82,21 @@ FIELD_RENAMES = {
 }
 PENDING_CONSTS = {"MAX_SNAPSHOT_INDEX": "M6, with the snapshot module"}
 EXCEPTIONS = {
-    "units::impl Display for Quantity": "the unit symbols are physics_unit_symbol; the shortest "
-                                         "round-trip number waits for the stdlib printer (S2)",
+    "units::impl Display for Quantity": "`impl ImQuantity { fn fmt(self, sb) }`: src/fmtf.cyr's "
+                                         "shortest digits in Rust's Display layout, then the symbol",
+    # Handles are plain words: index in the low 32 bits, generation in the high 32.
+    "body::BodyHandle": "a handle is a bare word (src/types.cyr)",
+    "collider::ColliderHandle": "a handle is a bare word (src/types.cyr)",
+    "joint::JointHandle": "a handle is a bare word (src/types.cyr)",
+    "arena::ArenaHandle": "a handle is a bare word; _im_arena_handle builds one",
+    "contact_tracker::type PairKey": "a pair key is two handle words; ImPairList holds them",
+    "arena::Arena::oracle_dump": "the oracle hook (Rust-only port tooling); M3's dump rows read the "
+                                 "port's slots through ImArena's fields",
+    "contact_tracker::ContactTracker::oracle_dump": "the oracle hook (Rust-only port tooling); M3's "
+                                                    "dump rows read ImContactTracker's lists",
+    "spring::impl PartialEq for StepCache": "StepCache is private: ImSpring's cache_* fields, which "
+                                             "ImSpring::eq ignores as Rust's equality does",
+    "spring::impl Debug for StepCache": "StepCache is private; there is no Debug in the port",
 }
 
 
@@ -136,14 +173,14 @@ def rust_items(module):
             owner, trait = m.group(2), m.group(1).split("::")[-1]
             items.append(("trait", owner, trait, None))
             continue
-        if (m := re.match(r"impl (\w+) \{", s)):
+        if (m := re.match(r"impl(?:<[^>]*>)? (\w+)(?:<[^>]*>)? \{", s)):
             owner, trait = m.group(1), None
             continue
-        if (m := re.match(r"pub enum (\w+)", s)):
+        if (m := re.match(r"pub(?:\(crate\))? enum (\w+)", s)):
             enum_name, struct_name = m.group(1), None
             items.append(("enum", None, enum_name, None))
             continue
-        if (m := re.match(r"pub struct (\w+)", s)):
+        if (m := re.match(r"pub(?:\(crate\))? struct (\w+)", s)):
             struct_name, enum_name = m.group(1), None
             items.append(("struct", None, struct_name, None))
             continue
@@ -154,11 +191,11 @@ def rust_items(module):
             items.append(("variant", enum_name, m.group(1), None))
         if struct_name and (m := re.match(r"pub (\w+):", s)):
             items.append(("field", struct_name, m.group(1), None))
-        if (m := re.match(r"pub fn (\w+)\((&?(?:mut )?self)?", s)):
+        if (m := re.match(r"pub(?:\(crate\))? fn (\w+)(?:<[^>]*>)?\((&?(?:mut )?self)?", s)):
             items.append(("fn", owner, m.group(1), bool(m.group(2))))
         if (m := re.match(r"pub const (\w+):", s)):
             items.append(("const", owner, m.group(1), None))
-        if (m := re.match(r"pub type (\w+)", s)):
+        if (m := re.match(r"pub(?:\(crate\))? type (\w+)", s)):
             items.append(("type", None, m.group(1), None))
     return items
 
@@ -168,6 +205,7 @@ def main():
     enum_owners = set()
     missing, ok = [], 0
     used_exceptions = set()
+    used_renames = set()
     for module in MODULES:
         items = rust_items(module)
         enum_owners |= {name for kind, _, name, _ in items if kind == "enum"}
@@ -192,6 +230,11 @@ def main():
                 else:
                     missing.append(label)
                 continue
+            ex = f"{module}::{owner + '::' if owner else ''}{name}"
+            if ex in EXCEPTIONS:
+                used_exceptions.add(ex)
+                ok += 1
+                continue
             if kind == "enum":
                 want = ENUM_NAMES.get(name, f"Im{name}")
                 (ok := ok + 1) if want in enums else missing.append(f"{label} -> enum {want}")
@@ -215,6 +258,11 @@ def main():
                 (ok := ok + 1) if f"IM_{name}" in consts else missing.append(f"{label} -> const IM_{name}")
                 continue
             if kind == "fn":
+                rename = FN_RENAMES.get(f"{owner + '::' if owner else ''}{name}")
+                if rename is not None:
+                    used_renames.add(f"{owner + '::' if owner else ''}{name}")
+                    (ok := ok + 1) if rename in fns else missing.append(f"{label} -> {rename}")
+                    continue
                 if owner is None:
                     want = [name]
                 elif owner in enum_owners:
@@ -227,6 +275,9 @@ def main():
     for ex in EXCEPTIONS:
         if ex not in used_exceptions:
             missing.append(f"EXCEPTIONS entry names no Rust item: {ex}")
+    for rn in FN_RENAMES:
+        if rn not in used_renames:
+            missing.append(f"FN_RENAMES entry names no Rust function: {rn}")
     # Every rust-old/src file is accounted for.
     accounted = set(MODULES) | set(PENDING_MODULES) | set(DEFERRED_MODULES) | set(NOT_APPLICABLE_MODULES)
     for path in sorted((root / "rust-old/src").rglob("*.rs")):

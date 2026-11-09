@@ -88,6 +88,37 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - The 11 M1a serde tests are ported, and `Quantity`'s Display is complete.
   - Finding: serde_json's default float parse is 1 ulp off on some long decimals. The oracle
     uses `float_roundtrip`, which matches the port's correctly rounded parse.
+- **Cyrius port, M1b part 2** (`docs/development/port-parity.md` §7):
+  - `src/types.cyr`: body, collider, joint, event and query descriptors. `ColliderShape`,
+    `JointType` and `CollisionEvent` are a kind enum (append-only values) plus one struct with
+    every variant's fields; shape arrays live on freelist storage the shape owns.
+  - `src/arena.cyr`: the generational arena on freelist, handles `generation << 32 | index`,
+    with LIFO reuse, `insert_at` and the lazy free-list rebuild (lowest index first), `retain`,
+    and generations wrapping at 2^32, as Rust's.
+  - `src/contact_tracker.cyr`: sorted pair lists, compared as unsigned u64 like Rust's handles,
+    with events once per frame and a contact that starts and stops within a frame reporting both.
+  - `src/spring.cyr`: `Spring`, `Spring2d` and `Spring3d`, the exact step with Rust's operation
+    order and the cached transition.
+  - `src/json.cyr`: codecs for every M1b type: externally tagged payload enums, u64 handles
+    written unsigned. Every reader also takes serde's sequence form (a struct as an array) and
+    one-key unit variants (`{"Average":null}`), part-1 types included (ADR 0010 findings).
+  - Golden rows: json 545 → 937, spring 1,000, types 1. **63,419 ok, 0 failed, 800 measured,
+    7 pending, 93 accepted** on x86_64 ELF, x86_64 PE and aarch64. `validate.py` recomputes all
+    1,000 spring rows on Python's libm.
+  - The spring step rows stay measured: their sensitivity, measured per row, puts the rule's
+    class-C bound far past 64, so the rule asks for exact exp, sin and cos (decision open, port
+    plan §8). 1,531 of 1,600 step outputs are already bit-identical.
+  - Findings: bayan refuses integers above i64::MAX (S3: u64 handles at generation ≥ 2^31) and
+    every duplicate key (S4), where serde_json reads both (7 rows pending); the writers inherit
+    `str_builder`'s abort on OOM.
+  - All 63 Rust tests of the M1b modules ported; surface parity 258/258.
+
+### Performance
+- **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
+  `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
+  `spring_settle_frames` 1.47 → 1.80 µs (1.2×); `quantity_display` 81 → 830 ns (10×); serde
+  `serialize_body_desc` 252 ns → 3.5 µs (14×), `deserialize_body_desc` 276 ns → 7.2 µs (26×),
+  `serialize_config` 422 ns → 8.9 µs (21×), `roundtrip_collider_desc` 892 ns → 16.1 µs (18×).
 
 ### Removed
 - Committed fuzz build output (`fuzz/target/`, 208 files). It is now ignored under

@@ -92,6 +92,141 @@ fn bench_quantity_new() {
     return 0;
 }
 
+# springs/spring_1d_step: one cached step at 60 fps (the transition is computed once).
+fn bench_spring_1d_step() {
+    var b = bench_new("springs/spring_1d_step");
+    var s: ImSpring = ImSpring_new(0.0, 100.0, 300.0, 15.0);
+    var dt: f64 = 1.0 / 60.0;
+    bench_batch_start(b);
+    for (var i = 0; i < N; i = i + 1) { s.step(dt); }
+    bench_batch_stop(b, N);
+    var p: f64 = s.position();
+    g_sink = p;
+    bench_report(b);
+    return 0;
+}
+
+# springs/spring_2d_step: both axes, cached.
+fn bench_spring_2d_step() {
+    var b = bench_new("springs/spring_2d_step");
+    var s: ImSpring2d = ImSpring2d_new(ImVec2_new(0.0, 0.0), ImVec2_new(100.0, 200.0), 300.0, 15.0);
+    var dt: f64 = 1.0 / 60.0;
+    bench_batch_start(b);
+    for (var i = 0; i < N; i = i + 1) { s.step(dt); }
+    bench_batch_stop(b, N);
+    var p: f64 = s.x.position;
+    g_sink = p;
+    bench_report(b);
+    return 0;
+}
+
+# springs/spring_settle_frames: a fresh critically damped spring stepped at 60 fps until settled
+# (the first step computes the transition).
+fn bench_spring_settle_frames() {
+    var b = bench_new("springs/spring_settle_frames");
+    var dt: f64 = 1.0 / 60.0;
+    var reps = N / 100;
+    bench_batch_start(b);
+    for (var i = 0; i < reps; i = i + 1) {
+        var s: ImSpring = ImSpring_critically_damped(0.0, 100.0, 300.0);
+        while (s.is_settled() == 0) { s.step(dt); }
+        g_sink = s.cache_valid;
+    }
+    bench_batch_stop(b, reps);
+    bench_report(b);
+    return 0;
+}
+
+# The serde and Display bodies build a fresh document per iteration, as Rust's `to_string` and
+# `format!` allocate a fresh String; 10,000 iterations bound the heap they grow.
+var NS = 10000;
+
+# materials/quantity_display: format 9.81 N (Rust's Display).
+fn bench_quantity_display() {
+    var b = bench_new("materials/quantity_display");
+    var q: ImQuantity = ImQuantity_newtons(9.81);
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var sb = str_builder_new();
+        q.fmt(sb);
+        g_sink = str_builder_build(sb);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+    return 0;
+}
+
+# serde/serialize_body_desc: a dynamic body at (5, 10, 0), rotated 1.57.
+fn bench_serialize_body_desc() {
+    var b = bench_new("serde/serialize_body_desc");
+    var d: ImBodyDesc = ImBodyDesc_default();
+    d.position = ImVec3_new(5.0, 10.0, 0.0);
+    d.rotation = 1.57;
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var sb = str_builder_new();
+        d.to_json(sb);
+        g_sink = str_builder_build(sb);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+    return 0;
+}
+
+# serde/deserialize_body_desc: the default descriptor's document.
+fn bench_deserialize_body_desc() {
+    var b = bench_new("serde/deserialize_body_desc");
+    var d: ImBodyDesc = ImBodyDesc_default();
+    var sb = str_builder_new();
+    d.to_json(sb);
+    var doc = str_builder_build(sb);
+    var out: ImBodyDesc = ImBodyDesc_default();
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var t, v = ImBodyDesc_from_json(str_data(doc), str_len(doc), &out);
+        g_sink = t;
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+    return 0;
+}
+
+# serde/serialize_config: the default world config.
+fn bench_serialize_config() {
+    var b = bench_new("serde/serialize_config");
+    var c: ImWorldConfig = ImWorldConfig_default();
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var sb = str_builder_new();
+        c.to_json(sb);
+        g_sink = str_builder_build(sb);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+    return 0;
+}
+
+# serde/roundtrip_collider_desc: a rubber ball of mass 5, written then read.
+fn bench_roundtrip_collider_desc() {
+    var b = bench_new("serde/roundtrip_collider_desc");
+    var d: ImColliderDesc = ImColliderDesc_new(ImColliderShape_ball(1.0));
+    d.material = ImPhysicsMaterial_rubber();
+    d.has_mass = 1;
+    d.mass = 5.0;
+    var out: ImColliderDesc = ImColliderDesc_new(ImColliderShape_ball(0.0));
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var sb = str_builder_new();
+        d.to_json(sb);
+        var doc = str_builder_build(sb);
+        var t, v = ImColliderDesc_from_json(str_data(doc), str_len(doc), &out);
+        g_sink = t;
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+    return 0;
+}
+
 # Runs every bench.
 fn main(): i64 {
     alloc_init();
@@ -101,6 +236,14 @@ fn main(): i64 {
     bench_preset_rubber();
     bench_degrees_to_radians();
     bench_quantity_new();
+    bench_quantity_display();
+    bench_serialize_body_desc();
+    bench_deserialize_body_desc();
+    bench_serialize_config();
+    bench_roundtrip_collider_desc();
+    bench_spring_1d_step();
+    bench_spring_2d_step();
+    bench_spring_settle_frames();
     return 0;
 }
 

@@ -69,6 +69,14 @@ impetus specifics:
   `f64::sin` and `f64::cos` rows.
 - `f64::powi2` and `f64::powi3` are `x.powi(2)` and `x.powi(3)` with **literal** exponents, as
   impetus writes them: LLVM expands them to products, which is what the port must reproduce.
+- A handle is `i:` of its word: two's complement above `i64::MAX`, the port's own representation.
+  A payload enum (`ColliderShape`, `JointType`, `CollisionEvent`) is `e:<Enum>.<Variant>` then the
+  variant's fields; a `Vec` is `v:<len>` then its elements (`flat.rs`).
+- `Spring::step` rows (`spring.tsv`) carry a note `[<regime> S=<n>]`: the regime the transition took
+  and its **sensitivity**, the most the two outputs move, in ulps, when one exp, sin or cos result
+  on the path moves by one ulp. `m_spring.rs` computes it from a transcription of `transition` and
+  `step` that it checks bit for bit against the oracle on every row, so the class-C bound comes from
+  the port-parity rule (`docs/development/port-parity.md` §2) rather than from the port's results.
 
 ## `validate.py`
 
@@ -80,6 +88,15 @@ Standard-library Python, run with `-I`. It never calls the oracle:
   rows at M0): sqrt, abs, floor, ceil, min/max (NaN-ignoring; the second operand when equal,
   as rustc 1.99.1 lowers them), clamp, is_nan, is_finite, to_radians, powi2, powi3;
 - class-C rows are checked for consistency: `sin_cos` equals `sin` and `cos`, and hypot of a
-  Pythagorean triple is exact.
+  Pythagorean triple is exact;
+- the M1a value rows (config verdicts, combine rules, `effective_static_friction`, `to_radians`,
+  magnitudes, gravity) are recomputed;
+- every `fmtf` string reads back to its bits, and serde_json's digits are Python's `repr`;
+- every JSON document the oracle reads or writes is read by Python's `json`, and its floats equal
+  the oracle's fields (any JSON value: serde reads structs from arrays and unit variants from
+  strings too);
+- every `spring` row is recomputed: the constructors, `is_settled`, and `step` through a Python
+  transcription. Python's `math` calls the same glibc `exp`, `sin` and `cos` as Rust's f64 methods,
+  so the step rows match bit for bit.
 
 A tampered row makes it exit 1.

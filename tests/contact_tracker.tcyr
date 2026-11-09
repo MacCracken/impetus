@@ -1,0 +1,216 @@
+# contact_tracker.tcyr — the ported Rust tests of rust-old/src/contact_tracker.rs (M1b), plus
+# Cyrius-only tests of event order, unsorted and duplicate input, forget_colliders and the unsigned
+# handle order (Rust compares u64; a handle at generation ≥ 2^31 is negative as a Cyrius word).
+
+include "tests/lib_2d.cyr"
+
+var _pairs = 0;
+
+# Records the n pairs (a_i, b_i) from words[0..2n] as one sub-step, each through _im_pair_key.
+fn sub(t: *ImContactTracker, words, n): i64 {
+    for (var i = 0; i < n; i = i + 1) {
+        var lo, hi = _im_pair_key(load64(words + i * 16), load64(words + i * 16 + 8));
+        store64(_pairs + i * 16, lo);
+        store64(_pairs + i * 16 + 8, hi);
+    }
+    return t.record_substep(_pairs, n);
+}
+
+# Records one pair as a sub-step.
+fn sub1(t: *ImContactTracker, a, b): i64 {
+    var w = fl_alloc(16);
+    store64(w, a);
+    store64(w + 8, b);
+    var r = sub(t, w, 1);
+    fl_free(w);
+    return r;
+}
+
+# 1 when event i of the last finish is (kind, a, b).
+fn ev_is(t: *ImContactTracker, i, kind, a, b): i64 {
+    var e: *ImCollisionEvent = t.event(i);
+    if (e.kind == kind && e.collider_a == a && e.collider_b == b) { return 1; }
+    return 0;
+}
+
+# A typed view of a word.
+fn as_tracker(p): *ImContactTracker {
+    return p;
+}
+
+# A tracker on the heap, so the tests hold it through a pointer as a world does.
+fn tracker(): *ImContactTracker {
+    var p: *ImContactTracker = as_tracker(fl_alloc(sizeof(ImContactTracker)));
+    var t: ImContactTracker = ImContactTracker_new();
+    memcpy(p, &t, sizeof(ImContactTracker));
+    return p;
+}
+
+# Runs the ported contact tracker tests.
+fn main() {
+    alloc_init();
+    _pairs = fl_alloc(64 * 16);
+    var w = fl_alloc(64 * 16);
+
+    test_group("started_ongoing_stopped");
+    var t: *ImContactTracker = tracker();
+    sub1(t, 1, 0);
+    assert_eq(t.finish(), 1, "one event");
+    assert_eq(ev_is(t, 0, IM_EVENT_STARTED, 0, 1), 1, "started (0, 1)");
+    sub1(t, 0, 1);
+    assert_eq(t.finish(), 1, "one event");
+    assert_eq(ev_is(t, 0, IM_EVENT_ONGOING, 0, 1), 1, "ongoing");
+    t.record_substep(_pairs, 0);
+    assert_eq(t.finish(), 1, "one event");
+    assert_eq(ev_is(t, 0, IM_EVENT_STOPPED, 0, 1), 1, "stopped");
+    t.record_substep(_pairs, 0);
+    assert_eq(t.finish(), 0, "no events");
+    t.free();
+
+    test_group("transient_contact_within_frame_reports_both");
+    t = tracker();
+    sub1(t, 0, 1);
+    t.record_substep(_pairs, 0);
+    assert_eq(t.finish(), 2, "two events");
+    assert_eq(ev_is(t, 0, IM_EVENT_STARTED, 0, 1), 1, "started");
+    assert_eq(ev_is(t, 1, IM_EVENT_STOPPED, 0, 1), 1, "then stopped");
+    t.free();
+
+    test_group("substeps_collapse_to_one_event_per_pair");
+    t = tracker();
+    for (var i = 0; i < 4; i = i + 1) { sub1(t, 0, 1); }
+    assert_eq(t.finish(), 1, "one event");
+    t.free();
+
+    # Cyrius-only from here.
+    test_group("pair_key");
+    var lo, hi = _im_pair_key(5, 3);
+    assert_eq(lo, 3, "smaller first");
+    assert_eq(hi, 5, "larger second");
+    var big = _im_arena_handle(0, 2147483648);
+    var lo2, hi2 = _im_pair_key(big, 7);
+    assert(big < 0, "generation 2^31 is a negative word");
+    assert_eq(lo2, 7, "unsigned: 7 < 2^63");
+    assert_eq(hi2, big, "the high-generation handle second");
+
+    test_group("event_order");
+    # Frame 1: (0,1), (2,3) start. Frame 2: (2,3) ongoing, (4,5) starts, (0,1) stops.
+    t = tracker();
+    store64(w, 3); store64(w + 8, 2);
+    store64(w + 16, 1); store64(w + 24, 0);
+    sub(t, w, 2);
+    assert_eq(t.finish(), 2, "two started");
+    assert_eq(ev_is(t, 0, IM_EVENT_STARTED, 0, 1), 1, "sorted: (0, 1) first");
+    assert_eq(ev_is(t, 1, IM_EVENT_STARTED, 2, 3), 1, "then (2, 3)");
+    assert_eq(t.has_previous_contacts(), 1, "previous contacts");
+    store64(w, 4); store64(w + 8, 5);
+    store64(w + 16, 2); store64(w + 24, 3);
+    sub(t, w, 2);
+    assert_eq(t.finish(), 3, "three events");
+    assert_eq(ev_is(t, 0, IM_EVENT_ONGOING, 2, 3), 1, "touching now, in order: ongoing (2, 3)");
+    assert_eq(ev_is(t, 1, IM_EVENT_STARTED, 4, 5), 1, "started (4, 5)");
+    assert_eq(ev_is(t, 2, IM_EVENT_STOPPED, 0, 1), 1, "then stopped (0, 1)");
+    t.free();
+
+    test_group("duplicates_and_unsorted_input");
+    t = tracker();
+    store64(w, 9); store64(w + 8, 8);
+    store64(w + 16, 1); store64(w + 24, 2);
+    store64(w + 32, 8); store64(w + 40, 9);
+    store64(w + 48, 2); store64(w + 56, 1);
+    store64(w + 64, 1); store64(w + 72, 2);
+    sub(t, w, 5);
+    assert_eq(t.current.len, 2, "deduplicated to two pairs");
+    assert_eq(t.finish(), 2, "two events");
+    assert_eq(ev_is(t, 0, IM_EVENT_STARTED, 1, 2), 1, "(1, 2)");
+    assert_eq(ev_is(t, 1, IM_EVENT_STARTED, 8, 9), 1, "(8, 9)");
+    t.free();
+
+    test_group("seen_union_across_substeps");
+    # Sub-steps (0,1) | (2,3) | (4,5): (0,1) and (2,3) are transient, (4,5) touches at the end.
+    t = tracker();
+    sub1(t, 0, 1);
+    sub1(t, 2, 3);
+    sub1(t, 4, 5);
+    assert_eq(t.seen.len, 2, "seen holds the earlier sub-steps");
+    assert_eq(t.finish(), 5, "five events");
+    assert_eq(ev_is(t, 0, IM_EVENT_STARTED, 4, 5), 1, "touching: started (4, 5)");
+    assert_eq(ev_is(t, 1, IM_EVENT_STARTED, 0, 1), 1, "transient (0, 1) started");
+    assert_eq(ev_is(t, 2, IM_EVENT_STOPPED, 0, 1), 1, "and stopped");
+    assert_eq(ev_is(t, 3, IM_EVENT_STARTED, 2, 3), 1, "transient (2, 3) started");
+    assert_eq(ev_is(t, 4, IM_EVENT_STOPPED, 2, 3), 1, "and stopped");
+    assert_eq(t.seen.len, 0, "seen cleared");
+    t.free();
+
+    test_group("prev_pair_lost_mid_frame");
+    # (0,1) touches in frame 1, then leaves and returns within frame 2: ongoing, no stop.
+    t = tracker();
+    sub1(t, 0, 1);
+    t.finish();
+    t.record_substep(_pairs, 0);
+    sub1(t, 0, 1);
+    assert_eq(t.finish(), 1, "one event");
+    assert_eq(ev_is(t, 0, IM_EVENT_ONGOING, 0, 1), 1, "ongoing");
+    t.free();
+
+    test_group("forget_colliders");
+    t = tracker();
+    store64(w, 0); store64(w + 8, 1);
+    store64(w + 16, 2); store64(w + 24, 3);
+    sub(t, w, 2);
+    t.finish();
+    var gone = fl_alloc(8);
+    store64(gone, 1);
+    t.forget_colliders(gone, 1);
+    t.record_substep(_pairs, 0);
+    assert_eq(t.finish(), 1, "one event");
+    assert_eq(ev_is(t, 0, IM_EVENT_STOPPED, 2, 3), 1, "no stop for the forgotten (0, 1)");
+    fl_free(gone);
+    t.free();
+
+    test_group("unsigned_handle_order");
+    # Handles at generation 2^31 are negative words but sort after every lower generation.
+    t = tracker();
+    var hb = _im_arena_handle(1, 2147483648);
+    var hc = _im_arena_handle(0, 2147483649);
+    store64(w, hc); store64(w + 8, 0);
+    store64(w + 16, hb); store64(w + 24, 5);
+    store64(w + 32, 3); store64(w + 40, 4);
+    sub(t, w, 3);
+    assert_eq(t.finish(), 3, "three events");
+    assert_eq(ev_is(t, 0, IM_EVENT_STARTED, 0, hc), 1, "(0, hc)");
+    assert_eq(ev_is(t, 1, IM_EVENT_STARTED, 3, 4), 1, "(3, 4)");
+    assert_eq(ev_is(t, 2, IM_EVENT_STARTED, 5, hb), 1, "(5, hb)");
+    store64(w, hb); store64(w + 8, hc);
+    sub(t, w, 1);
+    assert_eq(t.finish(), 4, "four events");
+    assert_eq(ev_is(t, 0, IM_EVENT_STARTED, hb, hc), 1, "(hb, hc): hb < hc unsigned");
+    assert_eq(ev_is(t, 1, IM_EVENT_STOPPED, 0, hc), 1, "stops in unsigned order");
+    assert_eq(ev_is(t, 2, IM_EVENT_STOPPED, 3, 4), 1, "(3, 4)");
+    assert_eq(ev_is(t, 3, IM_EVENT_STOPPED, 5, hb), 1, "(5, hb)");
+    t.free();
+
+    test_group("sort_many");
+    # 40 pairs in descending order through the merge sort: ascending, unique.
+    t = tracker();
+    for (var i = 0; i < 40; i = i + 1) {
+        store64(w + i * 16, 39 - i);
+        store64(w + i * 16 + 8, 100);
+    }
+    sub(t, w, 40);
+    var ok = 1;
+    for (var i = 0; i < 40; i = i + 1) {
+        if (t.current.first(i) != i) { ok = 0; }
+    }
+    assert_eq(ok, 1, "ascending");
+    assert_eq(t.current.is_sorted(), 1, "is_sorted");
+    t.free();
+
+    fl_free(w);
+    fl_free(_pairs);
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);
