@@ -1,0 +1,186 @@
+# parity_2d.tcyr — replays the golden corpus (tests/golden/*.tsv) against the port: the shared
+# modules and the 2D backend's (`b2_*`). tests/parity_3d.tcyr replays the `b3_*` modules from M4.
+#
+# Port plan §4 step 7, copied from kimiya's tests/parity.tcyr (itself tanmatra's). Format and
+# comparison rules: scripts/oracle/README.md. The module list is tests/golden/modules.txt, which
+# the generator writes. The replay machinery is tests/parity_core.cyr; this file holds the
+# dispatchers.
+#
+# Every row of every module is one of:
+# - ok: every output matched within its class;
+# - FAILED: an output differs; the first 10 per module are printed with the row's note and
+#   both bit patterns;
+# - measured: class C, with no bound set yet for its function. The ulp distance is recorded
+#   but not gated. Bounds are set per function before its comparison (M0 step 8,
+#   docs/development/port-parity.md);
+# - accepted: a divergence an ADR accepts, listed by row in _par_accepted;
+# - pending: its function isn't ported yet (no dispatcher entry).
+#
+# Per function it prints the row counts and the ulp histogram, which is the step 8 baseline.
+# Shadow lines (`fn ~ candidate`) compare the same rows against another Cyrius candidate and
+# are never gated. The exit code is the number of modules with a failure.
+
+include "tests/ulp.cyr"
+include "src/constants.cyr"
+
+alloc_init();
+
+include "tests/parity_core.cyr"
+
+# ── hooks ───────────────────────────────────────────────────────────────────────────
+
+# The Rust variant name of an error code. src/error.cyr (M1) brings `im_error_name`; until then
+# no dispatcher returns an error.
+#must_use
+fn _par_error_name(code): i64 {
+    return "Unknown";
+}
+
+# ── dispatch ────────────────────────────────────────────────────────────────────────
+# Each module's dispatcher fills the got list for one row. It returns 1 when it handled the
+# function, 0 when the function is pending (not ported), or -1 when the inputs are unusable (a
+# defect, counted as a failure). Add a function the moment it's ported.
+
+# `const` rows (input `s:<path>`). The config limits are src/constants.cyr's IM_ consts; the
+# snapshot index cap is generated with the snapshot module (M6) and pending until then. Any
+# other name is a defect.
+fn _par_constants(fp, fl): i64 {
+    if (_par_eq(fp, fl, "const") != 1 || _par_in_n != 1) { return 0 - 1; }
+    var np = load64(_par_in_v);
+    var nl = load64(_par_in_l);
+    if (_par_eq(np, nl, "config::WorldConfig::MAX_SUB_STEPS") == 1) {
+        _par_got_i(IM_MAX_SUB_STEPS);
+        return 1;
+    }
+    if (_par_eq(np, nl, "config::WorldConfig::MAX_ITERATIONS") == 1) {
+        _par_got_i(IM_MAX_ITERATIONS);
+        return 1;
+    }
+    if (_par_eq(np, nl, "world::PhysicsWorld::MAX_SNAPSHOT_INDEX") == 1) { return 0; }
+    return 0 - 1;
+}
+
+# `f64::*` rows: the Rust std reference values (port plan §7.1). Dispatched now: the functions
+# with a direct Cyrius counterpart. Pending until M1's src/mathx.cyr:
+# - min, max, clamp: f64_min / f64_max return the second operand when the first is NaN and NaN
+#   when the second is (probed), while Rust ignores a NaN operand either way (_im_min, _im_max,
+#   _im_clamp);
+# - is_nan, is_finite: no public stdlib predicate (_im_is_nan, _im_is_finite);
+# - to_radians, powi2, powi3: impetus's own one-line helpers in Rust's operation order.
+# sin_cos is the pair (f64_sin, f64_cos): there is no stdlib sin_cos.
+fn _par_math(fp, fl): i64 {
+    var x: f64 = _par_in(0);
+    if (_par_eq(fp, fl, "f64::sqrt") == 1) { var r: f64 = f64_sqrt(x); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::abs") == 1) { var r: f64 = f64_abs(x); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::floor") == 1) { var r: f64 = f64_floor(x); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::ceil") == 1) { var r: f64 = f64_ceil(x); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::sin_cos") == 1) {
+        var s: f64 = f64_sin(x);
+        var c: f64 = f64_cos(x);
+        _par_got_f(s);
+        _par_got_f(c);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "f64::sin") == 1) { var r: f64 = f64_sin(x); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::cos") == 1) { var r: f64 = f64_cos(x); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::exp") == 1) { var r: f64 = f64_exp(x); _par_got_f(r); return 1; }
+    if (_par_in_n < 2) { return 0; }
+    var y: f64 = _par_in(1);
+    # Rust's y.atan2(x) is the golden f64::atan2(y, x): inputs in C order.
+    if (_par_eq(fp, fl, "f64::atan2") == 1) { var r: f64 = ganita_f64_atan2(x, y); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::hypot") == 1) { var r: f64 = ganita_f64_hypot(x, y); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::powf") == 1) { var r: f64 = ganita_f64_pow(x, y); _par_got_f(r); return 1; }
+    return 0;
+}
+
+fn _par_dispatch(mp, ml, fp, fl): i64 {
+    _par_got_n = 0;
+    if (_par_eq(mp, ml, "constants") == 1) { return _par_constants(fp, fl); }
+    if (_par_eq(mp, ml, "math") == 1) { return _par_math(fp, fl); }
+    return 0;
+}
+
+# Shadow comparisons, never gated: the same golden rows through another Cyrius candidate.
+# - the exp polyfill, which gives the same bits on every target (the builtin is x87 on x86_64):
+#   the cross-target choice the port plan §7.1 makes for the spring;
+# - the sin / cos polyfills, which the builtins are on every target (probed: same bits on x86_64);
+# - the stdlib min / max, to show where their NaN semantics differ from Rust's.
+fn _par_shadows(mp, ml, fp, fl, cls) {
+    if (_par_eq(mp, ml, "math") != 1) { return 0; }
+    var x: f64 = _par_in(0);
+    if (_par_eq(fp, fl, "f64::exp") == 1) {
+        _par_got_n = 0;
+        var r: f64 = _f64_exp_polyfill(x);
+        _par_got_f(r);
+        _par_shadow_record("f64::exp ~ _f64_exp_polyfill", cls);
+        return 0;
+    }
+    if (_par_eq(fp, fl, "f64::sin") == 1) {
+        _par_got_n = 0;
+        var r: f64 = _f64_sin_polyfill(x);
+        _par_got_f(r);
+        _par_shadow_record("f64::sin ~ _f64_sin_polyfill", cls);
+        return 0;
+    }
+    if (_par_eq(fp, fl, "f64::cos") == 1) {
+        _par_got_n = 0;
+        var r: f64 = _f64_cos_polyfill(x);
+        _par_got_f(r);
+        _par_shadow_record("f64::cos ~ _f64_cos_polyfill", cls);
+        return 0;
+    }
+    if (_par_in_n < 2) { return 0; }
+    var y: f64 = _par_in(1);
+    if (_par_eq(fp, fl, "f64::max") == 1) {
+        _par_got_n = 0;
+        var r: f64 = f64_max(x, y);
+        _par_got_f(r);
+        _par_shadow_record("f64::max ~ f64_max", cls);
+        return 0;
+    }
+    if (_par_eq(fp, fl, "f64::min") == 1) {
+        _par_got_n = 0;
+        var r: f64 = f64_min(x, y);
+        _par_got_f(r);
+        _par_shadow_record("f64::min ~ f64_min", cls);
+        return 0;
+    }
+    return 0;
+}
+
+# The class-C bound for a function, in ulps; -1 when none is set yet (the rows are measured).
+# Bounds are derived in M0 step 8 (docs/development/port-parity.md) per target against glibc,
+# BEFORE the function's first gated comparison, and never raised to make a row pass. None is set
+# yet: every class-C row is measured.
+#must_use
+fn _par_c_bound(fp, fl): i64 {
+    return 0 - 1;
+}
+
+# The ADR accepting a divergent row (function and raw input field), or 0. None yet: the ADR 0007
+# hisab paths arrive with M4, the ADR 0008 mappings with their modules.
+#must_use
+fn _par_accepted(fp, fl, ip, il): i64 {
+    return 0;
+}
+
+# 1 for an ADR whose accepted rows are counted but not printed row by row. None yet.
+#must_use
+fn _par_accepted_quiet(adr): i64 {
+    return 0;
+}
+
+# Module-specific summary lines after a module's report. None yet.
+fn _par_module_done(mp, ml) {
+    return 0;
+}
+
+# The 3D backend's modules (`b3_*`) are replayed by tests/parity_3d.tcyr (M4).
+#must_use
+fn _par_skip(mp, ml): i64 {
+    if (ml >= 3 && load8(mp) == 98 && load8(mp + 1) == 51 && load8(mp + 2) == 95) { return 1; }
+    return 0;
+}
+
+var exit_code = _par_main();
+sys_exit_group(exit_code);

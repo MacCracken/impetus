@@ -17,7 +17,7 @@
 | Cyrius toolchain | **6.7.18** (installed) | `~/.cyrius/current` |
 | hisab | **3.4.1**, Cyrius, tag `3.4.1`, bundle `dist/hisab.cyr` | `/home/macro/Repos/hisab` |
 | ganita | **1.2.15**, bundled in the 6.7.18 stdlib | `~/.cyrius/versions/6.7.18/lib/ganita.cyr` |
-| Oracle's math | Rust **std** → host **glibc 2.44** for `sin_cos` (15 calls), `sin`/`cos`, `atan2` (2), `hypot` (15), `exp` (4), `powf` (1). glam 0.34.3 (re-exported by Rust hisab 1.4.0) for `DVec3` / `DQuat` / `DMat3`, 3D only | `grep` of `src/`, `Cargo.lock` |
+| Oracle's math | Rust **std** → host **glibc 2.44** for `sin_cos` (15 calls), `sin`/`cos`, `atan2` (2), `hypot` (15), `exp` (4), `powf` (1). glam 0.29.3 (re-exported by Rust hisab 1.4.0) for `DVec3` / `DQuat` / `DMat3`, 3D only | `grep` of `src/`, `Cargo.lock` |
 | Cyrius consumers | **None yet.** kiran and joshua have no local repo; aethersafha is Cyrius (0.18.2) but declares no impetus dependency; the bridge partners dravya, sharira and ushma have no local repo | `~/Repos` |
 | Target | impetus **2.0.0**, Cyrius | this document |
 
@@ -260,11 +260,11 @@ tests only.
      which each profile defines.
    - hisab's own leaves (`dist/hisab.deps`: math, alloc, vec, ganita, result, str, fmt) are
      listed in `[deps] stdlib`.
-4. **Toolchain and math check.** Confirm the counterpart of every Rust f64 method impetus calls
+4. ✅ **Toolchain and math check. Done 2026-11-09.** Probed on 6.7.18: `f64_min` / `f64_max` return the second operand when the first is NaN and NaN when the second is (Rust ignores a NaN either way); `f64_sin` / `f64_cos` are the polyfills on x86_64 (same bits); `f64_floor` / `f64_ceil` / `f64_sqrt` / `ganita_f64_hypot` / `_f64_exp_polyfill` / `_f64_atan_polyfill` present; NaN is `x != x` and finiteness `x - x == 0`. Confirm the counterpart of every Rust f64 method impetus calls
    (§7.1). The stdlib lacks public `is_nan`, `is_finite`, `copysign`, `sin_cos`, `EPSILON`,
    `INFINITY` and `NAN`, and Rust-semantics `min` / `max`. Write local `_im_*` helpers for them
    (as kimiya's `mathx.cyr`) and file the gaps (§8).
-5. **Golden-value generator** in `scripts/oracle/`: copy tanmatra's crate and adapt it.
+5. ✅ **Golden-value generator. Done 2026-11-09** (`scripts/oracle/`, from kimiya's crate: `constants` 3 rows, `math` 18,919 rows, 2.2 MB; both builds `--check` clean; `validate.py` recomputes the 7,197 class-A/B math rows in Python and checks the constants against the Rust literals, and a tampered row fails it). hisab 1.4.0 links glam **0.29.3**, which the header records. Copy tanmatra's crate and adapt it.
    - **Two oracle builds.** The backends are exclusive, so the generator is one crate run
      twice: `--features 2d,oracle` and `--features 3d,oracle`. The 3D build writes
      `tests/golden/b3_*.tsv`.
@@ -274,11 +274,11 @@ tests only.
      full state dump at frame k plus the frame's applied forces; its outputs are the dump at
      k + 1 and the frame's events. State dumps flatten in a fixed order (bodies by handle, then
      manifolds by pair key, then joints).
-6. **Table and constant generator.** impetus has few tables: the material presets, config
+6. ✅ **Table and constant generator. Done 2026-11-09** for the public constants: `src/constants.cyr` (`IM_MAX_SUB_STEPS`, `IM_MAX_ITERATIONS`; `IM_MAX_SNAPSHOT_INDEX` waits for M6), with a proof that the list is every `pub const` in `rust-old/src`. The private constants are extracted and proven at their milestones. impetus has few tables: the material presets, config
    defaults and limits (`MAX_SUB_STEPS`, `MAX_ITERATIONS`, `MAX_SNAPSHOT_INDEX`), and solver
    constants (`RESTITUTION_VELOCITY_THRESHOLD`, `MAX_CONDITION_NUMBER`, `JOINT_BAUMGARTE`). They
    are extracted and proven as tanmatra does for private constants.
-7. **Parity harness.** Copy `tests/parity.tcyr`, `tests/parity_core.cyr` and `tests/ulp.cyr`, and
+7. ✅ **Parity harness. Done 2026-11-09:** `tests/parity_2d.tcyr` (skips `b3_*`), `tests/parity_core.cyr` (kimiya's, with an `_par_error_name` hook), `tests/ulp.cyr`. First run on x86_64 ELF: 3,154 ok, 0 failed, 11,722 measured, 4,046 pending (M1's Rust-semantics helpers). Against glibc: sin, cos, atan2, exp and powf ≤ 1 ulp, hypot ≤ 2; one outlier, ganita's `pow(-1, DBL_MAX)` (as tanmatra ADR 0007 / kimiya ADR 0004; impetus's bases are ≥ 10⁻⁴). Copy `tests/parity.tcyr`, `tests/parity_core.cyr` and `tests/ulp.cyr`, and
    split them per profile: `tests/parity_2d.tcyr` and `tests/parity_3d.tcyr`. Add:
    - a **state loader** that builds a world from a dump row;
    - a **step comparator** with per-field classes;
@@ -549,7 +549,7 @@ tanmatra filed its findings.
 
 | Milestone | Status | Golden rows | Reference tests | Benches | Notes |
 |---|---|---|---|---|---|
-| M0 Initialize | ◐ steps 0–3 done 2026-11-09 | | | | oracle hooks and `2d` without hisab (unreleased port tooling on 1.4.0); scaffold, repairs, `cyrius.cyml` with hisab 3.4.1, ADR 0008; all Cyrius gates clean. Next: step 4 (math check), 5–7 (generator, tables, harness), 8 (baselines), 9 (probes) |
+| M0 Initialize | ◐ steps 0–7 done 2026-11-09 | constants 3 + math 18,919: 3,154 ok, 0 failed, 11,722 measured, 4,046 pending (x86_64 ELF) | — | — | oracle hooks and `2d` without hisab (unreleased port tooling on 1.4.0); scaffold, repairs, `cyrius.cyml` with hisab 3.4.1, ADR 0008; generator, `validate.py`, `src/constants.cyr`, parity harness; all gates clean. Next: step 8 (baselines on x86_64 PE and aarch64, class-C bounds, the pow ADR), step 9 (probes) |
 | M1 Foundation | ☐ | | | | |
 | M2 2D collision | ☐ | | | | |
 | M3 2D dynamics | ☐ | | | | |

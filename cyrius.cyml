@@ -32,9 +32,9 @@ git = "https://github.com/MacCracken/hisab.git"
 tag = "3.4.1"
 modules = ["dist/hisab.cyr"]
 
-# Test / bench / fuzz compiles only.
+# Test / bench / fuzz compiles only. overflow: tests/ulp.cyr's saturating `-|` (ulp distance).
 [test]
-stdlib = ["assert", "bench"]
+stdlib = ["assert", "bench", "overflow"]
 
 # [lib] (the 2D default, as the Rust crate's default feature) and [lib.3d] arrive in M1 and M4.
 # Both list the shared modules in the same order; each adds its own backend. The order is

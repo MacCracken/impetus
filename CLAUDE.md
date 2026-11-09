@@ -41,6 +41,9 @@ cyrius test                                   # run tests/*.tcyr (parity + refer
 cyrius bench                                  # run tests/*.bcyr
 cargo test --manifest-path rust-old/Cargo.toml --features serialize,oracle   # the Rust oracle (2D), read-only
 cargo test --manifest-path rust-old/Cargo.toml --all-features                # the Rust oracle (3D), read-only
+cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml -- --check   # golden corpus (2D + shared) up to date
+cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml --no-default-features --features b3 -- --check   # (3D)
+python3 -I scripts/oracle/validate.py .                                         # independent check of the corpus
 ```
 
 ## Development Process

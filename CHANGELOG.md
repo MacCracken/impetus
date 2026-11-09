@@ -40,6 +40,14 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - CLAUDE.md and `docs/development/state.md` for the Cyrius process.
   - ADRs renumbered to four digits; [ADR 0008](docs/adr/0008-port-api-divergences.md)
     records the 2.0 API changes.
+- **Cyrius port, M0 steps 4–7**:
+  - `scripts/oracle/`, the golden-value generator (kimiya's format), built twice because the
+    oracle's backends are exclusive. It writes `tests/golden/constants.tsv` (3 rows) and
+    `math.tsv` (18,919 rows: every std f64 method impetus calls, against glibc 2.44), and
+    `src/constants.cyr`, with a proof that every public Rust constant is listed.
+  - `validate.py` recomputes the 7,197 class-A/B math rows and the constants independently.
+  - `tests/parity_2d.tcyr` replays the corpus: 3,154 ok, 0 failed, 11,722 measured (class C,
+    bounds come with the step-8 baselines), 4,046 pending (M1's Rust-semantics math helpers).
 
 ### Removed
 - Committed fuzz build output (`fuzz/target/`, 208 files). It is now ignored under
