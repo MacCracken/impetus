@@ -102,6 +102,7 @@ let [x, y] = pos.position();
 | `3d` | no | 3D physics backend (uses hisab DVec3/DQuat); takes precedence over `2d` when both are enabled |
 | `serialize` | no | bitcode world snapshots |
 | `full` | no | all features (selects the 3D backend) |
+| `oracle` | no | internal: state dump for the Cyrius port's generator; not public API |
 
 Requires Rust 1.99 or newer (edition 2024).
 

@@ -60,6 +60,18 @@ fn merge_union(a: &[PairKey], b: &[PairKey]) -> Vec<PairKey> {
 }
 
 impl ContactTracker {
+    /// Bookkeeping state for the oracle dump (see `crate::oracle`).
+    #[cfg(feature = "oracle")]
+    pub(crate) fn oracle_dump(&self) -> crate::oracle::TrackerDump {
+        let words = |v: &[PairKey]| v.iter().map(|(a, b)| (a.0, b.0)).collect();
+        crate::oracle::TrackerDump {
+            prev: words(&self.prev),
+            current: words(&self.current),
+            seen: words(&self.seen),
+            recorded: self.recorded,
+        }
+    }
+
     /// Record the pairs touching at the end of a sub-step (any order;
     /// duplicates are fine).
     pub(crate) fn record_substep(&mut self, pairs: impl IntoIterator<Item = PairKey>) {

@@ -7,10 +7,10 @@ are enabled — so `--all-features` does **not** compile the 2D backend. Run
 both:
 
 ```bash
-# 2D backend (default) + serialization
-cargo test --features serialize
+# 2D backend (default) + serialization + oracle hooks
+cargo test --features serialize,oracle
 
-# 3D backend + serialization
+# 3D backend + serialization + oracle hooks
 cargo test --all-features
 
 # 3D backend only
@@ -37,6 +37,7 @@ cargo test --features serialize test_name
 | `src/*.rs` (other) | Serde round trips, config validation, springs (exactness, large-dt stability), bridges, units |
 | `tests/regressions.rs` | One test per defect fixed in the 1.4 audit, run against whichever backend is compiled |
 | `tests/integration.rs` | Cross-module integration |
+| `tests/oracle.rs` | The hidden `oracle` hooks (feature `oracle`): the dump is read-only, matches the public state, predicts handles; pair-level contacts; broadphase candidate pairs |
 | README code blocks | Compiled as doctests (`src/lib.rs` `ReadmeDoctests`) |
 
 Counts at the 1.4 audit: 298 unit tests on the 2D build and 274 on the 3D

@@ -170,6 +170,35 @@ impl<T> Arena<T> {
             })
     }
 
+    /// Allocation state for the oracle dump (see `crate::oracle`).
+    #[cfg(feature = "oracle")]
+    pub fn oracle_dump(&self) -> crate::oracle::ArenaDump {
+        let slots = self
+            .entries
+            .iter()
+            .map(|entry| match entry {
+                Entry::Occupied { generation, .. } => crate::oracle::SlotDump {
+                    occupied: true,
+                    generation: *generation,
+                    next_free: None,
+                },
+                Entry::Free {
+                    next_free,
+                    generation,
+                } => crate::oracle::SlotDump {
+                    occupied: false,
+                    generation: *generation,
+                    next_free: *next_free,
+                },
+            })
+            .collect();
+        crate::oracle::ArenaDump {
+            slots,
+            free_head: self.free_head,
+            free_list_stale: self.free_list_stale,
+        }
+    }
+
     /// Check if a handle is valid.
     pub fn contains(&self, handle: ArenaHandle) -> bool {
         self.get(handle).is_some()

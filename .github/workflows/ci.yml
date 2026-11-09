@@ -26,7 +26,7 @@ jobs:
       # so every backend combination is linted separately.
       - run: cargo clippy --all-features --all-targets -- -D warnings
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo clippy --no-default-features --features 2d,serialize --all-targets -- -D warnings
+      - run: cargo clippy --no-default-features --features 2d,serialize,oracle --all-targets -- -D warnings
       - run: cargo clippy --no-default-features --features 3d --all-targets -- -D warnings
       - run: cargo clippy --no-default-features --all-targets -- -D warnings
   security:
@@ -59,7 +59,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # 2D backend (default) — not compiled under --all-features.
-      - run: cargo test --features serialize
+      - run: cargo test --features serialize,oracle
       # 3D backend + serialization.
       - run: cargo test --all-features
       - run: cargo test --no-default-features
@@ -89,7 +89,7 @@ jobs:
       - run: cargo install cargo-llvm-cov
       # Merge 2D and 3D runs so both backends count toward coverage.
       - run: cargo llvm-cov clean --workspace
-      - run: cargo llvm-cov --no-report --features serialize
+      - run: cargo llvm-cov --no-report --features serialize,oracle
       - run: cargo llvm-cov --no-report --all-features
       - run: cargo llvm-cov report --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v7

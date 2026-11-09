@@ -60,8 +60,9 @@ The scope, milestones, probes and upstream gap list are in
   - The 3D backend can't be bit-identical to Rust, because its quaternion, matrix and GJK paths
     are hisab's. Agreement there rests on class-D bounds and physical reference tests.
   - Step parity needs internal state that Rust's public API doesn't expose: full 3D orientation,
-    manifolds, warm-start impulses and sleep timers. The oracle needs a hidden `oracle` feature
-    before it is frozen.
+    manifolds, warm-start impulses and sleep timers. A hidden `oracle` feature was added after
+    the 1.4.0 release as unreleased port tooling, so the oracle is tag 1.4.0 plus that read-only
+    change.
   - Until hisab has allocation-free vector operations (request H1), the solver's inner loops use
     plain struct values or scalars rather than hisab handles.
   - Two toolchains are needed until the port completes: cargo for the oracle and its generator,

@@ -13,16 +13,19 @@ categories = ["simulation", "game-engines"]
 
 [features]
 default = ["2d"]
-2d = ["dep:hisab"]
+2d = []
 3d = ["dep:hisab"]
 serialize = ["dep:bitcode"]
 full = ["2d", "3d", "serialize"]
+# Hidden state dump and pair-level entry points for the Cyrius port's golden-value
+# generator (docs/development/impetus-port-plan.md). Not public API.
+oracle = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 
-# Physics backend — native, built on hisab math
+# 3D backend math (DVec3 / DQuat / DMat3); the 2D backend uses none
 hisab = { version = "1.4", optional = true }
 
 # Serialization (optional)

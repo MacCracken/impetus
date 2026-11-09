@@ -6,6 +6,8 @@
 
 mod joints;
 mod narrowphase;
+#[cfg(feature = "oracle")]
+pub(crate) mod oracle;
 mod raycast;
 mod solver;
 mod state;

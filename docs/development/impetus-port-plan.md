@@ -11,7 +11,7 @@
 
 | Thing | Value | Source |
 |---|---|---|
-| Rust source (oracle) | impetus **1.4.0**: 10,399 code lines in `src/` (no tests, no comments), 36 files, two exclusive backends (`2d` default, `3d`) | `Cargo.toml`, `VERSION` |
+| Rust source (oracle) | impetus **1.4.0** (tagged and released) plus the unreleased port-tooling change of 2026-11-09 (the hidden `oracle` feature, `2d` without hisab; `VERSION` stays 1.4.0, behaviour unchanged): 10,399 code lines in `src/` (no tests, no comments), 36 files, two exclusive backends (`2d` default, `3d`) | `Cargo.toml`, `VERSION` |
 | Rust health, 2026-11-09 on rustc 1.99.1 | ✅ fmt, clippy `-D warnings` on 5 feature sets, rustdoc `-D warnings` on both backends, `cargo audit`, `cargo deny`. Tests: 298 unit (2D) / 274 (3D), 30 regression (2 `#[ignore]`d for the 2.0 snapshot format), 9 integration, 2 doc | local run |
 | Correctness baseline | The 1.4 audit-and-repair sweep: every fix is pinned by a test in `tests/regressions.rs` | `CHANGELOG.md` 1.4.0 |
 | Cyrius toolchain | **6.7.18** (installed) | `~/.cyrius/current` |
@@ -165,24 +165,39 @@ tests only.
 
 ## 4. M0 — Initialize with `cyrius port`
 
-0. **Freeze a green oracle (Rust, before the move).** *Maintainer action, with two Rust changes
-   to decide first.*
-   - **Oracle hooks.** The public API can't show what step parity needs:
-     - 3D orientation and angular velocity (`BodyState` is Z-only);
-     - manifolds and warm-start impulses;
-     - joint accumulators;
-     - sleep timers and islands;
-     - contact generation for a single shape pair.
+0. ✅ **Freeze a green oracle (Rust, before the move). Done 2026-11-09.** 1.4.0 was already
+   tagged and released, so the two oracle changes went in afterwards as **unreleased port
+   tooling**: `VERSION` stays 1.4.0, no tag, no release, and simulation behaviour is unchanged.
+   - **`oracle` feature** (non-default, `#[doc(hidden)]`, `impetus::oracle`). It is read-only;
+     `tests/oracle.rs` proves that dumping every frame leaves a 60-step run bit-identical. It
+     provides:
+     - `PhysicsWorld::oracle_dump() → WorldDump`:
+       - config, particles, emitters, force fields and the last step's events;
+       - per backend, the arena slot generations and free lists (they predict the next handle);
+       - every body field, including the full 3D quaternion, angular-velocity vector and the
+         three inertia tensors;
+       - colliders, and joints with their reference angle/rotation;
+       - body → collider attachment order;
+       - in 2D, the manifolds with their warm-start impulses;
+       - the contact tracker.
+     - `contacts_2d` / `shapes_touch_2d` (2D) and `contact_3d` (3D): the narrowphase for one
+       shape pair.
+     - `aabb_tree_pairs_{2d,3d}`, `spatial_hash_pairs_{2d,3d}` and `spatial_hash_auto_cell_size`:
+       broadphase candidate pairs. Both structures report a superset of the overlapping pairs:
+       the tree from its fattened leaves, the hash from shared cells.
 
-     Add a non-default, `#[doc(hidden)]` `oracle` cargo feature with a read-only state dump and
-     pair-level entry points for contacts, mass properties and ray tests. It is additive and
-     doesn't change behaviour. Put it in 1.4.0 if it lands before the tag, otherwise in 1.4.1.
-   - **`2d = ["dep:hisab"]` → `2d = []`.** The 2D backend uses no hisab; only `backend_3d/` and
-     one `#[cfg(feature = "3d")]` function in `world.rs` do. The default build compiles hisab
-     and glam for nothing.
-   - Commit and tag. The release workflow requires the tag to equal `VERSION`. Re-run the P(-1)
-     check on the tagged commit; nothing in `src/` changes after this point.
-   - Record the glibc version (2.44 today). The oracle's transcendental bits depend on it.
+     Mass properties come through the dump (body mass and inertia after `add_collider`); ray
+     tests through the public `raycast`. Neither backend keeps joint accumulators or the island
+     union-find between steps, and 3D keeps no manifolds, so there is nothing more to dump.
+   - **`2d = []`.** The 2D backend never used hisab; the default build no longer compiles hisab
+     and glam.
+   - Gates on the change: fmt; clippy `-D warnings` on six feature sets (including `2d,oracle`
+     and `3d,oracle`); rustdoc `-D warnings`; audit; deny. Tests: 2D 298 unit + 7 oracle + 28
+     regression; 3D 274 + 7 + 14. CI and the Makefile run the 2D build with `oracle`.
+   - **Maintainer:** commit it. Nothing in `src/` changes after this point. A wrong oracle
+     value is fixed as 1.4.x and the corpus regenerated.
+   - glibc is **2.44**. The oracle's transcendental bits depend on it, and every TSV header
+     records it.
 1. **Scaffold.** `cyrius port --dry-run .`, then `cyrius port .`.
    - Expect these to move into `rust-old/`: `Cargo.toml`, `Cargo.lock`, `src/`, `tests/`,
      `benches/`, `fuzz/`, `Makefile`, `deny.toml`, `codecov.yml`, `target/`.
@@ -334,7 +349,8 @@ Rules:
   - the block solver's condition number (1000);
   - the static/kinetic friction slip threshold;
   - sleep onset and wake-on-contact;
-  - the speculative margin;
+  - the speculative margin, and exactly touching shapes: a box placed at depth 0 registers a
+    contact on the first step in 2D but not in 3D (seen in `tests/oracle.rs`);
   - the spatial-hash oversize cap (`MAX_CELLS_PER_ENTRY`);
   - the spring's damping regimes (under, critical, over).
 
@@ -533,7 +549,7 @@ tanmatra filed its findings.
 
 | Milestone | Status | Golden rows | Reference tests | Benches | Notes |
 |---|---|---|---|---|---|
-| M0 Initialize | ☐ | | | | step 0 waits on the oracle-hook decision |
+| M0 Initialize | ◐ step 0 done 2026-11-09 | | | | oracle hooks and `2d` without hisab added as unreleased port tooling on 1.4.0; steps 1–9 (scaffold onward) next |
 | M1 Foundation | ☐ | | | | |
 | M2 2D collision | ☐ | | | | |
 | M3 2D dynamics | ☐ | | | | |

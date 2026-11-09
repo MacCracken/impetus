@@ -694,6 +694,27 @@ impl PhysicsWorld {
         }
     }
 
+    /// Full world state for the Cyrius port's golden-value generator. Not public
+    /// API; see [`crate::oracle`].
+    #[cfg(all(feature = "oracle", any(feature = "2d", feature = "3d")))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn oracle_dump(&self) -> crate::oracle::WorldDump {
+        crate::oracle::WorldDump {
+            config: self.config.clone(),
+            next_particle_id: self.next_particle_id,
+            next_emitter_id: self.next_emitter_id,
+            collision_events: self.collision_events.clone(),
+            particles: self.particles.clone(),
+            emitters: self.emitters.clone(),
+            force_fields: self.force_fields.clone(),
+            #[cfg(all(feature = "2d", not(feature = "3d")))]
+            backend: self.backend_2d.oracle_dump(),
+            #[cfg(feature = "3d")]
+            backend: self.backend_3d.oracle_dump(),
+        }
+    }
+
     /// Get collision events from the last step.
     #[must_use]
     pub fn collision_events(&self) -> &[CollisionEvent] {

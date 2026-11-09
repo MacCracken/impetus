@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+Port tooling only. These changes are not scheduled for a release: they exist so
+the Cyrius port's golden-value generator can drive the Rust oracle
+(`docs/development/impetus-port-plan.md`, M0 step 0). Simulation behaviour is
+unchanged.
+
+### Added
+- **oracle** — a hidden, non-default `oracle` feature (`impetus::oracle`, not
+  public API):
+  - `PhysicsWorld::oracle_dump()` returns the full world state that the public API
+    hides: arena slots and free lists, every body field (full 3D quaternion,
+    angular velocity vector and inertia tensors), colliders, joints with
+    reference angles and rotations, 2D manifolds with warm-start impulses, and the
+    contact tracker;
+  - pair-level entry points: `contacts_2d`, `shapes_touch_2d`, `contact_3d`;
+  - broadphase candidate pairs from the AABB tree and the spatial hash.
+
+  `tests/oracle.rs` checks that the dump is read-only (dumping every frame
+  leaves the simulation bit-identical), that it matches the public state, and
+  that it predicts the next handle.
+
+### Changed
+- `2d` feature: no longer depends on hisab. The 2D backend never used it; only
+  the 3D backend does. The default build no longer compiles hisab and glam.
+
 ## [1.4.0] - 2026-11-09
 
 Audit and repair sweep. Simulation results change: most items below fix

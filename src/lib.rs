@@ -44,6 +44,11 @@ mod contact_tracker;
 #[cfg(any(feature = "2d", feature = "3d"))]
 mod spatial_hash;
 
+/// Oracle hooks for the Cyrius port's golden-value generator. Not public API.
+#[cfg(all(feature = "oracle", any(feature = "2d", feature = "3d")))]
+#[doc(hidden)]
+pub mod oracle;
+
 mod error;
 pub use error::ImpetusError;
 
