@@ -78,6 +78,35 @@ impetus specifics:
   `step` that it checks bit for bit against the oracle on every row, so the class-C bound comes from
   the port-parity rule (`docs/development/port-parity.md` §2) rather than from the port's results.
 
+## The corrected oracle and the crmath tables (ADR 0011)
+
+exp, sin and cos are correctly rounded in the port (`src/crmath.cyr`), and glibc 2.44 is not (it misrounds about
+0.1–0.2 % of their arguments). A class-C row's reference is therefore the **corrected oracle**: the oracle's own
+operations with every exp, sin and cos result correctly rounded. Where glibc rounded every call correctly, that is
+the golden row and nothing is written. Where it didn't, `tests/golden/<module>.cr.tsv` holds the corrected outputs
+(kimiya's format, its ADR 0006):
+
+```text
+fn <TAB> inputs <TAB> corrected outputs <TAB> note
+```
+
+after five `#` header lines. The fn and inputs fields are the golden row's, byte for byte (the key). The note gives
+the oracle's outputs, then each call glibc misrounded with both values. The harness compares such a row against the
+corrected outputs only (accepted under ADR 11). A correction that matches no golden row fails its module.
+
+`validate.py` builds the corrected oracle with MPFR 4.x (`mpfr_ref.py`, ctypes on `libmpfr.so.6`, no Python
+package; copied from kimiya). It also renders `src/crmath_data.cyr` from `crtables.py`: 2/π, π/2 and ln 2 for the
+slow path, and the fast paths' split constants, all from π and ln 2 computed exactly in integer arithmetic and
+checked against MPFR to 2,048 bits.
+
+```sh
+python3 -I scripts/oracle/validate.py .           # checks both are current
+python3 -I scripts/oracle/validate.py . --write   # rewrites them
+```
+
+The generator owns neither file. Its `--check` treats a `<module>.cr.tsv` as part of its module (stale only if the
+module has no emitter) and never lists it in `modules.txt`.
+
 ## `validate.py`
 
 Standard-library Python, run with `-I`. It never calls the oracle:
@@ -97,6 +126,7 @@ Standard-library Python, run with `-I`. It never calls the oracle:
   strings too);
 - every `spring` row is recomputed: the constructors, `is_settled`, and `step` through a Python
   transcription. Python's `math` calls the same glibc `exp`, `sin` and `cos` as Rust's f64 methods,
-  so the step rows match bit for bit.
+  so the step rows match bit for bit;
+- the corrected oracle and `src/crmath_data.cyr` are current (above).
 
 A tampered row makes it exit 1.

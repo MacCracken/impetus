@@ -44,6 +44,7 @@ cargo test --manifest-path rust-old/Cargo.toml --all-features                # t
 cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml -- --check   # golden corpus (2D + shared) up to date
 cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml --no-default-features --features b3 -- --check   # (3D)
 python3 -I scripts/oracle/validate.py .                                         # independent check of the corpus
+python3 -I scripts/oracle/validate.py . --write                                 # regenerate src/crmath_data.cyr and tests/golden/*.cr.tsv (needs MPFR)
 ```
 
 ## Development Process

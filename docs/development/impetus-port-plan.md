@@ -336,7 +336,7 @@ tanmatra's classes apply (its plan §4), with two additions for the simulation:
 |---|---|---|
 | **A — exact** | bit-identical / equal integers | handles and generations, config validation verdicts, material presets, combine rules, collision layers, broadphase pair **sets**, contact counts and feature ids, event sequences, constants |
 | **B — arithmetic** | ≤ 2 ulp, expected 0 | spring step with its cached matrix (× + only), 2D contact generation (SAT, clipping), 2D mass properties, solver arithmetic on 2D paths, AABBs |
-| **C — transcendental** | ulp ≤ K by the port-parity rule | spring transition (exp, sin, cos), 2D rotation (`sin_cos`), `atan2`, `hypot` sites, joint angles |
+| **C — transcendental** | ulp ≤ K by the port-parity rule; **0** on the correctly rounded primitives, against the corrected oracle (ADR 0011) | spring transition (exp, sin, cos), 2D rotation (`sin_cos`), `atan2`, `hypot` sites, joint angles |
 | **D — iterative / hisab-backed** | relative ≤ 1e-12, or a per-function bound set before its first comparison | every ADR 0007 path: 3D quaternion rotation, mat3 inverse, GJK/EPA normal and depth, BVH-derived pair order (the pair *set* stays class A), `detect_islands` membership (class A on sets) |
 | **S — single step** | per field: the class of the path that produced it | one `step()` from an oracle state dump. Positions, velocities and impulses take the path's class; contact sets and events are class A, except a named near-degenerate contact flip |
 | **R — reference** | physical tolerance stated in the test | the 30 regression scenarios, the Rust unit tests that assert physics (resting height, bounce speed, swing, settling, sleep), and energy and momentum invariants over long runs |
@@ -400,9 +400,9 @@ Every std f64 method in `src/` outside tests, 1.4.0:
 | Rust (calls) | Cyrius | Parity |
 |---|---|---|
 | `sqrt` (41), `abs` (284), `floor` (2), `ceil` (2) | `f64_sqrt`, `f64_abs`, `f64_floor`, `f64_ceil` (builtins) | exact on every target |
-| `sin_cos` (15), `sin` (1), `cos` (1) | `f64_sin`, `f64_cos`, two calls (no `sin_cos`) | the polyfill on every target, so identical everywhere; class C against glibc |
+| `sin_cos` (15), `sin` (1), `cos` (1) | `_im_sin_cos`, `_im_sin`, `_im_cos`: correctly rounded (`src/crmath.cyr`, [ADR 0011](../adr/0011-correctly-rounded-exp-sin-cos.md)) | identical everywhere; class C compared exactly against the corrected oracle |
 | `atan2` (2) | an atan2 on `_f64_atan_polyfill`, as the language survey recommends | `ganita_f64_atan2` calls the native x87 `f64_atan` on x86_64, so its bits differ between targets |
-| `exp` (4, spring) | `_f64_exp_polyfill` | `f64_exp` is x87 on x86_64; the polyfill keeps §3.3 #7 |
+| `exp` (4, spring) | `_im_exp`: correctly rounded (`src/crmath.cyr`, ADR 0011) | identical everywhere; class C compared exactly against the corrected oracle (`f64_exp` is x87 on x86_64) |
 | `hypot` (15) | `ganita_f64_hypot` (pure Cyrius) | ≤ 2 ulp from libm (tanmatra measured); class C, or exact by the rule if a site is ill-conditioned |
 | `powf` (1) | `ganita_f64_pow` | class C; mind ganita's `pow(-1, huge)` defect (tanmatra ADR 0007) |
 | `powi` (19) | explicit products in LLVM's square-and-multiply order (as tanmatra) | class B |
@@ -536,10 +536,12 @@ tanmatra filed its findings.
 - **`str_builder` aborts on OOM** (not filed yet): the back-compat calls (`putc`, `add_cstr`,
   `add_int`) exit the process when a grow fails, so `src/fmtf.cyr` and `src/json.cyr`'s writers do too.
   The `_a` variants return -1; moving the writers onto them, with an error return, is impetus-side work.
-- **Exact transcendentals for the spring** (decision open): `Spring::step`'s sensitivity puts the
-  port-parity rule's bound far past 64 on most rows (`port-parity.md` §7), so the rule asks for
-  correctly rounded exp, sin and cos on the spring path (as kimiya's ADR 0005 did for glibc's
-  ill-conditioned calls), a ganita or impetus task. Until then the 800 step rows are measured, not gated.
+- **Correctly rounded transcendentals in ganita** (not filed yet). impetus now owns correctly rounded
+  exp, sin and cos (`src/crmath.cyr`, ADR 0011), as kimiya owns its acos, cos, ln and pow. They belong in
+  ganita, once, with a two-phase (Ziv) design like impetus's. impetus's fast paths cost 2.6 µs (exp)
+  and 3.3 µs (sin_cos) against the polyfills' 64 and 83 ns (`benchmarks-rust-v-cyrius.md`). A
+  table-driven reduction and Horner coefficients are the obvious first steps, and they are needed
+  before M3's per-body rotations.
 - **Derive features for serde-shaped JSON** (not filed yet): variant renaming (`"Average"`, not the member
   name), `Option` fields as `null`, externally tagged payload enums (`{"Ball":{"radius":0.5}}`). With them,
   `src/json.cyr`'s hand-written codecs could move to `#derive`.
@@ -596,7 +598,7 @@ tanmatra filed its findings.
 |---|---|---|---|---|---|
 | M0 Initialize | ✅ done 2026-11-09 | constants 3 + math 18,919: **14,875 ok, 0 failed, 0 measured, 4,046 pending (M1 helpers), 1 accepted (ADR 0009)**, identical bits on x86_64 ELF, x86_64 PE and aarch64 | — | 1 probe bench | oracle hooks; scaffold and repairs; `cyrius.cyml` with hisab 3.4.1; generator, `validate.py`, `src/constants.cyr`, parity harness; exp and atan2 on the polyfills (cross-target bits), K = 2; ADRs 0008, 0009 and the 0007 amendment (hisab off the step path until S1/H9); six probes ([`port-parity.md`](port-parity.md) §4). Next: M1 |
 | M1a Foundation: math helpers, error, config, material, units, force | ✅ done 2026-11-09 | config 293 + material 2,046 + units 2,236 + force 1,308 + math (0 pending now): **24,431 ok, 0 failed, 281 pending (S2 280, M6 1), 93 accepted** on x86_64 ELF, x86_64 PE and aarch64; every row 0 ulp | 33 of 44 Rust tests ported (2 partial: the Display symbols), 11 serde n/a; 97 assertions | 6 (4.8–31× Rust; [benchmarks](../benchmarks-rust-v-cyrius.md)) | `src/error.cyr`, `mathx.cyr`, `vec.cyr`, `config.cyr`, `material.cyr`, `units.cyr`, `force.cyr`; `[lib]` + `dist/impetus.cyr`; `tests/lib_2d.cyr`; surface parity 100/100 (`scripts/surface_parity.py`); ADR 0008 #6 mapped |
-| M1b Foundation: types, arena, contact tracker, spring | ◐ parts 1 and 2 done 2026-11-09; the spring's class-C gate waits on a decision | fmtf 37,576 + json 937 + spring 1,000 + types 1: **63,419 ok, 0 failed, 800 measured (`Spring::step`), 7 pending (S3 3, S4 3, M6 1), 93 accepted** on x86_64 ELF, x86_64 PE and aarch64; 1,531 of 1,600 step outputs bit-identical | all 63 Rust tests of the M1b modules ported (body 6, collider 7, joint 12, event 6, query 3, arena 10, tracker 3, spring 16), plus Cyrius-only groups; 226 assertions in 4 files | 3 spring + 4 serde + Display (1.2–26× Rust; [benchmarks](../benchmarks-rust-v-cyrius.md)) | part 1: ADR 0010, `src/fmtf.cyr`, `src/json.cyr` for the M1a types. Part 2: `src/types.cyr`, `arena.cyr`, `contact_tracker.cyr`, `spring.cyr`; codecs for every M1b type, both serde struct forms (arrays too) and one-key unit variants, retrofitted to the part-1 types; the spring's sensitivity measured per row (`port-parity.md` §7); S3, S4 found; surface parity 258/258 |
+| M1b Foundation: types, arena, contact tracker, spring | ✅ done 2026-11-09 | fmtf 37,576 + json 937 + spring 1,000 + types 1 (+ math 19,165 with the crmath threshold rows): **64,455 ok, 0 failed, 0 measured, 7 pending (S3 3, S4 3, M6 1), 103 accepted (ADR 11: 10)** on x86_64 ELF, x86_64 PE and aarch64; every spring step row 0 ulp | all 63 Rust tests of the M1b modules ported (body 6, collider 7, joint 12, event 6, query 3, arena 10, tracker 3, spring 16), plus Cyrius-only groups and `crmath.tcyr` (23) | 3 spring + 4 serde + Display + 2 crmath ([benchmarks](../benchmarks-rust-v-cyrius.md)) | part 1: ADR 0010, `src/fmtf.cyr`, `src/json.cyr` for the M1a types. Part 2: `src/types.cyr`, `arena.cyr`, `contact_tracker.cyr`, `spring.cyr`; codecs for every M1b type in both serde struct forms; S3, S4 found; surface parity 258/258. Part 3: [ADR 0011](../adr/0011-correctly-rounded-exp-sin-cos.md), correctly rounded exp, sin and cos (`src/crmath.cyr`, generated `crmath_data.cyr`), the corrected oracle (`*.cr.tsv`, 10 rows), class C exact on them |
 | M2 2D collision | ☐ | | | | |
 | M3 2D dynamics | ☐ | | | | |
 | M4 3D collision | ☐ | | | | |

@@ -109,9 +109,9 @@ fn _par_constants(fp, fl): i64 {
 
 # `f64::*` rows: the Rust std reference values (port plan §7.1), through the counterparts the port
 # uses: the builtins where they match Rust, and src/mathx.cyr's `_im_` helpers where they don't.
-# exp and atan2 are the polyfill forms, which give the same bits on every target (port-parity.md
-# §2): `f64_exp` and the `f64_atan` inside ganita's atan2 are x87 on x86_64 and the polyfill on
-# aarch64.
+# exp, sin and cos are correctly rounded (src/crmath.cyr, ADR 0011); atan2 is ganita's on the atan
+# polyfill, which gives the same bits on every target (port-parity.md §2): the `f64_atan` inside
+# ganita's atan2 is x87 on x86_64 and the polyfill on aarch64.
 fn _par_math(fp, fl): i64 {
     var x: f64 = _par_in(0);
     if (_par_eq(fp, fl, "f64::sqrt") == 1) { var r: f64 = f64_sqrt(x); _par_got_f(r); return 1; }
@@ -126,8 +126,8 @@ fn _par_math(fp, fl): i64 {
         _par_got_f(c);
         return 1;
     }
-    if (_par_eq(fp, fl, "f64::sin") == 1) { var r: f64 = f64_sin(x); _par_got_f(r); return 1; }
-    if (_par_eq(fp, fl, "f64::cos") == 1) { var r: f64 = f64_cos(x); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::sin") == 1) { var r: f64 = _im_sin(x); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::cos") == 1) { var r: f64 = _im_cos(x); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::exp") == 1) { var r: f64 = _im_exp(x); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::is_nan") == 1) { _par_got_i(_im_is_nan(x)); return 1; }
     if (_par_eq(fp, fl, "f64::is_finite") == 1) { _par_got_i(_im_is_finite(x)); return 1; }
@@ -1356,7 +1356,8 @@ fn _par_dispatch(mp, ml, fp, fl): i64 {
 # Shadow comparisons, never gated: the same golden rows through another Cyrius candidate.
 # - the native exp and ganita's atan2 (on the native atan): x87 on x86_64, so their bits differ
 #   between targets; the polyfill forms are dispatched instead (port-parity.md §2);
-# - the sin / cos polyfills, which the builtins are on every target (probed: same bits on x86_64);
+# - the exp, sin and cos polyfills (the builtin sin / cos on every target), the port's primitives
+#   before the correctly rounded ones (ADR 0011);
 # - the stdlib min / max, to show where their NaN semantics differ from Rust's.
 fn _par_shadows(mp, ml, fp, fl, cls) {
     if (_par_eq(mp, ml, "math") != 1) { return 0; }
@@ -1369,6 +1370,9 @@ fn _par_shadows(mp, ml, fp, fl, cls) {
         _par_got_f(r);
         _par_shadow_record("f64::exp ~ f64_exp (native)", cls);
         _par_dg_fold(8);
+        _par_got_n = 0;
+        _par_got_f(_f64_exp_polyfill(x));
+        _par_shadow_record("f64::exp ~ _f64_exp_polyfill", cls);
         return 0;
     }
     if (_par_eq(fp, fl, "f64::sin") == 1) {
@@ -1420,14 +1424,19 @@ fn _par_shadows(mp, ml, fp, fl, cls) {
 # about 1 ulp, so two implementations can differ by up to 2. Measured 2026-11-09 on x86_64 ELF,
 # x86_64 PE and aarch64: max 1 ulp, except hypot's 3 rows at 2 (port-parity.md §2). impetus's own
 # class-C functions get K_F = 2·S·c + 2 at their milestones (port-parity.md, the rule).
+#
+# On correctly rounded primitives (ADR 0011) the bound is 0: the port and the corrected oracle
+# evaluate the same operations on the same correctly rounded results, so any difference is a defect.
+# That covers exp, sin, cos, sin_cos and the spring step; atan2, hypot and powf keep 2.
 #must_use
 fn _par_c_bound(fp, fl): i64 {
-    if (_par_eq(fp, fl, "f64::sin_cos") == 1) { return 2; }
-    if (_par_eq(fp, fl, "f64::sin") == 1) { return 2; }
-    if (_par_eq(fp, fl, "f64::cos") == 1) { return 2; }
+    if (_par_eq(fp, fl, "f64::sin_cos") == 1) { return 0; }
+    if (_par_eq(fp, fl, "f64::sin") == 1) { return 0; }
+    if (_par_eq(fp, fl, "f64::cos") == 1) { return 0; }
+    if (_par_eq(fp, fl, "f64::exp") == 1) { return 0; }
+    if (_par_eq(fp, fl, "Spring::step") == 1) { return 0; }
     if (_par_eq(fp, fl, "f64::atan2") == 1) { return 2; }
     if (_par_eq(fp, fl, "f64::hypot") == 1) { return 2; }
-    if (_par_eq(fp, fl, "f64::exp") == 1) { return 2; }
     if (_par_eq(fp, fl, "f64::powf") == 1) { return 2; }
     return 0 - 1;
 }

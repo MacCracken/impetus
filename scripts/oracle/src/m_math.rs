@@ -72,6 +72,49 @@ fn sweep(seed: u64, n: usize, lo: f64, hi: f64) -> Vec<f64> {
     (0..n).map(|_| rng.uniform(lo, hi)).collect()
 }
 
+/// x, its two neighbours, and the three negated.
+fn around(x: f64) -> [f64; 6] {
+    [
+        x,
+        x.next_up(),
+        x.next_down(),
+        -x,
+        -x.next_up(),
+        -x.next_down(),
+    ]
+}
+
+/// The correctly rounded sin and cos's thresholds (ADR 0011, src/crmath.cyr), each straddled: the
+/// tiny-argument cut 2^-27, the slow path's no-reduction cut 0.78, the fast path's 2^20, the
+/// cancellation cut on a reduced 2^-24 (the doubles nearest kπ/2 for k = 1 … 8 reduce below it),
+/// and the double closest to a multiple of π/2 (6381956970095103·2^797, 2^-60.9 away).
+fn sin_cos_edges() -> Vec<f64> {
+    let mut v = Vec::new();
+    let pio2 = f64::from_bits(0x3FF9_21FB_5444_2D18);
+    for x in [
+        2f64.powi(-27),
+        0.78,
+        2f64.powi(20),
+        6_381_956_970_095_103.0 * 2f64.powi(797),
+    ] {
+        v.extend(around(x));
+    }
+    for k in 1..=8_i32 {
+        v.extend(around(f64::from(k) * pio2));
+    }
+    v
+}
+
+/// The correctly rounded exp's thresholds, each straddled: the 1.0 cut 2^-55, the fast path's
+/// −708 and 709.7, the overflow cut 710 and the underflow cut −746.
+fn exp_edges() -> Vec<f64> {
+    let mut v = Vec::new();
+    for x in [2f64.powi(-55), 708.0, 709.7, 710.0, 746.0] {
+        v.extend(around(x));
+    }
+    v
+}
+
 fn log_sweep(seed: u64, n: usize, lo_exp10: f64, hi_exp10: f64) -> Vec<f64> {
     let mut rng = Rng::new(seed);
     (0..n)
@@ -237,6 +280,7 @@ pub fn emit() -> Module {
     ang.extend(log_sweep(0x5103, 200, -12.0, 0.0));
     ang.extend(log_sweep(0x5104, 200, 0.0, 15.0));
     ang.extend(wide(0x5105, 100));
+    ang.extend(sin_cos_edges());
     for &x in &ang {
         let (s, c) = black_box(x).sin_cos();
         m.row("f64::sin_cos", Class::C, &[f(x)], &[f(s), f(c)]);
@@ -291,6 +335,7 @@ pub fn emit() -> Module {
         1e-300,
         -1e-300,
     ]);
+    ex.extend(exp_edges());
     unary(&mut m, "f64::exp", Class::C, f64::exp, &ex);
 
     // powf: a radial force field divides by (d² + ε²)^(falloff/2), so a base ≥ 10⁻⁴ and an

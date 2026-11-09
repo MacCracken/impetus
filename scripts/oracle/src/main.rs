@@ -18,7 +18,10 @@
 //! `--check` regenerates the build's outputs in memory and compares them byte for byte with the
 //! committed files. It exits 1 if any output differs or is missing, if an owned `.tsv` has no
 //! emitter, or if an owned file was recorded on another glibc platform (`glibc.rs`): its
-//! transcendental rows are glibc's bits, so they can only be checked where they were made.
+//! transcendental rows are glibc's bits, so they can only be checked where they were made. A
+//! `<module>.cr.tsv` beside a module's file is the corrected oracle (ADR 0011), which
+//! `validate.py --write` writes and checks: here it is stale only when its module has no emitter,
+//! and its platform is checked like the corpus's.
 //!
 //! Adapted from kimiya's and tanmatra's `scripts/oracle/` (same format, same rules). Modules are
 //! added at the start of their milestone, with the golden grid from the port plan §6:
@@ -257,9 +260,14 @@ fn run() -> Result<bool, String> {
     }
     // The harnesses read this list, so a module added here can't go untested: without a
     // dispatcher it is reported as pending, row by row. It is the union of both builds'
-    // modules: this build's emitters, plus the other build's files already present.
+    // modules: this build's emitters, plus the other build's files already present (never a
+    // `<module>.cr.tsv`, which is its module's corrected oracle, not a module).
     let mut all = emitted.clone();
-    all.extend(tsv_names(&dir).into_iter().filter(|n| !owns(n)));
+    all.extend(
+        tsv_names(&dir)
+            .into_iter()
+            .filter(|n| !owns(n) && !n.ends_with(".cr.tsv")),
+    );
     let mut index = String::from(
         "# impetus golden corpus: one module per line; tests/parity_2d.tcyr replays the shared and\n\
          # b2_ modules, tests/parity_3d.tcyr the b3_ modules\n",
@@ -279,9 +287,14 @@ fn run() -> Result<bool, String> {
         ok &= emit(&root, check, out)?;
     }
 
-    // An owned .tsv with no emitter is stale: the harness would test rows nobody regenerates.
+    // An owned .tsv with no emitter is stale: the harness would test rows nobody regenerates. A
+    // `<module>.cr.tsv` (the corrected oracle, ADR 0011, written by validate.py) belongs to its
+    // module's emitter.
     for name in tsv_names(&dir) {
-        if owns(&name) && !emitted.contains(&name) {
+        let module_file = name
+            .strip_suffix(".cr.tsv")
+            .map_or_else(|| name.clone(), |m| format!("{m}.tsv"));
+        if owns(&name) && !emitted.contains(&module_file) {
             println!("STALE    tests/golden/{name} (no emitter)");
             ok = false;
         }

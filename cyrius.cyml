@@ -47,6 +47,8 @@ stdlib = ["assert", "bench", "overflow"]
 modules = [
     "src/error.cyr",
     "src/constants.cyr",
+    "src/crmath_data.cyr",
+    "src/crmath.cyr",
     "src/mathx.cyr",
     "src/fmtf.cyr",
     "src/vec.cyr",

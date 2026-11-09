@@ -12,15 +12,38 @@ calls the Rust oracle, so it catches a generator that records the wrong thing:
 - the class-C rows are checked for internal consistency: `sin_cos(x)` equals the separate
   `sin(x)` and `cos(x)` rows, and hypot of a Pythagorean triple is exact.
 
-Exit status 1 on any failure. Adapted in spirit from kimiya's and tanmatra's validate.py; the
-class-C references (60-digit transcendental values) arrive with the step 8 baselines.
+Exit status 1 on any failure. Adapted in spirit from kimiya's and tanmatra's validate.py.
+
+The correctly rounded math (ADR 0011) adds two generated outputs, which `--write` writes and a plain
+run checks are current:
+- `src/crmath_data.cyr`, the tables of src/crmath.cyr (scripts/oracle/crtables.py), whose π and ln 2
+  are checked against MPFR;
+- the corrected oracle, `tests/golden/<module>.cr.tsv` (from M1b part 3).
+MPFR (libmpfr.so.6, 4.x) is the one system library this needs, through ctypes
+(scripts/oracle/mpfr_ref.py).
 """
 
+import importlib.util
 import math
 import re
 import struct
 import sys
 from pathlib import Path
+
+WRITE = "--write" in sys.argv[2:]
+sys.dont_write_bytecode = True   # the modules loaded below leave no __pycache__ in the repo
+
+
+def _load(name):
+    """A module beside this script, by path: `-I` keeps the script's directory off sys.path."""
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parent / f"{name}.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+MPFR = _load("mpfr_ref")
+CRTABLES = _load("crtables")
 
 FAILS = []
 
@@ -529,10 +552,156 @@ def check_spring(rows):
     return counted
 
 
+# ── the corrected oracle (ADR 0011) ──────────────────────────────────────────────────
+# A class-C row's reference is the oracle's own operations with every exp, sin and cos result
+# correctly rounded (MPFR). Where glibc rounded every call of a row correctly, that is the oracle's
+# row and nothing is written; where it didn't, tests/golden/<module>.cr.tsv carries the corrected
+# outputs, which the harness compares against (accepted under ADR 11).
+
+
+def _cr_spring_step(p, v, t, k, c, dt, n, prim):
+    """_spring_step with exp, sin and cos from `prim` (a name -> function map)."""
+    if math.isnan(dt) or dt <= 0.0:
+        return p, v
+    if math.isinf(dt):
+        if c > 0.0 and k >= 0.0:
+            return t, 0.0
+        return p, v
+    alpha = 0.5 * c
+    disc = alpha * alpha - k
+    scale = alpha * alpha + abs(k)
+    if abs(disc) <= 1e-9 * scale or scale == 0.0:
+        e = prim["exp"](-alpha * dt)
+        m = [e * (1.0 + alpha * dt), e * dt, -e * alpha * alpha * dt, e * (1.0 - alpha * dt)]
+    elif disc < 0.0:
+        wd = math.sqrt(-disc)
+        e = prim["exp"](-alpha * dt)
+        sn, cs = prim["sin"](wd * dt), prim["cos"](wd * dt)
+        m = [e * (cs + alpha / wd * sn), e * sn / wd, -e * k / wd * sn, e * (cs - alpha / wd * sn)]
+    else:
+        beta = math.sqrt(disc)
+        r1, r2 = -alpha + beta, -alpha - beta
+        d = r1 - r2
+        e1, e2 = prim["exp"](r1 * dt), prim["exp"](r2 * dt)
+        m = [(r1 * e2 - r2 * e1) / d, (e1 - e2) / d, r1 * r2 * (e2 - e1) / d, (r1 * e1 - r2 * e2) / d]
+    for _ in range(n):
+        y0 = p - t
+        v0 = v
+        y = m[0] * y0 + m[1] * v0
+        vv = m[2] * y0 + m[3] * v0
+        if math.isfinite(y) and math.isfinite(vv):
+            p = t + y
+            v = vv
+    return p, v
+
+
+def _glibc(name):
+    return {"exp": _exp, "sin": lambda x: _sin_cos(x)[0], "cos": lambda x: _sin_cos(x)[1]}[name]
+
+
+def _logged(name, log):
+    """MPFR's correctly rounded `name`, recording each call glibc rounds otherwise into `log`."""
+    def f(x):
+        want = MPFR.cr(name, x)
+        got = _glibc(name)(x)
+        if not same(got, want):
+            log.append(f"{name}(f:{bits(x):016x}) glibc f:{bits(got):016x} correctly rounded f:{bits(want):016x}")
+        return want
+    return f
+
+
+def corrections(module, rows):
+    """(fn, inputs text, corrected outputs text, note) for every row of `module` whose outputs change
+    when every exp, sin and cos result is correctly rounded."""
+    out = []
+    for fn, cls, ins, outs, note in rows:
+        log = []
+        prim = {nm: _logged(nm, log) for nm in ("exp", "sin", "cos")}
+        if module == "math" and fn in ("f64::exp", "f64::sin", "f64::cos", "f64::sin_cos"):
+            x = tok_f(ins[0])
+            if fn == "f64::sin_cos":
+                want = [prim["sin"](x), prim["cos"](x)]
+            else:
+                want = [prim[fn[5:]](x)]
+        elif module == "spring" and fn == "Spring::step":
+            x = [tok_f(t) if t.startswith("f:") else int(t[2:]) for t in ins]
+            want = list(_cr_spring_step(*x, prim))
+        else:
+            continue
+        got = [tok_f(t) for t in outs]
+        if all(same(a, b) for a, b in zip(got, want)) and len(got) == len(want):
+            continue
+        new = " ".join(f"f:{bits(w):016x}" for w in want)
+        out.append((fn, " ".join(ins), new, "oracle " + " ".join(outs) + "; " + "; ".join(log)))
+    return out
+
+
+def cr_text(module, golden_header, rows):
+    """The text of tests/golden/<module>.cr.tsv, or None when no row needs a correction."""
+    fixes = corrections(module, rows)
+    if not fixes:
+        return None
+    oracle = next(l for l in golden_header if l.startswith("# oracle:"))
+    oracle = oracle.replace(" Generated by scripts/oracle; do not edit.", "")
+    head = [
+        f"# impetus corrected oracle (ADR 0011), format 1: {module}",
+        f"{oracle} Correctly rounded: MPFR {MPFR.VERSION}. Generated by scripts/oracle/validate.py; do not edit.",
+        "# regenerate: python3 -I scripts/oracle/validate.py . --write",
+        "# columns: fn<TAB>inputs<TAB>outputs<TAB>note (fn, inputs: the golden row's, byte for byte; outputs: "
+        "the oracle's operations with every exp, sin and cos result correctly rounded; note: the oracle's "
+        "outputs, then each call glibc misrounded)",
+        f"# rows: {len(fixes)}",
+    ]
+    return "\n".join(head + ["\t".join(f) for f in fixes]) + "\n"
+
+
+def check_corrections(root, module, path_tsv, rows):
+    """tests/golden/<module>.cr.tsv is current (written with --write)."""
+    header = [l for l in path_tsv.read_text().splitlines()[:5]]
+    text = cr_text(module, header, rows)
+    path = path_tsv.with_name(f"{module}.cr.tsv")
+    rel = f"tests/golden/{module}.cr.tsv"
+    if WRITE:
+        if text is None:
+            if path.exists():
+                path.unlink()
+                print(f"removed {rel}")
+        else:
+            path.write_text(text)
+            print(f"wrote {rel} ({text.count(chr(10)) - 5} rows)")
+        return
+    if text is None:
+        if path.exists():
+            fail(f"{rel}: no row needs a correction, but the file exists (regenerate with --write)")
+        return
+    if not path.exists() or path.read_text() != text:
+        fail(f"{rel}: differs from the corrected oracle (regenerate with --write)")
+        return
+    print(f"{module}.cr.tsv: current, {text.count(chr(10)) - 5} corrected rows")
+
+
+def check_tables(root):
+    """src/crmath_data.cyr is crtables.py's rendering, and its π and ln 2 are MPFR's."""
+    n = CRTABLES.PREC
+    for name, fn in (("pi", CRTABLES.pi_bits), ("log2", CRTABLES.ln2_bits)):
+        if fn(n) != MPFR.const_bits(name, n):
+            fail(f"crtables: {name} to {n} bits differs from MPFR's")
+    path = root / "src/crmath_data.cyr"
+    text = CRTABLES.render()
+    if WRITE:
+        path.write_text(text)
+        print(f"wrote src/crmath_data.cyr ({len(text.splitlines())} lines)")
+    elif not path.exists() or path.read_text() != text:
+        fail("src/crmath_data.cyr is not crtables.py's output (regenerate with --write)")
+    else:
+        print(f"crmath_data: current; π and ln 2 to {n} bits equal MPFR {MPFR.VERSION}'s")
+
+
 def main():
     root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
+    check_tables(root)
     golden = root / "tests/golden"
-    names = sorted(p.stem for p in golden.glob("*.tsv"))
+    names = sorted(p.stem for p in golden.glob("*.tsv") if not p.name.endswith(".cr.tsv"))
     index = [
         l for l in (golden / "modules.txt").read_text().splitlines() if l and not l.startswith("#")
     ]
@@ -542,6 +711,8 @@ def main():
     for name in names:
         rows = read_module(golden / f"{name}.tsv")
         total += len(rows)
+        if name in ("math", "spring"):
+            check_corrections(root, name, golden / f"{name}.tsv", rows)
         if name == "constants":
             check_constants(root, rows)
             print(f"constants: {len(rows)} rows checked against rust-old/src")

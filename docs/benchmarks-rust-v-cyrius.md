@@ -49,7 +49,7 @@ builder grows the global heap).
 |---|---|---|---|---|
 | `springs/spring_1d_step` | one cached step at 60 fps | 4.98 ns | 28.5 ns | 5.7× |
 | `springs/spring_2d_step` | both axes, cached | 6.04 ns | 59.5 ns | 9.9× |
-| `springs/spring_settle_frames` | a critically damped spring from rest until settled | 1.47 µs | 1.80 µs | 1.2× |
+| `springs/spring_settle_frames` | a critically damped spring from rest until settled | 1.47 µs | 1.80 µs → 4.44 µs (ADR 0011) | 1.2× → 3.0× |
 | `materials/quantity_display` | format 9.81 N | 81.3 ns | 830 ns | 10× |
 | `serde/serialize_body_desc` | a dynamic body to JSON | 252 ns | 3.48 µs | 14× |
 | `serde/deserialize_body_desc` | the default body from JSON | 276 ns | 7.19 µs | 26× |
@@ -71,4 +71,26 @@ builder grows the global heap).
   would close most of it.
 - **Decoding** builds bayan's value tree on the decode arena, then looks each field up by name; serde_json
   streams into the struct. The tree costs allocation and a second pass.
+
+## M1b part 3: correctly rounded exp, sin and cos (2026-11-09, ADR 0011)
+
+The spring's transition now calls the correctly rounded primitives (`src/crmath.cyr`). Cyrius-only rows, with the
+polyfills they replaced for scale (scratch bench, 200,000 iterations; Rust's std calls glibc, about 5 ns):
+
+| Body | Cyrius | The polyfill it replaced |
+|---|---|---|
+| `math/exp_cr`: exp(−0.3), the fast path | 2.61 µs | 64 ns (`_f64_exp_polyfill`) |
+| `math/sin_cos_cr`: sin and cos of 2.5, the fast path | 3.29 µs | 83 ns (`f64_sin` + `f64_cos`) |
+| exp, the slow path (forced) | 26.6 µs | — |
+| sin of ~2^996, the slow path (Payne–Hanek) | 18.1 µs | — |
+
+**Reading it.** The fast path is about 80 double-double operations: 27 Taylor terms for exp, 16 per series for sin
+and cos, each term a TwoProduct, a division and a renormalising sum. In Cyrius each of those is a multi-return call
+through memory. The slow path runs about 70 fixed-point products of 14 limbs.
+- **Steady state is unaffected.** The spring caches its transition, so `spring_1d_step` and `spring_2d_step` don't
+  change.
+- **A fresh spring pays one transition:** `spring_settle_frames` goes from 1.80 to 4.44 µs.
+- **Next steps** (port plan §8): a 2^(j/64) table for exp (11 terms instead of 27), Horner coefficients instead of
+  per-term divisions, and one shared series for sin_cos. The same probes then prove the results unchanged. They are
+  wanted before M3's per-body rotations call sin_cos every step.
 

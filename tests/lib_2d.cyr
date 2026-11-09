@@ -6,6 +6,8 @@
 
 include "src/error.cyr"
 include "src/constants.cyr"
+include "src/crmath_data.cyr"
+include "src/crmath.cyr"
 include "src/mathx.cyr"
 include "src/fmtf.cyr"
 include "src/vec.cyr"

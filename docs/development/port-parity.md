@@ -235,8 +235,8 @@ fails when either drifts from `cyrius.cyml`.
   Two things drive it: `position = target + y` cancels when the spring is near zero and the target is
   far (2^26 at dt = 1e-6), and the over-damped branch divides `e1 − e2` by `r1 − r2` near the critical
   point. By the rule (§2) the bound K = 2·S·c + 2 is far past 64 on most rows, so the rule's answer is
-  exact primitives (correctly rounded exp, sin, cos on the spring path), not a bound. The step rows
-  stay measured until that is decided (port plan §8).
+  exact primitives (correctly rounded exp, sin, cos on the spring path), not a bound. **Done in §8 (ADR
+  0011): the step rows are gated at 0 ulp.**
 - **What the port measures meanwhile**, identical on all three targets: of the 1,600 step outputs,
   **1,531 are bit-identical**, 12 are 1 ulp off, 6 are 2 ulp, 12 are 3–16 ulp, and 39 are over 16 (max
   2.4·10^7, at S = 2.4·10^7). Every mismatch is where the polyfill exp or the builtin sin/cos is 1 ulp
@@ -251,11 +251,63 @@ fails when either drifts from `cyrius.cyml`.
   failed, 800 measured (`Spring::step`), 7 pending (S3 3, S4 3, the M6 constant), 93 accepted**; the
   math digests are unchanged.
 
+## 8. Correctly rounded exp, sin and cos; the spring gated (2026-11-09, ADR 0011)
+
+- **glibc 2.44 is not correctly rounded** (MPFR 4.2.2 reference): it misrounds 0.105 % of random exp arguments in
+  [−700, 700], 0.14 % of sin and 0.15–0.17 % of cos arguments (in [−10, 10] and [−1000, 1000] alike). On the spring
+  grid: 2 of 377 sin calls, none of its 1,154 exp or 377 cos calls.
+- **`src/crmath.cyr`** gives the correctly rounded value on every argument:
+  - a double-double fast path with a proven rounding test;
+  - a 364-bit fixed-point slow path, with Payne–Hanek reduction for sin and cos;
+  - its tables generated from π and ln 2, which are computed exactly and equal MPFR's to 2,048 bits.
+
+  Verified beyond the corpus (scratch probes against MPFR):
+
+| Set | Arguments | Equal to MPFR | Slow calls |
+|---|---|---|---|
+| whole range: exp over [−745.2, 709.8] and every binade from 2^-55 up; sin and cos to 1.8·10^308; the edges | 180,062 | all, on the slow path alone and through the full functions, on x86_64 and aarch64 | 39,100 (the sin/cos arguments above 2^20, by design) |
+| the fast paths' ranges | 90,000 | all | 0 |
+| arguments where glibc misrounds (each within about 0.01 ulp of a rounding boundary) | 1,200 | all | 222 (those above 2^20) |
+
+- **The corrected oracle**:
+  - `tests/golden/math.cr.tsv` has 9 rows: exp, sin, cos and sin_cos where glibc misrounds; 4 of them (cos and
+    sin_cos at 2 arguments) are new threshold rows;
+  - `tests/golden/spring.cr.tsv` has 1 row, where glibc's sin(0.1531…) misrounds and the step's outputs move by 2
+    and 17 ulp.
+
+  The harness compares those rows against the corrected outputs: all 10 equal them, and none equals glibc's.
+- **Bounds:** 0 for `f64::exp`, `f64::sin`, `f64::cos`, `f64::sin_cos` and `Spring::step`. Every one of their rows
+  is 0 ulp on x86_64 ELF, x86_64 PE and aarch64:
+
+| Function | Rows | Result |
+|---|---|---|
+| `Spring::step` | 800 | 799 ok, 1 accepted (ADR 11); 1,600 outputs at 0 ulp |
+| `f64::sin_cos` | 2,156 | 2,152 ok, 4 accepted (ADR 11) |
+| `f64::sin` / `f64::cos` | 2,156 each | 2,154 ok, 2 accepted (ADR 11) each |
+| `f64::exp` | 1,555 | 1,554 ok, 1 accepted (ADR 11) |
+
+- The math grid gains 246 rows (18,919 → 19,165): 72 angles for sin_cos, sin and cos, and 30 exp arguments. They
+  straddle every threshold of `crmath.cyr`, and include the closest double to a multiple of π/2. The polyfills are now shadow lines: exp 1 ulp on 118 rows, sin on 47, cos on 46.
+- **Digests**, equal on all three targets (ELF and PE identical in full; aarch64 also, apart from the native-exp
+  shadow, which is x87 on x86_64):
+
+| Function | Digest |
+|---|---|
+| exp | `0x9763e0c4a6dc5471` |
+| sin | `0xe3107150ef837dbc` |
+| cos | `0x79eede887b756dc1` |
+| sin_cos | `0xa38fff9ee8badd98` |
+| atan2, hypot, powf | unchanged |
+
+- **Result, every target:** 10 modules, 0 failing; **64,455 ok, 0 failed, 0 measured, 7 pending (S3 3, S4 3, the
+  M6 constant), 103 accepted (ADR 0008 #6 92, ADR 0009 1, ADR 0011 10)**.
+
 ## How to reproduce
 
 ```sh
 cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml -- --check
-python3 -I scripts/oracle/validate.py .
+python3 -I scripts/oracle/validate.py .           # also checks src/crmath_data.cyr and tests/golden/*.cr.tsv
+python3 -I scripts/oracle/validate.py . --write   # regenerates them (needs libmpfr.so.6)
 cyrius test tests/parity_2d.tcyr                  # x86_64 ELF
 cyrius test --win tests/parity_2d.tcyr            # x86_64 PE, needs wine
 cyrius test --aarch64 tests/parity_2d.tcyr        # aarch64, needs qemu-aarch64

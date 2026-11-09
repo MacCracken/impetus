@@ -227,6 +227,36 @@ fn bench_roundtrip_collider_desc() {
     return 0;
 }
 
+# math/exp_cr: the correctly rounded exp on an ordinary argument (its fast path); no Rust row
+# (glibc's exp is about 5 ns).
+fn bench_exp_cr() {
+    var b = bench_new("math/exp_cr");
+    var x: f64 = -0.3;
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var r: f64 = _im_exp(x);
+        g_sink = _im_bits(r);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+    return 0;
+}
+
+# math/sin_cos_cr: the correctly rounded pair on a rotation angle (its fast path); no Rust row.
+fn bench_sin_cos_cr() {
+    var b = bench_new("math/sin_cos_cr");
+    var x: f64 = 2.5;
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var s, c = _im_sin_cos(x);
+        var sv: f64 = s;
+        g_sink = _im_bits(sv);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+    return 0;
+}
+
 # Runs every bench.
 fn main(): i64 {
     alloc_init();
@@ -244,6 +274,8 @@ fn main(): i64 {
     bench_spring_1d_step();
     bench_spring_2d_step();
     bench_spring_settle_frames();
+    bench_exp_cr();
+    bench_sin_cos_cr();
     return 0;
 }
 

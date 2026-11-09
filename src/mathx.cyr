@@ -6,9 +6,9 @@
 #   second operand when the first is NaN, and NaN when the second is);
 # - the predicates have no public stdlib counterpart;
 # - to_radians and the literal-exponent powi are Rust's exact operation order;
-# - exp and atan2 are the polyfill forms, the same bits on every target (the native f64_exp and
-#   f64_atan are x87 on x86_64); hypot is ganita's; sin_cos is the builtin pair.
-# Class-C results are within K = 2 ulp of glibc on every target (port-parity.md §2).
+# - exp, sin and cos are correctly rounded (src/crmath.cyr, ADR 0011), the same bits on every target;
+# - atan2 is ganita's on the atan polyfill, the same bits on every target (the native f64_atan is
+#   x87 on x86_64); hypot is ganita's. Both are within K = 2 ulp of glibc (port-parity.md §2).
 
 # π/180 as Rust folds `consts::PI / 180.0`: the double nearest, pinned by the to_radians rows.
 var _IM_RADS_PER_DEG: f64 = 0.017453292519943295;
@@ -86,10 +86,10 @@ fn _im_powi3(x: f64): f64 {
     return r;
 }
 
-# e^x through the exp polyfill: the same bits on every target. Stands for `f64::exp`.
+# e^x, correctly rounded (src/crmath.cyr). Stands for `f64::exp`.
 #must_use
 fn _im_exp(x: f64): f64 {
-    var r: f64 = _f64_exp_polyfill(x);
+    var r: f64 = _im_cr_exp(x);
     return r;
 }
 
@@ -100,13 +100,28 @@ fn _im_hypot(x: f64, y: f64): f64 {
     return r;
 }
 
-# (sin x, cos x): the builtin pair, which is the polyfill on every target. Stands for
-# `f64::sin_cos`. Read as `var s, c = _im_sin_cos(x);` and bind each to an f64 local.
+# (sin x, cos x), each correctly rounded (src/crmath.cyr). Stands for `f64::sin_cos`, which is
+# Rust's (x.sin(), x.cos()). Read as `var s, c = _im_sin_cos(x);` and bind each to an f64 local.
 #must_use
 fn _im_sin_cos(x: f64) {
-    var s: f64 = f64_sin(x);
-    var c: f64 = f64_cos(x);
-    return (s, c);
+    var s, c = _im_cr_sin_cos(x);
+    var sv: f64 = s;
+    var cv: f64 = c;
+    return (sv, cv);
+}
+
+# sin x, correctly rounded. Stands for `f64::sin`.
+#must_use
+fn _im_sin(x: f64): f64 {
+    var r: f64 = _im_cr_sin(x);
+    return r;
+}
+
+# cos x, correctly rounded. Stands for `f64::cos`.
+#must_use
+fn _im_cos(x: f64): f64 {
+    var r: f64 = _im_cr_cos(x);
+    return r;
 }
 
 # The angle of (x, y) in [−π, π]: ganita_f64_atan2 (1.2.15) with `_f64_atan_polyfill` in place of

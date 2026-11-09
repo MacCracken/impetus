@@ -1,0 +1,151 @@
+# crmath.tcyr — Cyrius-only tests of src/crmath.cyr, the correctly rounded exp, sin and cos (ADR 0011).
+#
+# Against the oracle, the golden math and spring rows gate them at 0 ulp (tests/parity_2d.tcyr, with the
+# corrected oracle where glibc misrounds). These check what the corpus can't say directly: the IEEE special
+# cases, that the fast and slow paths agree wherever both run, and that the fast path decides ordinary
+# arguments (the slow path is ~10× its cost).
+
+include "tests/lib_2d.cyr"
+
+# 1 when a and b have the same bits.
+fn same(a: f64, b: f64): i64 {
+    if (_im_cr_word(a) == _im_cr_word(b)) { return 1; }
+    return 0;
+}
+
+# A seeded xorshift64 step.
+var _seed = 88172645463325252;
+fn next_word(): i64 {
+    var x = _seed;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    _seed = x;
+    return x;
+}
+
+# A uniform double in [lo, hi).
+fn uniform(lo: f64, hi: f64): f64 {
+    var u = (next_word() >> 11) & 9007199254740991;
+    var uf: f64 = f64_from(u);
+    var t: f64 = uf * 0.00000000000000011102230246251565404236316680908203125;
+    var r: f64 = lo + (hi - lo) * t;
+    return r;
+}
+
+# Runs the crmath tests.
+fn main() {
+    alloc_init();
+    var zero: f64 = 0.0;
+    var nan: f64 = zero / zero;
+    var inf: f64 = 1.0 / zero;
+    var ninf: f64 = -inf;
+    var nzero: f64 = -zero;
+
+    test_group("exp_specials");
+    var e: f64 = _im_cr_exp(nan);
+    assert(e != e, "exp(NaN) is NaN");
+    e = _im_cr_exp(inf);
+    assert(same(e, inf) == 1, "exp(+inf) = +inf");
+    e = _im_cr_exp(ninf);
+    assert(same(e, zero) == 1, "exp(-inf) = +0");
+    e = _im_cr_exp(zero);
+    assert(e == 1.0, "exp(0) = 1");
+    e = _im_cr_exp(nzero);
+    assert(e == 1.0, "exp(-0) = 1");
+    e = _im_cr_exp(710.0);
+    assert(same(e, inf) == 1, "exp(710) overflows");
+    e = _im_cr_exp(709.0);
+    assert(e < inf, "exp(709) is finite");
+    e = _im_cr_exp(-746.0);
+    assert(same(e, zero) == 1, "exp(-746) underflows to +0");
+    e = _im_cr_exp(-745.1332191019411);
+    assert(_im_cr_word(e) == 1, "exp(-745.1332191019411) is the smallest subnormal");
+    e = _im_cr_exp(-740.0);
+    var w = _im_cr_word(e);
+    assert(w > 0 && w < 4503599627370496, "exp(-740) is subnormal");
+    e = _im_cr_exp(1.0);
+    assert(_im_cr_word(e) == 4613303445314885481, "exp(1) = e rounded (0x4005BF0A8B145769)");
+
+    test_group("sin_cos_specials");
+    var s, c = _im_cr_sin_cos(nan);
+    var sv: f64 = s;
+    var cv: f64 = c;
+    assert(sv != sv && cv != cv, "NaN gives NaN");
+    var s2, c2 = _im_cr_sin_cos(inf);
+    sv = s2;
+    cv = c2;
+    assert(sv != sv && cv != cv, "+inf gives NaN");
+    var s3, c3 = _im_cr_sin_cos(nzero);
+    sv = s3;
+    cv = c3;
+    assert(same(sv, nzero) == 1 && cv == 1.0, "sin(-0) = -0, cos(-0) = 1");
+    var tiny: f64 = _im_cr_from_word(1);
+    var s4, c4 = _im_cr_sin_cos(tiny);
+    sv = s4;
+    cv = c4;
+    assert(same(sv, tiny) == 1 && cv == 1.0, "sin of the smallest subnormal is itself");
+    var pi: f64 = 3.141592653589793;
+    sv = _im_cr_sin(pi);
+    assert(_im_cr_word(sv) == 4368955796522032135, "sin(fl(pi)) = 1.2246467991473532e-16 (0x3CA1A62633145C07)");
+    cv = _im_cr_cos(pi);
+    assert(cv == -1.0, "cos(fl(pi)) = -1");
+    var big: f64 = _im_cr_pow2(1023);
+    sv = _im_cr_sin(big);
+    var asv: f64 = f64_abs(sv);
+    assert(asv <= 1.0, "sin(2^1023) is in [-1, 1]");
+    var sn: f64 = _im_cr_sin(-big);
+    assert(same(sn, -sv) == 1, "sin is odd at 2^1023");
+    var cp: f64 = _im_cr_cos(big);
+    var cn: f64 = _im_cr_cos(-big);
+    assert(same(cp, cn) == 1, "cos is even at 2^1023");
+
+    test_group("fast_and_slow_agree");
+    # Every argument where the fast path runs: its answer is the slow path's.
+    var bad = 0;
+    for (var i = 0; i < 300; i = i + 1) {
+        var x: f64 = uniform(-700.0, 700.0);
+        var a: f64 = _im_cr_exp(x);
+        var b: f64 = _im_cr_exp_slow(x);
+        if (same(a, b) == 0) { bad = bad + 1; }
+        var y: f64 = uniform(-1000.0, 1000.0);
+        var sa: f64 = _im_cr_sin(y);
+        var sb: f64 = _im_cr_sin_cos_slow(y, 1);
+        var ca: f64 = _im_cr_cos(y);
+        var cb: f64 = _im_cr_sin_cos_slow(y, 0);
+        if (same(sa, sb) == 0 || same(ca, cb) == 0) { bad = bad + 1; }
+    }
+    assert_eq(bad, 0, "fast = slow on 300 exp and 300 sin/cos arguments");
+
+    test_group("fast_path_decides");
+    var before = _im_cr_slow_calls;
+    for (var i = 0; i < 2000; i = i + 1) {
+        var x2: f64 = uniform(-700.0, 700.0);
+        var r1: f64 = _im_cr_exp(x2);
+        var y2: f64 = uniform(-100000.0, 100000.0);
+        var r2, r3 = _im_cr_sin_cos(y2);
+        var r4: f64 = r2;
+        var keep = _im_cr_word(r1) + _im_cr_word(r4);
+        if (keep == 1) { bad = bad + 1; }
+    }
+    var slow = _im_cr_slow_calls - before;
+    assert(slow < 10, "at most a handful of 6,000 ordinary results need the slow path");
+
+    test_group("reduction_extremes");
+    # The double closest to a multiple of π/2 (6381956970095103·2^797): |cos| or |sin| is about 4.7e-19.
+    var m: f64 = 6381956970095103.0;
+    var hard: f64 = m * _im_cr_pow2(797);
+    var hs, hc = _im_cr_sin_cos(hard);
+    var hsv: f64 = hs;
+    var hcv: f64 = hc;
+    var ahs: f64 = f64_abs(hsv);
+    var ahc: f64 = f64_abs(hcv);
+    var small: f64 = ahs;
+    if (ahc < ahs) { small = ahc; }
+    assert(small > 0.0000000000000000001 && small < 0.000000000000000001, "the small one is ~4.7e-19");
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);
