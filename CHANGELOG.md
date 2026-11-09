@@ -83,6 +83,12 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   `cyrius/docs/development/issues/2026-11-02-memcpy-memset-byte-loops-dominate-frame-copies.md`:
   the byte-loop `memcpy` costs 4–7× on struct-sized copies too, with a new repro
   (`repros/2026-11-09-memcpy-small-struct-copies.bcyr`).
+- Correctly rounded exp, sin, cos and hypot filed for ganita, in its own queue:
+  `ganita/docs/development/issues/2026-11-09-correctly-rounded-exp-sin-cos-hypot.md`. It carries a
+  self-proving repro: 32 arguments, every one wrong on ganita 1.2.15 / cyrius 6.7.18, all right through
+  impetus's crmath. It proposes a correctly rounded tier seeded from `src/crmath.cyr`. Against MPFR,
+  `ganita_f64_hypot` misrounds 33.65 % of seeded arguments, and the stdlib polyfills misround 9.73 % (exp),
+  3.13 % (sin) and 2.96 % (cos).
 - **Cyrius port, M1b part 1** ([ADR 0010](docs/adr/0010-serde-compatible-json.md);
   `docs/development/port-parity.md` §6): serde-compatible JSON, replacing the plan's
   "serde not carried over".
@@ -194,6 +200,32 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - Found on the way: multi-return values are untyped words, so an operator applied to one works on
     the integer bits, with no f64 diagnostic (port plan §8). Two golden rows caught it, and the fix
     binds such values to `f64` locals.
+- **Cyrius port, M2 part 4: correctly rounded hypot, and the 2D queries**
+  ([ADR 0011, hypot amendment](docs/adr/0011-correctly-rounded-exp-sin-cos.md);
+  `docs/development/port-parity.md` §12). M2 is done.
+  - `_im_cr_hypot` in `src/crmath.cyr`:
+    - a double-double phase 1 after exact scaling, then an exact fixed-point slow path that rounds
+      the true midpoints (Pythagorean triples with a 54-bit odd hypotenuse) to even;
+    - matches MPFR on 404,234 probe pairs, with identical bits on x86_64 and aarch64;
+    - `_im_hypot` uses it, and the 1,715 `f64::hypot` rows are gated at 0 ulp (12 corrected where
+      glibc misrounds). ganita's `hypot` stays as a shadow line.
+  - `src/b2_raycast.cyr`:
+    - the ray tests for circle, oriented box, capsule, segment and convex hull;
+    - `RayInterval`;
+    - the per-collider parts of `raycast_filtered`, `overlap_sphere` and `overlap_aabb`. Their
+      world loops arrive with ImPhysicsState2d in M3.
+
+    No hisab: queries stay off it with the step until allocation can be scoped (ADR 0007
+    amendment).
+  - Golden `b2_ray.tsv`: 14,754 rows through the public world API.
+    - Rays are class C at 0 ulp against the corrected oracle (39 rows corrected, 38 of them
+      through `hypot`). Overlaps are class A and also pin `world_aabb`.
+    - `validate.py` reproduces every row on glibc's sin, cos and hypot.
+    - **97,160 ok, 0 failed, 0 measured, 7 pending, 157 accepted** on three targets.
+  - The 18 Rust raycast tests are ported (45 assertions), plus 14 `hypot` assertions in
+    `crmath.tcyr`. Surface parity is 394/394, with the 4 world query loops listed as pending M3.
+  - The oracle's 2D emitters share their shape builders (`scripts/oracle/src/shapes.rs`), and their
+    output is unchanged.
 
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
@@ -213,6 +245,10 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   3.18 µs. Taking one `sin_cos` per polygon and per contact, where Rust takes four and two of the
   same angle, gave 169 → 132 ns, 1.98 → 1.28 µs, 560 → 506 ns and 3.29 → 3.18 µs. The bits are
   identical, because `sin_cos` is pure.
+- **Correctly rounded hypot and the 2D queries, first numbers** (Cyrius only; Rust has no bench for
+  these alone): `hypot` 168 ns, against ganita's 33 ns. A ray costs 389 ns on a ball, 433 ns on a
+  rotated box, 667 ns on a capsule and 2.11 µs on an 8-vertex hull; a sphere overlap on a box costs
+  872 ns. The correctly rounded `sin_cos` and `hypot` dominate.
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

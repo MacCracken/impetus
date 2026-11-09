@@ -229,6 +229,30 @@ fn bench_roundtrip_collider_desc() {
 
 # math/exp_cr: the correctly rounded exp on an ordinary argument (its fast path); no Rust row
 # (glibc's exp is about 5 ns).
+# math/hypot_cr: the correctly rounded hypot (ADR 0011 as amended), and ganita's, which it replaced,
+# on (0.6, 0.8 + a small step) so no call repeats the last.
+fn bench_hypot_cr() {
+    var b = bench_new("math/hypot_cr");
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var y: f64 = 0.8 + f64_from(i & 1023) * 0.000001;
+        var r: f64 = _im_hypot(0.6, y);
+        g_sink = _im_bits(r);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+    var g = bench_new("math/hypot_ganita");
+    bench_batch_start(g);
+    for (var j = 0; j < NS; j = j + 1) {
+        var y2: f64 = 0.8 + f64_from(j & 1023) * 0.000001;
+        var r2: f64 = ganita_f64_hypot(0.6, y2);
+        g_sink = _im_bits(r2);
+    }
+    bench_batch_stop(g, NS);
+    bench_report(g);
+    return 0;
+}
+
 fn bench_exp_cr() {
     var b = bench_new("math/exp_cr");
     var x: f64 = -0.3;
@@ -423,6 +447,61 @@ fn bench_b2_narrowphase() {
     return 0;
 }
 
+# b2/<query>: one per-collider ray or overlap query on a collider of a static body at (1, 0.5)
+# rotated by 0.4 (Cyrius only; Rust has no query bench). The ray's direction is normalised once,
+# as `raycast_filtered` does before its loop; the origin steps so no call repeats the last.
+fn bench_b2_ray(name, s: ImColliderShape, sphere) {
+    var bd: ImBodyDesc = ImBodyDesc_default();
+    bd.body_type = IM_BODY_STATIC;
+    bd.position = ImVec3_new(1.0, 0.5, 0.0);
+    bd.rotation = 0.4;
+    var rb: ImRigidBody2d = ImRigidBody2d_from_desc(0, bd);
+    var c: ImCollider2d = ImCollider2d_from_desc(0, 0, ImColliderDesc_new(s));
+    var probe: ImColliderShape = ImColliderShape_ball(0.4);
+    var bn = bench_new(name);
+    var hit[24];
+    var reps = 100000;
+    bench_batch_start(bn);
+    for (var r = 0; r < reps; r = r + 1) {
+        var oy: f64 = 0.4 + f64_from(r & 1023) * 0.0001;
+        if (sphere == 1) {
+            var pbox: ImAabb2d = ImAabb2d_new(1.4, oy - 0.4, 2.2, oy + 0.4);
+            g_sink = _im_b2_overlap_collider(&rb, &c, &probe, 1.8, oy, &pbox);
+        } else {
+            g_sink = _im_b2_raycast_collider(&rb, &c, -4.0, oy, 1.0, 0.0, &hit);
+        }
+    }
+    bench_batch_stop(bn, reps);
+    bench_report(bn);
+    c.free();
+    return 0;
+}
+
+# The query rows: rays on a ball, a rotated box, a capsule and an 8-vertex hull; a sphere overlap on
+# the box.
+fn bench_b2_queries() {
+    bench_b2_ray("b2/raycast_ball", ImColliderShape_ball(0.75), 0);
+    bench_b2_ray("b2/raycast_box_rotated", ImColliderShape_box(1.0, 0.5, 0.0), 0);
+    bench_b2_ray("b2/raycast_capsule", ImColliderShape_capsule(0.75, 0.3), 0);
+    var w = fl_alloc(8 * 24);
+    for (var j = 0; j < 8; j = j + 1) {
+        var t: f64 = -3.0 + 6.0 * f64_from(j + 1) / 8.0;
+        var d: f64 = 1.0 + t * t;
+        var x: f64 = 1.2 * (1.0 - t * t) / d;
+        var y: f64 = 0.8 * (2.0 * t) / d;
+        var z: f64 = 0.0;
+        store64(w + j * 24, x);
+        store64(w + j * 24 + 8, y);
+        store64(w + j * 24 + 16, z);
+    }
+    var hull: ImColliderShape = ImColliderShape_convex_hull(w, 8);
+    fl_free(w);
+    bench_b2_ray("b2/raycast_hull8", hull, 0);
+    hull.free();
+    bench_b2_ray("b2/overlap_sphere_box", ImColliderShape_box(1.0, 0.5, 0.0), 1);
+    return 0;
+}
+
 # Runs every bench.
 fn main(): i64 {
     alloc_init();
@@ -442,12 +521,14 @@ fn main(): i64 {
     bench_spring_settle_frames();
     bench_exp_cr();
     bench_sin_cos_cr();
+    bench_hypot_cr();
     bench_aabb_tree_row();
     bench_spatial_hash_row();
     bench_b2_add_collider_mass();
     bench_b2_hull_mass();
     bench_b2_world_aabb();
     bench_b2_narrowphase();
+    bench_b2_queries();
     return 0;
 }
 

@@ -1125,6 +1125,142 @@ fn _par_b2_narrow(fp, fl): i64 {
     return 1;
 }
 
+# ── M2d: the 2D raycast and overlap queries ─────────────────────────────────────────
+# Inputs: `v:<bodies>`, then per body its x, y, rotation, collider shape, offset x, y and layer; then
+# the query. The loops are `raycast_filtered`'s and `overlap_shape`'s (M3's ImPhysicsState2d owns them):
+# the layer filter, the max-distance cut and the nearest hit (the first of equals), or the colliders
+# found in order. A collider's handle is its index (generation 0).
+
+const _PAR_RAY_MAX = 8;
+
+fn _par_b2_ray(fp, fl): i64 {
+    var is_r = _par_eq(fp, fl, "b2::raycast");
+    var is_s = _par_eq(fp, fl, "b2::overlap_sphere");
+    var is_a = _par_eq(fp, fl, "b2::overlap_aabb");
+    if (is_r == 0 && is_s == 0 && is_a == 0) { return 0; }
+    var n = _par_in(0);
+    if (n > _PAR_RAY_MAX) { return 0; }
+    var bsz = sizeof(ImRigidBody2d);
+    var csz = sizeof(ImCollider2d);
+    var bodies = fl_alloc(n * bsz + 8);
+    var colls = fl_alloc(n * csz + 8);
+    var k = 1;
+    for (var i = 0; i < n; i = i + 1) {
+        var x: f64 = _par_in(k);
+        var y: f64 = _par_in(k + 1);
+        var rot: f64 = _par_in(k + 2);
+        var sh: ImColliderShape = _im_shape(IM_SHAPE_BALL);
+        k = _par_in_shape(k + 3, &sh);
+        var ox: f64 = _par_in(k);
+        var oy: f64 = _par_in(k + 1);
+        var bd: ImBodyDesc = ImBodyDesc_default();
+        bd.body_type = IM_BODY_STATIC;
+        bd.position = ImVec3_new(x, y, 0.0);
+        bd.rotation = rot;
+        var rb: ImRigidBody2d = ImRigidBody2d_from_desc(i, bd);
+        var cd: ImColliderDesc = ImColliderDesc_new(sh);
+        cd.offset = ImVec3_new(ox, oy, 0.0);
+        cd.collision_layer = _par_in(k + 2);
+        var c: ImCollider2d = ImCollider2d_from_desc(i, i, cd);
+        memcpy(bodies + i * bsz, &rb, bsz);
+        memcpy(colls + i * csz, &c, csz);
+        sh.free();
+        k = k + 3;
+    }
+    if (is_r == 1) {
+        var rox: f64 = _par_in(k);
+        var roy: f64 = _par_in(k + 1);
+        var rdx: f64 = _par_in(k + 2);
+        var rdy: f64 = _par_in(k + 3);
+        var max: f64 = _par_in(k + 4);
+        var mask = _par_in(k + 5);
+        var ok, ux0, uy0 = _im_b2_ray_direction(rdx, rdy);
+        var best = 0 - 1;
+        var bt: f64 = 0.0;
+        var bnx: f64 = 0.0;
+        var bny: f64 = 0.0;
+        if (ok == 1) {
+            var ux: f64 = ux0;
+            var uy: f64 = uy0;
+            var hit[24];
+            for (var j = 0; j < n; j = j + 1) {
+                var cj = colls + j * csz;
+                var layer = _par_layer(cj);
+                if ((layer & mask) != 0) {
+                    if (_im_b2_raycast_collider(bodies + j * bsz, cj, rox, roy, ux, uy, &hit) == 1) {
+                        var t: f64 = load64(&hit);
+                        if (t <= max && (best < 0 || t < bt)) {
+                            best = j;
+                            bt = t;
+                            bnx = load64(&hit + 8);
+                            bny = load64(&hit + 16);
+                        }
+                    }
+                }
+            }
+            if (best >= 0) {
+                var px: f64 = rox + ux * bt;
+                var py: f64 = roy + uy * bt;
+                _par_got_i(best);
+                _par_got_f(px);
+                _par_got_f(py);
+                _par_got_f(bnx);
+                _par_got_f(bny);
+                _par_got_f(bt);
+            }
+        }
+        if (best < 0) { _par_got_none(); }
+    } else {
+        var probe: ImColliderShape = _im_shape(IM_SHAPE_BALL);
+        var cx: f64 = 0.0;
+        var cy: f64 = 0.0;
+        var pbox: ImAabb2d = ImAabb2d_new(0.0, 0.0, 0.0, 0.0);
+        if (is_s == 1) {
+            cx = _par_in(k);
+            cy = _par_in(k + 1);
+            var r: f64 = _par_in(k + 2);
+            probe = ImColliderShape_ball(r);
+            pbox = ImAabb2d_new(cx - r, cy - r, cx + r, cy + r);
+        } else {
+            var lx: f64 = _par_in(k);
+            var ly: f64 = _par_in(k + 1);
+            var hx: f64 = _par_in(k + 2);
+            var hy: f64 = _par_in(k + 3);
+            pbox = ImAabb2d_new(lx, ly, hx, hy);
+            var wx: f64 = f64_abs(hx - lx) * 0.5;
+            var wy: f64 = f64_abs(hy - ly) * 0.5;
+            probe = ImColliderShape_box(wx, wy, 0.0);
+            cx = (lx + hx) * 0.5;
+            cy = (ly + hy) * 0.5;
+        }
+        var found = 0;
+        var list[64];
+        for (var q = 0; q < n; q = q + 1) {
+            if (_im_b2_overlap_collider(bodies + q * bsz, colls + q * csz, &probe, cx, cy, &pbox) == 1) {
+                store64(&list + found * 8, q);
+                found = found + 1;
+            }
+        }
+        _par_got_seq(found);
+        for (var w = 0; w < found; w = w + 1) { _par_got_i(load64(&list + w * 8)); }
+    }
+    for (var f = 0; f < n; f = f + 1) { _par_free_collider(colls + f * csz); }
+    fl_free(bodies);
+    fl_free(colls);
+    return 1;
+}
+
+# The collision layer of the collider record at c.
+fn _par_layer(c: *ImCollider2d): i64 {
+    return c.collision_layer;
+}
+
+# Frees the shape arrays of the collider record at c.
+fn _par_free_collider(c: *ImCollider2d) {
+    c.free();
+    return 0;
+}
+
 # `f64::fmt_display` and `serde_json::f64` rows: src/fmtf.cyr's two layouts (ADR 0010).
 fn _par_fmtf(fp, fl): i64 {
     var x: f64 = _par_in(0);
@@ -1490,6 +1626,7 @@ fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_mapped = 0;
     if (_par_eq(mp, ml, "b2_mass") == 1) { return _par_b2_mass(fp, fl); }
     if (_par_eq(mp, ml, "b2_narrow") == 1) { return _par_b2_narrow(fp, fl); }
+    if (_par_eq(mp, ml, "b2_ray") == 1) { return _par_b2_ray(fp, fl); }
     if (_par_eq(mp, ml, "broadphase") == 1) { return _par_broadphase(fp, fl); }
     if (_par_eq(mp, ml, "config") == 1) { return _par_config(fp, fl); }
     if (_par_eq(mp, ml, "fmtf") == 1) { return _par_fmtf(fp, fl); }
@@ -1507,8 +1644,8 @@ fn _par_dispatch(mp, ml, fp, fl): i64 {
 # Shadow comparisons, never gated: the same golden rows through another Cyrius candidate.
 # - the native exp and ganita's atan2 (on the native atan): x87 on x86_64, so their bits differ
 #   between targets; the polyfill forms are dispatched instead (port-parity.md §2);
-# - the exp, sin and cos polyfills (the builtin sin / cos on every target), the port's primitives
-#   before the correctly rounded ones (ADR 0011);
+# - the exp, sin and cos polyfills (the builtin sin / cos on every target) and ganita's hypot, the
+#   port's primitives before the correctly rounded ones (ADR 0011);
 # - the stdlib min / max, to show where their NaN semantics differ from Rust's.
 fn _par_shadows(mp, ml, fp, fl, cls) {
     if (_par_eq(mp, ml, "math") != 1) { return 0; }
@@ -1550,6 +1687,13 @@ fn _par_shadows(mp, ml, fp, fl, cls) {
         _par_dg_fold(9);
         return 0;
     }
+    if (_par_eq(fp, fl, "f64::hypot") == 1) {
+        _par_got_n = 0;
+        var r: f64 = ganita_f64_hypot(x, y);
+        _par_got_f(r);
+        _par_shadow_record("f64::hypot ~ ganita_f64_hypot", cls);
+        return 0;
+    }
     if (_par_eq(fp, fl, "f64::max") == 1) {
         _par_got_n = 0;
         var r: f64 = f64_max(x, y);
@@ -1578,7 +1722,8 @@ fn _par_shadows(mp, ml, fp, fl, cls) {
 #
 # On correctly rounded primitives (ADR 0011) the bound is 0: the port and the corrected oracle
 # evaluate the same operations on the same correctly rounded results, so any difference is a defect.
-# That covers exp, sin, cos, sin_cos and the spring step; atan2, hypot and powf keep 2.
+# That covers exp, sin, cos, sin_cos, hypot, the spring step and the narrowphase; atan2 and powf
+# keep 2.
 #must_use
 fn _par_c_bound(fp, fl): i64 {
     if (_par_eq(fp, fl, "f64::sin_cos") == 1) { return 0; }
@@ -1587,8 +1732,9 @@ fn _par_c_bound(fp, fl): i64 {
     if (_par_eq(fp, fl, "f64::exp") == 1) { return 0; }
     if (_par_eq(fp, fl, "Spring::step") == 1) { return 0; }
     if (_par_eq(fp, fl, "b2::contacts") == 1) { return 0; }
+    if (_par_eq(fp, fl, "b2::raycast") == 1) { return 0; }
     if (_par_eq(fp, fl, "f64::atan2") == 1) { return 2; }
-    if (_par_eq(fp, fl, "f64::hypot") == 1) { return 2; }
+    if (_par_eq(fp, fl, "f64::hypot") == 1) { return 0; }
     if (_par_eq(fp, fl, "f64::powf") == 1) { return 2; }
     return 0 - 1;
 }

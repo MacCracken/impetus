@@ -146,6 +146,51 @@ fn main() {
     var small: f64 = ahs;
     if (ahc < ahs) { small = ahc; }
     assert(small > 0.0000000000000000001 && small < 0.000000000000000001, "the small one is ~4.7e-19");
+    test_group("hypot");
+    var hz: f64 = 0.0;
+    var hinf: f64 = 1.0 / hz;
+    var hnan: f64 = hz / hz;
+    var dmax: f64 = _im_cr_from_word(9218868437227405311);
+    var r5: f64 = _im_cr_hypot(-3.0, 4.0);
+    assert_eq(r5 == 5.0, 1, "(-3, 4) is exactly 5");
+    var r7: f64 = _im_cr_hypot(0.0, -7.0);
+    assert_eq(r7 == 7.0, 1, "(0, -7) is 7");
+    var rz: f64 = _im_cr_hypot(-hz, -hz);
+    assert_eq(_im_cr_word(rz), 0, "(-0, -0) is +0");
+    var ri: f64 = _im_cr_hypot(hinf, hnan);
+    var ri2: f64 = _im_cr_hypot(hnan, -hinf);
+    assert_eq(ri == hinf && ri2 == hinf, 1, "an infinity wins over a NaN");
+    var rn: f64 = _im_cr_hypot(hnan, 1.0);
+    assert_eq(rn != rn, 1, "NaN otherwise");
+    var ro: f64 = _im_cr_hypot(dmax, dmax);
+    var rm: f64 = _im_cr_hypot(dmax, 1.0);
+    assert_eq(ro == hinf, 1, "(DBL_MAX, DBL_MAX) overflows");
+    assert_eq(same(rm, dmax), 1, "(DBL_MAX, 1) is DBL_MAX");
+    var hs3: f64 = _im_cr_from_word(3);
+    var hs4: f64 = _im_cr_from_word(4);
+    var hs1: f64 = _im_cr_from_word(1);
+    var hrs: f64 = _im_cr_hypot(hs3, hs4);
+    var hrs2: f64 = _im_cr_hypot(hs1, hs1);
+    var hrs3: f64 = _im_cr_hypot(hs1, hs3);
+    assert_eq(_im_cr_word(hrs), 5, "subnormal 3-4-5 is exact");
+    assert_eq(_im_cr_word(hrs2), 1, "√2 · 2^-1074 rounds to 2^-1074");
+    assert_eq(_im_cr_word(hrs3), 3, "√10 · 2^-1074 rounds to 3 · 2^-1074");
+    var rg: f64 = _im_cr_hypot(-0.6500409241819365, -0.43523229591675383);
+    assert_eq(same(rg, 0.7822917323609363), 1, "where glibc misrounds: MPFR's value");
+    var hbefore = _im_cr_hypot_slow_calls;
+    var rt: f64 = _im_cr_hypot(4503599513168213.0, 7800463565973516.0);
+    assert_eq(same(rt, 9007199366012124.0), 1, "an exact midpoint (hypotenuse 9007199366012125) rounds to even");
+    assert_eq(_im_cr_hypot_slow_calls > hbefore, 1, "the tie is decided by the slow path");
+    var sym = 1;
+    for (var hk = 0; hk < 2000; hk = hk + 1) {
+        var hx: f64 = uniform(-50.0, 50.0);
+        var hy: f64 = uniform(-50.0, 50.0);
+        var p1: f64 = _im_cr_hypot(hx, hy);
+        var p2: f64 = _im_cr_hypot(hy, -hx);
+        if (same(p1, p2) == 0) { sym = 0; }
+    }
+    assert_eq(sym, 1, "symmetric in order and sign");
+
     return assert_summary();
 }
 

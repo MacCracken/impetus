@@ -17,8 +17,9 @@ checks that src/ defines the Cyrius name the naming rules give (port plan §7.4)
 - `pub enum E` and each variant V          -> `enum <ENUM_NAMES[E]> {` and `<ENUM_PREFIX[E]><SNAKE(V)> =`
 - `pub struct S` and each `pub` field f    -> `struct Im<S> {` with a field f, or FIELD_RENAMES' fields
 `pub`, `pub(crate)` and `pub(super)` items all count: the backend's types are crate-internal in
-Rust but are the port's surface all the same. A function the naming rules would name otherwise is in FN_RENAMES; anything else needs an
-EXCEPTIONS entry with its reason. Every file under rust-old/src must be in
+Rust but are the port's surface all the same. A function the naming rules would name otherwise is in FN_RENAMES; one whose Cyrius owner arrives
+with a later milestone is in PENDING_FNS (counted and listed); anything else needs an EXCEPTIONS entry
+with its reason. Every file under rust-old/src must be in
 MODULES, PENDING_MODULES (a later milestone), DEFERRED_MODULES or NOT_APPLICABLE_MODULES. Exits 1
 on a missing item, an EXCEPTIONS entry that names no Rust item, or a file unaccounted for.
 """
@@ -32,9 +33,9 @@ MODULES = [
     "error", "config", "material", "units", "force",
     "body", "collider", "joint", "event", "query", "arena", "contact_tracker", "spring",
     "aabb_tree", "spatial_hash", "backend_2d/types", "backend_2d/narrowphase",
+    "backend_2d/raycast",
 ]
 PENDING_MODULES = {
-    "backend_2d/raycast": "M2",
     "backend_2d/solver": "M3", "backend_2d/joints": "M3", "backend_2d/state": "M3",
     "backend_2d/tests": "M3", "particle": "M3", "world": "M3",
     "backend_3d/types": "M4", "backend_3d/narrowphase": "M4", "backend_3d/raycast": "M4",
@@ -82,7 +83,7 @@ FN_RENAMES = {
     **{f: f"_im_b2_{f}" for f in (
         "world_pos", "world_to_local", "local_to_world", "ordered_manifold_key", "generate_contact",
         "shapes_touch", "circle_circle", "circle_aabb", "capsule_endpoints", "closest_point_on_segment",
-        "generate_contacts_multi",
+        "generate_contacts_multi", "ray_circle", "ray_aabb_2d",
     )},
 }
 # Rust field -> the Cyrius fields that carry it (Option<T> is a presence flag plus the value).
@@ -99,6 +100,15 @@ FIELD_RENAMES = {
 # The Cyrius prefix of a module's crate-internal constants (scripts/oracle/src/t_private.rs).
 PRIVATE_PREFIX = {"backend_2d/types": "_IM_B2_"}
 PENDING_CONSTS = {"MAX_SNAPSHOT_INDEX": "M6, with the snapshot module"}
+# Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
+_STATE_QUERY = ("M3, as ImPhysicsState2d methods: the loop over its colliders of _im_b2_raycast_collider "
+                "or _im_b2_overlap_collider (src/b2_raycast.cyr), as tests/parity_2d.tcyr's b2_ray rows run")
+PENDING_FNS = {
+    "PhysicsState2d::raycast": _STATE_QUERY,
+    "PhysicsState2d::raycast_filtered": _STATE_QUERY,
+    "PhysicsState2d::overlap_sphere": _STATE_QUERY,
+    "PhysicsState2d::overlap_aabb": _STATE_QUERY,
+}
 EXCEPTIONS = {
     "units::impl Display for Quantity": "`impl ImQuantity { fn fmt(self, sb) }`: src/fmtf.cyr's "
                                          "shortest digits in Rust's Display layout, then the symbol",
@@ -237,6 +247,8 @@ def main():
     missing, ok = [], 0
     used_exceptions = set()
     used_renames = set()
+    used_pending = set()
+    pending = []
     for module in MODULES:
         items = rust_items(module)
         enum_owners |= {name for kind, _, name, _ in items if kind == "enum"}
@@ -293,6 +305,11 @@ def main():
                 (ok := ok + 1) if f"IM_{name}" in consts else missing.append(f"{label} -> const IM_{name}")
                 continue
             if kind == "fn":
+                if f"{owner + '::' if owner else ''}{name}" in PENDING_FNS:
+                    used_pending.add(f"{owner + '::' if owner else ''}{name}")
+                    pending.append(label)
+                    ok += 1
+                    continue
                 rename = FN_RENAMES.get(f"{owner + '::' if owner else ''}{name}")
                 if rename is not None:
                     used_renames.add(f"{owner + '::' if owner else ''}{name}")
@@ -313,13 +330,19 @@ def main():
     for rn in FN_RENAMES:
         if rn not in used_renames:
             missing.append(f"FN_RENAMES entry names no Rust function: {rn}")
+    for pn in PENDING_FNS:
+        if pn not in used_pending:
+            missing.append(f"PENDING_FNS entry names no Rust function: {pn}")
     # Every rust-old/src file is accounted for.
     accounted = set(MODULES) | set(PENDING_MODULES) | set(DEFERRED_MODULES) | set(NOT_APPLICABLE_MODULES)
     for path in sorted((root / "rust-old/src").rglob("*.rs")):
         rel = str(path.relative_to(root / "rust-old/src"))[:-3]
         if rel not in accounted:
             missing.append(f"rust-old/src/{rel}.rs is in no module list")
-    print(f"surface parity ({', '.join(MODULES)}): {ok} items ok, {len(missing)} missing")
+    print(f"surface parity ({', '.join(MODULES)}): {ok} items ok ({len(pending)} pending a later "
+          f"milestone), {len(missing)} missing")
+    for p in pending:
+        print("  PENDING", p)
     for m in missing:
         print("  MISSING", m)
     return 1 if missing else 0

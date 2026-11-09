@@ -411,6 +411,50 @@ fails when either drifts from `cyrius.cyml`.
 - **Result, every target:** 13 modules, 0 failing; **82,457 ok, 0 failed, 0 measured, 7 pending, 106 accepted**.
   Every narrowphase row is 0 ulp on x86_64 ELF, x86_64 PE and aarch64, and the digests are unchanged.
 
+## 12. M2d: correctly rounded hypot, and the 2D raycast and overlap queries (2026-11-09)
+
+- **hypot is correctly rounded** ([ADR 0011, hypot amendment](../adr/0011-correctly-rounded-exp-sin-cos.md)).
+  - The rays normalise their direction and normals with `f64::hypot`, and M3's joints call it six times. The
+    port's `hypot` was ganita's, which differs from glibc on 414 of the 1,715 golden rows. glibc's own misrounds
+    0.31 % of 300,000 seeded arguments against MPFR.
+  - `src/crmath.cyr` now has `_im_cr_hypot`. Phase 1 works in double-double from exact products after an exact
+    power-of-two scaling, with a 2^-96 rounding test. The slow path is exact: x² + y² in fixed point, compared
+    with the squares of the midpoints. `hypot` has exact midpoints (Pythagorean triples with a 54-bit odd
+    hypotenuse), and they round to even.
+  - It matches MPFR on 404,234 probe pairs, including 4,134 exact midpoints, subnormal results, overflow and the
+    specials. x86_64 and aarch64 give byte-identical output.
+  - In the corpus, `f64::hypot` is gated at 0 ulp: 1,703 rows equal glibc, and 12 equal `math.cr.tsv`. ganita's
+    `hypot` is a shadow line, 1 to 2 ulp off on 408 rows.
+- **The module:** `src/b2_raycast.cyr`. It covers:
+  - the ray tests: circle, the oriented box in its own frame, capsule (two discs and the shaft rectangle,
+    unioned in Rust's order), segment, and convex hull by Cyrus–Beck clipping;
+  - `RayInterval` with `first` and its union;
+  - the per-collider parts of the world's queries, `_im_b2_raycast_collider` and `_im_b2_overlap_collider`.
+
+  `PhysicsState2d::raycast`, `raycast_filtered`, `overlap_sphere` and `overlap_aabb` loop them over the colliders.
+  They arrive with ImPhysicsState2d in M3, and surface parity lists them as pending. A rotation's `sin_cos` is
+  taken once where Rust takes it per vertex.
+- **No hisab.** The plan had pointed the round shapes at hisab's `geo_ray_*`. Queries stay off hisab, as the step
+  does, until allocation can be scoped (ADR 0007 amendment, S1/H9). The port's rays also rest on correctly
+  rounded `sin_cos` and `hypot`, which hisab's don't.
+- **`b2_ray.tsv`**, 14,754 rows through the public world API. Each row is a world of static bodies with one
+  collider each, then one query:
+  - `b2::raycast` (class C, bound 0, 7,290 rows, 2,883 of them hits). Every catalog shape, including fields,
+    meshes and two-point hulls, which take no ray. Four rotations and two offsets. Rays from eight directions
+    at six lateral offsets, and from inside. Directions that are zero, below EPSILON, NaN, infinite or not unit.
+    Max-distance cuts. Layer masks. Several colliders, where the nearest wins, the first of equals, and the cut
+    applies before the choice. The Rust tests' scenes, big hulls, and 1,800 seeded worlds.
+  - `b2::overlap_sphere` and `b2::overlap_aabb` (class A, 4,772 and 2,692 rows). They also pin `world_aabb`, the
+    pre-filter, which accepts fields and meshes on their boxes alone. They include exactly touching boxes (closed
+    intervals) and an inverted probe.
+- **The corrected oracle.** `validate.py`'s transcription adds the ray tests, `world_aabb` and the overlap loop,
+  with `hypot` as a parameter: glibc's own through ctypes (CPython's `math.hypot` is a different implementation),
+  or MPFR's. On glibc it reproduces all 14,754 rows bit for bit. `b2_ray.cr.tsv` holds the 39 raycast rows where
+  glibc misrounds a call, 38 through `hypot` and 1 through `sin`, and the port equals all 39.
+- **Result, every target:** 14 modules, 0 failing; **97,160 ok, 0 failed, 0 measured, 7 pending, 157 accepted**
+  (ADR 0011: 64). Every query row is 0 ulp or exact. The `hypot` digest is identical on x86_64 ELF, x86_64 PE and
+  aarch64.
+
 ## How to reproduce
 
 ```sh

@@ -35,6 +35,8 @@ mod grids;
 mod m_b2_mass;
 #[cfg(not(feature = "b3"))]
 mod m_b2_narrow;
+#[cfg(not(feature = "b3"))]
+mod m_b2_ray;
 mod m_broadphase;
 mod m_config;
 mod m_constants;
@@ -46,6 +48,8 @@ mod m_math;
 mod m_spring;
 mod m_types;
 mod m_units;
+#[cfg(not(feature = "b3"))]
+mod shapes;
 mod t_constants;
 mod t_private;
 mod tsv;
@@ -77,6 +81,8 @@ fn golden_modules() -> Vec<tsv::Module> {
             m_b2_mass::emit(),
             #[cfg(not(feature = "b3"))]
             m_b2_narrow::emit(),
+            #[cfg(not(feature = "b3"))]
+            m_b2_ray::emit(),
             m_broadphase::emit(),
             m_config::emit(),
             m_constants::emit(),

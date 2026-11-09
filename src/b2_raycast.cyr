@@ -1,0 +1,543 @@
+# b2_raycast.cyr — 2D ray and overlap queries (port of rust-old/src/backend_2d/raycast.rs).
+#
+# The ray tests per shape (circle, oriented box, capsule, segment, convex hull), the entry/exit interval
+# a ray makes with a convex shape, and the per-collider parts of the world's queries: a ray against one
+# collider, and one collider against an overlap probe. ImPhysicsState2d (M3) loops them over its
+# colliders as `raycast_filtered`, `overlap_sphere` and `overlap_aabb` do.
+#
+# Every expression keeps Rust's operation order. Rotations go through `_im_sin_cos` and lengths through
+# `_im_hypot`, both correctly rounded (ADR 0011 and its hypot amendment), so the rows are class C at
+# 0 ulp against the corrected oracle. A rotation's sin_cos is taken once where Rust takes it per vertex
+# (a pure function: the same bits). A hit is (t, normal x, y) in a caller's three-word buffer.
+
+# ── the interval a ray makes with a convex shape ────────────────────────────────────
+
+# Where a ray enters and leaves a convex shape (t along a unit direction), with the outward normal at
+# each. Mirrors `RayInterval`.
+struct ImRayInterval {
+    t_in: f64;
+    nx_in: f64;
+    ny_in: f64;
+    t_out: f64;
+    nx_out: f64;
+    ny_out: f64;
+}
+
+# Copies interval src to dst, field by field.
+fn _im_b2_ray_copy(dst: *ImRayInterval, src: *ImRayInterval) {
+    var a: f64 = src.t_in;
+    var b: f64 = src.nx_in;
+    var c: f64 = src.ny_in;
+    var d: f64 = src.t_out;
+    var e: f64 = src.nx_out;
+    var f: f64 = src.ny_out;
+    dst.t_in = a;
+    dst.nx_in = b;
+    dst.ny_in = c;
+    dst.t_out = d;
+    dst.nx_out = e;
+    dst.ny_out = f;
+    return 0;
+}
+
+# Writes the hit (t, nx, ny) at out.
+fn _im_b2_put_hit(out, t: f64, nx: f64, ny: f64) {
+    store64(out, t);
+    store64(out + 8, nx);
+    store64(out + 16, ny);
+    return 0;
+}
+
+impl ImRayInterval {
+    # The first hit at t ≥ 0 into out (t, nx, ny): the entry, or the exit for a ray that starts
+    # inside. 1, or 0 when the shape is behind the ray. Mirrors `RayInterval::first`.
+    fn first(self, out): i64 {
+        var ti: f64 = self.t_in;
+        if (ti >= 0.0) {
+            var a: f64 = self.nx_in;
+            var b: f64 = self.ny_in;
+            _im_b2_put_hit(out, ti, a, b);
+            return 1;
+        }
+        var to: f64 = self.t_out;
+        if (to >= 0.0) {
+            var c: f64 = self.nx_out;
+            var d: f64 = self.ny_out;
+            _im_b2_put_hit(out, to, c, d);
+            return 1;
+        }
+        return 0;
+    }
+
+    # This interval unioned with o, two overlapping intervals of one convex shape: the earlier entry
+    # and the later exit (o's only when strictly so). Mirrors `RayInterval::union`.
+    fn merge(self, o: *ImRayInterval) {
+        var si: f64 = self.t_in;
+        var oi: f64 = o.t_in;
+        if (oi < si) {
+            var a: f64 = o.nx_in;
+            var b: f64 = o.ny_in;
+            self.t_in = oi;
+            self.nx_in = a;
+            self.ny_in = b;
+        }
+        var so: f64 = self.t_out;
+        var oo: f64 = o.t_out;
+        if (oo > so) {
+            var c: f64 = o.nx_out;
+            var d: f64 = o.ny_out;
+            self.t_out = oo;
+            self.nx_out = c;
+            self.ny_out = d;
+        }
+        return 0;
+    }
+}
+
+# ── circles ─────────────────────────────────────────────────────────────────────────
+
+# A circle's outward normal at offset (px, py) from its centre: the unit offset, or the reversed ray
+# direction when the offset is shorter than EPSILON.
+#must_use
+fn _im_b2_ray_circle_normal(px: f64, py: f64, dx: f64, dy: f64) {
+    var len: f64 = _im_hypot(px, py);
+    if (len > _IM_B2_EPSILON) {
+        var nx: f64 = px / len;
+        var ny: f64 = py / len;
+        return (nx, ny);
+    }
+    var rx: f64 = -dx;
+    var ry: f64 = -dy;
+    return (rx, ry);
+}
+
+# The first hit (t ≥ 0) of the ray o + t·d (d unit) on the circle at (cx, cy) of radius r into out:
+# the exit point when o is inside. 1, or 0. Mirrors `ray_circle_first`.
+fn _im_b2_ray_circle_first(ox: f64, oy: f64, dx: f64, dy: f64, cx: f64, cy: f64, r: f64, out): i64 {
+    var ocx: f64 = ox - cx;
+    var ocy: f64 = oy - cy;
+    var half_b: f64 = ocx * dx + ocy * dy;
+    var c: f64 = ocx * ocx + ocy * ocy - r * r;
+    var disc: f64 = half_b * half_b - c;
+    if (disc != disc || disc < 0.0) { return 0; }
+    var sq: f64 = f64_sqrt(disc);
+    var t: f64 = -half_b - sq;
+    if (!(t >= 0.0)) {
+        t = -half_b + sq;
+        if (!(t >= 0.0)) { return 0; }
+    }
+    var px: f64 = ocx + dx * t;
+    var py: f64 = ocy + dy * t;
+    var nx, ny = _im_b2_ray_circle_normal(px, py, dx, dy);
+    _im_b2_put_hit(out, t, nx, ny);
+    return 1;
+}
+
+# The interval of the ray on the circle into iv: 1, or 0 when the ray's line misses it. Mirrors
+# `ray_circle_interval`.
+fn _im_b2_ray_circle_interval(ox: f64, oy: f64, dx: f64, dy: f64, cx: f64, cy: f64, r: f64, iv: *ImRayInterval): i64 {
+    var ocx: f64 = ox - cx;
+    var ocy: f64 = oy - cy;
+    var half_b: f64 = ocx * dx + ocy * dy;
+    var c: f64 = ocx * ocx + ocy * ocy - r * r;
+    var disc: f64 = half_b * half_b - c;
+    if (disc != disc || disc < 0.0) { return 0; }
+    var sq: f64 = f64_sqrt(disc);
+    var t_in: f64 = -half_b - sq;
+    var t_out: f64 = -half_b + sq;
+    var pix: f64 = ox + dx * t_in - cx;
+    var piy: f64 = oy + dy * t_in - cy;
+    var nix, niy = _im_b2_ray_circle_normal(pix, piy, dx, dy);
+    var pox: f64 = ox + dx * t_out - cx;
+    var poy: f64 = oy + dy * t_out - cy;
+    var nox, noy = _im_b2_ray_circle_normal(pox, poy, dx, dy);
+    iv.t_in = t_in;
+    iv.nx_in = nix;
+    iv.ny_in = niy;
+    iv.t_out = t_out;
+    iv.nx_out = nox;
+    iv.ny_out = noy;
+    return 1;
+}
+
+# ── boxes and polygons ──────────────────────────────────────────────────────────────
+
+# One slab of `ray_aabb_interval`: the ray's coordinate o and direction d on axis `axis` (0 x, 1 y)
+# against [mn, mx], narrowing iv. 0 when the ray misses.
+fn _im_b2_ray_slab(iv: *ImRayInterval, o: f64, d: f64, mn: f64, mx: f64, axis): i64 {
+    var ad: f64 = f64_abs(d);
+    if (ad < _IM_B2_EPSILON) {
+        if (o < mn || o > mx) { return 0; }
+        return 1;
+    }
+    var inv: f64 = 1.0 / d;
+    var t1: f64 = (mn - o) * inv;
+    var t2: f64 = (mx - o) * inv;
+    var s1: f64 = -1.0;
+    var s2: f64 = 1.0;
+    if (t1 > t2) {
+        var tt: f64 = t1;
+        t1 = t2;
+        t2 = tt;
+        s1 = 1.0;
+        s2 = -1.0;
+    }
+    var ti: f64 = iv.t_in;
+    if (t1 > ti) {
+        iv.t_in = t1;
+        if (axis == 0) {
+            iv.nx_in = s1;
+            iv.ny_in = 0.0;
+        } else {
+            iv.nx_in = 0.0;
+            iv.ny_in = s1;
+        }
+    }
+    var to: f64 = iv.t_out;
+    if (t2 < to) {
+        iv.t_out = t2;
+        if (axis == 0) {
+            iv.nx_out = s2;
+            iv.ny_out = 0.0;
+        } else {
+            iv.nx_out = 0.0;
+            iv.ny_out = s2;
+        }
+    }
+    var ni: f64 = iv.t_in;
+    var no: f64 = iv.t_out;
+    if (ni > no) { return 0; }
+    return 1;
+}
+
+# The interval of the ray on the axis-aligned box [min, max] into iv (slabs): 1, or 0. Mirrors
+# `ray_aabb_interval`.
+fn _im_b2_ray_aabb_interval(ox: f64, oy: f64, dx: f64, dy: f64, mnx: f64, mny: f64, mxx: f64, mxy: f64,
+  iv: *ImRayInterval): i64 {
+    var zero: f64 = 0.0;
+    var inf: f64 = 1.0 / zero;
+    iv.t_in = -inf;
+    iv.nx_in = -dx;
+    iv.ny_in = -dy;
+    iv.t_out = inf;
+    iv.nx_out = dx;
+    iv.ny_out = dy;
+    if (_im_b2_ray_slab(iv, ox, dx, mnx, mxx, 0) == 0) { return 0; }
+    return _im_b2_ray_slab(iv, oy, dy, mny, mxy, 1);
+}
+
+# The interval of the ray on the counter-clockwise convex polygon of n vertices at verts ((x, y)
+# pairs) into iv, by Cyrus–Beck clipping: 1, or 0. Mirrors `ray_polygon_interval`.
+fn _im_b2_ray_polygon_interval(ox: f64, oy: f64, dx: f64, dy: f64, verts, n, iv: *ImRayInterval): i64 {
+    var zero: f64 = 0.0;
+    var inf: f64 = 1.0 / zero;
+    iv.t_in = -inf;
+    iv.nx_in = -dx;
+    iv.ny_in = -dy;
+    iv.t_out = inf;
+    iv.nx_out = dx;
+    iv.ny_out = dy;
+    for (var i = 0; i < n; i = i + 1) {
+        var j = i + 1;
+        if (j == n) { j = 0; }
+        var ax: f64 = load64(verts + i * 16);
+        var ay: f64 = load64(verts + i * 16 + 8);
+        var bx: f64 = load64(verts + j * 16);
+        var by: f64 = load64(verts + j * 16 + 8);
+        var ex: f64 = bx - ax;
+        var ey: f64 = by - ay;
+        var len: f64 = _im_hypot(ex, ey);
+        if (!(len < _IM_B2_EPSILON)) {
+            var nx: f64 = ey / len;
+            var ny: f64 = -ex / len;
+            var dist: f64 = (ox - ax) * nx + (oy - ay) * ny;
+            var rate: f64 = dx * nx + dy * ny;
+            var ar: f64 = f64_abs(rate);
+            if (ar < _IM_B2_EPSILON) {
+                if (dist > 0.0) { return 0; }
+            } else {
+                var t: f64 = -dist / rate;
+                if (rate < 0.0) {
+                    var ti: f64 = iv.t_in;
+                    if (t > ti) {
+                        iv.t_in = t;
+                        iv.nx_in = nx;
+                        iv.ny_in = ny;
+                    }
+                } else {
+                    var to: f64 = iv.t_out;
+                    if (t < to) {
+                        iv.t_out = t;
+                        iv.nx_out = nx;
+                        iv.ny_out = ny;
+                    }
+                }
+                var ni: f64 = iv.t_in;
+                var no: f64 = iv.t_out;
+                if (ni > no) { return 0; }
+            }
+        }
+    }
+    return 1;
+}
+
+# The hit of the ray on segment (a, b) into out (t, normal facing the ray): 1, or 0 when parallel,
+# outside the segment or behind the ray. Mirrors `ray_segment`.
+fn _im_b2_ray_segment(ox: f64, oy: f64, dx: f64, dy: f64, ax: f64, ay: f64, bx: f64, by: f64, out): i64 {
+    var ex: f64 = bx - ax;
+    var ey: f64 = by - ay;
+    var denom: f64 = dx * ey - dy * ex;
+    var ad: f64 = f64_abs(denom);
+    if (ad < _IM_B2_EPSILON) { return 0; }
+    var aox: f64 = ax - ox;
+    var aoy: f64 = ay - oy;
+    var t: f64 = (aox * ey - aoy * ex) / denom;
+    var u: f64 = (aox * dy - aoy * dx) / denom;
+    if (!(u >= 0.0 && u <= 1.0) || t < 0.0) { return 0; }
+    var len: f64 = _im_hypot(ex, ey);
+    var nx: f64 = ey / len;
+    var ny: f64 = -ex / len;
+    var facing: f64 = nx * dx + ny * dy;
+    if (facing > 0.0) {
+        nx = -nx;
+        ny = -ny;
+    }
+    _im_b2_put_hit(out, t, nx, ny);
+    return 1;
+}
+
+# ── capsules ────────────────────────────────────────────────────────────────────────
+
+# The interval of the ray on a capsule (at (cx, cy), rotated by crot, half height hh, radius r) into
+# iv: the union of its two end discs and its shaft rectangle, in that order. 1, or 0. Mirrors
+# `ray_capsule_interval`.
+fn _im_b2_ray_capsule_interval(ox: f64, oy: f64, dx: f64, dy: f64, cx: f64, cy: f64, crot: f64, hh: f64, r: f64,
+  iv: *ImRayInterval): i64 {
+    var e[32];
+    _im_b2_capsule_endpoints(cx, cy, crot, hh, &e);
+    var eax: f64 = load64(&e);
+    var eay: f64 = load64(&e + 8);
+    var ebx: f64 = load64(&e + 16);
+    var eby: f64 = load64(&e + 24);
+    var part: ImRayInterval;
+    var have = _im_b2_ray_circle_interval(ox, oy, dx, dy, eax, eay, r, iv);
+    if (_im_b2_ray_circle_interval(ox, oy, dx, dy, ebx, eby, r, &part) == 1) {
+        if (have == 1) {
+            iv.merge(&part);
+        } else {
+            _im_b2_ray_copy(iv, &part);
+            have = 1;
+        }
+    }
+    var axx: f64 = ebx - eax;
+    var axy: f64 = eby - eay;
+    var axis_len: f64 = _im_hypot(axx, axy);
+    if (axis_len > _IM_B2_EPSILON) {
+        var ux: f64 = axx / axis_len;
+        var uy: f64 = axy / axis_len;
+        var px: f64 = -uy;
+        var py: f64 = ux;
+        var rx: f64 = ox - cx;
+        var ry: f64 = oy - cy;
+        var lox: f64 = rx * ux + ry * uy;
+        var loy: f64 = rx * px + ry * py;
+        var ldx: f64 = dx * ux + dy * uy;
+        var ldy: f64 = dx * px + dy * py;
+        if (_im_b2_ray_aabb_interval(lox, loy, ldx, ldy, -hh, -r, hh, r, &part) == 1) {
+            # Back to world: n.x along the axis, n.y along its perpendicular.
+            var a0: f64 = part.nx_in;
+            var a1: f64 = part.ny_in;
+            var b0: f64 = part.nx_out;
+            var b1: f64 = part.ny_out;
+            var wix: f64 = a0 * ux + a1 * px;
+            var wiy: f64 = a0 * uy + a1 * py;
+            var wox: f64 = b0 * ux + b1 * px;
+            var woy: f64 = b0 * uy + b1 * py;
+            part.nx_in = wix;
+            part.ny_in = wiy;
+            part.nx_out = wox;
+            part.ny_out = woy;
+            if (have == 1) {
+                iv.merge(&part);
+            } else {
+                _im_b2_ray_copy(iv, &part);
+                have = 1;
+            }
+        }
+    }
+    return have;
+}
+
+# ── any shape ───────────────────────────────────────────────────────────────────────
+
+# The interval of the ray (d unit) on shape s at (px, py) rotated by rot into iv: 1, or 0 when it
+# misses or the shape takes no ray (a heightfield, a mesh, a hull of fewer than 3 points). Mirrors
+# `ray_shape`.
+fn _im_b2_ray_shape(s: *ImColliderShape, px: f64, py: f64, rot: f64, ox: f64, oy: f64, dx: f64, dy: f64,
+  iv: *ImRayInterval): i64 {
+    var k = s.kind;
+    if (k == IM_SHAPE_BALL) {
+        var br: f64 = s.radius;
+        return _im_b2_ray_circle_interval(ox, oy, dx, dy, px, py, br, iv);
+    }
+    if (k == IM_SHAPE_BOX) {
+        # In the box's frame, then the normals rotated back (one sin_cos for all three).
+        var sn, cs = _im_sin_cos(rot);
+        var sv: f64 = sn;
+        var cv: f64 = cs;
+        var rx: f64 = ox - px;
+        var ry: f64 = oy - py;
+        var lox: f64 = cv * rx + sv * ry;
+        var loy: f64 = -sv * rx + cv * ry;
+        var ldx: f64 = cv * dx + sv * dy;
+        var ldy: f64 = -sv * dx + cv * dy;
+        var hx0: f64 = s.half_extents.x;
+        var hy0: f64 = s.half_extents.y;
+        var hx: f64 = f64_abs(hx0);
+        var hy: f64 = f64_abs(hy0);
+        if (_im_b2_ray_aabb_interval(lox, loy, ldx, ldy, -hx, -hy, hx, hy, iv) == 0) { return 0; }
+        var a0: f64 = iv.nx_in;
+        var a1: f64 = iv.ny_in;
+        var b0: f64 = iv.nx_out;
+        var b1: f64 = iv.ny_out;
+        var wix: f64 = cv * a0 - sv * a1;
+        var wiy: f64 = sv * a0 + cv * a1;
+        var wox: f64 = cv * b0 - sv * b1;
+        var woy: f64 = sv * b0 + cv * b1;
+        iv.nx_in = wix;
+        iv.ny_in = wiy;
+        iv.nx_out = wox;
+        iv.ny_out = woy;
+        return 1;
+    }
+    if (k == IM_SHAPE_CAPSULE) {
+        var hh: f64 = s.half_height;
+        var cr: f64 = s.radius;
+        return _im_b2_ray_capsule_interval(ox, oy, dx, dy, px, py, rot, hh, cr, iv);
+    }
+    if (k == IM_SHAPE_SEGMENT) {
+        var sax: f64 = s.a.x;
+        var say: f64 = s.a.y;
+        var sbx: f64 = s.b.x;
+        var sby: f64 = s.b.y;
+        var wax, way = _im_b2_world_pos(px, py, rot, sax, say);
+        var wbx, wby = _im_b2_world_pos(px, py, rot, sbx, sby);
+        var hit[24];
+        if (_im_b2_ray_segment(ox, oy, dx, dy, wax, way, wbx, wby, &hit) == 0) { return 0; }
+        var t: f64 = load64(&hit);
+        var nx: f64 = load64(&hit + 8);
+        var ny: f64 = load64(&hit + 16);
+        iv.t_in = t;
+        iv.nx_in = nx;
+        iv.ny_in = ny;
+        iv.t_out = t;
+        iv.nx_out = nx;
+        iv.ny_out = ny;
+        return 1;
+    }
+    if (k == IM_SHAPE_CONVEX_HULL && s.point_count >= 3) {
+        var n = s.point_count;
+        var local[256];
+        var verts = &local;
+        var heap = 0;
+        if (n > _IM_B2_POLY_STACK) {
+            heap = fl_alloc(n * 16);
+            if (heap == 0) { return 0; }
+            verts = heap;
+        }
+        var hs, hc = _im_sin_cos(rot);
+        var hsv: f64 = hs;
+        var hcv: f64 = hc;
+        for (var j = 0; j < n; j = j + 1) {
+            var qx: f64 = load64(s.points + j * 24);
+            var qy: f64 = load64(s.points + j * 24 + 8);
+            var tx: f64 = px + hcv * qx - hsv * qy;
+            var ty: f64 = py + hsv * qx + hcv * qy;
+            store64(verts + j * 16, tx);
+            store64(verts + j * 16 + 8, ty);
+        }
+        var area: f64 = _im_b2_signed_area_2x(verts, n, 16);
+        if (area < 0.0) {
+            var lo = 0;
+            var hi = n - 1;
+            while (lo < hi) {
+                var x0 = load64(verts + lo * 16);
+                var y0 = load64(verts + lo * 16 + 8);
+                store64(verts + lo * 16, load64(verts + hi * 16));
+                store64(verts + lo * 16 + 8, load64(verts + hi * 16 + 8));
+                store64(verts + hi * 16, x0);
+                store64(verts + hi * 16 + 8, y0);
+                lo = lo + 1;
+                hi = hi - 1;
+            }
+        }
+        var got = _im_b2_ray_polygon_interval(ox, oy, dx, dy, verts, n, iv);
+        if (heap != 0) { fl_free(heap); }
+        return got;
+    }
+    return 0;
+}
+
+# The first hit of the ray on circle (cx, cy, r) into out: `ray_circle_first`, which Rust's tests
+# check against the interval's. Mirrors `ray_circle` (test-only in Rust).
+fn _im_b2_ray_circle(ox: f64, oy: f64, dx: f64, dy: f64, cx: f64, cy: f64, r: f64, out): i64 {
+    return _im_b2_ray_circle_first(ox, oy, dx, dy, cx, cy, r, out);
+}
+
+# The first hit of the ray on the box [min, max] into out. Mirrors `ray_aabb_2d` (test-only in Rust).
+fn _im_b2_ray_aabb_2d(ox: f64, oy: f64, dx: f64, dy: f64, mnx: f64, mny: f64, mxx: f64, mxy: f64, out): i64 {
+    var iv: ImRayInterval;
+    if (_im_b2_ray_aabb_interval(ox, oy, dx, dy, mnx, mny, mxx, mxy, &iv) == 0) { return 0; }
+    return iv.first(out);
+}
+
+# ── the world's queries, per collider ───────────────────────────────────────────────
+
+# The unit direction of (dx, dy): (1, x, y), or (0, 0, 0) when its length is NaN, infinite or below
+# EPSILON (no ray). The first step of `raycast_filtered`.
+#must_use
+fn _im_b2_ray_direction(dx: f64, dy: f64): i64 {
+    var len: f64 = _im_hypot(dx, dy);
+    var z: f64 = 0.0;
+    if (len != len || len < _IM_B2_EPSILON || _im_is_finite(len) == 0) { return (0, z, z); }
+    var ux: f64 = dx / len;
+    var uy: f64 = dy / len;
+    return (1, ux, uy);
+}
+
+# The first hit of the ray o + t·d (d unit, from `_im_b2_ray_direction`) on collider c of body b into
+# out (t, nx, ny): 1, or 0. The loop body of `raycast_filtered`, before its layer filter and
+# max-distance and nearest-hit choice.
+fn _im_b2_raycast_collider(b: *ImRigidBody2d, c: *ImCollider2d, ox: f64, oy: f64, dx: f64, dy: f64, out): i64 {
+    var bx: f64 = b.position.x;
+    var by: f64 = b.position.y;
+    var rot: f64 = b.rotation;
+    var offx: f64 = c.offset.x;
+    var offy: f64 = c.offset.y;
+    var wx, wy = _im_b2_world_pos(bx, by, rot, offx, offy);
+    if (c.shape.kind == IM_SHAPE_BALL) {
+        var r: f64 = c.shape.radius;
+        return _im_b2_ray_circle_first(ox, oy, dx, dy, wx, wy, r, out);
+    }
+    var iv: ImRayInterval;
+    if (_im_b2_ray_shape(c.shape, wx, wy, rot, ox, oy, dx, dy, &iv) == 0) { return 0; }
+    return iv.first(out);
+}
+
+# 1 when collider c of body b overlaps the probe shape at (px, py) whose box is probe_box: its world
+# AABB must meet the box, then the contact test decides (a heightfield or a mesh on its box alone).
+# The loop body of `overlap_shape`.
+fn _im_b2_overlap_collider(b: *ImRigidBody2d, c: *ImCollider2d, probe: *ImColliderShape, px: f64, py: f64,
+  probe_box: *ImAabb2d): i64 {
+    var bx: f64 = b.position.x;
+    var by: f64 = b.position.y;
+    var rot: f64 = b.rotation;
+    var wb: ImAabb2d = c.world_aabb(ImVec2_new(bx, by), rot);
+    if (probe_box.overlaps(&wb) == 0) { return 0; }
+    var k = c.shape.kind;
+    if (k == IM_SHAPE_HEIGHTFIELD || k == IM_SHAPE_TRI_MESH) { return 1; }
+    var offx: f64 = c.offset.x;
+    var offy: f64 = c.offset.y;
+    var wx, wy = _im_b2_world_pos(bx, by, rot, offx, offy);
+    return _im_b2_shapes_touch(probe, px, py, 0.0, c.shape, wx, wy, rot);
+}

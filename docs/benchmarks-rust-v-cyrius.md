@@ -180,3 +180,27 @@ narrowphase only inside the step benches, so the comparison waits for M3.
   is the 0.7 µs off the rotated box pair.
 - **The hull pair is arithmetic.** It runs about 2 × 8 × 8 dot products for the separations and 16 edge-normal
   square roots per call, on the compiler's xmm0/xmm1 code (port plan §8).
+
+## M2 part 4: correctly rounded hypot, and the 2D queries (2026-11-09)
+
+Cyrius-only rows, x86_64 ELF. Rust has no bench for `hypot` or the queries alone.
+
+| Bench | Body | Cyrius |
+|---|---|---|
+| `math/hypot_cr` | the correctly rounded `hypot` (ADR 0011 amendment), on (0.6, 0.8 + a step) | 168 ns |
+| `math/hypot_ganita` | ganita's `hypot`, which it replaced (a shadow line now) | 33 ns |
+| `b2/raycast_ball` | a ray on a ball collider of a rotated body | 389 ns |
+| `b2/raycast_box_rotated` | a ray on a box at 0.4 rad (slabs in the box's frame) | 433 ns |
+| `b2/raycast_capsule` | a ray on a capsule (two discs and the shaft, unioned) | 667 ns |
+| `b2/raycast_hull8` | a ray on an 8-vertex hull (Cyrus–Beck) | 2.11 µs |
+| `b2/overlap_sphere_box` | a sphere probe on a box (world AABB, then the contact test) | 872 ns |
+
+**Reading it.**
+- **Exact `hypot` costs 5× ganita's.** It sits between exp (104 ns) and sin_cos (201 ns), and every call is
+  correctly rounded. ganita's is 1 to 2 ulp off on 24 % of the golden rows.
+- **The correctly rounded primitives dominate the queries.**
+  - The ball ray pays one `sin_cos` (the collider's world position) and one `hypot` (the normal).
+  - The hull ray pays one `hypot` per edge, as Rust's does.
+  - The sphere overlap pays four `sin_cos` of one angle: `world_aabb`, `world_pos`, and `circle_obb`'s two
+    transforms. Rust takes four as well. Sharing them, as the narrowphase's box paths now do, is open for M3's
+    profiling.

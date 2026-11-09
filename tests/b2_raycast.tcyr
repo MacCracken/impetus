@@ -1,0 +1,267 @@
+# b2_raycast.tcyr — the ported Rust tests of rust-old/src/backend_2d/raycast.rs (M2d): its own 3 and the
+# 15 ray and overlap tests of backend_2d/tests.rs, plus Cyrius-only tests of the direction check and
+# the per-collider queries.
+#
+# The world-level tests (rays and overlaps through PhysicsState2d) run on a test-local world: bodies and
+# colliders in order, with `raycast_filtered`'s and `overlap_shape`'s loops over the per-collider
+# queries. M3 points them at ImPhysicsState2d.
+
+include "tests/lib_2d.cyr"
+
+var EPS: f64 = 0.000001;
+var TIGHT: f64 = 0.000000000001;
+
+# 1 when |got − want| < eps.
+fn near(got: f64, want: f64, eps: f64): i64 {
+    var d: f64 = f64_abs(got - want);
+    if (d < eps) { return 1; }
+    return 0;
+}
+
+# Field w (0 t, 1 nx, 2 ny) of the hit at h.
+fn hf(h, w): f64 {
+    var r: f64 = load64(h + w * 8);
+    return r;
+}
+
+# ── the test-local world ──
+var W_N = 0;
+var W_BODIES = 0;
+var W_COLLS = 0;
+
+fn w_reset() {
+    for (var i = 0; i < W_N; i = i + 1) { w_free_coll(W_COLLS + i * sizeof(ImCollider2d)); }
+    if (W_BODIES == 0) {
+        W_BODIES = fl_alloc(4 * sizeof(ImRigidBody2d));
+        W_COLLS = fl_alloc(4 * sizeof(ImCollider2d));
+    }
+    W_N = 0;
+    return 0;
+}
+
+fn w_free_coll(c: *ImCollider2d) {
+    c.free();
+    return 0;
+}
+
+# Adds a static body at (x, y) with one collider of shape s (the world keeps its own copy).
+fn w_add(s: ImColliderShape, x: f64, y: f64) {
+    var bd: ImBodyDesc = ImBodyDesc_default();
+    bd.body_type = IM_BODY_STATIC;
+    bd.position = ImVec3_new(x, y, 0.0);
+    var rb: ImRigidBody2d = ImRigidBody2d_from_desc(W_N, bd);
+    var c: ImCollider2d = ImCollider2d_from_desc(W_N, W_N, ImColliderDesc_new(s));
+    memcpy(W_BODIES + W_N * sizeof(ImRigidBody2d), &rb, sizeof(ImRigidBody2d));
+    memcpy(W_COLLS + W_N * sizeof(ImCollider2d), &c, sizeof(ImCollider2d));
+    W_N = W_N + 1;
+    return 0;
+}
+
+# `raycast`: the nearest hit within max into out (t, nx, ny): its collider index, or -1.
+fn w_ray(ox: f64, oy: f64, dx: f64, dy: f64, max: f64, out): i64 {
+    var ok, ux0, uy0 = _im_b2_ray_direction(dx, dy);
+    if (ok == 0) { return 0 - 1; }
+    var ux: f64 = ux0;
+    var uy: f64 = uy0;
+    var best = 0 - 1;
+    var bt: f64 = 0.0;
+    var hit[24];
+    for (var i = 0; i < W_N; i = i + 1) {
+        var b = W_BODIES + i * sizeof(ImRigidBody2d);
+        var c = W_COLLS + i * sizeof(ImCollider2d);
+        if (_im_b2_raycast_collider(b, c, ox, oy, ux, uy, &hit) == 1) {
+            var t: f64 = load64(&hit);
+            if (t <= max && (best < 0 || t < bt)) {
+                best = i;
+                bt = t;
+                for (var w = 0; w < 3; w = w + 1) { store64(out + w * 8, load64(&hit + w * 8)); }
+            }
+        }
+    }
+    return best;
+}
+
+# The colliders overlapping probe (at (px, py), box pbox), as a bit mask of their indices.
+fn w_overlap(probe: *ImColliderShape, px: f64, py: f64, pbox: *ImAabb2d): i64 {
+    var mask = 0;
+    for (var i = 0; i < W_N; i = i + 1) {
+        var b = W_BODIES + i * sizeof(ImRigidBody2d);
+        var c = W_COLLS + i * sizeof(ImCollider2d);
+        if (_im_b2_overlap_collider(b, c, probe, px, py, pbox) == 1) { mask = mask | (1 << i); }
+    }
+    return mask;
+}
+
+# `overlap_sphere`.
+fn w_sphere(cx: f64, cy: f64, r: f64): i64 {
+    var probe: ImColliderShape = ImColliderShape_ball(r);
+    var pbox: ImAabb2d = ImAabb2d_new(cx - r, cy - r, cx + r, cy + r);
+    return w_overlap(&probe, cx, cy, &pbox);
+}
+
+# `overlap_aabb`.
+fn w_aabb(lx: f64, ly: f64, hx: f64, hy: f64): i64 {
+    var wx: f64 = f64_abs(hx - lx) * 0.5;
+    var wy: f64 = f64_abs(hy - ly) * 0.5;
+    var probe: ImColliderShape = ImColliderShape_box(wx, wy, 0.0);
+    var pbox: ImAabb2d = ImAabb2d_new(lx, ly, hx, hy);
+    var cx: f64 = (lx + hx) * 0.5;
+    var cy: f64 = (ly + hy) * 0.5;
+    return w_overlap(&probe, cx, cy, &pbox);
+}
+
+# Runs the ported raycast tests.
+fn main() {
+    alloc_init();
+    var h[24];
+
+    # ── raycast.rs ──
+    test_group("ray_from_inside_box_reports_exit_face");
+    assert_eq(_im_b2_ray_aabb_2d(5.0, 0.0, 1.0, 0.0, 4.0, -1.0, 6.0, 1.0, &h), 1, "hits");
+    assert_eq(near(hf(&h, 0), 1.0, TIGHT), 1, "t = 1");
+    assert_eq(hf(&h, 1) == 1.0 && hf(&h, 2) == 0.0, 1, "the exit face's normal (1, 0)");
+
+    test_group("ray_from_inside_capsule_exits_through_cap");
+    var iv: ImRayInterval;
+    assert_eq(_im_b2_ray_capsule_interval(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.5, &iv), 1, "an interval");
+    assert_eq(iv.first(&h), 1, "a first hit");
+    assert_eq(near(hf(&h, 0), 1.5, TIGHT), 1, "t = 1.5, through the cap");
+    assert_eq(near(hf(&h, 2), 1.0, TIGHT), 1, "normal up");
+
+    test_group("ray_hits_segment_and_hull");
+    assert_eq(_im_b2_ray_segment(0.0, 5.0, 0.0, -1.0, -1.0, 0.0, 1.0, 0.0, &h), 1, "segment hit");
+    assert_eq(near(hf(&h, 0), 5.0, TIGHT), 1, "t = 5");
+    assert_eq(hf(&h, 1) == 0.0 && hf(&h, 2) == 1.0, 1, "normal (0, 1), facing the ray");
+    var sq[64];
+    var m1: f64 = -1.0;
+    var p1: f64 = 1.0;
+    store64(&sq, m1); store64(&sq + 8, m1);
+    store64(&sq + 16, p1); store64(&sq + 24, m1);
+    store64(&sq + 32, p1); store64(&sq + 40, p1);
+    store64(&sq + 48, m1); store64(&sq + 56, p1);
+    assert_eq(_im_b2_ray_polygon_interval(-5.0, 0.0, 1.0, 0.0, &sq, 4, &iv), 1, "hull interval");
+    assert_eq(iv.first(&h), 1, "hull hit");
+    assert_eq(near(hf(&h, 0), 4.0, TIGHT), 1, "t = 4");
+    assert_eq(hf(&h, 1) == -1.0 && hf(&h, 2) == 0.0, 1, "normal (-1, 0)");
+
+    # ── backend_2d/tests.rs ──
+    test_group("ray_circle_hit");
+    assert_eq(_im_b2_ray_circle(0.0, 0.0, 1.0, 0.0, 5.0, 0.0, 1.0, &h), 1, "hits");
+    assert_eq(near(hf(&h, 0), 4.0, EPS) + near(hf(&h, 1), -1.0, EPS), 2, "t = 4, normal -x");
+
+    test_group("ray_circle_miss");
+    assert_eq(_im_b2_ray_circle(0.0, 0.0, 0.0, 1.0, 5.0, 0.0, 1.0, &h), 0, "misses");
+
+    test_group("ray_circle_inside");
+    assert_eq(_im_b2_ray_circle(5.0, 0.0, 1.0, 0.0, 5.0, 0.0, 1.0, &h), 1, "from the centre");
+    assert_eq(near(hf(&h, 0), 1.0, EPS), 1, "exits at t = 1");
+
+    test_group("ray_aabb_hit");
+    assert_eq(_im_b2_ray_aabb_2d(0.0, 0.0, 1.0, 0.0, 4.0, -1.0, 6.0, 1.0, &h), 1, "hits");
+    assert_eq(near(hf(&h, 0), 4.0, EPS) + near(hf(&h, 1), -1.0, EPS), 2, "t = 4, normal -x");
+
+    test_group("ray_aabb_miss");
+    assert_eq(_im_b2_ray_aabb_2d(0.0, 0.0, 0.0, 1.0, 4.0, -1.0, 6.0, 1.0, &h), 0, "misses");
+
+    test_group("ray_aabb_inside");
+    assert_eq(_im_b2_ray_aabb_2d(5.0, 0.0, 1.0, 0.0, 4.0, -1.0, 6.0, 1.0, &h), 1, "from inside");
+
+    test_group("ray_capsule_hit_shaft");
+    w_reset();
+    w_add(ImColliderShape_capsule(1.0, 0.5), 5.0, 0.0);
+    assert_eq(w_ray(0.0, 0.0, 1.0, 0.0, 100.0, &h), 0, "hits the capsule");
+    assert_eq(near(hf(&h, 0), 4.5, 0.1), 1, "at about 4.5");
+
+    test_group("ray_capsule_hit_endpoint");
+    w_reset();
+    w_add(ImColliderShape_capsule(2.0, 0.5), 5.0, 0.0);
+    assert_eq(w_ray(0.0, 2.0, 1.0, 0.0, 100.0, &h), 0, "hits the top cap");
+
+    test_group("ray_capsule_miss");
+    w_reset();
+    w_add(ImColliderShape_capsule(1.0, 0.5), 5.0, 0.0);
+    assert_eq(w_ray(0.0, 5.0, 1.0, 0.0, 100.0, &h), 0 - 1, "passes above");
+
+    test_group("overlap_sphere_finds_ball");
+    w_reset();
+    w_add(ImColliderShape_ball(1.0), 5.0, 0.0);
+    assert_eq(w_sphere(5.0, 0.0, 0.5), 1, "finds the ball");
+    assert_eq(w_sphere(100.0, 0.0, 0.5), 0, "not the distant one");
+
+    test_group("overlap_sphere_finds_box");
+    w_reset();
+    w_add(ImColliderShape_box(2.0, 2.0, 0.0), 0.0, 0.0);
+    assert_eq(w_sphere(2.3, 0.0, 0.5), 1, "near the box edge");
+    assert_eq(w_sphere(10.0, 0.0, 0.5), 0, "far away");
+
+    test_group("overlap_sphere_misses_distant");
+    w_reset();
+    w_add(ImColliderShape_ball(1.0), 0.0, 0.0);
+    assert_eq(w_sphere(10.0, 10.0, 0.5), 0, "nothing");
+
+    test_group("overlap_aabb_finds_colliders");
+    w_reset();
+    w_add(ImColliderShape_ball(1.0), 0.0, 0.0);
+    w_add(ImColliderShape_ball(1.0), 10.0, 0.0);
+    assert_eq(w_aabb(-2.0, -2.0, 2.0, 2.0), 1, "the one at the origin only");
+    assert_eq(w_aabb(-2.0, -2.0, 12.0, 2.0), 3, "both");
+
+    test_group("overlap_aabb_empty");
+    w_reset();
+    w_add(ImColliderShape_ball(1.0), 0.0, 0.0);
+    assert_eq(w_aabb(50.0, 50.0, 60.0, 60.0), 0, "nothing");
+
+    test_group("overlap_sphere_finds_capsule");
+    w_reset();
+    w_add(ImColliderShape_capsule(2.0, 0.5), 0.0, 0.0);
+    assert_eq(w_sphere(0.0, 2.3, 0.5), 1, "near the capsule's end");
+    assert_eq(w_sphere(5.0, 0.0, 0.5), 0, "far away");
+
+    # ── Cyrius-only ──
+    test_group("ray_direction");
+    var z: f64 = 0.0;
+    var nan: f64 = z / z;
+    var inf: f64 = 1.0 / z;
+    var ok1, ux1, uy1 = _im_b2_ray_direction(3.0, 4.0);
+    var fx1: f64 = ux1;
+    var fy1: f64 = uy1;
+    assert_eq(ok1 == 1 && fx1 == 0.6 && fy1 == 0.8, 1, "(3, 4) normalises to (0.6, 0.8)");
+    var ok2, ux2, uy2 = _im_b2_ray_direction(0.0, 0.0);
+    var ok3, ux3, uy3 = _im_b2_ray_direction(nan, 1.0);
+    var ok4, ux4, uy4 = _im_b2_ray_direction(inf, 0.0);
+    var ok5, ux5, uy5 = _im_b2_ray_direction(0.00000000001, 0.0);
+    assert_eq(ok2 + ok3 + ok4 + ok5, 0, "zero, NaN, infinite and sub-EPSILON directions are no ray");
+
+    test_group("nearest_hit_first_of_equals");
+    w_reset();
+    w_add(ImColliderShape_ball(0.5), 3.0, 0.0);
+    w_add(ImColliderShape_ball(0.5), 3.0, 0.0);
+    w_add(ImColliderShape_box(0.5, 0.5, 0.0), 1.5, 0.0);
+    assert_eq(w_ray(0.0, 0.0, 1.0, 0.0, 100.0, &h), 2, "the nearer box");
+    assert_eq(w_ray(0.0, 0.0, 1.0, 0.0, 0.9, &h), 0 - 1, "the cut applies before the choice");
+    w_reset();
+    w_add(ImColliderShape_ball(0.5), 3.0, 0.0);
+    w_add(ImColliderShape_ball(0.5), 3.0, 0.0);
+    assert_eq(w_ray(0.0, 0.0, 1.0, 0.0, 100.0, &h), 0, "of equal hits, the first");
+
+    test_group("heightfield_overlaps_on_its_box");
+    w_reset();
+    var hw[24];
+    var h0: f64 = 0.0;
+    var h1: f64 = 1.0;
+    var h2: f64 = 0.5;
+    store64(&hw, h0); store64(&hw + 8, h1); store64(&hw + 16, h2);
+    var field: ImColliderShape = ImColliderShape_heightfield(&hw, 3, ImVec3_new(1.0, 1.0, 1.0));
+    w_add(field, 0.0, 0.0);
+    field.free();
+    assert_eq(w_aabb(1.5, 0.5, 1.9, 0.9), 1, "inside its box: found, with no contact test");
+    assert_eq(w_aabb(2.1, 0.0, 3.0, 1.0), 0, "past its box");
+    assert_eq(w_ray(-1.0, 0.5, 1.0, 0.0, 100.0, &h), 0 - 1, "a ray skips it");
+
+    w_reset();
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

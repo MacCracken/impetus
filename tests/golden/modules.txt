@@ -2,6 +2,7 @@
 # b2_ modules, tests/parity_3d.tcyr the b3_ modules
 b2_mass
 b2_narrow
+b2_ray
 broadphase
 config
 constants

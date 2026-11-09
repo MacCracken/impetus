@@ -66,5 +66,6 @@ modules = [
     "src/spatial_hash.cyr",
     "src/b2_types.cyr",
     "src/b2_narrowphase.cyr",
+    "src/b2_raycast.cyr",
     "src/json.cyr",
 ]

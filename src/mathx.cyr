@@ -93,10 +93,10 @@ fn _im_exp(x: f64): f64 {
     return r;
 }
 
-# √(x² + y²) without undue overflow or underflow (ganita). Stands for `f64::hypot`.
+# √(x² + y²), correctly rounded (src/crmath.cyr, ADR 0011 as amended). Stands for `f64::hypot`.
 #must_use
 fn _im_hypot(x: f64, y: f64): f64 {
-    var r: f64 = ganita_f64_hypot(x, y);
+    var r: f64 = _im_cr_hypot(x, y);
     return r;
 }
 

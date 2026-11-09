@@ -1,4 +1,5 @@
-# crmath.cyr — correctly rounded exp, sin and cos (ADR 0011).
+# crmath.cyr — correctly rounded exp, sin, cos and hypot (ADR 0011 and its hypot amendment; hypot
+# has its own section at the end).
 #
 # Round-to-nearest-even of the exact mathematical value, on every input, the same bits on every
 # target: only + − × ÷, the f64 rounding builtins and integer operations, no x87 and no polyfill.
@@ -970,4 +971,184 @@ fn _im_cr_cos(x: f64): f64 {
     var s, c = _im_cr_sc(x, 2);
     var r: f64 = c;
     return r;
+}
+
+# ── hypot ───────────────────────────────────────────────────────────────────────────
+# hypot(x, y) = √(x² + y²), correctly rounded (ADR 0011, amended for hypot). The operands are scaled by a
+# power of two so the larger is in [1, 2); x² + y² is formed in double-double from exact products, its
+# square root corrected once by the residual (relative error below 2^-100, tested against 2^-96), and
+# the result scaled back exactly. Undecided cases, and results in the first normal binade or below
+# (whose spacing is the subnormal grid's), take the slow path: x² + y² exactly in fixed point,
+# compared with the exact squares of the midpoints next to the candidate. An exact midpoint can occur
+# (a Pythagorean triple with a 54-bit odd hypotenuse) and rounds to even.
+
+var _im_cr_hypot_slow_calls = 0;
+
+# h·2^k, exact whenever the result is representable (subnormal included) and in up to three exact
+# steps; ±∞ on overflow.
+#must_use
+fn _im_cr_ldexp(h: f64, k): f64 {
+    var r: f64 = h;
+    var j = k;
+    while (j > 1000) {
+        var up: f64 = _im_cr_pow2(1000);
+        r = r * up;
+        j = j - 1000;
+    }
+    while (j < 0 - 1000) {
+        var down: f64 = _im_cr_pow2(0 - 1000);
+        r = r * down;
+        j = j + 1000;
+    }
+    var p: f64 = _im_cr_pow2(j);
+    var out: f64 = r * p;
+    return out;
+}
+
+# The doubles next above and below a positive finite double.
+#must_use
+fn _im_cr_next_up(x: f64): f64 { return _im_cr_from_word(_im_cr_word(x) + 1); }
+#must_use
+fn _im_cr_next_down(x: f64): f64 { return _im_cr_from_word(_im_cr_word(x) - 1); }
+
+# The exact square of (c + g) into Q, for c ≥ 0, |g| ≤ c a power of two, sign gs (1 adds, -1
+# subtracts), both with no set bit below 2^-60, using M and G as scratch.
+fn _im_cr_sq_mid(Q, M, G, c: f64, g: f64, gs) {
+    _im_cr_set(M, c);
+    _im_cr_set(G, g);
+    if (gs > 0) { _im_cr_add(M, M, G); } else { _im_cr_sub(M, M, G); }
+    _im_cr_mul(Q, M, M);
+    return 0;
+}
+
+# The slow path: a in [1, 2), b ≤ a (at least 2^-54), the result c·2^k for the candidate c0 within an
+# ulp. The grid is the doubles' near c0, or, when c0·2^k is in the first normal binade or below, the
+# multiples of 2^(-1074-k).
+#must_use
+fn _im_cr_hypot_slow(a: f64, b: f64, k, c0: f64): f64 {
+    _im_cr_hypot_slow_calls = _im_cr_hypot_slow_calls + 1;
+    var A[112];
+    var B[112];
+    var S[112];
+    var Q[112];
+    var M[112];
+    var G[112];
+    _im_cr_set(&A, a);
+    _im_cr_set(&B, b);
+    _im_cr_mul(&S, &A, &A);
+    _im_cr_mul(&Q, &B, &B);
+    _im_cr_add(&S, &S, &Q);
+    var c: f64 = c0;
+    var sub = 0;
+    var u: f64 = 0.0;
+    var ce = (_im_cr_word(c) >> 52) - 1023;
+    if (ce + k <= 0 - 1022) {
+        sub = 1;
+        u = _im_cr_pow2(0 - 1074 - k);
+        var q: f64 = c / u + 0.5;
+        var n: f64 = f64_floor(q);
+        c = n * u;
+    }
+    var done = 0;
+    var it = 0;
+    while (done == 0 && it < 8) {
+        it = it + 1;
+        var lo: f64 = 0.0;
+        var hi: f64 = 0.0;
+        if (sub == 1) {
+            lo = c - u;
+            hi = c + u;
+        } else {
+            lo = _im_cr_next_down(c);
+            hi = _im_cr_next_up(c);
+        }
+        var gl: f64 = (c - lo) * 0.5;
+        var gh: f64 = (hi - c) * 0.5;
+        _im_cr_sq_mid(&Q, &M, &G, c, gl, 0 - 1);
+        var cl = _im_cr_cmp(&S, &Q);
+        if (cl < 0) {
+            c = lo;
+        } else {
+            _im_cr_sq_mid(&Q, &M, &G, c, gh, 1);
+            var chi = _im_cr_cmp(&S, &Q);
+            if (chi > 0) {
+                c = hi;
+            } else {
+                # Inside [lower midpoint, upper midpoint]: c, unless exactly on a midpoint (ties to even).
+                var odd = _im_cr_word(c) & 1;
+                if (sub == 1) {
+                    var nc: f64 = c / u;
+                    odd = f64_to(nc) & 1;
+                }
+                if (odd == 1) {
+                    if (chi == 0) { c = hi; } elif (cl == 0) { c = lo; }
+                }
+                done = 1;
+            }
+        }
+    }
+    return _im_cr_ldexp(c, k);
+}
+
+# hypot(x, y), correctly rounded: +∞ when either is infinite (even with a NaN), NaN when either is NaN,
+# |x| when y is 0, +∞ on overflow, subnormal results rounded once. Mirrors `f64::hypot` with the
+# exact result in place of libm's.
+#must_use
+fn _im_cr_hypot(x: f64, y: f64): f64 {
+    var ax: f64 = f64_abs(x);
+    var ay: f64 = f64_abs(y);
+    var inf: f64 = _im_cr_from_word(9218868437227405312);
+    if (ax == inf || ay == inf) { return inf; }
+    if (ax != ax || ay != ay) {
+        var nan: f64 = x + y;
+        return nan;
+    }
+    var a: f64 = ax;
+    var b: f64 = ay;
+    if (b > a) {
+        a = ay;
+        b = ax;
+    }
+    if (b == 0.0) { return a; }
+    var top: f64 = a;
+    var k = 0;
+    var ef = _im_cr_word(a) >> 52;
+    if (ef == 0) {
+        var up: f64 = _im_cr_pow2(64);
+        a = a * up;
+        b = b * up;
+        k = 0 - 64;
+        ef = _im_cr_word(a) >> 52;
+    }
+    var e = ef - 1023;
+    var sa: f64 = _im_cr_ldexp(a, 0 - e);
+    var sb: f64 = _im_cr_ldexp(b, 0 - e);
+    k = k + e;
+    # b/a below 2^-54: the true value exceeds a by under 2^-109 of it, so it rounds to a.
+    var tiny: f64 = _im_cr_pow2(0 - 54);
+    if (sb < tiny) { return top; }
+    var ph, pl = _im_cr_two_prod(sa, sa);
+    var qh, ql = _im_cr_two_prod(sb, sb);
+    var sh, sl = _im_cr_dd_add(ph, pl, qh, ql);
+    var s_hi: f64 = sh;
+    var s_lo: f64 = sl;
+    var r: f64 = f64_sqrt(s_hi);
+    var rh, rl = _im_cr_two_prod(r, r);
+    var rhf: f64 = rh;
+    var rlf: f64 = rl;
+    var d1: f64 = s_hi - rhf;
+    var e1: f64 = d1 - rlf;
+    var e2: f64 = e1 + s_lo;
+    var two_r: f64 = 2.0 * r;
+    var corr: f64 = e2 / two_r;
+    var h, l = _im_cr_fast_two_sum(r, corr);
+    var hf: f64 = h;
+    var lf: f64 = l;
+    var bound: f64 = _im_cr_pow2(0 - 96);
+    var err: f64 = hf * bound;
+    var he = (_im_cr_word(hf) >> 52) - 1023;
+    if (he + k > 0 - 1022 && _im_cr_rounds_to(hf, lf, err) == 1) {
+        return _im_cr_ldexp(hf, k);
+    }
+    return _im_cr_hypot_slow(sa, sb, k, hf);
 }

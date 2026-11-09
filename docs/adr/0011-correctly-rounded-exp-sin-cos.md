@@ -126,3 +126,34 @@ user: "WE WANT TO BE BETTER THAN glibc"). The user chose the same remedy here ("
   every future rotation would pay it.
 - **Double-double as the first phase** (this ADR's first version): correct, but 2.6–3.3 µs a call, 30–40× the
   polyfills. The table-driven phase 1 brought it to about 2×.
+
+## Amendment — M2d (2026-11-09): hypot joins exp, sin and cos
+
+**Context.** The 2D raycasts normalise the ray direction and their normals with `f64::hypot`, and M3's joints call
+it six times (lengths, impulse magnitudes, the rope and distance biases). The port's `hypot` was ganita's. It
+differs from glibc on 414 of the 1,715 golden math rows (411 by 1 ulp, 3 by 2), so every row through it could only
+have a measured bound. glibc's own `hypot` misrounds 0.31 % of 300,000 seeded arguments against MPFR (CPython's
+`math.hypot` is not glibc's and was no reference), and 12 of the golden rows. The project's aim is accuracy across
+the Cyrius libraries, not parity with glibc's limitations (user, 2026-11-09).
+
+**Decision.** `src/crmath.cyr` gains `_im_cr_hypot`, correctly rounded on every input. `_im_hypot` calls it, and
+`f64::hypot` rows are gated at 0 ulp against the corrected oracle, as exp, sin and cos are. It works in two phases:
+- **Phase 1.** Both operands are scaled by a power of two so the larger is in [1, 2), so the scaling is exact.
+  x² + y² is formed in double-double from exact products, its square root is corrected once by the residual, and
+  the result is kept when the rounding test decides it. The relative error is below 2^-100, tested against 2^-96.
+- **The slow path** handles undecided cases, and results in the first normal binade or below, whose spacing is the
+  subnormal grid's. It forms x² + y² exactly in the 364-bit fixed point and compares it with the exact squares of
+  the midpoints next to the candidate.
+
+Unlike exp, sin and cos, `hypot` has **exact midpoints**: a Pythagorean triple with a 54-bit odd hypotenuse. The
+exact comparison rounds them to even.
+
+**Consequences.**
+- **Verified against MPFR.** All 404,234 probe pairs match, on x86_64 and aarch64, which produce identical output.
+  The pairs cover near and far exponents, the whole range with subnormal results and overflow, the IEEE specials
+  (an infinity wins over a NaN), and 4,134 exact midpoints.
+- **The golden rows.** All 1,715 golden rows are at 0 ulp: 1,703 equal glibc, and 12 equal `math.cr.tsv`'s
+  corrections. ganita's `hypot` stays as a shadow line.
+- **Cost.** 168 ns a call against ganita's 33 ns (`math/hypot_cr`), between exp (104 ns) and sin_cos (201 ns).
+- **For a Rust 1.x user:** results differ in the last bit wherever glibc misrounds a `hypot`.
+- **Upstream.** Like exp, sin and cos, `hypot` belongs in ganita once (port plan §8).
