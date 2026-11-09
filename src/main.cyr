@@ -1,0 +1,16 @@
+# impetus — Cyrius port
+# Ported from 21825 lines of Rust (rust-old/, the parity oracle)
+
+# Stdlib auto-included via cyrius.cyml
+
+# Entry point of the scaffold binary. The library itself is the [lib] bundle (from M1).
+fn main() {
+    alloc_init();
+    println("impetus ready");
+    return 0;
+}
+
+var r = main();
+# sys_exit_group, not syscall(SYS_EXIT, ...): SYS_EXIT ends only the calling
+# thread, so the bare syscall hangs once this program spawns its first worker.
+sys_exit_group(r);

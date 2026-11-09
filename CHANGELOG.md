@@ -6,10 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
-Port tooling only. These changes are not scheduled for a release: they exist so
-the Cyrius port's golden-value generator can drive the Rust oracle
-(`docs/development/impetus-port-plan.md`, M0 step 0). Simulation behaviour is
-unchanged.
+The Cyrius port (2.0.0) has begun; the plan of record is
+`docs/development/impetus-port-plan.md`. Rust 1.4.0 is frozen in `rust-old/` as
+the parity oracle, together with the port-tooling changes below. Those are not
+scheduled for a Rust release; they exist so the port's golden-value generator
+can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
 
 ### Added
 - **oracle** — a hidden, non-default `oracle` feature (`impetus::oracle`, not
@@ -29,6 +30,20 @@ unchanged.
 ### Changed
 - `2d` feature: no longer depends on hisab. The 2D backend never used it; only
   the 3D backend does. The default build no longer compiles hisab and glam.
+- **Cyrius port, M0 steps 1–3** ([ADR 0007](docs/adr/0007-cyrius-port-hisab-first.md)):
+  - `cyrius port` scaffold. The Rust crate moved into `rust-old/`: sources, tests,
+    benches, fuzz targets, examples, Cargo files, `rust-toolchain.toml`,
+    cargo-vet config, CI workflows, scripts, the architecture overview and the
+    testing guide. `rust-old/README.md` is restored for the crate's README doctest.
+  - `cyrius.cyml` pins Cyrius 6.7.18 and hisab 3.4.1; `lib/` and `cyrius.lock` are vendored.
+  - Cyrius CI with `test --bounds`, `deps --locked` and `audit`.
+  - CLAUDE.md and `docs/development/state.md` for the Cyrius process.
+  - ADRs renumbered to four digits; [ADR 0008](docs/adr/0008-port-api-divergences.md)
+    records the 2.0 API changes.
+
+### Removed
+- Committed fuzz build output (`fuzz/target/`, 208 files). It is now ignored under
+  `rust-old/`.
 
 ## [1.4.0] - 2026-11-09
 
@@ -40,10 +55,10 @@ physically wrong behaviour, so replays recorded with 1.3 will diverge.
 - **deps** — hisab 1.3 → 1.4; serde 1.0.229, serde_json 1.0.154, thiserror 2.0.21 (lockfile); CI actions checkout v7, codecov-action v7, action-gh-release v3
 - **ci** — every backend combination is linted and tested (`--all-features` compiles only the 3D backend, so the 2D backend and its tests were never run in CI); coverage merges 2D and 3D runs; README code blocks are doctested
 - **world** — `sub_steps` now applies to the 3D backend too; forces applied before `step()` act over the whole step (were cleared after the first sub-step); collision events are diffed once per step (Started was lost with sub-steps), and a contact that starts and ends within one step reports Started then Stopped
-- **joints (2D)** — velocity-level constraint solver with angular terms, soft springs, clamped motors and limits, interleaved with contacts ([ADR 005](docs/adr/005-velocity-level-joints.md)); Fixed and Prismatic hold their creation-time relative rotation; prismatic/wheel axes are in body A's frame; `break_force` is the linear constraint force in newtons; generic joint `damping` acts on relative angular velocity (revolute, wheel), along the axis (prismatic) or along the anchors (distance, rope)
+- **joints (2D)** — velocity-level constraint solver with angular terms, soft springs, clamped motors and limits, interleaved with contacts ([ADR 0005](docs/adr/0005-velocity-level-joints.md)); Fixed and Prismatic hold their creation-time relative rotation; prismatic/wheel axes are in body A's frame; `break_force` is the linear constraint force in newtons; generic joint `damping` acts on relative angular velocity (revolute, wheel), along the axis (prismatic) or along the anchors (distance, rope)
 - **joints (3D)** — Fixed, Distance, Rope and Wheel are velocity-level, mass-weighted constraints; spring/wheel/mouse/damping forces apply once per sub-step (were multiplied by the iteration count); Fixed also locks rotation; Wheel constrains both axes perpendicular to the suspension (z was ignored); `break_force` compares the reaction force
 - **friction (3D)** — two tangent directions with their own effective mass, clamped to μ·N; static friction holds when the impulse needed to stop slipping fits within μ_s·N
-- **manifolds (2D)** — rebuilt each frame with impulses carried over from matching points, instead of accumulating stale points ([ADR 006](docs/adr/006-manifold-rebuild-per-frame.md))
+- **manifolds (2D)** — rebuilt each frame with impulses carried over from matching points, instead of accumulating stale points ([ADR 0006](docs/adr/0006-manifold-rebuild-per-frame.md))
 - **sleep (2D)** — islands sleep atomically and no longer merge through static or kinematic bodies; sleeping bodies are immovable in the solver and are woken when a contact begins or a neighbour is removed
 - **spring** — `Spring::step` uses the exact closed-form solution (was semi-implicit Euler, which diverged for `k·dt` large enough, e.g. a 0.5 s frame hitch); one long step equals many short ones; the step's transition matrix is cached while `dt`, stiffness and damping are unchanged; non-positive/NaN `dt` is ignored; negative stiffness in the presets is treated as its magnitude (was a debug-only panic)
 - **particles** — drag is quadratic as documented (was linear); emitter spread uses an R3 low-discrepancy sequence (x and y offsets were ~perfectly anti-correlated); radial fields are softened (ε = 0.01) so they stay finite near the centre

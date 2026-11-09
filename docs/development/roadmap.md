@@ -15,7 +15,7 @@
 
 **Next: the Cyrius port (2.0.0).** Rust 1.4.0 is the final Rust feature release and the parity
 oracle; see [`impetus-port-plan.md`](impetus-port-plan.md) and
-[ADR 007](../adr/007-cyrius-port-hisab-first.md). The 2.0 breaking items below land in the Cyrius
+[ADR 0007](../adr/0007-cyrius-port-hisab-first.md). The 2.0 breaking items below land in the Cyrius
 API; the themed sections continue in Cyrius after 2.0.
 
 Planned sections below are grouped by theme; version numbers are assigned when work is scheduled.

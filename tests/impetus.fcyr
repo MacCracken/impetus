@@ -1,0 +1,18 @@
+# impetus fuzz harness
+
+# One fuzz input. M6 ports the Rust snapshot fuzzer (`fuzz_serialize`) here.
+fn fuzz_main(data, len) {
+    if (len == 0) { return 0; }
+    return 0;
+}
+
+# Runs the harness on a fixed input.
+fn main() {
+    alloc_init();
+    fuzz_main("test", 4);
+    println("fuzz: ok");
+    return 0;
+}
+
+var r = main();
+sys_exit_group(r);

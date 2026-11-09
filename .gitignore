@@ -1,6 +1,14 @@
-/target
-/coverage
-/fuzz/target
-/fuzz/corpus
-/fuzz/artifacts
-benchmarks.md
+target/
+*.swp
+.DS_Store
+coverage/
+
+# Cyrius port. Cargo.lock is tracked on purpose: rust-old/Cargo.lock (and
+# scripts/oracle/Cargo.lock, once it exists) pin the oracle's dependency graph.
+# `target/` above also covers rust-old/target, rust-old/fuzz/target and
+# scripts/oracle/target.
+/rust-old/fuzz/corpus/
+/rust-old/fuzz/artifacts/
+/rust-old/**/__pycache__/
+/rust-old/benchmarks.md
+/build/

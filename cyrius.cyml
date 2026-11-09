@@ -1,0 +1,42 @@
+[package]
+name = "impetus"
+version = "${file:VERSION}"
+description = "impetus — physics engine: 2D/3D rigid bodies, collision, constraints, spatial queries, particles, springs"
+license = "GPL-3.0-only"
+repository = "https://github.com/MacCracken/impetus"
+language = "cyrius"
+cyrius = "6.7.18"
+
+[build]
+entry = "src/main.cyr"
+output = "build/impetus"
+
+# stdlib leaves, vendored into lib/ by `cyrius deps` and prepended to every compile.
+#   math     — f64_sin / f64_cos and the _polyfill transcendentals (cross-target determinism)
+#   ganita   — ganita_f64_hypot / pow (ganita 1.2.15 in the 6.7.18 bundle)
+#   tagged / result — the value-form Option and Result
+#   freelist — fl_alloc / fl_free: world-owned storage that is returned, not leaked
+#   fnptr    — hisab's GJK/EPA support-function callbacks
+# hisab's own bundle needs math, alloc, vec, ganita, result, str and fmt (dist/hisab.deps).
+# sakshi (logging: tracing → sakshi spans) arrives through hisab's own [deps.sakshi] 2.5.10;
+# listing it here too makes `cyrius deps` refuse one copy.
+[deps]
+stdlib = ["syscalls", "string", "alloc", "str", "fmt", "io", "vec", "math", "ganita",
+    "tagged", "result", "freelist", "fnptr"]
+
+# hisab 3.4.1, pinned by tag: vectors, quaternions, mat3, ray tests, GJK/EPA, BVH, islands,
+# inertia (ADR 0007, hisab-first). No `path =` override, which would bypass the commit pin that
+# cyrius.lock records.
+[deps.hisab]
+git = "https://github.com/MacCracken/hisab.git"
+tag = "3.4.1"
+modules = ["dist/hisab.cyr"]
+
+# Test / bench / fuzz compiles only.
+[test]
+stdlib = ["assert", "bench"]
+
+# [lib] (the 2D default, as the Rust crate's default feature) and [lib.3d] arrive in M1 and M4.
+# Both list the shared modules in the same order; each adds its own backend. The order is
+# load-bearing: no src/ file includes another, so each module resolves at file scope against what
+# precedes it (port plan §4 step 3).

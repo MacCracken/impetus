@@ -83,7 +83,7 @@ call. impetus is a **stateful simulation**, so five things change.
    - hisab's GJK is a more robust algorithm than impetus's.
 
    Those paths are compared within a class-D tolerance and by the reference tests, never by
-   bits. ADR 007 accepts each divergence by name (§5).
+   bits. ADR 0007 accepts each divergence by name (§5).
 3. **Memory per frame is a design problem.** The stdlib `alloc` is a bump allocator with no free.
    hisab allocates every vector, quaternion and matrix it returns. `alloc_reset` would wipe the
    consumer's heap as well as impetus's. A world that steps 60 times a second for hours must
@@ -142,7 +142,7 @@ every `pub fn` and every `pub` method on the re-exported types.
 | `Send + Sync` assertions, `#[inline]` | **not carried** | Rust-only mechanics |
 | Heightfield and TriMesh colliders | **carried as in Rust**: accepted, generating no contacts | parity; contacts for them are a roadmap item |
 
-### 3.3 API changes in the Cyrius version (accepted divergences, ADR 008)
+### 3.3 API changes in the Cyrius version (accepted divergences, [ADR 0008](../adr/0008-port-api-divergences.md))
 
 These come from the roadmap's "2.0 — Breaking Cleanup". Each row says how the harness still
 compares it, so no function leaves parity entirely.
@@ -198,11 +198,11 @@ tests only.
      value is fixed as 1.4.x and the corpus regenerated.
    - glibc is **2.44**. The oracle's transcendental bits depend on it, and every TSV header
      records it.
-1. **Scaffold.** `cyrius port --dry-run .`, then `cyrius port .`.
+1. ✅ **Scaffold. Done 2026-11-09.** `cyrius port --dry-run .`, then `cyrius port .`.
    - Expect these to move into `rust-old/`: `Cargo.toml`, `Cargo.lock`, `src/`, `tests/`,
      `benches/`, `fuzz/`, `Makefile`, `deny.toml`, `codecov.yml`, `target/`.
    - Untrack `fuzz/target/` first. 208 build files under it are committed despite `.gitignore`.
-2. **Repair what the scaffold overwrites** (as tanmatra's plan §2 step 2, filed as
+2. ✅ **Repair what the scaffold overwrites** (done 2026-11-09). The scaffold reports appending `/rust-old/` to `.gitignore` but appends `/rust-old/target/`, so `rust-old/` stays tracked; `rust-old/README.md` is restored for the crate's `include_str!` doctest. The steps were (as tanmatra's plan §2 step 2, filed as
    `cyrius/docs/development/issues/2026-11-08-cyrius-port-clobbers-project-docs-and-omits-bench.md`):
    - **CLAUDE.md**: merge, keeping the identity, process and DO NOT list. Translate the principles:
      - `#[non_exhaustive]` → append-only enum values;
@@ -220,11 +220,11 @@ tests only.
      `scripts/version-bump.sh`, `bench-history.csv`, `docs/guides/testing.md`,
      `docs/architecture/overview.md`.
    - **ADRs**: renumber `docs/adr/001`–`006` to the scaffold's four-digit form and add:
-     - 0007, the port (drafted as [ADR 007](../adr/007-cyrius-port-hisab-first.md));
+     - [0007](../adr/0007-cyrius-port-hisab-first.md), the port (drafted as 007 before the renumbering);
      - 0008, the §3.3 API divergences.
    - Check that `cyrius.cyml` reads `version = "${file:VERSION}"` and that `bench` is in
      `[test] stdlib`. Document the scaffold's stub functions so `cyrius audit` passes.
-3. **`cyrius.cyml`.** Confirm the keys with `cyrius help manifest`.
+3. ✅ **`cyrius.cyml`. Done 2026-11-09.** No `[lib]` until M1. sakshi comes through hisab's own dependency: listing it in `[deps] stdlib` as well makes `cyrius deps` refuse one copy. Confirm the keys with `cyrius help manifest`.
    ```toml
    [package]
    name = "impetus"
@@ -235,7 +235,7 @@ tests only.
 
    [deps]
    stdlib = ["syscalls", "string", "alloc", "str", "fmt", "io", "vec", "math", "ganita",
-             "tagged", "result", "freelist", "fnptr", "sakshi"]
+             "tagged", "result", "freelist", "fnptr"]   # sakshi arrives via hisab
 
    [deps.hisab]
    git = "https://github.com/MacCracken/hisab.git"
@@ -282,7 +282,7 @@ tests only.
    split them per profile: `tests/parity_2d.tcyr` and `tests/parity_3d.tcyr`. Add:
    - a **state loader** that builds a world from a dump row;
    - a **step comparator** with per-field classes;
-   - a **divergence table** naming every ADR 007 path, reported by name, as kimiya's ADR 0002
+   - a **divergence table** naming every ADR 0007 path, reported by name, as kimiya's ADR 0002
      mapping.
 8. **Baseline measurements** → `docs/development/port-parity.md`. The math sweep runs every
    Cyrius counterpart against glibc on x86_64 ELF, x86_64 PE (wine) and aarch64 (qemu). Set the
@@ -330,7 +330,7 @@ tanmatra's classes apply (its plan §4), with two additions for the simulation:
 | **A — exact** | bit-identical / equal integers | handles and generations, config validation verdicts, material presets, combine rules, collision layers, broadphase pair **sets**, contact counts and feature ids, event sequences, constants |
 | **B — arithmetic** | ≤ 2 ulp, expected 0 | spring step with its cached matrix (× + only), 2D contact generation (SAT, clipping), 2D mass properties, solver arithmetic on 2D paths, AABBs |
 | **C — transcendental** | ulp ≤ K by the port-parity rule | spring transition (exp, sin, cos), 2D rotation (`sin_cos`), `atan2`, `hypot` sites, joint angles |
-| **D — iterative / hisab-backed** | relative ≤ 1e-12, or a per-function bound set before its first comparison | every ADR 007 path: 3D quaternion rotation, mat3 inverse, GJK/EPA normal and depth, BVH-derived pair order (the pair *set* stays class A), `detect_islands` membership (class A on sets) |
+| **D — iterative / hisab-backed** | relative ≤ 1e-12, or a per-function bound set before its first comparison | every ADR 0007 path: 3D quaternion rotation, mat3 inverse, GJK/EPA normal and depth, BVH-derived pair order (the pair *set* stays class A), `detect_islands` membership (class A on sets) |
 | **S — single step** | per field: the class of the path that produced it | one `step()` from an oracle state dump. Positions, velocities and impulses take the path's class; contact sets and events are class A, except a named near-degenerate contact flip |
 | **R — reference** | physical tolerance stated in the test | the 30 regression scenarios, the Rust unit tests that assert physics (resting height, bounce speed, swing, settling, sleep), and energy and momentum invariants over long runs |
 
@@ -418,7 +418,7 @@ Every std f64 method in `src/` outside tests, 1.4.0:
 | `DVec3` new/ZERO/splat/X/Y/Z, `+ − neg`, `* f64`, `dot`, `cross`, `length(_squared)`, `min`/`max`/`abs` | `hvec3_*` | use; hot loops per probe 2 until H1 |
 | `/ f64`, `+= −= *=`, `==`, vector `is_finite`, `normalize_or`, `try_normalize`, `any_orthogonal_vector`, `any_orthonormal_pair`, `from_array`/`to_array` | none | H2; local helpers until then |
 | `DQuat` IDENTITY, `from_xyzw`, `from_rotation_z`, `q * q`, `.inverse()`, `.normalize()` | `hquat_identity`, `hquat_new`, `hquat_from_rotation_z`, `hquat_mul`, `hquat_conjugate` (bit-exact with glam's inverse), `hquat_normalize_checked` | use |
-| `q * v` (glam assumes a unit q) | `hquat_rotate_vec3` (divides by \|q\|² unless it is exactly 1) | use; class D, ADR 007. A unit-assuming variant is H2 |
+| `q * v` (glam assumes a unit q) | `hquat_rotate_vec3` (divides by \|q\|² unless it is exactly 1) | use; class D, ADR 0007. A unit-assuming variant is H2 |
 | `-q` | none (`hquat_new` on negated parts) | H2 |
 | `DMat3` ZERO, `from_cols`, `from_quat`, `M·v`, `M·M`, `+`, `* f64`, transpose, determinant | `m3_new`, `m3_from_cols`, `m3_from_quat`, `m3_mul_vec3`, `m3_mul`, `m3_add`, `m3_scale`, `m3_transpose`, `m3_determinant` | use |
 | `from_diagonal`, `M − M`, `−M` | none | H2 |
@@ -438,7 +438,7 @@ Every std f64 method in `src/` outside tests, 1.4.0:
 | Rust | Cyrius |
 |---|---|
 | `Arena<T>` (generational) | a typed stride buffer, `*ImBody` + k stepping by `sizeof` (probe 3), with a generation column and the free list. Its storage comes from freelist or the world arena, never `vec` (8-byte words only, and growth never frees) |
-| `BTreeMap` (11) / `BTreeSet` (2) | sorted arrays keyed by `u64` pair or handle keys, with binary search. Manifolds are rebuilt every frame (ADR 006), so a sorted array rebuilt per frame fits. **Never `hashmap`**: its seed is random per process, so iteration order changes between runs |
+| `BTreeMap` (11) / `BTreeSet` (2) | sorted arrays keyed by `u64` pair or handle keys, with binary search. Manifolds are rebuilt every frame (ADR 0006), so a sorted array rebuilt per frame fits. **Never `hashmap`**: its seed is random per process, so iteration order changes between runs |
 | `HashMap` (1) | the same sorted array |
 | `AabbTree<K>`, `SpatialHashGrid<K>` | keys are already handle words (`i64`); no generics needed |
 | `ColliderShape`, `JointType`, `ForceField`, `CollisionEvent` (payload enums) | a kind enum (`IM_SHAPE_BALL`, …, append-only) plus one payload struct with the union of fields. Hull points sit behind a pointer and a count: struct fields can't be fixed arrays |
@@ -549,7 +549,7 @@ tanmatra filed its findings.
 
 | Milestone | Status | Golden rows | Reference tests | Benches | Notes |
 |---|---|---|---|---|---|
-| M0 Initialize | ◐ step 0 done 2026-11-09 | | | | oracle hooks and `2d` without hisab added as unreleased port tooling on 1.4.0; steps 1–9 (scaffold onward) next |
+| M0 Initialize | ◐ steps 0–3 done 2026-11-09 | | | | oracle hooks and `2d` without hisab (unreleased port tooling on 1.4.0); scaffold, repairs, `cyrius.cyml` with hisab 3.4.1, ADR 0008; all Cyrius gates clean. Next: step 4 (math check), 5–7 (generator, tables, harness), 8 (baselines), 9 (probes) |
 | M1 Foundation | ☐ | | | | |
 | M2 2D collision | ☐ | | | | |
 | M3 2D dynamics | ☐ | | | | |

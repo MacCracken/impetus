@@ -1,5 +1,10 @@
 # Impetus
 
+> **Porting to Cyrius.** impetus 2.0 is being ported to Cyrius
+> ([plan](docs/development/impetus-port-plan.md), [state](docs/development/state.md)).
+> The Rust crate 1.4.0 described below is frozen in `rust-old/` as the parity oracle;
+> the code examples are its API.
+
 **Impetus** (Latin: *impetus* — driving force, the medieval theory of why
 objects keep moving after being thrown) is a physics engine for the AGNOS
 ecosystem. It provides 2D/3D rigid-body simulation with deterministic stepping,

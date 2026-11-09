@@ -1,119 +1,66 @@
 name: CI
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-  workflow_call:
+  workflow_call:   # reusable: release.yml gates on this CI workflow
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
+
 jobs:
-  check:
-    name: Check & Lint
+  build-and-test:
+    name: Build & Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      # `2d` and `3d` select different backends (3d wins when both are on),
-      # so every backend combination is linted separately.
-      - run: cargo clippy --all-features --all-targets -- -D warnings
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo clippy --no-default-features --features 2d,serialize,oracle --all-targets -- -D warnings
-      - run: cargo clippy --no-default-features --features 3d --all-targets -- -D warnings
-      - run: cargo clippy --no-default-features --all-targets -- -D warnings
-  security:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo install cargo-audit
-      - run: cargo audit
-  deny:
-    name: Supply Chain
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
-  test:
-    name: Test (${{ matrix.os }})
-    needs: [check]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-          - os: macos-latest
-          - os: windows-latest
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # 2D backend (default) — not compiled under --all-features.
-      - run: cargo test --features serialize,oracle
-      # 3D backend + serialization.
-      - run: cargo test --all-features
-      - run: cargo test --no-default-features
-      - run: cargo test --doc --all-features
-  msrv:
-    name: MSRV (1.99)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.99"
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-features
-      - run: cargo test --features serialize
-      - run: cargo test --all-features
-  coverage:
-    name: Coverage
-    runs-on: ubuntu-latest
-    needs: [check]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-llvm-cov
-      # Merge 2D and 3D runs so both backends count toward coverage.
-      - run: cargo llvm-cov clean --workspace
-      - run: cargo llvm-cov --no-report --features serialize,oracle
-      - run: cargo llvm-cov --no-report --all-features
-      - run: cargo llvm-cov report --lcov --output-path lcov.info
-      - uses: codecov/codecov-action@v7
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        with:
-          files: lcov.info
-          fail_ci_if_error: false
-  doc:
-    name: Documentation
-    runs-on: ubuntu-latest
-    needs: [check]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-  semver:
-    name: SemVer Check
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-semver-checks
-      - run: cargo semver-checks check-release
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4 (pinned — the release-integrity hardening item)
+
+      - name: Install Cyrius toolchain
+        # The cyrius.cyml [package].cyrius pin is the single source of
+        # truth for the toolchain version — never hardcode it here. Read
+        # the pin and hand it to the canonical upstream installer, which
+        # fetches + lays out $HOME/.cyrius/{bin,lib}. Do NOT hand-roll
+        # curl+tar+cp — scripts/install.sh is the supported entry point
+        # (matches patra / sigil).
+        run: |
+          set -e
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
+          echo "Installing Cyrius $CYRIUS_VERSION"
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve dependencies
+        run: cyrius deps
+
+      - name: Build
+        run: |
+          mkdir -p build
+          cyrius build src/main.cyr build/${{ github.event.repository.name }}
+
+      - name: Test
+        # v5.6.28: bare `cyrius test` picks up the [build].test entry
+        # AND auto-discovers tests/*.tcyr — avoids the previous
+        # `cyrius test src/test.cyr` form that hard-failed when the
+        # stub didn't exist (Issue 1) and also wouldn't ever exercise
+        # tests/${proj}.tcyr.
+        run: cyrius test
+
+      - name: Test (bounds-checked)
+        run: cyrius test --bounds
+
+      - name: Lockfile matches lib/
+        run: cyrius deps --locked
+
+      - name: Audit (fmt, lint, test, bench)
+        run: cyrius audit
+
+      # Added as the port reaches them (port plan §6 gates):
+      #   M1 — `cyrius distlib --check` once [lib] exists, and the surface-parity check
+      #        against rust-old/ (scripts/surface_parity.py);
+      #   M4 — a job for the [lib.3d] profile.
+      # The golden corpus is regenerated locally from rust-old/, so CI has no Rust job;
+      # rust-old/.github/workflows/ keeps the 1.4.0 Rust CI for reference.
