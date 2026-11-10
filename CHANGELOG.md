@@ -554,6 +554,26 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - Surface parity is 662 across 30 modules: Rust's `serialize` module joins, with its snapshot records mapped onto
     ADR 0013's and `serialize_world` / `deserialize_world` pending part 2.
 
+- **Cyrius port, M6 part 2: the binary form** ([ADR 0013](docs/adr/0013-complete-snapshots.md);
+  `docs/development/port-parity.md` §26):
+  - `snap.to_bytes(out)` writes version 1: little-endian 64-bit words, the same on every target. A five-word header
+    (magic "IMPSNAP\0", version, profile, payload length, a 64-bit FNV-1a of the payload) leads the world half and
+    the backend half. An absent optional is a 0 flag and zero words, and a payload enum writes only its variant's
+    fields, so the bytes depend on the state alone.
+  - `ImWorldSnapshot_from_bytes` refuses a bad length, magic, version, profile, payload length or checksum before
+    reading a field. It checks every count against the words left before allocating, and refuses short reads,
+    unknown kinds, flags out of range and leftover words. `serialize_world` and `deserialize_world` keep Rust's
+    names. Their bytes are the port's own, since Rust's bitcode can't be read here.
+  - `tests/snapshot.tcyr` grows from 31 to 49 assertions:
+    - the five 2D tests of `serialize.rs` that use bytes, exact where Rust allows 1e-10;
+    - `restore_preserves_handle_allocation` and `restore_replaces_force_fields` through bytes, both `#[ignore]`d
+      in Rust;
+    - byte round trips in five scenes, the header's refusals, every truncation, a one-bit change in any word;
+    - 1,500 seeded corruptions behind a recomputed checksum (Rust's `fuzz_serialize` contract: refused with the
+      world unchanged, or restored and stepping);
+    - a pinned checksum, which the PE and aarch64 runs confirm.
+  - Surface parity is 662 across 30 modules with nothing pending.
+
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
   sin_cos from 3.3 µs to 187 ns (the polyfills: 48–64 and 75–83 ns).
@@ -654,6 +674,9 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
 - **Snapshots, first numbers** (Cyrius only, the struct; Rust's `snapshot/*` rows go through bytes, part 2): on Rust's
   scenes a capture of an empty world takes 1.39 µs, of 100 balls 208 µs, and a restore of those 100 into a fresh world
   234 µs. Not profiled yet.
+- **Snapshots against Rust** (quiet machine; Rust's bitcode on its 2D build): `snapshot/serialize_empty` 1.35 →
+  2.24 µs, `serialize_100_bodies` 14.5 → 282 µs, `roundtrip_100_bodies` 33.6 → 357 µs. The port's snapshot holds the
+  whole state (49 words for a ball and its body), and the struct capture is 208 µs of the 282; not profiled yet.
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

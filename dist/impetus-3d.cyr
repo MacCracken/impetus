@@ -14739,3 +14739,627 @@ impl ImTrackerSnapshot {
         return 0;
     }
 }
+
+# ── the binary form (ADR 0013, version 1) ───────────────────────────────────────────
+# Little-endian 64-bit words: integers and handles as words, f64 as their bits, flags as 0 or 1, an absent optional as
+# a 0 flag and zero value words, a list as its count then its items, a payload enum (shape, joint type, force field)
+# as its kind then that variant's own fields. Five header words lead: the magic "IMPSNAP\0", the version, the
+# profile (2 or 3), the payload's length in words and its checksum. The same bytes on every target (ADR 0008 #7).
+
+const _IM_SNAP_MAGIC = 0x0050414E53504D49;
+const _IM_SNAP_VERSION = 1;
+const _IM_SNAP_HEADER = 5;
+
+# The 64-bit FNV-1a of the n words at p, a word at a time: h ← (h ⊕ w) × 0x100000001b3 from
+# 0xcbf29ce484222325, wrapping. Each step maps h one to one, so changing any one word changes the result.
+#must_use
+fn _im_snap_checksum(p, n): i64 {
+    var h = 0xcbf29ce484222325;
+    for (var i = 0; i < n; i = i + 1) { h = (h ^ load64(p + i * 8)) * 0x100000001b3; }
+    return h;
+}
+
+#must_use
+fn _im_as_wlist(p): *ImWordList { return p; }
+
+# A word sink over an ImWordList (`out`, its address); `bad` turns 1 when a write runs out of memory, and later writes
+# are dropped.
+struct ImSnapWriter { out; bad; }
+
+# A writer appending to *out.
+#must_use
+fn _im_snap_writer(out: *ImWordList): ImSnapWriter {
+    var wr: ImSnapWriter;
+    wr.out = out;
+    wr.bad = 0;
+    return wr;
+}
+
+impl ImSnapWriter {
+    # Appends the word x.
+    fn w(self, x) {
+        if (self.bad == 0) {
+            var l: *ImWordList = _im_as_wlist(self.out);
+            if (l.push(x) == 0) { self.bad = 1; }
+        }
+        return 0;
+    }
+
+    # Appends x's bits.
+    fn f(self, x: f64) {
+        var t[8];
+        store64(&t, x);
+        self.w(load64(&t));
+        return 0;
+    }
+
+    # Appends v's two components.
+    fn v2(self, v: ImVec2) {
+        var x: f64 = v.x;
+        var y: f64 = v.y;
+        self.f(x);
+        self.f(y);
+        return 0;
+    }
+
+    # Appends v's three components.
+    fn v3(self, v: ImVec3) {
+        var x: f64 = v.x;
+        var y: f64 = v.y;
+        var z: f64 = v.z;
+        self.f(x);
+        self.f(y);
+        self.f(z);
+        return 0;
+    }
+
+    # Appends an optional f64: the flag, then x, or 0 when has is 0.
+    fn opt_f(self, has, x: f64) {
+        self.w(has);
+        if (has == 1) { self.f(x); } else { self.w(0); }
+        return 0;
+    }
+
+    # Appends the n words at p.
+    fn words(self, p, n) {
+        for (var i = 0; i < n; i = i + 1) { self.w(load64(p + i * 8)); }
+        return 0;
+    }
+}
+
+# A word source over the n words at `data`; `at` is the next word, and `bad` turns 1 when a read runs past the end or
+# finds a malformed word. Reads past the end give 0.
+struct ImSnapReader { data; n; at; bad; }
+
+# A reader over the n words at p.
+#must_use
+fn _im_snap_reader(p, n): ImSnapReader {
+    var rd: ImSnapReader;
+    rd.data = p;
+    rd.n = n;
+    rd.at = 0;
+    rd.bad = 0;
+    return rd;
+}
+
+impl ImSnapReader {
+    # The next word.
+    fn w(self): i64 {
+        if (self.at >= self.n) {
+            self.bad = 1;
+            return 0;
+        }
+        var x = load64(self.data + self.at * 8);
+        self.at = self.at + 1;
+        return x;
+    }
+
+    # The next word as an f64.
+    fn f(self): f64 {
+        var zero: f64 = 0.0;
+        if (self.at >= self.n) {
+            self.bad = 1;
+            return zero;
+        }
+        var x: f64 = load64(self.data + self.at * 8);
+        self.at = self.at + 1;
+        return x;
+    }
+
+    # The next two words as an ImVec2.
+    fn v2(self): ImVec2 {
+        var x: f64 = self.f();
+        var y: f64 = self.f();
+        return ImVec2_new(x, y);
+    }
+
+    # The next three words as an ImVec3.
+    fn v3(self): ImVec3 {
+        var x: f64 = self.f();
+        var y: f64 = self.f();
+        var z: f64 = self.f();
+        return ImVec3_new(x, y, z);
+    }
+
+    # The next word, which must be 0 or 1.
+    fn flag(self): i64 {
+        var x = self.w();
+        if (x != 0 && x != 1) { self.bad = 1; }
+        return x;
+    }
+
+    # The next word as a count of items of at least `per` words each, which must fit in the words left: else 0, and
+    # the read is bad. It bounds every allocation by the input's length.
+    fn count(self, per): i64 {
+        var c = self.w();
+        if (c < 0 || c > (self.n - self.at) / per) {
+            self.bad = 1;
+            return 0;
+        }
+        return c;
+    }
+
+    # A freelist copy of the next n words (n checked by `count`), or 0 for none or no memory (then the read is bad).
+    fn words(self, n): i64 {
+        if (n == 0) { return 0; }
+        var p = fl_alloc(n * 8);
+        if (p == 0) {
+            self.bad = 1;
+            return 0;
+        }
+        for (var i = 0; i < n; i = i + 1) { store64(p + i * 8, self.w()); }
+        return p;
+    }
+}
+
+# ── shared records in the binary form ───────────────────────────────────────────────
+
+# Writes shape s: its kind and that kind's fields. 1, or 0 for an unknown kind.
+fn _im_snap_put_shape(wr: *ImSnapWriter, s: *ImColliderShape): i64 {
+    var k = s.kind;
+    wr.w(k);
+    if (k == IM_SHAPE_BOX) {
+        wr.v3(s.half_extents);
+    } elif (k == IM_SHAPE_BALL) {
+        var r: f64 = s.radius;
+        wr.f(r);
+    } elif (k == IM_SHAPE_CAPSULE) {
+        var hh: f64 = s.half_height;
+        var cr: f64 = s.radius;
+        wr.f(hh);
+        wr.f(cr);
+    } elif (k == IM_SHAPE_CONVEX_HULL) {
+        wr.w(s.point_count);
+        wr.words(s.points, s.point_count * 3);
+    } elif (k == IM_SHAPE_TRI_MESH) {
+        wr.w(s.vertex_count);
+        wr.words(s.vertices, s.vertex_count * 3);
+        wr.w(s.index_count);
+        wr.words(s.indices, s.index_count * 3);
+    } elif (k == IM_SHAPE_HEIGHTFIELD) {
+        wr.w(s.height_count);
+        wr.words(s.heights, s.height_count);
+        wr.v3(s.scale);
+    } elif (k == IM_SHAPE_SEGMENT) {
+        wr.v3(s.a);
+        wr.v3(s.b);
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
+# Reads a shape into *out: 1, or 0 for an unknown kind, a short read or no memory (then nothing stays allocated).
+fn _im_snap_get_shape(rd: *ImSnapReader, out: *ImColliderShape): i64 {
+    var k = rd.w();
+    var s: ImColliderShape = _im_shape(k);
+    if (k == IM_SHAPE_BOX) {
+        var he: ImVec3 = rd.v3();
+        s.half_extents = he;
+    } elif (k == IM_SHAPE_BALL) {
+        s.radius = rd.f();
+    } elif (k == IM_SHAPE_CAPSULE) {
+        s.half_height = rd.f();
+        s.radius = rd.f();
+    } elif (k == IM_SHAPE_CONVEX_HULL) {
+        s.point_count = rd.count(3);
+        s.points = rd.words(s.point_count * 3);
+    } elif (k == IM_SHAPE_TRI_MESH) {
+        s.vertex_count = rd.count(3);
+        s.vertices = rd.words(s.vertex_count * 3);
+        s.index_count = rd.count(3);
+        s.indices = rd.words(s.index_count * 3);
+    } elif (k == IM_SHAPE_HEIGHTFIELD) {
+        s.height_count = rd.count(1);
+        s.heights = rd.words(s.height_count);
+        var sc: ImVec3 = rd.v3();
+        s.scale = sc;
+    } elif (k == IM_SHAPE_SEGMENT) {
+        var a: ImVec3 = rd.v3();
+        var b: ImVec3 = rd.v3();
+        s.a = a;
+        s.b = b;
+    } else {
+        rd.bad = 1;
+    }
+    if (rd.bad == 1) {
+        s.free();
+        return 0;
+    }
+    memcpy(out, &s, sizeof(ImColliderShape));
+    return 1;
+}
+
+# Writes material m (8 words).
+fn _im_snap_put_material(wr: *ImSnapWriter, m: *ImPhysicsMaterial) {
+    var fr: f64 = m.friction;
+    var re: f64 = m.restitution;
+    var de: f64 = m.density;
+    var sf: f64 = m.static_friction;
+    var ro: f64 = m.rolling_friction;
+    wr.f(fr);
+    wr.f(re);
+    wr.f(de);
+    wr.opt_f(m.has_static_friction, sf);
+    wr.f(ro);
+    wr.w(m.friction_combine);
+    wr.w(m.restitution_combine);
+    return 0;
+}
+
+# Reads a material into *m.
+fn _im_snap_get_material(rd: *ImSnapReader, m: *ImPhysicsMaterial) {
+    m.friction = rd.f();
+    m.restitution = rd.f();
+    m.density = rd.f();
+    m.has_static_friction = rd.flag();
+    m.static_friction = rd.f();
+    m.rolling_friction = rd.f();
+    m.friction_combine = rd.w();
+    m.restitution_combine = rd.w();
+    return 0;
+}
+
+# Writes joint type j: its kind and that kind's fields. 1, or 0 for an unknown kind.
+fn _im_snap_put_joint_type(wr: *ImSnapWriter, j: *ImJointType): i64 {
+    var k = j.kind;
+    wr.w(k);
+    var lo: f64 = j.limits.x;
+    var hi: f64 = j.limits.y;
+    if (k == IM_JOINT_REVOLUTE || k == IM_JOINT_PRISMATIC) {
+        if (k == IM_JOINT_REVOLUTE) { wr.v2(j.anchor); } else { wr.v2(j.axis); }
+        wr.w(j.has_limits);
+        if (j.has_limits == 1) {
+            wr.f(lo);
+            wr.f(hi);
+        } else {
+            wr.w(0);
+            wr.w(0);
+        }
+    } elif (k == IM_JOINT_SPRING) {
+        var rl: f64 = j.rest_length;
+        var st: f64 = j.stiffness;
+        var dp: f64 = j.damping;
+        wr.f(rl);
+        wr.f(st);
+        wr.f(dp);
+    } elif (k == IM_JOINT_DISTANCE) {
+        var ln: f64 = j.length;
+        wr.f(ln);
+    } elif (k == IM_JOINT_WHEEL) {
+        var ws: f64 = j.stiffness;
+        var wd: f64 = j.damping;
+        wr.v2(j.axis);
+        wr.f(ws);
+        wr.f(wd);
+    } elif (k == IM_JOINT_ROPE) {
+        var ml: f64 = j.max_length;
+        wr.f(ml);
+    } elif (k == IM_JOINT_MOUSE) {
+        var ms: f64 = j.stiffness;
+        var md: f64 = j.damping;
+        var mf: f64 = j.max_force;
+        wr.v3(j.target);
+        wr.f(ms);
+        wr.f(md);
+        wr.f(mf);
+    } elif (k != IM_JOINT_FIXED) {
+        return 0;
+    }
+    return 1;
+}
+
+# Reads a joint type into *out: 1, or 0 for an unknown kind (the read is then bad).
+fn _im_snap_get_joint_type(rd: *ImSnapReader, out: *ImJointType): i64 {
+    var k = rd.w();
+    var j: ImJointType = _im_joint(k);
+    if (k == IM_JOINT_REVOLUTE || k == IM_JOINT_PRISMATIC) {
+        var v: ImVec2 = rd.v2();
+        if (k == IM_JOINT_REVOLUTE) { j.anchor = v; } else { j.axis = v; }
+        j.has_limits = rd.flag();
+        var lim: ImVec2 = rd.v2();
+        j.limits = lim;
+    } elif (k == IM_JOINT_SPRING) {
+        j.rest_length = rd.f();
+        j.stiffness = rd.f();
+        j.damping = rd.f();
+    } elif (k == IM_JOINT_DISTANCE) {
+        j.length = rd.f();
+    } elif (k == IM_JOINT_WHEEL) {
+        var ax: ImVec2 = rd.v2();
+        j.axis = ax;
+        j.stiffness = rd.f();
+        j.damping = rd.f();
+    } elif (k == IM_JOINT_ROPE) {
+        j.max_length = rd.f();
+    } elif (k == IM_JOINT_MOUSE) {
+        var tg: ImVec3 = rd.v3();
+        j.target = tg;
+        j.stiffness = rd.f();
+        j.damping = rd.f();
+        j.max_force = rd.f();
+    } elif (k != IM_JOINT_FIXED) {
+        rd.bad = 1;
+        return 0;
+    }
+    memcpy(out, &j, sizeof(ImJointType));
+    return 1;
+}
+
+# Writes an arena snapshot: the slot count, three words a slot, the free-list head and the stale flag.
+fn _im_snap_put_arena(wr: *ImSnapWriter, a: *ImArenaSnapshot) {
+    wr.w(a.slots.len);
+    wr.words(a.slots.data, a.slots.len * 3);
+    wr.w(a.free_head);
+    wr.w(a.free_list_stale);
+    return 0;
+}
+
+# Reads an arena snapshot into the empty *a: 1, or 0 on a bad read or no memory.
+fn _im_snap_get_arena(rd: *ImSnapReader, a: *ImArenaSnapshot): i64 {
+    var n = rd.count(3);
+    if (a.slots.reserve(n) == 0) { return 0; }
+    for (var i = 0; i < n * 3; i = i + 1) { store64(a.slots.data + i * 8, rd.w()); }
+    a.slots.len = n;
+    a.free_head = rd.w();
+    a.free_list_stale = rd.w();
+    if (rd.bad == 1) { return 0; }
+    return 1;
+}
+
+# Writes a pair list: its count, then two words a pair.
+fn _im_snap_put_pairs(wr: *ImSnapWriter, p: *ImPairList) {
+    wr.w(p.len);
+    wr.words(p.data, p.len * 2);
+    return 0;
+}
+
+# Reads a pair list into the empty *p: 1, or 0 on a bad read or no memory.
+fn _im_snap_get_pairs(rd: *ImSnapReader, p: *ImPairList): i64 {
+    var n = rd.count(2);
+    if (p.reserve(n) == 0) { return 0; }
+    for (var i = 0; i < n * 2; i = i + 1) { store64(p.data + i * 8, rd.w()); }
+    p.len = n;
+    if (rd.bad == 1) { return 0; }
+    return 1;
+}
+
+# Writes a tracker snapshot: the three pair lists, the flag, then the events (count, three words each).
+fn _im_snap_put_tracker(wr: *ImSnapWriter, t: *ImTrackerSnapshot) {
+    _im_snap_put_pairs(wr, t.prev);
+    _im_snap_put_pairs(wr, t.current);
+    _im_snap_put_pairs(wr, t.seen);
+    wr.w(t.recorded);
+    wr.w(t.events.len);
+    wr.words(t.events.data, t.events.len * 3);
+    return 0;
+}
+
+# Reads a tracker snapshot into the empty *t: 1, or 0 on a bad read or no memory.
+fn _im_snap_get_tracker(rd: *ImSnapReader, t: *ImTrackerSnapshot): i64 {
+    if (_im_snap_get_pairs(rd, t.prev) == 0 || _im_snap_get_pairs(rd, t.current) == 0) { return 0; }
+    if (_im_snap_get_pairs(rd, t.seen) == 0) { return 0; }
+    t.recorded = rd.flag();
+    var n = rd.count(3);
+    if (t.events.reserve(n) == 0) { return 0; }
+    for (var i = 0; i < n * 3; i = i + 1) { store64(t.events.data + i * 8, rd.w()); }
+    t.events.len = n;
+    if (rd.bad == 1) { return 0; }
+    return 1;
+}
+
+# Writes the config (16 words, its fields in order).
+fn _im_snap_put_config(wr: *ImSnapWriter, c: *ImWorldConfig) {
+    var ts: f64 = c.timestep;
+    var sl: f64 = c.position_slop;
+    var pc: f64 = c.position_correction;
+    var mv: f64 = c.max_velocity;
+    var fq: f64 = c.constraint_frequency;
+    var dr: f64 = c.constraint_damping_ratio;
+    wr.f(ts);
+    wr.v3(c.gravity);
+    wr.w(c.velocity_iterations);
+    wr.w(c.position_iterations);
+    wr.w(c.deterministic);
+    wr.w(c.step);
+    wr.f(sl);
+    wr.f(pc);
+    wr.f(mv);
+    wr.w(c.sub_steps);
+    wr.f(fq);
+    wr.f(dr);
+    wr.w(c.broadphase);
+    wr.w(c.solver);
+    return 0;
+}
+
+# Reads a config into *c.
+fn _im_snap_get_config(rd: *ImSnapReader, c: *ImWorldConfig) {
+    c.timestep = rd.f();
+    var g: ImVec3 = rd.v3();
+    c.gravity = g;
+    c.velocity_iterations = rd.w();
+    c.position_iterations = rd.w();
+    c.deterministic = rd.w();
+    c.step = rd.w();
+    c.position_slop = rd.f();
+    c.position_correction = rd.f();
+    c.max_velocity = rd.f();
+    c.sub_steps = rd.w();
+    c.constraint_frequency = rd.f();
+    c.constraint_damping_ratio = rd.f();
+    c.broadphase = rd.w();
+    c.solver = rd.w();
+    return 0;
+}
+
+# Writes particle p (20 words): handle, position, velocity, lifetime, radius, drag, restitution, gravity scale,
+# damping, then the sub-emitter (flag, count, speed, lifetime, radius, gravity scale, restitution; zeros for none).
+fn _im_snap_put_particle(wr: *ImSnapWriter, p: *ImParticle) {
+    var lt: f64 = p.lifetime;
+    var ra: f64 = p.radius;
+    var dg: f64 = p.drag;
+    var rs: f64 = p.restitution;
+    var gs: f64 = p.gravity_scale;
+    var dm: f64 = p.damping;
+    wr.w(p.handle);
+    wr.v3(p.position);
+    wr.v3(p.velocity);
+    wr.f(lt);
+    wr.f(ra);
+    wr.f(dg);
+    wr.f(rs);
+    wr.f(gs);
+    wr.f(dm);
+    wr.w(p.has_on_death_emit);
+    if (p.has_on_death_emit == 1) {
+        var sp: f64 = p.on_death_emit.speed;
+        var sl: f64 = p.on_death_emit.lifetime;
+        var sr: f64 = p.on_death_emit.radius;
+        var sg: f64 = p.on_death_emit.gravity_scale;
+        var se: f64 = p.on_death_emit.restitution;
+        wr.w(p.on_death_emit.count);
+        wr.f(sp);
+        wr.f(sl);
+        wr.f(sr);
+        wr.f(sg);
+        wr.f(se);
+    } else {
+        for (var z = 0; z < 6; z = z + 1) { wr.w(0); }
+    }
+    return 0;
+}
+
+# Reads a particle into *p.
+fn _im_snap_get_particle(rd: *ImSnapReader, p: *ImParticle) {
+    p.handle = rd.w();
+    var pos: ImVec3 = rd.v3();
+    var vel: ImVec3 = rd.v3();
+    p.position = pos;
+    p.velocity = vel;
+    p.lifetime = rd.f();
+    p.radius = rd.f();
+    p.drag = rd.f();
+    p.restitution = rd.f();
+    p.gravity_scale = rd.f();
+    p.damping = rd.f();
+    p.has_on_death_emit = rd.flag();
+    var cnt = rd.w();
+    var sp: f64 = rd.f();
+    var sl: f64 = rd.f();
+    var sr: f64 = rd.f();
+    var sg: f64 = rd.f();
+    var se: f64 = rd.f();
+    var sub: ImSubEmitter = ImSubEmitter_new(cnt, sp, sl, sr, sg, se);
+    p.on_death_emit = sub;
+    return 0;
+}
+
+# Writes emitter e (18 words, its fields in order).
+fn _im_snap_put_emitter(wr: *ImSnapWriter, e: *ImParticleEmitter) {
+    var ra: f64 = e.rate;
+    var lt: f64 = e.particle_lifetime;
+    var rd2: f64 = e.particle_radius;
+    var rs: f64 = e.particle_restitution;
+    var gs: f64 = e.particle_gravity_scale;
+    var dm: f64 = e.particle_damping;
+    var ac: f64 = e.accumulator;
+    wr.w(e.handle);
+    wr.v3(e.position);
+    wr.v3(e.velocity);
+    wr.v3(e.velocity_spread);
+    wr.f(ra);
+    wr.f(lt);
+    wr.f(rd2);
+    wr.f(rs);
+    wr.f(gs);
+    wr.f(dm);
+    wr.w(e.active);
+    wr.f(ac);
+    return 0;
+}
+
+# Reads an emitter into *e.
+fn _im_snap_get_emitter(rd: *ImSnapReader, e: *ImParticleEmitter) {
+    e.handle = rd.w();
+    var pos: ImVec3 = rd.v3();
+    var vel: ImVec3 = rd.v3();
+    var spr: ImVec3 = rd.v3();
+    e.position = pos;
+    e.velocity = vel;
+    e.velocity_spread = spr;
+    e.rate = rd.f();
+    e.particle_lifetime = rd.f();
+    e.particle_radius = rd.f();
+    e.particle_restitution = rd.f();
+    e.particle_gravity_scale = rd.f();
+    e.particle_damping = rd.f();
+    e.active = rd.flag();
+    e.accumulator = rd.f();
+    return 0;
+}
+
+# Writes force field f: its kind, then the radial field's center, strength, falloff and radius, or the directional
+# field's force, min and max. 1, or 0 for an unknown kind.
+fn _im_snap_put_field(wr: *ImSnapWriter, f: *ImForceField): i64 {
+    wr.w(f.kind);
+    if (f.kind == IM_FORCE_FIELD_RADIAL) {
+        var st: f64 = f.strength;
+        var fo: f64 = f.falloff;
+        var ra: f64 = f.radius;
+        wr.v3(f.center);
+        wr.f(st);
+        wr.f(fo);
+        wr.f(ra);
+    } elif (f.kind == IM_FORCE_FIELD_DIRECTIONAL) {
+        wr.v3(f.force);
+        wr.v3(f.min);
+        wr.v3(f.max);
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
+# Reads a force field into *f: 1, or 0 for an unknown kind (the read is then bad).
+fn _im_snap_get_field(rd: *ImSnapReader, f: *ImForceField): i64 {
+    var k = rd.w();
+    var g: ImForceField = ImForceField_radial(ImVec3_zero(), 0.0, 0.0, 0.0);
+    if (k == IM_FORCE_FIELD_RADIAL) {
+        var c: ImVec3 = rd.v3();
+        var st: f64 = rd.f();
+        var fo: f64 = rd.f();
+        var ra: f64 = rd.f();
+        g = ImForceField_radial(c, st, fo, ra);
+    } elif (k == IM_FORCE_FIELD_DIRECTIONAL) {
+        var fv: ImVec3 = rd.v3();
+        var lo: ImVec3 = rd.v3();
+        var hi: ImVec3 = rd.v3();
+        g = ImForceField_directional(fv, lo, hi);
+    } else {
+        rd.bad = 1;
+        return 0;
+    }
+    memcpy(f, &g, sizeof(ImForceField));
+    return 1;
+}

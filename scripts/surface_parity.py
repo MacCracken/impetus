@@ -125,10 +125,7 @@ PRIVATE_PREFIX = {"backend_2d/types": "_IM_B2_", "backend_3d/types": "_IM_B3_", 
                   "backend_3d/solver": "_IM_B3_"}
 PENDING_CONSTS = {}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
-PENDING_FNS = {
-    "serialize_world": "M6 part 2, the binary form (ADR 0013)",
-    "deserialize_world": "M6 part 2, the binary form (ADR 0013)",
-}
+PENDING_FNS = {}
 EXCEPTIONS = {
     "units::impl Display for Quantity": "`impl ImQuantity { fn fmt(self, sb) }`: src/fmtf.cyr's "
                                          "shortest digits in Rust's Display layout, then the symbol",

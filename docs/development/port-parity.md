@@ -1143,6 +1143,46 @@ fails when either drifts from `cyrius.cyml`.
   ELF, x86_64 PE and aarch64, where `tests/snapshot.tcyr` also passes. Surface parity is 662 across 30 modules:
   `serialize` joins, with `serialize_world` and `deserialize_world` pending part 2.
 
+## 26. M6b: the binary form (2026-11-10, ADR 0013)
+
+- **The format, version 1.** Little-endian 64-bit words. A five-word header holds the magic "IMPSNAP\0", the
+  version, the profile (2 for 2D), the payload length in words and the payload's FNV-1a, taken a word at a time. The
+  payload is:
+  - the world half: the config's 16 words, the two counters, then the particles (20 words each), emitters (18) and
+    force fields (kind and that kind's fields);
+  - the backend half: the body arena, then each body (its record's 28 words, then its collider list); the collider
+    arena and colliders (shape by kind); the joint arena and joints (joint type by kind); the manifolds (keys,
+    bodies, normal, points); the tracker.
+
+  An absent optional is a 0 flag and zero value words, and a payload enum writes only its variant's fields. So the
+  bytes depend only on the state, never on a record's unused fields. `src/snapshot.cyr` has the header, the word
+  writer and reader, and the shared records; `src/b2_snapshot.cyr` the backend half; `src/world_snapshot.cyr`
+  `to_bytes`, `ImWorldSnapshot_from_bytes`, `serialize_world` and `deserialize_world`.
+- **Reading defensively.** A length that is not whole words or is shorter than the header is refused, and so is a
+  wrong magic, version, profile, payload length or checksum. All of that happens before any field is read. Every
+  count is checked against the words left before anything is allocated, so a corrupted count can't ask for more
+  memory than the input's size. A read past the end, an unknown kind, a flag that isn't 0 or 1, or words left over
+  refuse the bytes. `restore` then runs the full checks of §25.
+- **Tests** (`tests/snapshot.tcyr`, 31 → 49 assertions):
+  - The five 2D tests of `serialize.rs` that use bytes (its JSON one waits for part 3). Two of Rust's assert a
+    tolerance of 1e-10; here they are exact.
+  - `restore_preserves_handle_allocation` and `restore_replaces_force_fields` through bytes, both `#[ignore]`d in
+    Rust.
+  - Cyrius-only tests:
+    - byte round trips in five scenes (bytes → snapshot → bytes, and bytes → world → bytes, unchanged);
+    - the header's five refusals;
+    - every whole-word prefix refused, and every truncated payload refused even behind a resealed header;
+    - a one-bit change in any word refused;
+    - 1,500 seeded corruptions behind a recomputed checksum, each either refused with the world unchanged or
+      restored to a world that steps and serializes again. That is Rust's `fuzz_serialize` contract, and both
+      outcomes occur.
+    - the checksum of all of one scene's words, pinned, so the bytes are checked to be the same on every target.
+- **Mutations.** Swapping two body fields on decode fails Rust's `step_exact_determinism` and the byte round trip.
+  Swapping a manifold point's two impulses on encode fails the round trip and the pin.
+- **Result:** 2D **98,874 ok, 0 failed, 6 pending**; 3D **29,404 ok**; the same on x86_64 ELF, x86_64 PE and aarch64,
+  where `tests/snapshot.tcyr` (pin included) also passes. Surface parity is 662 across 30 modules with nothing pending:
+  `serialize_world` and `deserialize_world` are in.
+
 ## How to reproduce
 
 ```sh

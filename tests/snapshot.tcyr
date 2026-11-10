@@ -1,11 +1,16 @@
-# snapshot.tcyr — 2D snapshots (M6 part 1, ADR 0013): `snapshot` and `restore` on the struct. Rust's snapshot tests go
-# through bytes and arrive with part 2; here are the struct-level ones: `restore_rejects_huge_handle_index` and
-# `restore_replaces_force_fields` (one of the two `#[ignore]`d in Rust), and Cyrius-only tests of an exact round trip,
-# step-equivalence (a restored world steps to the same bits, with the same events and next handles) in scenes with
-# contacts, joints, sleep, removals, forces, particles and sub-steps, every refusal leaving the world unchanged, and a
-# flat heap.
+# snapshot.tcyr — 2D snapshots (M6, ADR 0013). Part 1, the struct: `restore_rejects_huge_handle_index` and
+# `restore_replaces_force_fields` at the struct, and Cyrius-only tests of an exact round trip, step-equivalence (a
+# restored world steps to the same bits, with the same events and next handles) in scenes with contacts, joints, sleep,
+# removals, forces, particles and sub-steps, every refusal leaving the world unchanged, and a flat heap. Part 2, the
+# binary form: the five 2D tests of rust-old/src/serialize.rs that go through bytes (its JSON one waits for part 3),
+# `restore_preserves_handle_allocation` and `restore_replaces_force_fields` through bytes (both `#[ignore]`d in Rust),
+# and Cyrius-only tests of byte round trips, the header's refusals, every truncation, every one-word change, seeded
+# corruption behind a recomputed checksum (fuzz_serialize's contract) and the bytes' target independence.
 
 include "tests/lib_2d.cyr"
+
+# The checksum of every word of scene 2's bytes after 33 frames (bytes_are_target_independent).
+var PIN_SUM = 0 - 287178870282660922;
 
 # ── comparing snapshots, bit for bit ────────────────────────────────────────────────
 
@@ -270,6 +275,68 @@ fn take(k, n, out: *ImWorldSnapshot) {
     return 0;
 }
 
+# ── the binary form ─────────────────────────────────────────────────────────────────
+
+# A seeded LCG step (Knuth's MMIX constants).
+var _lcg = 88172645463325252;
+# The next pseudo-random word.
+fn lcg(): i64 {
+    _lcg = _lcg * 6364136223846793005 + 1442695040888963407;
+    return (_lcg >> 17) & 0x7FFFFFFFFFFF;
+}
+
+# Rewrites the header's payload length and checksum of the n bytes at b (after an edit to the payload).
+fn reseal(b, n) {
+    var words = n / 8 - 5;
+    store64(b + 24, words);
+    store64(b + 32, _im_snap_checksum(b + 40, words));
+    return 0;
+}
+
+# 1 when deserializing the n bytes at b into a world holding scene 1 is refused and leaves it unchanged. With
+# `steps_ok` 1, an accepted snapshot also counts, provided the world then steps three times and serializes again
+# (Rust's fuzz_serialize contract).
+fn bytes_refused(b, n, steps_ok): i64 {
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    scene(&w, 1);
+    var before: ImWorldSnapshot = ImWorldSnapshot_new();
+    w.snapshot(&before);
+    var t, v = deserialize_world(&w, b, n);
+    var r = 0;
+    if (is_ok(t) == 0) {
+        var after: ImWorldSnapshot = ImWorldSnapshot_new();
+        w.snapshot(&after);
+        if (v == IM_ERR_DESERIALIZE || v == IM_ERR_INVALID_CONFIG || v == IM_ERR_UNSUPPORTED) {
+            r = snap_eq(&before, &after);
+        }
+        after.free();
+    } elif (steps_ok == 1) {
+        for (var s = 0; s < 3; s = s + 1) { w.step(); }
+        var again: ImWordList = ImWordList_new();
+        var ta, va = serialize_world(&w, &again);
+        r = is_ok(ta);
+        again.free();
+    }
+    before.free();
+    w.free();
+    return r;
+}
+
+# The bytes of scene k after n frames into *out.
+fn scene_bytes(k, n, out: *ImWordList) {
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    scene(&w, k);
+    for (var i = 0; i < n; i = i + 1) { w.step(); }
+    var t, v = serialize_world(&w, out);
+    w.free();
+    return is_ok(t);
+}
+
+# A ball of radius r (Rust's `ColliderDesc`, material m) on a body of type t at (x, y): its handle.
+fn rust_ball(w: *ImPhysicsWorld, t, x: f64, y: f64, r: f64, m: ImPhysicsMaterial): i64 {
+    return body(w, t, x, y, 0.0, ImColliderShape_ball(r), m);
+}
+
 # Runs the snapshot tests.
 fn main() {
     alloc_init();
@@ -448,6 +515,251 @@ fn main() {
     assert_eq(is_ok(tm), 1, "a Mouse joint's second body may be missing");
     mw.free();
     s3.free();
+
+    # ── serialize.rs, through bytes ──
+    test_group("roundtrip_empty_world");
+    var e1: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    var eb: ImWordList = ImWordList_new();
+    var te1, ve1 = serialize_world(&e1, &eb);
+    var e2: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    var te2, ve2 = deserialize_world(&e2, eb.data, eb.len * 8);
+    var ets1: f64 = e1.timestep();
+    var ets2: f64 = e2.timestep();
+    assert_eq(is_ok(te1) == 1 && is_ok(te2) == 1 && e2.body_count() == 0 && ets1 == ets2, 1, "empty, timestep kept");
+    e1.free();
+    e2.free();
+
+    test_group("roundtrip_with_bodies");
+    var r1: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    rust_ball(&r1, IM_BODY_DYNAMIC, 5.0, 10.0, 1.0, ImPhysicsMaterial_rubber());
+    body(&r1, IM_BODY_STATIC, 0.0, 0.0, 0.0, ImColliderShape_box(50.0, 0.5, 0.0), ImPhysicsMaterial_wood());
+    for (var s10 = 0; s10 < 10; s10 = s10 + 1) { r1.step(); }
+    var rb1: ImWordList = ImWordList_new();
+    var tr1, vr1 = serialize_world(&r1, &rb1);
+    var r2: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    var tr2, vr2 = deserialize_world(&r2, rb1.data, rb1.len * 8);
+    assert_eq(is_ok(tr1) == 1 && rb1.len > 0 && is_ok(tr2) == 1, 1, "bytes written and read");
+    assert_eq(r2.body_count() == 2 && r2.current_step() == r1.current_step(), 1, "two bodies, the same step");
+    r1.free();
+    r2.free();
+
+    test_group("roundtrip_preserves_positions");
+    var p1: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    var pb = rust_ball(&p1, IM_BODY_DYNAMIC, 0.0, 10.0, 0.5, ImPhysicsMaterial_default());
+    for (var s30 = 0; s30 < 30; s30 = s30 + 1) { p1.step(); }
+    var sb4: ImBodyState;
+    p1.get_body_state(pb, &sb4);
+    var pbytes: ImWordList = ImWordList_new();
+    serialize_world(&p1, &pbytes);
+    var p2: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    deserialize_world(&p2, pbytes.data, pbytes.len * 8);
+    var sa4: ImBodyState;
+    var tp, vp = p2.get_body_state(pb, &sa4);
+    var py1: f64 = sb4.position.y;
+    var py2: f64 = sa4.position.y;
+    var vy1: f64 = sb4.linear_velocity.y;
+    var vy2: f64 = sa4.linear_velocity.y;
+    assert_eq(is_ok(tp) == 1 && py1 == py2 && vy1 == vy2, 1, "position and velocity kept (exactly; Rust: 1e-10)");
+    p1.free();
+    p2.free();
+
+    test_group("roundtrip_continues_simulation");
+    var zg: ImWorldConfig = ImWorldConfig_default();
+    zg.gravity = ImVec3_zero();
+    var c1: ImPhysicsWorld = ImPhysicsWorld_new(zg);
+    var cb = rust_ball(&c1, IM_BODY_DYNAMIC, 0.0, 0.0, 0.5, ImPhysicsMaterial_default());
+    var cst: ImBodyState;
+    c1.get_body_state(cb, &cst);
+    cst.linear_velocity = ImVec3_new(1.0, 0.0, 0.0);
+    c1.set_body_state(cb, cst);
+    for (var c10 = 0; c10 < 10; c10 = c10 + 1) { c1.step(); }
+    c1.get_body_state(cb, &cst);
+    var save_x: f64 = cst.position.x;
+    var cbytes: ImWordList = ImWordList_new();
+    serialize_world(&c1, &cbytes);
+    var c2: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    deserialize_world(&c2, cbytes.data, cbytes.len * 8);
+    for (var c20 = 0; c20 < 10; c20 = c20 + 1) { c2.step(); }
+    c2.get_body_state(cb, &cst);
+    var after_x: f64 = cst.position.x;
+    assert_eq(after_x > save_x, 1, "it keeps moving");
+    c1.free();
+    c2.free();
+
+    test_group("step_exact_determinism");
+    var da: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    scene(&da, 0);
+    for (var d50 = 0; d50 < 50; d50 = d50 + 1) { da.step(); }
+    var dbytes: ImWordList = ImWordList_new();
+    serialize_world(&da, &dbytes);
+    var dr: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    deserialize_world(&dr, dbytes.data, dbytes.len * 8);
+    for (var d100 = 0; d100 < 100; d100 = d100 + 1) { dr.step(); }
+    var dbw: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    scene(&dbw, 0);
+    for (var d150 = 0; d150 < 150; d150 = d150 + 1) { dbw.step(); }
+    var bsa: ImBodyState;
+    var bsb: ImBodyState;
+    dr.get_body_state(_im_arena_handle(1, 0), &bsa);
+    dbw.get_body_state(_im_arena_handle(1, 0), &bsb);
+    assert_eq(memeq(&bsa, &bsb, sizeof(ImBodyState)) == 1 && same_world(&dr, &dbw) == 1, 1,
+      "restored at 50 and stepped 100 = 150 straight, bit for bit (Rust: within 1e-10)");
+    da.free();
+    dr.free();
+    dbw.free();
+
+    # ── regressions.rs, through bytes ──
+    test_group("restore_preserves_handle_allocation");
+    var h1: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    var hh[32];
+    for (var hi = 0; hi < 4; hi = hi + 1) {
+        var hd: ImBodyDesc = ImBodyDesc_default();
+        var hx: f64 = f64_from(hi) * 3.0;
+        hd.position = ImVec3_new(hx, 0.0, 0.0);
+        store64(&hh + hi * 8, h1.add_body(hd));
+    }
+    h1.remove_body(load64(&hh));
+    h1.remove_body(load64(&hh + 16));
+    var hbytes: ImWordList = ImWordList_new();
+    serialize_world(&h1, &hbytes);
+    var h2: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    deserialize_world(&h2, hbytes.data, hbytes.len * 8);
+    var ha1 = h1.add_body(ImBodyDesc_default());
+    var ha2 = h2.add_body(ImBodyDesc_default());
+    var hb1 = h1.add_body(ImBodyDesc_default());
+    var hb2 = h2.add_body(ImBodyDesc_default());
+    assert_eq(ha1 == ha2 && hb1 == hb2, 1, "the next handles are the original's (#[ignore]d in Rust)");
+    h1.free();
+    h2.free();
+
+    test_group("restore_replaces_force_fields_bytes");
+    var g1: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    g1.add_force_field(ImForceField_directional(ImVec3_new(1.0, 0.0, 0.0), ImVec3_new(-1.0, -1.0, -1.0),
+        ImVec3_new(1.0, 1.0, 1.0)));
+    var gbytes: ImWordList = ImWordList_new();
+    serialize_world(&g1, &gbytes);
+    var g2: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    g2.add_force_field(ImForceField_radial(ImVec3_zero(), 1.0, 2.0, 1.0));
+    var tgf, vgf = deserialize_world(&g2, gbytes.data, gbytes.len * 8);
+    var ga, gn1 = g1.force_fields();
+    var gb, gn2 = g2.force_fields();
+    assert_eq(is_ok(tgf) == 1 && gn1 == 1 && gn2 == 1 && memeq(ga, gb, sizeof(ImForceField)) == 1, 1,
+      "the fields are the bytes' (#[ignore]d in Rust)");
+    g1.free();
+    g2.free();
+
+    # ── Cyrius-only: the binary form ──
+    test_group("byte_round_trips");
+    var bt = 1;
+    for (var bk = 0; bk < 5; bk = bk + 1) {
+        var xb1: ImWordList = ImWordList_new();
+        scene_bytes(bk, 37, &xb1);
+        var bs1: ImWorldSnapshot = ImWorldSnapshot_new();
+        var tb1, vb1 = ImWorldSnapshot_from_bytes(xb1.data, xb1.len * 8, &bs1);
+        var xb2: ImWordList = ImWordList_new();
+        var tb2, vb2 = bs1.to_bytes(&xb2);
+        var bw: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+        var tb3, vb3 = deserialize_world(&bw, xb1.data, xb1.len * 8);
+        var xb3: ImWordList = ImWordList_new();
+        serialize_world(&bw, &xb3);
+        if (is_ok(tb1) == 0 || is_ok(tb2) == 0 || is_ok(tb3) == 0) { bt = 0; }
+        if (xb1.len != xb2.len || memeq(xb1.data, xb2.data, xb1.len * 8) == 0) { bt = 0; }
+        if (xb1.len != xb3.len || memeq(xb1.data, xb3.data, xb1.len * 8) == 0) { bt = 0; }
+        xb1.free();
+        xb2.free();
+        xb3.free();
+        bs1.free();
+        bw.free();
+    }
+    assert_eq(bt, 1, "bytes → snapshot → bytes, and bytes → world → bytes, unchanged in every scene");
+
+    test_group("header_refusals");
+    var xb: ImWordList = ImWordList_new();
+    scene_bytes(1, 20, &xb);
+    var xn = xb.len * 8;
+    assert_eq(bytes_refused(xb.data, 0, 0) + bytes_refused(xb.data, 39, 0) + bytes_refused(xb.data, xn - 3, 0), 3,
+      "empty, shorter than the header, not whole words");
+    var keep = load64(xb.data);
+    store64(xb.data, keep ^ 1);
+    var r_magic = bytes_refused(xb.data, xn, 0);
+    store64(xb.data, keep);
+    store64(xb.data + 8, 2);
+    var r_ver = bytes_refused(xb.data, xn, 0);
+    store64(xb.data + 8, 1);
+    store64(xb.data + 16, 3);
+    var r_prof = bytes_refused(xb.data, xn, 0);
+    store64(xb.data + 16, 2);
+    store64(xb.data + 24, load64(xb.data + 24) - 1);
+    var r_len = bytes_refused(xb.data, xn, 0);
+    store64(xb.data + 24, load64(xb.data + 24) + 1);
+    store64(xb.data + 32, load64(xb.data + 32) + 1);
+    var r_sum = bytes_refused(xb.data, xn, 0);
+    store64(xb.data + 32, load64(xb.data + 32) - 1);
+    assert_eq(r_magic + r_ver + r_prof + r_len + r_sum, 5, "a wrong magic, version, profile, length or checksum");
+    assert_eq(bytes_refused(xb.data, xn, 0), 0, "(the untouched bytes restore)");
+
+    test_group("every_truncation_refused");
+    var tr_all = 1;
+    for (var cut = 0; cut < xn; cut = cut + 8) {
+        if (bytes_refused(xb.data, cut, 0) == 0) { tr_all = 0; }
+    }
+    assert_eq(tr_all, 1, "every whole-word prefix refused by the header");
+    var tp_all = 1;
+    var copy = fl_alloc(xn);
+    for (var pc = 5; pc < xb.len; pc = pc + 1) {
+        memcpy(copy, xb.data, pc * 8);
+        reseal(copy, pc * 8);
+        if (bytes_refused(copy, pc * 8, 0) == 0) { tp_all = 0; }
+    }
+    assert_eq(tp_all, 1, "every truncated payload refused, even behind a resealed header");
+
+    test_group("every_word_change_refused");
+    var flip_all = 1;
+    for (var fw = 0; fw < xb.len; fw = fw + 1) {
+        memcpy(copy, xb.data, xn);
+        store64(copy + fw * 8, load64(copy + fw * 8) ^ (1 << (fw % 64)));
+        if (bytes_refused(copy, xn, 0) == 0) { flip_all = 0; }
+    }
+    assert_eq(flip_all, 1, "a one-bit change in any word refused (the checksum, or the header)");
+
+    test_group("corruption_behind_a_resealed_checksum");
+    # Rust's fuzz_serialize contract: damaged bytes never crash; an accepted one steps and serializes again.
+    var fz = 1;
+    var accepted = 0;
+    for (var fi = 0; fi < 1500; fi = fi + 1) {
+        memcpy(copy, xb.data, xn);
+        var nmut = 1 + (lcg() % 3);
+        for (var mu = 0; mu < nmut; mu = mu + 1) {
+            var at = 5 + (lcg() % (xb.len - 5));
+            var kind = lcg() % 4;
+            if (kind == 0) { store64(copy + at * 8, lcg()); }
+            if (kind == 1) { store64(copy + at * 8, load64(copy + at * 8) + 1); }
+            if (kind == 2) { store64(copy + at * 8, 0 - 1); }
+            if (kind == 3) { store64(copy + at * 8, load64(copy + at * 8) ^ (1 << (lcg() % 64))); }
+        }
+        reseal(copy, xn);
+        var t9, v9 = ImWorldSnapshot_from_bytes(copy, xn, &snap);
+        if (is_ok(t9) == 1) {
+            var w9: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+            var tr9, vr9 = w9.restore(&snap);
+            if (is_ok(tr9) == 1) { accepted = accepted + 1; }
+            w9.free();
+            snap.free();
+        }
+        if (bytes_refused(copy, xn, 1) == 0) { fz = 0; }
+    }
+    assert_eq(fz, 1, "1,500 corruptions: each refused with the world unchanged, or restored and stepping");
+    assert_eq(accepted > 0 && accepted < 1500, 1, "(some corruptions are values a world can hold)");
+    fl_free(copy);
+
+    test_group("bytes_are_target_independent");
+    # The same scene gives the same bytes on every target: pinned here, checked on x86_64 ELF, x86_64 PE and aarch64.
+    var pin: ImWordList = ImWordList_new();
+    scene_bytes(2, 33, &pin);
+    var pin_sum = _im_snap_checksum(pin.data, pin.len);
+    assert_eq(pin_sum, PIN_SUM, "scene 2 after 33 frames: the pinned checksum of all its words");
+    pin.free();
+    xb.free();
 
     test_group("flat_heap_snapshots");
     # Snapshot and restore, round and round: after warm-up the heap stays put.

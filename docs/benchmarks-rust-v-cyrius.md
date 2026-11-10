@@ -560,3 +560,24 @@ with part 2. These rows run Rust's scenes at the struct (ADR 0013): a capture in
 About 2 µs a body each way. Each body copies its record (224 B), its collider's record (320 B) with the shape, and
 allocates its collider list; how the 2 µs splits between them is not profiled yet. Part 2 sets Rust's byte rows beside
 these.
+
+## M6 part 2: the binary form against Rust (2026-11-10)
+
+x86_64 ELF, quiet machine. Rust's rows are criterion on the default 2D build with `serialize` (`cargo bench --features
+serialize -- snapshot/`, medians), which writes bitcode. Cyrius writes ADR 0013's binary form into a reused buffer.
+
+| Bench | Body | Rust | Cyrius | Ratio |
+|---|---|---|---|---|
+| `snapshot/serialize_empty` | an empty world's bytes | 1.35 µs | 2.24 µs | 1.7× |
+| `snapshot/serialize_100_bodies` | 100 balls in rows of 10 | 14.5 µs | 282 µs | 19× |
+| `snapshot/roundtrip_100_bodies` | those bytes into a fresh world | 33.6 µs | 357 µs | 11× |
+
+**Reading it.**
+- **The two snapshots hold different amounts.** Rust 1.4.0 writes descriptors and the kinematic state. The port
+  writes the whole state: mass properties, accumulators, sleep timers, arena slots, collider lists, manifolds and
+  the tracker. In the port a body with one collider is 30 words, and a ball collider another 19.
+- **The capture dominates.** `serialize_100_bodies` is a capture (208 µs, part 1's struct row) plus 74 µs of encoding
+  and frees. The capture copies whole records and allocates a list per body. Part 1 left its 2 µs a body
+  unprofiled, and it still is.
+- **Recorded, not acted on**: speed is measured, not gated. Part 5 (benches and the close) is the place to profile
+  the capture.

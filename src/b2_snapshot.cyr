@@ -42,6 +42,9 @@ struct ImWorldSnapshot {
     tracker: ImTrackerSnapshot;
 }
 
+# The binary form's profile word for this profile (ADR 0013).
+const _IM_SNAP_PROFILE = 2;
+
 #must_use
 fn _im_as_body_snap(p): *ImBodySnapshot { return p; }
 #must_use
@@ -304,6 +307,237 @@ impl ImWorldSnapshot {
             st.manifolds.len = m + 1;
         }
         return self.tracker.load(st.contact_tracker);
+    }
+
+    # ── the binary form (ADR 0013, version 1): the backend half ──
+    # The body arena, then each body (28 words, its record's fields in order, then its collider list); the collider
+    # arena, then each collider (handle, body, shape, offset, material, sensor flag, optional mass, layer, mask); the
+    # joint arena, then each joint (handle, bodies, joint type, anchors, optional motor, damping, optional break force,
+    # reference angle); the manifolds (keys, bodies, normal, point count, seven words a point, rolling impulse); the
+    # tracker.
+
+    # Writes the backend half: 1, or 0 for a shape or joint type of unknown kind.
+    fn _encode_backend(self, wr: *ImSnapWriter): i64 {
+        _im_snap_put_arena(wr, self.body_arena);
+        wr.w(self.bodies.len);
+        for (var i = 0; i < self.bodies.len; i = i + 1) {
+            var r = self.bodies.at(i);
+            var b: *ImRigidBody2d = _im_b2_as_body(r);
+            var rot: f64 = b.rotation;
+            var av: f64 = b.angular_velocity;
+            var ld: f64 = b.linear_damping;
+            var ad: f64 = b.angular_damping;
+            var gs: f64 = b.gravity_scale;
+            var tq: f64 = b.torque_accumulator;
+            var ms: f64 = b.mass;
+            var im: f64 = b.inv_mass;
+            var it: f64 = b.inertia;
+            var ii: f64 = b.inv_inertia;
+            var pa: f64 = b.pseudo_angular_velocity;
+            var pr: f64 = b.prev_rotation;
+            var st: f64 = b.sleep_timer;
+            wr.w(b.handle);
+            wr.w(b.body_type);
+            wr.v2(b.position);
+            wr.f(rot);
+            wr.v2(b.linear_velocity);
+            wr.f(av);
+            wr.f(ld);
+            wr.f(ad);
+            wr.w(b.fixed_rotation);
+            wr.f(gs);
+            wr.v2(b.force_accumulator);
+            wr.f(tq);
+            wr.f(ms);
+            wr.f(im);
+            wr.f(it);
+            wr.f(ii);
+            wr.v2(b.pseudo_velocity);
+            wr.f(pa);
+            wr.v2(b.prev_position);
+            wr.f(pr);
+            wr.w(b.is_sleeping);
+            wr.f(st);
+            wr.w(b.island_id);
+            var l: *ImWordList = _im_b2_snap_list(r);
+            wr.w(l.len);
+            wr.words(l.data, l.len);
+        }
+        _im_snap_put_arena(wr, self.collider_arena);
+        wr.w(self.colliders.len);
+        for (var c = 0; c < self.colliders.len; c = c + 1) {
+            var cp: *ImCollider2d = _im_b2_as_coll(self.colliders.at(c));
+            var cm: f64 = cp.mass;
+            wr.w(cp.handle);
+            wr.w(cp.body);
+            if (_im_snap_put_shape(wr, cp.shape) == 0) { return 0; }
+            wr.v2(cp.offset);
+            _im_snap_put_material(wr, cp.material);
+            wr.w(cp.is_sensor);
+            wr.opt_f(cp.has_mass, cm);
+            wr.w(cp.collision_layer);
+            wr.w(cp.collision_mask);
+        }
+        _im_snap_put_arena(wr, self.joint_arena);
+        wr.w(self.joints.len);
+        for (var j = 0; j < self.joints.len; j = j + 1) {
+            var js: *ImJointSnapshot = _im_as_joint_snap(self.joints.at(j));
+            var tv: f64 = js.joint.motor.target_velocity;
+            var mf: f64 = js.joint.motor.max_force;
+            var dp: f64 = js.joint.damping;
+            var bf: f64 = js.joint.break_force;
+            var ra: f64 = js.joint.reference_angle;
+            wr.w(js.handle);
+            wr.w(js.joint.body_a);
+            wr.w(js.joint.body_b);
+            if (_im_snap_put_joint_type(wr, js.joint.joint_type) == 0) { return 0; }
+            wr.v2(js.joint.local_anchor_a);
+            wr.v2(js.joint.local_anchor_b);
+            wr.w(js.joint.has_motor);
+            if (js.joint.has_motor == 1) {
+                wr.f(tv);
+                wr.f(mf);
+            } else {
+                wr.w(0);
+                wr.w(0);
+            }
+            wr.f(dp);
+            wr.opt_f(js.joint.has_break_force, bf);
+            wr.f(ra);
+        }
+        wr.w(self.manifolds.len);
+        for (var m = 0; m < self.manifolds.len; m = m + 1) {
+            var mn: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(m));
+            var ri: f64 = mn.rolling_impulse;
+            wr.w(mn.collider_a);
+            wr.w(mn.collider_b);
+            wr.w(mn.body_a);
+            wr.w(mn.body_b);
+            wr.v2(mn.normal);
+            wr.w(mn.point_count);
+            wr.words(mn.points, mn.point_count * 7);
+            wr.f(ri);
+        }
+        _im_snap_put_tracker(wr, self.tracker);
+        return 1;
+    }
+
+    # Reads the backend half into this empty snapshot: 1, or 0 on a bad read, an unknown kind or no memory (what was
+    # read stays owned by the snapshot, for `free`).
+    fn _decode_backend(self, rd: *ImSnapReader): i64 {
+        if (_im_snap_get_arena(rd, self.body_arena) == 0) { return 0; }
+        var nb = rd.count(29);
+        if (self.bodies.reserve(nb) == 0) { return 0; }
+        var empty: ImWordList = ImWordList_new();
+        for (var i = 0; i < nb; i = i + 1) {
+            var r = self.bodies.at(i);
+            var b: *ImRigidBody2d = _im_b2_as_body(r);
+            var dl: *ImWordList = _im_b2_snap_list(r);
+            memcpy(dl, &empty, sizeof(ImWordList));
+            self.bodies.len = i + 1;
+            b.handle = rd.w();
+            b.body_type = rd.w();
+            var pos: ImVec2 = rd.v2();
+            b.position = pos;
+            b.rotation = rd.f();
+            var lv: ImVec2 = rd.v2();
+            b.linear_velocity = lv;
+            b.angular_velocity = rd.f();
+            b.linear_damping = rd.f();
+            b.angular_damping = rd.f();
+            b.fixed_rotation = rd.flag();
+            b.gravity_scale = rd.f();
+            var fa: ImVec2 = rd.v2();
+            b.force_accumulator = fa;
+            b.torque_accumulator = rd.f();
+            b.mass = rd.f();
+            b.inv_mass = rd.f();
+            b.inertia = rd.f();
+            b.inv_inertia = rd.f();
+            var pv: ImVec2 = rd.v2();
+            b.pseudo_velocity = pv;
+            b.pseudo_angular_velocity = rd.f();
+            var pp: ImVec2 = rd.v2();
+            b.prev_position = pp;
+            b.prev_rotation = rd.f();
+            b.is_sleeping = rd.flag();
+            b.sleep_timer = rd.f();
+            b.island_id = rd.w();
+            var nl = rd.count(1);
+            if (dl.reserve(nl) == 0) { return 0; }
+            for (var q = 0; q < nl; q = q + 1) { dl.push(rd.w()); }
+            if (rd.bad == 1) { return 0; }
+        }
+        if (_im_snap_get_arena(rd, self.collider_arena) == 0) { return 0; }
+        # A collider is at least 19 words (a ball or an empty hull).
+        var nc = rd.count(19);
+        if (self.colliders.reserve(nc) == 0) { return 0; }
+        var sh: ImColliderShape;
+        for (var c = 0; c < nc; c = c + 1) {
+            var cp: *ImCollider2d = _im_b2_as_coll(self.colliders.at(c));
+            cp.handle = rd.w();
+            cp.body = rd.w();
+            if (_im_snap_get_shape(rd, &sh) == 0) { return 0; }
+            cp.shape = sh;
+            self.colliders.len = c + 1;
+            var off: ImVec2 = rd.v2();
+            cp.offset = off;
+            _im_snap_get_material(rd, cp.material);
+            cp.is_sensor = rd.flag();
+            cp.has_mass = rd.flag();
+            cp.mass = rd.f();
+            cp.collision_layer = rd.w();
+            cp.collision_mask = rd.w();
+            if (rd.bad == 1) { return 0; }
+        }
+        if (_im_snap_get_arena(rd, self.joint_arena) == 0) { return 0; }
+        # A Fixed joint is the shortest: 15 words.
+        var nj = rd.count(15);
+        if (self.joints.reserve(nj) == 0) { return 0; }
+        var jt: ImJointType;
+        for (var j = 0; j < nj; j = j + 1) {
+            var js: *ImJointSnapshot = _im_as_joint_snap(self.joints.at(j));
+            js.handle = rd.w();
+            js.joint.body_a = rd.w();
+            js.joint.body_b = rd.w();
+            if (_im_snap_get_joint_type(rd, &jt) == 0) { return 0; }
+            js.joint.joint_type = jt;
+            var la: ImVec2 = rd.v2();
+            var lb: ImVec2 = rd.v2();
+            js.joint.local_anchor_a = la;
+            js.joint.local_anchor_b = lb;
+            js.joint.has_motor = rd.flag();
+            var tv: f64 = rd.f();
+            var mf: f64 = rd.f();
+            var mo: ImJointMotor = ImJointMotor_new(tv, mf);
+            js.joint.motor = mo;
+            js.joint.damping = rd.f();
+            js.joint.has_break_force = rd.flag();
+            js.joint.break_force = rd.f();
+            js.joint.reference_angle = rd.f();
+            self.joints.len = j + 1;
+            if (rd.bad == 1) { return 0; }
+        }
+        var nm = rd.count(8);
+        if (self.manifolds.reserve(nm) == 0) { return 0; }
+        for (var m = 0; m < nm; m = m + 1) {
+            var mn: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(m));
+            mn.points = 0;
+            mn.point_count = 0;
+            self.manifolds.len = m + 1;
+            mn.collider_a = rd.w();
+            mn.collider_b = rd.w();
+            mn.body_a = rd.w();
+            mn.body_b = rd.w();
+            var nv: ImVec2 = rd.v2();
+            mn.normal = nv;
+            var np = rd.count(7);
+            mn.points = rd.words(np * 7);
+            mn.point_count = np;
+            mn.rolling_impulse = rd.f();
+            if (rd.bad == 1) { return 0; }
+        }
+        return _im_snap_get_tracker(rd, self.tracker);
     }
 
     # Releases the backend half: the collider lists, shapes, manifold points, arenas and tracker.

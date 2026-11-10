@@ -46,9 +46,11 @@ steps to the same bits and hands out the same handles.
 - **The binary form, version 1.** Little-endian 64-bit words, the same bytes on every target (ADR 0008 #7). A header
   of five words: the magic, the format version, the profile (2 or 3), the payload's length in words, and a 64-bit
   FNV-1a over the payload words (h ← (h ⊕ w) × 0x100000001b3 from 0xcbf29ce484222325). Any one changed word changes it,
-  since each step maps h one to one. Integers are words, f64 are their bits, flags are 0 or 1, a missing optional is
-  a 0 flag word and its value word. A wrong magic, version, profile, length or checksum is refused before any field
-  is read.
+  since each step maps h one to one. Integers are words, f64 are their bits, flags are 0 or 1, an absent optional is a
+  0 flag and zero value words, a list is its count then its items, and a payload enum (shape, joint type, force
+  field) is its kind then that variant's own fields. So the bytes depend only on the state, never on a record's
+  unused fields. The magic is "IMPSNAP\0". A wrong magic, version, profile, length or checksum is refused before any
+  field is read, and every count is checked against the words left before anything is allocated.
 - **JSON.** serde's form for the struct, each record's field names as keys, enums by variant name, an absent optional
   as `null` (ADR 0010's conventions), with the format and profile as the first keys. It has no checksum, since it is
   meant to be read and edited; it gets the same validation.

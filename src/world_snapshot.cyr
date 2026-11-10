@@ -100,3 +100,125 @@ impl ImPhysicsWorld {
         return Ok(0);
     }
 }
+
+# ── the binary form (ADR 0013, version 1) ───────────────────────────────────────────
+# The payload is the world half (the config, the two counters, then the particles, emitters and force fields, each a
+# count and its records), then the profile's backend half. src/snapshot.cyr has the header and the word codec.
+
+impl ImWorldSnapshot {
+    # Writes the world half: 1, or 0 for a force field of unknown kind.
+    fn _encode_world(self, wr: *ImSnapWriter): i64 {
+        _im_snap_put_config(wr, self.config);
+        wr.w(self.next_particle_id);
+        wr.w(self.next_emitter_id);
+        wr.w(self.particles.len);
+        for (var i = 0; i < self.particles.len; i = i + 1) {
+            _im_snap_put_particle(wr, _im_as_particle(self.particles.at(i)));
+        }
+        wr.w(self.emitters.len);
+        for (var e = 0; e < self.emitters.len; e = e + 1) {
+            _im_snap_put_emitter(wr, _im_as_emitter(self.emitters.at(e)));
+        }
+        wr.w(self.force_fields.len);
+        for (var f = 0; f < self.force_fields.len; f = f + 1) {
+            if (_im_snap_put_field(wr, _im_as_force_field(self.force_fields.at(f))) == 0) { return 0; }
+        }
+        return 1;
+    }
+
+    # Reads the world half into this empty snapshot: 1, or 0 on a bad read or no memory.
+    fn _decode_world(self, rd: *ImSnapReader): i64 {
+        _im_snap_get_config(rd, self.config);
+        self.next_particle_id = rd.w();
+        self.next_emitter_id = rd.w();
+        var np = rd.count(20);
+        if (self.particles.reserve(np) == 0) { return 0; }
+        for (var i = 0; i < np; i = i + 1) {
+            _im_snap_get_particle(rd, _im_as_particle(self.particles.at(i)));
+            self.particles.len = i + 1;
+        }
+        var ne = rd.count(18);
+        if (self.emitters.reserve(ne) == 0) { return 0; }
+        for (var e = 0; e < ne; e = e + 1) {
+            _im_snap_get_emitter(rd, _im_as_emitter(self.emitters.at(e)));
+            self.emitters.len = e + 1;
+        }
+        var nf = rd.count(7);
+        if (self.force_fields.reserve(nf) == 0) { return 0; }
+        for (var f = 0; f < nf; f = f + 1) {
+            if (_im_snap_get_field(rd, _im_as_force_field(self.force_fields.at(f))) == 0) { return 0; }
+            self.force_fields.len = f + 1;
+        }
+        if (rd.bad == 1) { return 0; }
+        return 1;
+    }
+
+    # The snapshot's binary form into out, replacing what it held: Ok(0), or Err(IM_ERR_SERIALIZE) when there is no
+    # memory or a shape, joint type or force field has an unknown kind. The bytes are out.data, out.len × 8 of them: the
+    # header (magic, version, profile, payload length, checksum), then the payload. The snapshot is not checked here;
+    # `restore` checks it. ADR 0013.
+    fn to_bytes(self, out: *ImWordList): Result {
+        out.len = 0;
+        var wr: ImSnapWriter = _im_snap_writer(out);
+        for (var h = 0; h < _IM_SNAP_HEADER; h = h + 1) { wr.w(0); }
+        if (self._encode_world(&wr) == 0 || self._encode_backend(&wr) == 0) { return Err(IM_ERR_SERIALIZE); }
+        if (wr.bad == 1) { return Err(IM_ERR_SERIALIZE); }
+        var n = out.len - _IM_SNAP_HEADER;
+        var payload = out.data + _IM_SNAP_HEADER * 8;
+        store64(out.data, _IM_SNAP_MAGIC);
+        store64(out.data + 8, _IM_SNAP_VERSION);
+        store64(out.data + 16, _IM_SNAP_PROFILE);
+        store64(out.data + 24, n);
+        store64(out.data + 32, _im_snap_checksum(payload, n));
+        return Ok(0);
+    }
+}
+
+# Reads the binary form at buf (len bytes) into *out (overwritten; free it after): Ok(0), or Err(IM_ERR_DESERIALIZE) for
+# a length not a whole number of words or shorter than the header, a wrong magic, version or profile, a payload length
+# that disagrees, a checksum that doesn't match, a malformed or truncated payload, or no memory. A snapshot read here is
+# checked in full by `restore`. ADR 0013.
+fn ImWorldSnapshot_from_bytes(buf, len, out: *ImWorldSnapshot): Result {
+    if (len < _IM_SNAP_HEADER * 8 || (len % 8) != 0) { return Err(IM_ERR_DESERIALIZE); }
+    var words = len / 8;
+    var n = load64(buf + 24);
+    if (load64(buf) != _IM_SNAP_MAGIC || load64(buf + 8) != _IM_SNAP_VERSION) { return Err(IM_ERR_DESERIALIZE); }
+    if (load64(buf + 16) != _IM_SNAP_PROFILE || n != words - _IM_SNAP_HEADER) { return Err(IM_ERR_DESERIALIZE); }
+    var payload = buf + _IM_SNAP_HEADER * 8;
+    if (_im_snap_checksum(payload, n) != load64(buf + 32)) { return Err(IM_ERR_DESERIALIZE); }
+    var s: ImWorldSnapshot = ImWorldSnapshot_new();
+    var rd: ImSnapReader = _im_snap_reader(payload, n);
+    var ok = s._decode_world(&rd);
+    if (ok == 1) { ok = s._decode_backend(&rd); }
+    if (ok == 0 || rd.bad == 1 || rd.at != n) {
+        s.free();
+        return Err(IM_ERR_DESERIALIZE);
+    }
+    memcpy(out, &s, sizeof(ImWorldSnapshot));
+    return Ok(0);
+}
+
+# The world's binary form into out (ADR 0013): `snapshot`, then `to_bytes`. Ok(0), or Err(IM_ERR_SERIALIZE). Mirrors
+# `serialize_world`; its bytes are Cyrius's own, not Rust's bitcode.
+fn serialize_world(w: *ImPhysicsWorld, out: *ImWordList): Result {
+    var s: ImWorldSnapshot = ImWorldSnapshot_new();
+    var t, v = w.snapshot(&s);
+    if (is_ok(t) == 0) { return Err(v); }
+    var tb, vb = s.to_bytes(out);
+    s.free();
+    if (is_ok(tb) == 0) { return Err(vb); }
+    return Ok(0);
+}
+
+# Restores world w from the binary form at buf (len bytes): `ImWorldSnapshot_from_bytes`, then `restore`. Ok(0), or
+# their error; on any error the world is unchanged. Mirrors `deserialize_world`.
+fn deserialize_world(w: *ImPhysicsWorld, buf, len): Result {
+    var s: ImWorldSnapshot = ImWorldSnapshot_new();
+    var t, v = ImWorldSnapshot_from_bytes(buf, len, &s);
+    if (is_ok(t) == 0) { return Err(v); }
+    var tr, vr = w.restore(&s);
+    s.free();
+    if (is_ok(tr) == 0) { return Err(vr); }
+    return Ok(0);
+}
+
