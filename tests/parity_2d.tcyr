@@ -139,7 +139,7 @@ fn _par_math(fp, fl): i64 {
     # Rust's y.atan2(x) is the golden f64::atan2(y, x): inputs in C order.
     if (_par_eq(fp, fl, "f64::atan2") == 1) { _par_got_f(_im_atan2(_par_in(0), _par_in(1))); return 1; }
     if (_par_eq(fp, fl, "f64::hypot") == 1) { var r: f64 = _im_hypot(x, y); _par_got_f(r); return 1; }
-    if (_par_eq(fp, fl, "f64::powf") == 1) { var r: f64 = ganita_f64_pow(x, y); _par_got_f(r); return 1; }
+    if (_par_eq(fp, fl, "f64::powf") == 1) { var r: f64 = _im_powf(x, y); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::max") == 1) { var r: f64 = _im_max(x, y); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::min") == 1) { var r: f64 = _im_min(x, y); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::clamp") == 1) {
@@ -1732,6 +1732,169 @@ fn _par_b2_step(fp, fl): i64 {
     return 1;
 }
 
+# ── M3d: world steps ────────────────────────────────────────────────────────────────
+# A `world::step` row is the config, the world's own state (the particle and emitter counters, the
+# particles, emitters and force fields) and the backend dump; the port loads all three into an
+# ImPhysicsWorld, steps it, and writes them again with the frame's events.
+
+# The world's own state at token k into w (fresh): the token after it.
+fn _par_load_world(w: *ImPhysicsWorld, k0): i64 {
+    var k = k0;
+    w.next_particle_id = _par_in(k);
+    w.next_emitter_id = _par_in(k + 1);
+    k = k + 2;
+    var np = _par_in(k);
+    k = k + 1;
+    var p: ImParticle;
+    for (var i = 0; i < np; i = i + 1) {
+        p = ImParticle_new(_par_in_v3(k + 1), _par_in_v3(k + 4), _par_in_f(k + 7));
+        p.handle = _par_in(k);
+        p.radius = _par_in_f(k + 8);
+        p.drag = _par_in_f(k + 9);
+        p.restitution = _par_in_f(k + 10);
+        p.gravity_scale = _par_in_f(k + 11);
+        p.damping = _par_in_f(k + 12);
+        if (_par_in_is_none(k + 13) == 1) {
+            k = k + 14;
+        } else {
+            p.has_on_death_emit = 1;
+            p.on_death_emit = ImSubEmitter_new(_par_in(k + 13), _par_in_f(k + 14), _par_in_f(k + 15), _par_in_f(k + 16),
+              _par_in_f(k + 17), _par_in_f(k + 18));
+            k = k + 19;
+        }
+        w.particles.push(&p);
+    }
+    var ne = _par_in(k);
+    k = k + 1;
+    var e: ImParticleEmitter;
+    for (var j = 0; j < ne; j = j + 1) {
+        e = ImParticleEmitter_new(_par_in_v3(k + 1), _par_in_v3(k + 4), _par_in_f(k + 10));
+        e.handle = _par_in(k);
+        e.velocity_spread = _par_in_v3(k + 7);
+        e.particle_lifetime = _par_in_f(k + 11);
+        e.particle_radius = _par_in_f(k + 12);
+        e.particle_restitution = _par_in_f(k + 13);
+        e.particle_gravity_scale = _par_in_f(k + 14);
+        e.particle_damping = _par_in_f(k + 15);
+        e.active = _par_in(k + 16);
+        e.accumulator = _par_in_f(k + 17);
+        w.emitters.push(&e);
+        k = k + 18;
+    }
+    var nf = _par_in(k);
+    k = k + 1;
+    var f: ImForceField;
+    for (var q = 0; q < nf; q = q + 1) {
+        if (_par_in_enum_is(k, "ForceField.", "Radial") == 1) {
+            f = ImForceField_radial(_par_in_v3(k + 1), _par_in_f(k + 4), _par_in_f(k + 5), _par_in_f(k + 6));
+            k = k + 7;
+        } else {
+            f = ImForceField_directional(_par_in_v3(k + 1), _par_in_v3(k + 4), _par_in_v3(k + 7));
+            k = k + 10;
+        }
+        w.force_fields.push(&f);
+    }
+    return k;
+}
+
+fn _par_got_world(w: *ImPhysicsWorld) {
+    _par_got_config(w.config);
+    _par_got_i(w.next_particle_id);
+    _par_got_i(w.next_emitter_id);
+    _par_got_seq(w.particles.len);
+    for (var i = 0; i < w.particles.len; i = i + 1) {
+        var p: *ImParticle = _im_as_particle(w.particles.at(i));
+        _par_got_i(p.handle);
+        _par_got_v3(p.position);
+        _par_got_v3(p.velocity);
+        var pa: f64 = p.lifetime;
+        var pb: f64 = p.radius;
+        var pc: f64 = p.drag;
+        var pd: f64 = p.restitution;
+        var pe: f64 = p.gravity_scale;
+        var pf: f64 = p.damping;
+        _par_got_f(pa);
+        _par_got_f(pb);
+        _par_got_f(pc);
+        _par_got_f(pd);
+        _par_got_f(pe);
+        _par_got_f(pf);
+        if (p.has_on_death_emit == 1) {
+            _par_got_i(p.on_death_emit.count);
+            var sa: f64 = p.on_death_emit.speed;
+            var sb: f64 = p.on_death_emit.lifetime;
+            var sc: f64 = p.on_death_emit.radius;
+            var sd: f64 = p.on_death_emit.gravity_scale;
+            var se: f64 = p.on_death_emit.restitution;
+            _par_got_f(sa);
+            _par_got_f(sb);
+            _par_got_f(sc);
+            _par_got_f(sd);
+            _par_got_f(se);
+        } else {
+            _par_got_none();
+        }
+    }
+    _par_got_seq(w.emitters.len);
+    for (var j = 0; j < w.emitters.len; j = j + 1) {
+        var e: *ImParticleEmitter = _im_as_emitter(w.emitters.at(j));
+        _par_got_i(e.handle);
+        _par_got_v3(e.position);
+        _par_got_v3(e.velocity);
+        _par_got_v3(e.velocity_spread);
+        var ea: f64 = e.rate;
+        var eb: f64 = e.particle_lifetime;
+        var ec: f64 = e.particle_radius;
+        var ed: f64 = e.particle_restitution;
+        var ee: f64 = e.particle_gravity_scale;
+        var ef: f64 = e.particle_damping;
+        var eg: f64 = e.accumulator;
+        _par_got_f(ea);
+        _par_got_f(eb);
+        _par_got_f(ec);
+        _par_got_f(ed);
+        _par_got_f(ee);
+        _par_got_f(ef);
+        _par_got_i(e.active);
+        _par_got_f(eg);
+    }
+    _par_got_seq(w.force_fields.len);
+    for (var q = 0; q < w.force_fields.len; q = q + 1) {
+        var f: *ImForceField = _im_as_force_field(w.force_fields.at(q));
+        _par_got_enum("ForceField.", force_field_kind_name(f.kind));
+        if (f.kind == IM_FORCE_FIELD_RADIAL) {
+            _par_got_v3(f.center);
+            var fa: f64 = f.strength;
+            var fb: f64 = f.falloff;
+            var fc: f64 = f.radius;
+            _par_got_f(fa);
+            _par_got_f(fb);
+            _par_got_f(fc);
+        } else {
+            _par_got_v3(f.force);
+            _par_got_v3(f.min);
+            _par_got_v3(f.max);
+        }
+    }
+    _par_got_state(w.backend);
+    return 0;
+}
+
+fn _par_world_step(fp, fl): i64 {
+    if (_par_eq(fp, fl, "world::step") != 1) { return 0; }
+    var cfg: ImWorldConfig = _par_in_config(0);
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    var k = _par_load_world(&w, 16);
+    _par_load_state(w.backend, k);
+    w.step();
+    _par_got_world(&w);
+    var ev, n = w.collision_events();
+    _par_got_seq(n);
+    for (var e = 0; e < n; e = e + 1) { _par_got_event(ev + e * sizeof(ImCollisionEvent)); }
+    w.free();
+    return 1;
+}
+
 # `f64::fmt_display` and `serde_json::f64` rows: src/fmtf.cyr's two layouts (ADR 0010).
 fn _par_fmtf(fp, fl): i64 {
     var x: f64 = _par_in(0);
@@ -2100,6 +2263,7 @@ fn _par_dispatch(mp, ml, fp, fl): i64 {
     if (_par_eq(mp, ml, "b2_ray") == 1) { return _par_b2_ray(fp, fl); }
     if (_par_eq(mp, ml, "b2_state") == 1) { return _par_b2_state(fp, fl); }
     if (_par_eq(mp, ml, "b2_step") == 1 || _par_eq(mp, ml, "b2_contact") == 1) { return _par_b2_step(fp, fl); }
+    if (_par_eq(mp, ml, "world_step") == 1) { return _par_world_step(fp, fl); }
     if (_par_eq(mp, ml, "broadphase") == 1) { return _par_broadphase(fp, fl); }
     if (_par_eq(mp, ml, "config") == 1) { return _par_config(fp, fl); }
     if (_par_eq(mp, ml, "fmtf") == 1) { return _par_fmtf(fp, fl); }
@@ -2195,8 +2359,8 @@ fn _par_shadows(mp, ml, fp, fl, cls) {
 #
 # On correctly rounded primitives (ADR 0011) the bound is 0: the port and the corrected oracle
 # evaluate the same operations on the same correctly rounded results, so any difference is a defect.
-# That covers exp, sin, cos, sin_cos, hypot, the spring step and the narrowphase; atan2 and powf
-# keep 2.
+# That covers exp, sin, cos, sin_cos, hypot, pow, the spring step, the narrowphase and the step; atan2
+# keeps 2.
 #must_use
 fn _par_c_bound(fp, fl): i64 {
     if (_par_eq(fp, fl, "f64::sin_cos") == 1) { return 0; }
@@ -2207,9 +2371,10 @@ fn _par_c_bound(fp, fl): i64 {
     if (_par_eq(fp, fl, "b2::contacts") == 1) { return 0; }
     if (_par_eq(fp, fl, "b2::raycast") == 1) { return 0; }
     if (_par_eq(fp, fl, "b2::step") == 1) { return 0; }
+    if (_par_eq(fp, fl, "world::step") == 1) { return 0; }
     if (_par_eq(fp, fl, "f64::atan2") == 1) { return 2; }
     if (_par_eq(fp, fl, "f64::hypot") == 1) { return 0; }
-    if (_par_eq(fp, fl, "f64::powf") == 1) { return 2; }
+    if (_par_eq(fp, fl, "f64::powf") == 1) { return 0; }
     return 0 - 1;
 }
 
@@ -2220,10 +2385,7 @@ fn _par_c_bound(fp, fl): i64 {
 fn _par_accepted(fp, fl, ip, il): i64 {
     # ADR 0008 #6: a `validate` row the port refuses as XPBD (mapped by the config dispatcher).
     if (_par_mapped == 8) { return 8; }
-    # ADR 0009: ganita pow(-1, DBL_MAX) gives +inf instead of 1 (tanmatra ADR 0007, kimiya ADR 0004).
-    if (_par_eq(fp, fl, "f64::powf") == 1 && _par_eq(ip, il, "f:bff0000000000000 f:7fefffffffffffff") == 1) {
-        return 9;
-    }
+    # (ADR 0009's pow(-1, DBL_MAX) row needs no entry since crmath's pow replaced ganita's: it is ok.)
     return 0;
 }
 

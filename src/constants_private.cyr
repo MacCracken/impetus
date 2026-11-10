@@ -80,3 +80,23 @@ const _IM_B2_MAX_MANIFOLD_POINTS = 4;
 var _IM_B2_WARM_START_FACTOR: f64 = 0.95;
 
 # FALLBACK is not carried: the (1, [0, 0], 1) tuple local to `shape_props`, written in place in src/b2_types.cyr.
+
+# ── rust-old/src/world.rs ──
+
+# MAX_SNAPSHOT_INDEX is not carried: the snapshot code's public cap on restored handle indices, carried with M6.
+
+# Softening length for radial force fields.
+# Rust: `FIELD_SOFTENING: f64 = 0.01`
+var _IM_FIELD_SOFTENING: f64 = 0.01;
+
+# Most particles one emitter may spawn in a single step.
+# Rust: `MAX_SPAWNS_PER_EMITTER_STEP: usize = 10_000`
+const _IM_MAX_SPAWNS_PER_EMITTER_STEP = 10000;
+
+# R3 sequence increments: 1/φ₃, 1/φ₃², 1/φ₃³ with φ₃ ≈ 1.2207 the plastic-like
+# root of x⁴ = x + 1 (Roberts, "The Unreasonable Effectiveness of
+# Quasirandom Sequences").
+# Rust: `R3_ALPHA: [f64; 3] = [0.819_172_513_396_164_4, 0.671_043_606_703_789_2, 0.549_700_477_901_970_4]`
+var _IM_R3_ALPHA_0: f64 = 0.8191725133961644;
+var _IM_R3_ALPHA_1: f64 = 0.6710436067037892;
+var _IM_R3_ALPHA_2: f64 = 0.5497004779019704;

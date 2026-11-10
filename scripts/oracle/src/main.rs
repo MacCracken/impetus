@@ -57,6 +57,8 @@ mod m_spring;
 mod m_types;
 mod m_units;
 #[cfg(not(feature = "b3"))]
+mod m_world;
+#[cfg(not(feature = "b3"))]
 mod shapes;
 mod t_constants;
 mod t_private;
@@ -108,6 +110,8 @@ fn golden_modules() -> Vec<tsv::Module> {
             m_spring::emit(),
             m_types::emit(),
             m_units::emit(),
+            #[cfg(not(feature = "b3"))]
+            m_world::emit(),
         ]
     }
 }

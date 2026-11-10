@@ -253,6 +253,30 @@ fn bench_hypot_cr() {
     return 0;
 }
 
+# The correctly rounded pow (ADR 0011, amended for pow) against ganita's, on the radial force field's
+# form: a base d² + ε² near 4, the exponent falloff/2 = 0.75.
+fn bench_pow_cr() {
+    var b = bench_new("math/pow_cr");
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var x: f64 = 4.0001 + f64_from(i & 1023) * 0.000001;
+        var r: f64 = _im_powf(x, 0.75);
+        g_sink = _im_bits(r);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+    var g = bench_new("math/pow_ganita");
+    bench_batch_start(g);
+    for (var j = 0; j < NS; j = j + 1) {
+        var x2: f64 = 4.0001 + f64_from(j & 1023) * 0.000001;
+        var r2: f64 = ganita_f64_pow(x2, 0.75);
+        g_sink = _im_bits(r2);
+    }
+    bench_batch_stop(g, NS);
+    bench_report(g);
+    return 0;
+}
+
 fn bench_exp_cr() {
     var b = bench_new("math/exp_cr");
     var x: f64 = -0.3;
@@ -632,6 +656,104 @@ fn bench_step_balls(name, n, per, warm, reps) {
     return 0;
 }
 
+# Rust's world/step_N_bodies scene through the world (M3d): n balls in rows of `per`, falling together.
+fn bench_world_balls(name, n, per, warm, reps) {
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    for (var i = 0; i < n; i = i + 1) {
+        var d: ImBodyDesc = ImBodyDesc_default();
+        var x: f64 = f64_from(i % per);
+        var y: f64 = f64_from(i / per) * 2.0;
+        d.position = ImVec3_new(x, y, 0.0);
+        var h = w.add_body(d);
+        var t, c = w.add_collider(h, ImColliderDesc_new(ImColliderShape_ball(0.5)));
+    }
+    for (var k = 0; k < warm; k = k + 1) { w.step(); }
+    var bn = bench_new(name);
+    bench_batch_start(bn);
+    for (var r = 0; r < reps; r = r + 1) { w.step(); }
+    bench_batch_stop(bn, reps);
+    bench_report(bn);
+    w.free();
+    return 0;
+}
+
+# A fresh world with n particles of radius 0.05 in rows of `per`, 2 apart from y = 5 (Rust's
+# particles/step_N_particles), one step timed per sample.
+fn bench_fresh_particles(name, n, per, reps) {
+    var bn = bench_new(name);
+    for (var r = 0; r < reps; r = r + 1) {
+        var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+        for (var i = 0; i < n; i = i + 1) {
+            var x: f64 = f64_from(i % per);
+            var y: f64 = f64_from(i / per) * 2.0 + 5.0;
+            var p: ImParticle = ImParticle_new(ImVec3_new(x, y, 0.0), ImVec3_zero(), 100.0);
+            p.with_radius(0.05);
+            w.spawn_particle(p);
+        }
+        bench_start(bn);
+        w.step();
+        bench_stop(bn);
+        w.free();
+    }
+    bench_report(bn);
+    return 0;
+}
+
+# The world (M3d) against Rust's world/* and particles/* rows.
+fn bench_world() {
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    var be = bench_new("world/step_empty");
+    bench_batch_start(be);
+    for (var r = 0; r < 100000; r = r + 1) { w.step(); }
+    bench_batch_stop(be, 100000);
+    bench_report(be);
+    w.free();
+    bench_world_balls("world/step_10_bodies", 10, 5, 100, 2000);
+    bench_world_balls("world/step_100_bodies", 100, 10, 100, 200);
+    bench_world_balls("world/step_1000_bodies", 1000, 32, 20, 20);
+    bench_fresh_particles("particles/step_100_particles", 100, 10, 2000);
+    bench_fresh_particles("particles/step_1000_particles", 1000, 32, 200);
+    # A floor and 100 falling particles, stepped on and on as criterion does (they expire at 10 s).
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var fd: ImBodyDesc = ImBodyDesc_default();
+    fd.body_type = IM_BODY_STATIC;
+    var fh = w.add_body(fd);
+    var tf, cf = w.add_collider(fh, ImColliderDesc_new(ImColliderShape_box(50.0, 0.5, 0.0)));
+    for (var i = 0; i < 100; i = i + 1) {
+        var x: f64 = f64_from(i % 10);
+        var y: f64 = f64_from(i / 10) + 1.0;
+        var p: ImParticle = ImParticle_new(ImVec3_new(x, y, 0.0), ImVec3_new(0.0, -2.0, 0.0), 10.0);
+        p.with_radius(0.05).with_restitution(0.5);
+        w.spawn_particle(p);
+    }
+    var bf = bench_new("particles/step_100_particles_with_floor");
+    bench_batch_start(bf);
+    for (var r2 = 0; r2 < 100000; r2 = r2 + 1) { w.step(); }
+    bench_batch_stop(bf, 100000);
+    bench_report(bf);
+    w.free();
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var bs = bench_new("particles/spawn_particle");
+    bench_batch_start(bs);
+    for (var r3 = 0; r3 < 100000; r3 = r3 + 1) {
+        g_sink = w.spawn_particle(ImParticle_new(ImVec3_zero(), ImVec3_new(1.0, 2.0, 0.0), 3.0));
+    }
+    bench_batch_stop(bs, 100000);
+    bench_report(bs);
+    w.free();
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var em: ImParticleEmitter = ImParticleEmitter_new(ImVec3_zero(), ImVec3_new(0.0, 10.0, 0.0), 100.0);
+    em.with_lifetime(0.5);
+    w.add_emitter(em);
+    var bm = bench_new("particles/emitter_step");
+    bench_batch_start(bm);
+    for (var r4 = 0; r4 < 100000; r4 = r4 + 1) { w.step(); }
+    bench_batch_stop(bm, 100000);
+    bench_report(bm);
+    w.free();
+    return 0;
+}
+
 # The 2D step with contacts (M3c): Rust's world/step_* scenes through the backend, and a settled stack
 # of five boxes (two-point manifolds through the block solver, warm started).
 fn bench_step() {
@@ -695,6 +817,7 @@ fn main(): i64 {
     bench_exp_cr();
     bench_sin_cos_cr();
     bench_hypot_cr();
+    bench_pow_cr();
     bench_aabb_tree_row();
     bench_spatial_hash_row();
     bench_b2_add_collider_mass();
@@ -705,6 +828,7 @@ fn main(): i64 {
     bench_states();
     bench_joints();
     bench_step();
+    bench_world();
     return 0;
 }
 

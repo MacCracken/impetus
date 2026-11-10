@@ -34,9 +34,10 @@ MODULES = [
     "body", "collider", "joint", "event", "query", "arena", "contact_tracker", "spring",
     "aabb_tree", "spatial_hash", "backend_2d/types", "backend_2d/narrowphase",
     "backend_2d/raycast", "backend_2d/state", "backend_2d/joints", "backend_2d/solver",
+    "particle", "world",
 ]
 PENDING_MODULES = {
-    "backend_2d/tests": "M3", "particle": "M3", "world": "M3",
+    "backend_2d/tests": "M3",
     "backend_3d/types": "M4", "backend_3d/narrowphase": "M4", "backend_3d/raycast": "M4",
     "backend_3d/solver": "M5", "backend_3d/joints": "M5", "backend_3d/state": "M5",
     "backend_3d/tests": "M5", "serialize": "M6",
@@ -54,12 +55,13 @@ NOT_APPLICABLE_MODULES = {
 # the enum check finds the kind enum, the struct is `Im<Name>`.
 ENUM_NAMES = {
     "ImpetusError": "ImError", "ColliderShape": "ImShapeKind", "JointType": "ImJointKind",
-    "CollisionEvent": "ImEventKind",
+    "CollisionEvent": "ImEventKind", "ForceField": "ImForceFieldKind",
 }
 ENUM_PREFIX = {
     "ImpetusError": "IM_ERR_", "BroadphaseKind": "IM_BROADPHASE_", "SolverKind": "IM_SOLVER_",
     "CombineRule": "IM_COMBINE_", "PhysicsUnit": "IM_UNIT_", "BodyType": "IM_BODY_",
     "ColliderShape": "IM_SHAPE_", "JointType": "IM_JOINT_", "CollisionEvent": "IM_EVENT_",
+    "ForceField": "IM_FORCE_FIELD_",
 }
 # Rust function -> the Cyrius function that provides it, where the naming rules give another name.
 FN_RENAMES = {
@@ -101,7 +103,11 @@ FIELD_RENAMES = {
 PRIVATE_PREFIX = {"backend_2d/types": "_IM_B2_"}
 PENDING_CONSTS = {"MAX_SNAPSHOT_INDEX": "M6, with the snapshot module"}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
-PENDING_FNS = {}
+PENDING_FNS = {
+    "PhysicsWorld::snapshot": "M6, with the snapshot module",
+    "PhysicsWorld::restore": "M6 (ADR 0008 #2: one fallible restore)",
+    "PhysicsWorld::try_restore": "M6 (ADR 0008 #2: one fallible restore)",
+}
 EXCEPTIONS = {
     "units::impl Display for Quantity": "`impl ImQuantity { fn fmt(self, sb) }`: src/fmtf.cyr's "
                                          "shortest digits in Rust's Display layout, then the symbol",
@@ -110,6 +116,10 @@ EXCEPTIONS = {
     "collider::ColliderHandle": "a handle is a bare word (src/types.cyr)",
     "joint::JointHandle": "a handle is a bare word (src/types.cyr)",
     "arena::ArenaHandle": "a handle is a bare word; _im_arena_handle builds one",
+    "particle::ParticleHandle": "a particle id is a bare word the world assigns (src/particle.cyr)",
+    "particle::EmitterHandle": "an emitter id is a bare word the world assigns (src/particle.cyr)",
+    "world::PhysicsWorld::oracle_dump": "the oracle hook (Rust-only port tooling); the world_step rows "
+                                        "read ImPhysicsWorld's fields",
     "contact_tracker::type PairKey": "a pair key is two handle words; ImPairList holds them",
     "arena::Arena::oracle_dump": "the oracle hook (Rust-only port tooling); M3's dump rows read the "
                                  "port's slots through ImArena's fields",

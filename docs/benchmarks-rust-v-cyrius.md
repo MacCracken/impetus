@@ -270,3 +270,39 @@ sides time a world that has already stepped (criterion's warm-up; 20–100 frame
   manifold, and `hypot` (168 ns) in the circle contacts. The 10-ball scene pays the most for both, relative to its
   size.
 - **Not acted on.** Speed is measured, not gated. These are first numbers.
+
+## M3 part 4: the world, its particles, and a correctly rounded pow (2026-11-09)
+
+Rust's `world/*` and `particles/*` rows (criterion, the latest `rust-old/bench-history.csv` run) against the same
+scenes through `ImPhysicsWorld`. x86_64 ELF. The two `step_N_particles` rows time one step of a fresh world per sample,
+as Rust's `iter_custom` does. The others step one world on and on, as criterion does: the floor scene's particles have
+expired before most of its 100,000 iterations, and the emitter scene holds about 50 live particles.
+
+| Bench | Body | Rust | Cyrius | Cyrius / Rust |
+|---|---|---|---|---|
+| `world/step_empty` | an empty world's step | 115 ns | 403 ns | 3.5× |
+| `world/step_10_bodies` | 10 balls in rows of 5 | 4.31 µs | 28.1 µs | 6.5× |
+| `world/step_100_bodies` | 100 balls in rows of 10 | 101 µs | 355 µs | 3.5× |
+| `world/step_1000_bodies` | 1,000 balls in rows of 32 | 853 µs | 3.81 ms | 4.5× |
+| `particles/step_100_particles` | a fresh world's first step, 100 particles | 1.95 µs | 9.92 µs | 5.1× |
+| `particles/step_1000_particles` | the same with 1,000 | 5.49 µs | 93.0 µs | 17× |
+| `particles/step_100_particles_with_floor` | a floor and 100 falling particles, stepped on | 444 ns | 1.89 µs | 4.3× |
+| `particles/spawn_particle` | spawn one particle | 20.1 ns | 694 ns | 35× |
+| `particles/emitter_step` | an emitter at 100/s, lifetime 0.5 | 493 ns | 18.5 µs | 37× |
+| `math/pow_cr` | the correctly rounded pow, at the force field's form (x ≈ 4, y = 0.75) | — | 755 ns | — |
+| `math/pow_ganita` | ganita's pow, the same arguments | — | 200 ns | — |
+
+**Reading it.**
+- **The world adds nothing measurable to the backend.** Its rows are within 5 % of the `b2/step_*` rows: the frame
+  counter, an empty particle pass and the event copy are small.
+- **The slow particle rows are S5 again.** A particle is a 136-byte record:
+  - `spawn_particle` copies it three times, by the stdlib's byte-loop `memcpy` (the value parameter, the local, the
+    push);
+  - `emitter_step` removes one expired particle from the front about every frame, and Rust's `retain` order means
+    every later record moves.
+
+  The 1,000-particle step is one integration per particle. Most of it is the record's field traffic.
+- **pow costs 3.8× ganita's.** Phase 1 decides over 99 % of arguments with a double-double log, whose series runs 4
+  terms in double-double and 11 more in double, and exp's table phase. The first design ran the full double-double
+  series and exp's phase 2 on every call: 5.4 µs.
+- **Not acted on.** Speed is measured, not gated: S5 is filed with the cyrius memcpy issue, and pow is a first number.

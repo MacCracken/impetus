@@ -577,6 +577,55 @@ fails when either drifts from `cyrius.cyml`.
 - **Result, every target:** 17 modules, 0 failing; **98,194 ok, 0 failed, 0 measured, 7 pending, 166 accepted**
   (ADR 0011: 70).
 
+## 16. M3d: correctly rounded pow, the world and its particles (2026-11-09)
+
+- **pow first** (ADR 0011, amended for pow). The radial force field is the port's one `powf`, and ganita's misrounds
+  9.62 % of ordinary arguments. So crmath gained `_im_cr_pow`, correctly rounded everywhere.
+  - Two double-double phases: log x by the atanh series, relative near 1 (measured worst 2^-73.2 in phase 1 and
+    2^-103.4 in phase 2), then exp.
+  - A slow path with an exactness test for the dyadic results. 25^11.5 = 5^23 is a 54-bit tie, and glibc 2.44
+    misrounds the subnormal ties of §8. Otherwise the 364-bit fixed point.
+  - It matches MPFR on 1,290,769 pairs on the final code.
+  - The 1,030 `f64::powf` rows are now gated at 0 ulp, the ADR 0009 row among them. glibc is correctly rounded on all
+    1,030, so there is no correction file. ADR 0009 is superseded.
+- **The modules:**
+  - `src/particle.cyr`: `ImParticle`, `ImParticleEmitter`, `ImSubEmitter` and the payload form of `ForceField`, with
+    Rust's builders, which chain on a pointer.
+  - `src/world.cyr`: `ImPhysicsWorld` and its 2D step. That is the frame counter, the backend's sub-steps and events,
+    then the particles: emitter spawns with the R3 spread and the 10,000 cap, gravity, fields, drag, damping,
+    collisions with balls, boxes, capsules and segments, sub-emitters, and removal of the dead.
+  - The API follows Rust's with ADR 0008's changes (#1, #6). Slices come back as (address, count). Snapshots wait for
+    M6, and particle JSON for a later part.
+  - `FIELD_SOFTENING`, `MAX_SPAWNS_PER_EMITTER_STEP` and the `R3_ALPHA` array are generated (`t_private.rs` now reads
+    multi-line array constants).
+- **`world_step.tsv`**, 198 rows: the config, the world's own state (counters, particles, emitters with their spawn
+  accumulator, fields) and the backend dump in; the same after `step()`, with the frame's events, out.
+  - The generator reads the emitter's private `accumulator` through `serde_json`, which carries it exactly, so
+    `rust-old/` is untouched.
+  - The scenes:
+    - emitters: valid, inactive, NaN rate, negative rate, sub-stepped, several spawns a frame;
+    - radial fields at falloffs 0, 0.7, 1, 1.5 and 2, with a reach limit, a particle at the centre, and repulsion;
+    - a directional wind box;
+    - drag, one case of which would reverse the motion, and damping;
+    - collisions with every shape kind: a sensor, a hull that collides with nothing, a particle starting inside a
+      box, a zero radius, three restitutions;
+    - a kinematic paddle and a dynamic box;
+    - sub-emitters bursting into 1 to 13 children;
+    - particles under a field beside contact events;
+    - 30 seeded scenes.
+
+  Class C. **All 0 ulp** (68,166 floats) on three targets, on the first run.
+- **The transcription.** `validate.py` now transcribes the world step: the backend frame, then the particles on
+  glibc's sin, cos and pow. It reproduces all 198 rows bit for bit. MPFR changes none of them, so there is no
+  `world_step.cr.tsv`.
+- **Rust tests.** All 22 of `world.rs` are ported (its four XPBD tests excepted), 6 of `particle.rs` (its two serde
+  tests wait for particle JSON), 9 of `tests/integration.rs`, and 26 of `tests/regressions.rs` (the 2D ones; the three
+  snapshot tests wait for M6). That makes `tests/world.tcyr` (50 assertions, with Cyrius-only checks of `try_new`, the
+  spawn cap, emitter removal and a flat heap) and `tests/regressions.tcyr` (44).
+- **Result, every target:** 18 modules, 0 failing; **98,393 ok, 0 failed, 0 measured, 7 pending, 165 accepted**
+  (ADR 0011: 70). The ELF and PE digests are equal (their `powf` digest is new). On aarch64 only the native shadows
+  differ.
+
 ## How to reproduce
 
 ```sh

@@ -100,6 +100,13 @@ fn _im_hypot(x: f64, y: f64): f64 {
     return r;
 }
 
+# x^y, correctly rounded (src/crmath.cyr, ADR 0011 as amended for pow). Stands for `f64::powf`.
+#must_use
+fn _im_powf(x: f64, y: f64): f64 {
+    var r: f64 = _im_cr_pow(x, y);
+    return r;
+}
+
 # (sin x, cos x), each correctly rounded (src/crmath.cyr). Stands for `f64::sin_cos`, which is
 # Rust's (x.sin(), x.cos()). Read as `var s, c = _im_sin_cos(x);` and bind each to an f64 local.
 #must_use

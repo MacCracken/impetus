@@ -293,6 +293,30 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - Surface parity is 418/418 across 21 modules. It now skips `#[cfg(test)]` helpers.
     `RESTITUTION_VELOCITY_THRESHOLD` and `MAX_CONDITION_NUMBER` are generated.
   - The parity harness names a failing row's first differing output.
+- **Cyrius port, M3 part 4: correctly rounded pow, the world and its particles**
+  (`docs/development/port-parity.md` §16):
+  - **pow** (ADR 0011 amended; ADR 0009 superseded). `src/crmath.cyr` gains `_im_cr_pow`, correctly
+    rounded on every input with C99 Annex F's specials.
+    - Two double-double phases: log x by the atanh series, then exp.
+    - A slow path that computes dyadic results exactly, its ties to even, and otherwise uses the
+      364-bit fixed point.
+    - It matches MPFR on 1,290,769 pairs, and ganita's pow misrounds 9.62 % of ordinary arguments.
+    - `f64::powf` rows are gated at 0 ulp. The `pow(-1, DBL_MAX)` row is an ordinary match.
+  - `src/particle.cyr`: particles, emitters, sub-emitters and force fields, with Rust's builders.
+  - `src/world.cyr`: `ImPhysicsWorld`, the 2D world. Its step runs the frame counter, the backend's
+    sub-steps and events, then the particles: spawns with the R3 spread and the 10,000 cap, gravity,
+    radial and directional fields, quadratic drag, damping, collisions, sub-emitters and removal of
+    the dead. `add_collider` and `add_joint` return a Result (ADR 0008 #1); `ImPhysicsWorld_try_new`
+    validates and refuses XPBD (#6).
+  - The new `world_step.tsv` holds 198 world steps from dumps that include the particles, emitters
+    and fields. All 0 ulp on three targets, and `validate.py` transcribes the world step.
+    **98,393 ok, 0 failed, 0 measured, 7 pending, 165 accepted.**
+  - 63 more Rust tests: `world.rs` (22), `particle.rs` (6), `tests/integration.rs` (9) and the 2D
+    tests of `tests/regressions.rs` (26), in `tests/world.tcyr` and `tests/regressions.tcyr`.
+  - Surface parity is 507/507 across 23 modules, with `snapshot`, `restore` and `try_restore`
+    pending M6.
+  - The world's constants are generated, the `R3_ALPHA` array as three globals.
+  - Particle JSON is not ported yet.
 
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
@@ -331,6 +355,15 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - 1,000 balls: 4.07 ms against 853 µs (4.8×).
 
   A resting stack of five boxes steps in 51 µs.
+- **Correctly rounded pow**: 755 ns a call (`math/pow_cr`), against ganita's 200 ns. The first design,
+  a double-double phase alone, took 5.4 µs.
+- **The world and particles against Rust** (`docs/benchmarks-rust-v-cyrius.md`):
+  - `world/step_*` through the world: 3.5–6.5×.
+  - `particles/step_100_particles` 9.9 µs against 1.95 µs, and `step_100_particles_with_floor` 1.89 µs
+    against 444 ns.
+  - `step_1000_particles` (93 µs against 5.5 µs), `spawn_particle` (694 ns against 20 ns) and
+    `emitter_step` (18.5 µs against 493 ns) are 17–37×. Each 136-byte particle record moves by the
+    stdlib's byte-loop `memcpy` (S5) on push and on every removal.
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

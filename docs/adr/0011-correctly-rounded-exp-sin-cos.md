@@ -157,3 +157,45 @@ exact comparison rounds them to even.
 - **Cost.** 168 ns a call against ganita's 33 ns (`math/hypot_cr`), between exp (104 ns) and sin_cos (201 ns).
 - **For a Rust 1.x user:** results differ in the last bit wherever glibc misrounds a `hypot`.
 - **Upstream.** Like exp, sin and cos, `hypot` belongs in ganita once (port plan §8).
+
+## Amendment — M3d (2026-11-09): pow joins exp, sin, cos and hypot
+
+**Context.** The world's radial force fields divide by `(d² + ε²)^(falloff/2)`, the port's one `powf`. The port's
+`pow` was ganita's, which misrounds 9.62 % of 100,000 ordinary arguments (x in [10⁻⁴, 10⁴], y in [−10, 10]; glibc
+0.096 %), and returns +∞ for `pow(−1, DBL_MAX)` (ADR 0009). So the `f64::powf` rows had a 2-ulp bound, and the world's
+rows could not have been held at 0. The aim is accuracy, not parity with glibc (user, 2026-11-09). The user chose a
+correctly rounded pow before the world.
+
+**Decision.** `src/crmath.cyr` gains `_im_cr_pow`, correctly rounded on every input, with C99 Annex F's specials.
+`_im_powf` calls it, and the `f64::powf` rows and the world's rows are gated at 0 ulp against the corrected oracle.
+- **Phases 1 and 2.**
+  - log x is computed in double-double by the atanh series of s = (m − 1)/(1 + m), on 0.75 ≤ m < 1.5, so it stays
+    relative near x = 1.
+  - Then y·log x by TwoProduct, then exp of the high word times exp of the low word.
+  - Phase 1 carries the log to 2^-73 (measured worst 2^-73.2), with exp's table phase, tested against
+    2^-61 + |y·log x|·2^-71. It decides over 99 % of ordinary arguments.
+  - Phase 2 carries the log to 2^-100 (measured worst 2^-103.4), with exp's phase 2, tested against 2^-80.
+- **The slow path** first runs an exactness test in integer arithmetic. x^y is a dyadic rational exactly when, with
+  x = a·2^u (a odd), y is a non-negative integer, or y = Y/2^s (Y > 0 odd) with a a perfect 2^s-th power and 2^s
+  dividing u. Such a value is computed exactly and rounded once when its odd part is below 2^63. Otherwise log x,
+  y·log x and exp go through the 364-bit fixed point (relative error below 2^-290). exp's slow path now takes a
+  fixed-point argument, so pow shares it.
+
+pow has **exact midpoints**, for example 25^11.5 = 5^23, a 54-bit tie. The exactness test rounds them to even, as it
+does the subnormal ties glibc 2.44 misrounds (`port-parity.md` §8). Unlike exp, sin and cos, pow's worst cases are not
+known in general:
+- An inexact dyadic value of B > 63 bits is at least 2^-B from every midpoint, so the slow path decides it outright for
+  B below about 290.
+- Beyond that, and for every other input, it relies on no x^y lying within 2^-290 of a midpoint without being one. The
+  published hard cases need about 2^-120.
+
+**Consequences.**
+- **Verified against MPFR.** 1,290,769 pairs on the final code match, in three seeded sets. They cover ordinary
+  arguments, x near 1 with huge y, results at the overflow and subnormal edges, integer and dyadic exponents, exact
+  cases and constructed midpoints, negative bases, tiny y, random bit patterns and the specials. An earlier design
+  matched 1,176,923 more.
+- **The golden rows.** All 1,030 `f64::powf` rows are at 0 ulp; glibc is correctly rounded on all of them, so no
+  correction file is needed. The ADR 0009 row is now an ordinary match.
+- **Cost.** 755 ns a call against ganita's 200 ns (`math/pow_cr`). The first design, phase 2 alone, cost 5.4 µs.
+- **For a Rust 1.x user:** results differ in the last bit wherever glibc misrounds a `pow`.
+- **Upstream.** Added to ganita's correctly rounded tier filing (2026-11-09), with 8 more repro rows.

@@ -1,0 +1,249 @@
+# particle.cyr — physics particles, emitters and force fields (port of rust-old/src/particle.rs).
+#
+# Lightweight point masses with no rotation, simulated by the world after its rigid bodies
+# (src/world.cyr). `ImForceField` is the payload form of Rust's `ForceField` enum (port plan §7.3): a
+# kind and every variant's fields. A particle's or emitter's handle is a bare word the world assigns.
+# The builders mirror Rust's `with_*`: each sets its field in place and returns the record, so they
+# chain on a pointer.
+
+# ── force fields ────────────────────────────────────────────────────────────────────
+
+enum ImForceFieldKind {
+    IM_FORCE_FIELD_RADIAL = 0;
+    IM_FORCE_FIELD_DIRECTIONAL = 1;
+}
+
+# Radial: `center`, `strength` (positive attracts), `falloff` (0 constant, 1 linear, 2 inverse-square)
+# and `radius` (the reach, 0 for unlimited). Directional: `force` inside the box `min`..`max`.
+struct ImForceField {
+    kind;
+    center: ImVec3;
+    strength: f64;
+    falloff: f64;
+    radius: f64;
+    force: ImVec3;
+    min: ImVec3;
+    max: ImVec3;
+}
+
+# A radial field. Mirrors `ForceField::Radial { center, strength, falloff, radius }`.
+#must_use
+fn ImForceField_radial(center: ImVec3, strength: f64, falloff: f64, radius: f64): ImForceField {
+    var f: ImForceField;
+    f.kind = IM_FORCE_FIELD_RADIAL;
+    f.center = center;
+    f.strength = strength;
+    f.falloff = falloff;
+    f.radius = radius;
+    f.force = ImVec3_zero();
+    f.min = ImVec3_zero();
+    f.max = ImVec3_zero();
+    return f;
+}
+
+# A directional field over a box. Mirrors `ForceField::Directional { force, min, max }`.
+#must_use
+fn ImForceField_directional(force: ImVec3, min: ImVec3, max: ImVec3): ImForceField {
+    var f: ImForceField;
+    f.kind = IM_FORCE_FIELD_DIRECTIONAL;
+    f.center = ImVec3_zero();
+    f.strength = 0.0;
+    f.falloff = 0.0;
+    f.radius = 0.0;
+    f.force = force;
+    f.min = min;
+    f.max = max;
+    return f;
+}
+
+# The Rust variant name of a force-field kind (`"Radial"`), or "Unknown".
+#must_use
+fn force_field_kind_name(k): i64 {
+    if (k == IM_FORCE_FIELD_RADIAL) { return "Radial"; }
+    if (k == IM_FORCE_FIELD_DIRECTIONAL) { return "Directional"; }
+    return "Unknown";
+}
+
+# ── particles ───────────────────────────────────────────────────────────────────────
+
+# What a particle spawns when it dies: `count` particles evenly spread around it at `speed`, each with
+# the given lifetime, radius, gravity scale and restitution. Mirrors `SubEmitter`.
+struct ImSubEmitter {
+    count;
+    speed: f64;
+    lifetime: f64;
+    radius: f64;
+    gravity_scale: f64;
+    restitution: f64;
+}
+
+# A sub-emitter. (Rust builds the struct literally.)
+#must_use
+fn ImSubEmitter_new(count, speed: f64, lifetime: f64, radius: f64, gravity_scale: f64,
+  restitution: f64): ImSubEmitter {
+    var s: ImSubEmitter;
+    s.count = count;
+    s.speed = speed;
+    s.lifetime = lifetime;
+    s.radius = radius;
+    s.gravity_scale = gravity_scale;
+    s.restitution = restitution;
+    return s;
+}
+
+# A particle. Rust's `on_death_emit: Option<SubEmitter>` is a presence flag plus the value. Mirrors
+# `Particle`.
+struct ImParticle {
+    handle;
+    position: ImVec3;
+    velocity: ImVec3;
+    lifetime: f64;
+    radius: f64;
+    drag: f64;
+    restitution: f64;
+    gravity_scale: f64;
+    damping: f64;
+    has_on_death_emit;
+    on_death_emit: ImSubEmitter;
+}
+
+# A particle at `position` moving at `velocity` for `lifetime` seconds: radius 0.05, no drag,
+# restitution 0.3, full gravity, no damping, no sub-emitter, handle 0 (the world sets it on spawn).
+# Mirrors `Particle::new`.
+#must_use
+fn ImParticle_new(position: ImVec3, velocity: ImVec3, lifetime: f64): ImParticle {
+    var p: ImParticle;
+    p.handle = 0;
+    p.position = position;
+    p.velocity = velocity;
+    p.lifetime = lifetime;
+    p.radius = 0.05;
+    p.drag = 0.0;
+    p.restitution = 0.3;
+    p.gravity_scale = 1.0;
+    p.damping = 0.0;
+    p.has_on_death_emit = 0;
+    p.on_death_emit = ImSubEmitter_new(0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    return p;
+}
+
+impl ImParticle {
+    # Sets the collision radius, clamped to at least 0 (Rust's `f64::max`: a NaN gives 0). Mirrors
+    # `with_radius`.
+    fn with_radius(self, radius: f64): *ImParticle {
+        var r: f64 = _im_max(radius, 0.0);
+        self.radius = r;
+        return self;
+    }
+
+    # Sets the quadratic drag coefficient. Mirrors `with_drag`.
+    fn with_drag(self, drag: f64): *ImParticle {
+        self.drag = drag;
+        return self;
+    }
+
+    # Sets the restitution against colliders. Mirrors `with_restitution`.
+    fn with_restitution(self, restitution: f64): *ImParticle {
+        self.restitution = restitution;
+        return self;
+    }
+
+    # Sets the gravity scale. Mirrors `with_gravity_scale`.
+    fn with_gravity_scale(self, scale: f64): *ImParticle {
+        self.gravity_scale = scale;
+        return self;
+    }
+
+    # Sets the linear damping. Mirrors `with_damping`.
+    fn with_damping(self, damping: f64): *ImParticle {
+        self.damping = damping;
+        return self;
+    }
+
+    # Sets what the particle spawns when it dies. Mirrors `with_sub_emitter`.
+    fn with_sub_emitter(self, sub: ImSubEmitter): *ImParticle {
+        self.has_on_death_emit = 1;
+        self.on_death_emit = sub;
+        return self;
+    }
+
+    # 1 while the lifetime is above 0. Mirrors `is_alive`.
+    #must_use
+    fn is_alive(self): i64 {
+        var l: f64 = self.lifetime;
+        if (l > 0.0) { return 1; }
+        return 0;
+    }
+}
+
+# ── emitters ────────────────────────────────────────────────────────────────────────
+
+# A source that spawns `rate` particles a second at `position`, moving at `velocity` give or take
+# `velocity_spread` on each axis. `accumulator` is the time owed to the next spawn (Rust's private
+# field, carried for the step and the dump). Mirrors `ParticleEmitter`.
+struct ImParticleEmitter {
+    handle;
+    position: ImVec3;
+    velocity: ImVec3;
+    velocity_spread: ImVec3;
+    rate: f64;
+    particle_lifetime: f64;
+    particle_radius: f64;
+    particle_restitution: f64;
+    particle_gravity_scale: f64;
+    particle_damping: f64;
+    active;
+    accumulator: f64;
+}
+
+# An active emitter with no spread, spawning particles of lifetime 2, radius 0.05, restitution 0.3,
+# full gravity and no damping. Mirrors `ParticleEmitter::new`.
+#must_use
+fn ImParticleEmitter_new(position: ImVec3, velocity: ImVec3, rate: f64): ImParticleEmitter {
+    var e: ImParticleEmitter;
+    e.handle = 0;
+    e.position = position;
+    e.velocity = velocity;
+    e.velocity_spread = ImVec3_zero();
+    e.rate = rate;
+    e.particle_lifetime = 2.0;
+    e.particle_radius = 0.05;
+    e.particle_restitution = 0.3;
+    e.particle_gravity_scale = 1.0;
+    e.particle_damping = 0.0;
+    e.active = 1;
+    e.accumulator = 0.0;
+    return e;
+}
+
+impl ImParticleEmitter {
+    # Sets the velocity spread. Mirrors `with_spread`.
+    fn with_spread(self, spread: ImVec3): *ImParticleEmitter {
+        self.velocity_spread = spread;
+        return self;
+    }
+
+    # Sets the spawned particles' lifetime. Mirrors `with_lifetime`.
+    fn with_lifetime(self, lifetime: f64): *ImParticleEmitter {
+        self.particle_lifetime = lifetime;
+        return self;
+    }
+
+    # Sets the spawned particles' radius. Mirrors `with_radius`.
+    fn with_radius(self, radius: f64): *ImParticleEmitter {
+        self.particle_radius = radius;
+        return self;
+    }
+
+    # Sets the spawned particles' gravity scale. Mirrors `with_gravity_scale`.
+    fn with_gravity_scale(self, scale: f64): *ImParticleEmitter {
+        self.particle_gravity_scale = scale;
+        return self;
+    }
+
+    # Sets the spawned particles' damping. Mirrors `with_damping`.
+    fn with_damping(self, damping: f64): *ImParticleEmitter {
+        self.particle_damping = damping;
+        return self;
+    }
+}

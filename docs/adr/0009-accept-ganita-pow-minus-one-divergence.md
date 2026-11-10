@@ -1,7 +1,11 @@
 # 0009 — Accept ganita's pow(−1, DBL_MAX) divergence
 
-**Status**: Accepted
+**Status**: Superseded by ADR 0011's pow amendment (2026-11-09)
 **Date**: 2026-11-09
+
+> **Superseded.** The port's `pow` is now crmath's correctly rounded `_im_cr_pow`, not ganita's. It returns 1 for
+> `pow(-1, DBL_MAX)`, as glibc does, so the row is an ordinary match and the harness no longer lists it. The ganita
+> defect stays filed upstream.
 
 ## Context
 

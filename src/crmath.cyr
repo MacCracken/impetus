@@ -244,13 +244,24 @@ fn _im_cr_round(a, k, neg): f64 {
 fn _im_cr_exp_slow(x: f64): f64 {
     _im_cr_load();
     var X[112];
+    var ax: f64 = f64_abs(x);
+    _im_cr_set(&X, ax);
+    var q: f64 = x * _IM_CR_INVLN2;
+    var neg = 0;
+    if (x < 0.0) { neg = 1; }
+    var r: f64 = _im_cr_exp_fx(&X, neg, q, 0);
+    return r;
+}
+
+# exp(x) for the fixed-point |x| = X (below 746), x negative when neg is 1, correctly rounded (and
+# negated when rneg is 1), with q an estimate of x/ln 2 within 1: the reduction and the series of
+# `_im_cr_exp_slow`, which pow's slow path shares.
+#must_use
+fn _im_cr_exp_fx(X, neg, q: f64, rneg): f64 {
     var A[112];
     var R[112];
     var T[112];
     var S[112];
-    var ax: f64 = f64_abs(x);
-    _im_cr_set(&X, ax);
-    var q: f64 = x * _IM_CR_INVLN2;
     var kf: f64 = f64_floor(q);
     var k = f64_to(kf);
     var tries = 0;
@@ -259,10 +270,10 @@ fn _im_cr_exp_slow(x: f64): f64 {
         if (kk < 0) { kk = 0 - kk; }
         _im_cr_mul_small(&A, &_im_cr_ln2, kk);
         var lo = 0;
-        if (x >= 0.0) {
-            if (_im_cr_cmp(&X, &A) < 0) { lo = 1; } else { _im_cr_sub(&R, &X, &A); }
+        if (neg == 0) {
+            if (_im_cr_cmp(X, &A) < 0) { lo = 1; } else { _im_cr_sub(&R, X, &A); }
         } else {
-            if (_im_cr_cmp(&A, &X) < 0) { lo = 1; } else { _im_cr_sub(&R, &A, &X); }
+            if (_im_cr_cmp(&A, X) < 0) { lo = 1; } else { _im_cr_sub(&R, &A, X); }
         }
         if (lo == 1) {
             k = k - 1;
@@ -283,7 +294,7 @@ fn _im_cr_exp_slow(x: f64): f64 {
         if (_im_cr_is_zero(&T) == 1) { break; }
         _im_cr_add(&S, &S, &T);
     }
-    return _im_cr_round(&S, k, 0);
+    return _im_cr_round(&S, k, rneg);
 }
 
 # Y = (ax·2/π mod 1)·π/2 in fixed point, by Payne–Hanek, and the quadrant floor(ax·2/π) mod 4.
@@ -1151,4 +1162,580 @@ fn _im_cr_hypot(x: f64, y: f64): f64 {
         return _im_cr_ldexp(hf, k);
     }
     return _im_cr_hypot_slow(sa, sb, k, hf);
+}
+
+# ── pow ─────────────────────────────────────────────────────────────────────────────
+# pow(x, y) = x^y, correctly rounded (ADR 0011, amended for pow). The specials follow C99 Annex F, as
+# glibc's pow does. For x > 0 (a negative x with an integer y takes the sign of the parity):
+# - two fast phases: log x in double-double (x = 2^e·m with 0.75 ≤ m < 1.5, log m = 2·atanh(s),
+#   s = (m − 1)/(1 + m), so the relative error holds near x = 1 too), r = y·log x by TwoProduct, then
+#   exp(r) as exp at the high word times exp of the low word. Phase 1 takes the series' tail in double
+#   (log about 2^-73) and exp's table-driven phase 1, tested against 2^-61 + |r|·2^-71; phase 2 the full
+#   double-double series (about 2^-100) and exp's phase 2, tested against 2^-80 (the error is about
+#   2^-87);
+# - the slow path, for the undecided, results below 2^-1022 or near overflow: first an exactness test
+#   in integer arithmetic. x^y is a dyadic rational (a double, a midpoint between two, or neither)
+#   exactly when x = a·2^u (a odd) and either y is a non-negative integer, or y = Y/2^s (Y > 0 odd) with
+#   a a perfect 2^s-th power c^(2^s) and 2^s dividing u, or a = 1 with an integer exponent; then
+#   x^y = c^Y·2^(uY/2^s), computed and rounded exactly when its odd part is below 2^63, which covers every
+#   double and midpoint (25^11.5 = 5^23 is a midpoint; glibc 2.44 misrounds the subnormal ties of
+#   port-parity.md §8). Otherwise log x, y·log x and exp in the 364-bit fixed point, relative error
+#   below 2^-290.
+# Unlike exp, sin and cos, pow's hardest cases are not known in general. An inexact dyadic value of
+# B > 63 bits is at least 2^-B (relative) from every midpoint, so the slow path decides it outright for
+# B below about 290; otherwise, as for every other input, it relies on no x^y lying within 2^-290 of a
+# midpoint without being one (the published hard cases need about 2^-120).
+
+var _im_cr_pow_phase2_calls = 0;
+var _im_cr_pow_slow_calls = 0;
+
+# The series coefficients 1/(2k + 1), k = 0 .. 24, in double-double (hi, lo pairs), computed once.
+var _im_cr_odd_inv[400];
+var _im_cr_odd_ready = 0;
+
+# Fills the coefficient table on first use.
+fn _im_cr_odd_load() {
+    if (_im_cr_odd_ready == 1) { return 0; }
+    for (var k = 0; k < 25; k = k + 1) {
+        var den: f64 = f64_from(2 * k + 1);
+        var h, l = _im_cr_dd_div_d(1.0, 0.0, den);
+        store64(&_im_cr_odd_inv + k * 16, h);
+        store64(&_im_cr_odd_inv + k * 16 + 8, l);
+    }
+    _im_cr_odd_ready = 1;
+    return 0;
+}
+
+# 1 when the finite y is an integer.
+#must_use
+fn _im_cr_is_int(y: f64): i64 {
+    var ay: f64 = f64_abs(y);
+    if (ay >= 4503599627370496.0) { return 1; }
+    var fl: f64 = f64_floor(y);
+    if (fl == y) { return 1; }
+    return 0;
+}
+
+# 1 when the finite y is an odd integer.
+#must_use
+fn _im_cr_is_odd(y: f64): i64 {
+    var ay: f64 = f64_abs(y);
+    if (ay >= 9007199254740992.0 || _im_cr_is_int(y) == 0) { return 0; }
+    return f64_to(y) & 1;
+}
+
+# b^k for b ≥ 3, k ≥ 0 when it is below 2^63, else 0.
+#must_use
+fn _im_cr_ipow(b, k): i64 {
+    var n = 1;
+    var lim = 9223372036854775807 / b;
+    for (var i = 0; i < k; i = i + 1) {
+        if (n > lim) { return 0; }
+        n = n * b;
+    }
+    return n;
+}
+
+# floor(√n) for 0 ≤ n < 2^53.
+#must_use
+fn _im_cr_isqrt(n): i64 {
+    var nf: f64 = f64_from(n);
+    var rf: f64 = f64_sqrt(nf);
+    var r = f64_to(rf);
+    while (r * r > n) { r = r - 1; }
+    while ((r + 1) * (r + 1) <= n) { r = r + 1; }
+    return r;
+}
+
+# (ah + al) / (bh + bl), for bh ≠ 0.
+#must_use
+fn _im_cr_dd_div(ah: f64, al: f64, bh: f64, bl: f64): (f64, f64) {
+    var q1: f64 = ah / bh;
+    var p, e = _im_cr_two_prod(q1, bh);
+    var pf: f64 = p;
+    var ef: f64 = e;
+    var r: f64 = (((ah - pf) - ef) + al) - q1 * bl;
+    var q2: f64 = r / bh;
+    var s, t = _im_cr_fast_two_sum(q1, q2);
+    return (s, t);
+}
+
+# x = 2^e·m with 0.75 ≤ m < 1.5, for finite x > 0, into out: e, then m's word.
+fn _im_cr_log_split(x: f64, out) {
+    var adj = 0;
+    var w = _im_cr_word(x);
+    if (((w >> 52) & 2047) == 0) {
+        var up: f64 = _im_cr_pow2(54);
+        var xs: f64 = x * up;
+        w = _im_cr_word(xs);
+        adj = 54;
+    }
+    var e = ((w >> 52) & 2047) - 1023 - adj;
+    var m: f64 = _im_cr_from_word((w & 4503599627370495) | (1023 << 52));
+    if (m >= 1.5) {
+        m = m * 0.5;
+        e = e + 1;
+    }
+    store64(out, e);
+    store64(out + 8, _im_cr_word(m));
+    return 0;
+}
+
+# log m for 0.75 ≤ m < 1.5 in double-double: t = m − 1 (exact), s = t/(1 + m), log m = 2s·(1 + s²/3 +
+# s⁴/5 + …) by Horner from the 25th term (|s| ≤ 0.2: the first omitted is below 2^-116 relative).
+#must_use
+fn _im_cr_log_m_dd(m: f64): (f64, f64) {
+    var t: f64 = m - 1.0;
+    var z: f64 = 0.0;
+    if (t == 0.0) { return (z, z); }
+    var dh, dl = _im_cr_two_sum(1.0, m);
+    var sh, sl = _im_cr_dd_div(t, 0.0, dh, dl);
+    var zh, zl = _im_cr_dd_mul(sh, sl, sh, sl);
+    _im_cr_odd_load();
+    var ph: f64 = load64(&_im_cr_odd_inv + 24 * 16);
+    var pl: f64 = load64(&_im_cr_odd_inv + 24 * 16 + 8);
+    for (var k = 23; k >= 0; k = k - 1) {
+        var mh, ml = _im_cr_dd_mul(zh, zl, ph, pl);
+        var ch: f64 = load64(&_im_cr_odd_inv + k * 16);
+        var cl: f64 = load64(&_im_cr_odd_inv + k * 16 + 8);
+        var nh, nl = _im_cr_dd_add(ch, cl, mh, ml);
+        ph = nh;
+        pl = nl;
+    }
+    var rh, rl = _im_cr_dd_mul(sh, sl, ph, pl);
+    var rhf: f64 = rh;
+    var rlf: f64 = rl;
+    var h: f64 = rhf * 2.0;
+    var l: f64 = rlf * 2.0;
+    return (h, l);
+}
+
+# log m for 0.75 ≤ m < 1.5 in double-double to about 2^-73 relative, for phase 1: the series of
+# `_im_cr_log_m_dd` with its first four terms in double-double and the rest (from s⁸/9, below 2^-21.7 of
+# the sum, to the 15th) by Horner in double, whose 2^-53 relative error is then below 2^-74 of the whole.
+#must_use
+fn _im_cr_log_m_p1(m: f64): (f64, f64) {
+    var t: f64 = m - 1.0;
+    var z: f64 = 0.0;
+    if (t == 0.0) { return (z, z); }
+    var dh, dl = _im_cr_two_sum(1.0, m);
+    var sh, sl = _im_cr_dd_div(t, 0.0, dh, dl);
+    var zh, zl = _im_cr_dd_mul(sh, sl, sh, sl);
+    var zhf: f64 = zh;
+    _im_cr_odd_load();
+    var tail: f64 = load64(&_im_cr_odd_inv + 14 * 16);
+    for (var k = 13; k >= 4; k = k - 1) {
+        var ck: f64 = load64(&_im_cr_odd_inv + k * 16);
+        tail = ck + zhf * tail;
+    }
+    var c7h: f64 = load64(&_im_cr_odd_inv + 3 * 16);
+    var c7l: f64 = load64(&_im_cr_odd_inv + 3 * 16 + 8);
+    var th, tl = _im_cr_dd_mul(zh, zl, tail, 0.0);
+    var qh, ql = _im_cr_dd_add(c7h, c7l, th, tl);
+    var c5h: f64 = load64(&_im_cr_odd_inv + 2 * 16);
+    var c5l: f64 = load64(&_im_cr_odd_inv + 2 * 16 + 8);
+    var uh, ul = _im_cr_dd_mul(zh, zl, qh, ql);
+    var vh, vl = _im_cr_dd_add(c5h, c5l, uh, ul);
+    var c3h: f64 = load64(&_im_cr_odd_inv + 16);
+    var c3l: f64 = load64(&_im_cr_odd_inv + 24);
+    var wh, wl = _im_cr_dd_mul(zh, zl, vh, vl);
+    var xh, xl = _im_cr_dd_add(c3h, c3l, wh, wl);
+    var yh, yl = _im_cr_dd_mul(zh, zl, xh, xl);
+    var ph, pl = _im_cr_dd_add(1.0, 0.0, yh, yl);
+    var rh, rl = _im_cr_dd_mul(sh, sl, ph, pl);
+    var rhf: f64 = rh;
+    var rlf: f64 = rl;
+    var h: f64 = rhf * 2.0;
+    var l: f64 = rlf * 2.0;
+    return (h, l);
+}
+
+# log x in double-double for finite x > 0: e·ln 2 (e·hi exact, e·mid by TwoProduct) plus log m, the
+# latter to about 2^-100 relative (precise 1) or about 2^-69 (0, phase 1).
+#must_use
+fn _im_cr_log_dd_at(x: f64, precise): (f64, f64) {
+    var sp[16];
+    _im_cr_log_split(x, &sp);
+    var e = load64(&sp);
+    var m: f64 = load64(&sp + 8);
+    var lmh: f64 = 0.0;
+    var lml: f64 = 0.0;
+    if (precise == 1) {
+        var ah0, al0 = _im_cr_log_m_dd(m);
+        lmh = ah0;
+        lml = al0;
+    } else {
+        var ah1, al1 = _im_cr_log_m_p1(m);
+        lmh = ah1;
+        lml = al1;
+    }
+    var ef: f64 = f64_from(e);
+    var hk: f64 = ef * _IM_CR_LN2_HI;
+    var mh, ml = _im_cr_two_prod(ef, _IM_CR_LN2_MID);
+    var lo: f64 = ef * _IM_CR_LN2_LO;
+    var ah, al = _im_cr_dd_add(hk, 0.0, mh, ml);
+    var bh, bl = _im_cr_dd_add(ah, al, lo, 0.0);
+    var ch, cl = _im_cr_dd_add(bh, bl, lmh, lml);
+    return (ch, cl);
+}
+
+# log x in double-double for finite x > 0, relative error about 2^-100 (measured worst 2^-103.4 over
+# 200,000 arguments against MPFR at 320 bits, near 1 included).
+#must_use
+fn _im_cr_log_dd(x: f64): (f64, f64) {
+    var h, l = _im_cr_log_dd_at(x, 1);
+    return (h, l);
+}
+
+# The fast phases for x > 0 (x ≠ 1), finite y ≠ 0, into out as a word, the result negated when neg is
+# 1: 1 when decided (out of range included), 0 for the slow path. Phase 1 (precise 0): log x to about
+# 2^-73 (measured worst 2^-73.2) and exp's phase 1 (2^-62), tested against 2^-61 + |r|·2^-71; phase 2
+# (precise 1): log x to about 2^-100 (measured 2^-103.4) and exp's phase 2 (2^-88), tested against 2^-80.
+fn _im_cr_pow_p1(x: f64, y: f64, neg, out, precise): i64 {
+    var sign = 0;
+    if (neg == 1) { sign = 0 - 9223372036854775807 - 1; }
+    var lh, ll = _im_cr_log_dd_at(x, precise);
+    var lhf: f64 = lh;
+    var llf: f64 = ll;
+    var rough: f64 = y * lhf;
+    # |r − rough| < 2^-42: above ln(DBL_MAX + ulp/2) ≈ 709.7827 it overflows, at or below
+    # −1075·ln 2 ≈ −745.1332 it rounds to 0 (2^-1075 is a tie to even), and below 2^-60 in magnitude
+    # exp(r) is within 2^-59 of 1, which rounds to 1.
+    if (rough > 709.79) {
+        store64(out, sign | 9218868437227405312);
+        return 1;
+    }
+    if (rough < 0.0 - 745.14) {
+        store64(out, sign);
+        return 1;
+    }
+    var ar: f64 = f64_abs(rough);
+    if (ar < 0.000000000000000000867361737988403547205962240695953369140625) {
+        store64(out, sign | 4607182418800017408);
+        return 1;
+    }
+    var ph, pl = _im_cr_two_prod(y, lhf);
+    var phf: f64 = ph;
+    var plf: f64 = pl;
+    var ql: f64 = y * llf;
+    var e1: f64 = plf + ql;
+    var rh, rl = _im_cr_fast_two_sum(phf, e1);
+    var rhf: f64 = rh;
+    var rlf: f64 = rl;
+    if (rhf < 0.0 - 708.0 || rhf > 709.7) { return 0; }
+    var o[24];
+    if (precise == 1) { _im_cr_exp_p2(rhf, &o); } else { _im_cr_exp_p1(rhf, &o); }
+    var h: f64 = load64(&o);
+    var l: f64 = load64(&o + 8);
+    # exp(rl) = 1 + c, |rl| ≤ 2^-44: c = rl + rl²/2 (the next term is below 2^-133).
+    var c: f64 = rlf * rlf * 0.5;
+    c = rlf + c;
+    var hch, hcl = _im_cr_two_prod(h, c);
+    var hchf: f64 = hch;
+    var hclf: f64 = hcl;
+    var s1, s2 = _im_cr_fast_two_sum(h, hchf);
+    var s2f: f64 = s2;
+    var lc: f64 = l * c;
+    var low: f64 = s2f + (l + (hclf + lc));
+    var fh, fl = _im_cr_fast_two_sum(s1, low);
+    var fhf: f64 = fh;
+    var flf: f64 = fl;
+    var bound: f64 = _im_cr_pow2(0 - 80);
+    if (precise == 0) {
+        var arh: f64 = f64_abs(rhf);
+        var b1: f64 = _im_cr_pow2(0 - 61);
+        var b2: f64 = _im_cr_pow2(0 - 71);
+        bound = b1 + arh * b2;
+    }
+    var err: f64 = fhf * bound;
+    if (_im_cr_rounds_to(fhf, flf, err) == 0) { return 0; }
+    var res: f64 = _im_cr_scale(fhf, load64(&o + 16));
+    store64(out, sign | _im_cr_word(res));
+    return 1;
+}
+
+# d = a·2^q (d may be a), bits below 2^-364 dropped; the result's integer part below 2^27.
+fn _im_cr_shift(d, a, q) {
+    if (d != a) { memcpy(d, a, 112); }
+    var k = q;
+    while (k > 0) {
+        var s = k;
+        if (s > 27) { s = 27; }
+        _im_cr_mul_small(d, d, 1 << s);
+        k = k - s;
+    }
+    while (k < 0) {
+        var s2 = 0 - k;
+        if (s2 > 27) { s2 = 27; }
+        _im_cr_div_small(d, d, 1 << s2);
+        k = k + s2;
+    }
+    return 0;
+}
+
+# D = (−1)^sa·A + (−1)^sb·B in magnitude (D may be A or B): its sign, 0 or 1.
+fn _im_cr_sadd(D, A, sa, B, sb): i64 {
+    if (sa == sb) {
+        _im_cr_add(D, A, B);
+        return sa;
+    }
+    if (_im_cr_cmp(A, B) >= 0) {
+        _im_cr_sub(D, A, B);
+        return sa;
+    }
+    _im_cr_sub(D, B, A);
+    return sb;
+}
+
+# R = 1/D for 1 ≤ D < 4, from the double estimate d: Newton's R·(2 − D·R) four times (53 bits, then
+# double each time, to the 364-bit truncation).
+fn _im_cr_recip(R, D, d: f64) {
+    var two[112];
+    var E[112];
+    var W[112];
+    _im_cr_zero(&two);
+    store64(&two, 2);
+    var r0: f64 = 1.0 / d;
+    _im_cr_set(R, r0);
+    for (var i = 0; i < 4; i = i + 1) {
+        _im_cr_mul(&E, D, R);
+        _im_cr_sub(&W, &two, &E);
+        _im_cr_mul(R, R, &W);
+    }
+    return 0;
+}
+
+# L = |log x| in fixed point for finite x > 0: its sign (1 for x < 1). e·ln 2 plus log m = 2·atanh(s),
+# s = |m − 1|/(1 + m) ≤ 0.2, summed until the terms vanish (about 75).
+fn _im_cr_log_fx(L, x: f64): i64 {
+    var sp[16];
+    _im_cr_log_split(x, &sp);
+    var e = load64(&sp);
+    var m: f64 = load64(&sp + 8);
+    var t: f64 = m - 1.0;
+    var ts = 0;
+    if (t < 0.0) { ts = 1; }
+    var at: f64 = f64_abs(t);
+    var S[112];
+    _im_cr_zero(&S);
+    if (at != 0.0) {
+        var T[112];
+        var D[112];
+        var R[112];
+        var Z[112];
+        var Z2[112];
+        var P[112];
+        var Q[112];
+        _im_cr_set(&T, at);
+        _im_cr_set(&D, m);
+        store64(&D, load64(&D) + 1);
+        var dm: f64 = 1.0 + m;
+        _im_cr_recip(&R, &D, dm);
+        _im_cr_mul(&Z, &T, &R);
+        _im_cr_mul(&Z2, &Z, &Z);
+        memcpy(&P, &Z, 112);
+        memcpy(&S, &Z, 112);
+        for (var k = 1; k < 200; k = k + 1) {
+            _im_cr_mul(&P, &P, &Z2);
+            _im_cr_div_small(&Q, &P, 2 * k + 1);
+            if (_im_cr_is_zero(&Q) == 1) { break; }
+            _im_cr_add(&S, &S, &Q);
+        }
+        _im_cr_add(&S, &S, &S);
+    }
+    var E[112];
+    var ae = e;
+    var es = 0;
+    if (e < 0) {
+        ae = 0 - e;
+        es = 1;
+    }
+    _im_cr_mul_small(&E, &_im_cr_ln2, ae);
+    return _im_cr_sadd(L, &E, es, &S, ts);
+}
+
+# The exactness test of the slow path for x > 0 (x ≠ 1), finite y ≠ 0: when x^y is a dyadic rational
+# whose odd part is below 2^63, its correct rounding into out (negated when neg is 1) and 1;
+# otherwise 0. See the section comment.
+fn _im_cr_pow_exact(x: f64, y: f64, neg, out): i64 {
+    var w = _im_cr_word(x);
+    var ef = (w >> 52) & 2047;
+    var a = w & 4503599627370495;
+    var u = 0 - 1074;
+    if (ef != 0) {
+        a = a | 4503599627370496;
+        u = ef - 1075;
+    }
+    while ((a & 1) == 0) {
+        a = a >> 1;
+        u = u + 1;
+    }
+    var wy = _im_cr_word(y) & 9223372036854775807;
+    var ey = (wy >> 52) & 2047;
+    var yy = wy & 4503599627370495;
+    var v = 0 - 1074;
+    if (ey != 0) {
+        yy = yy | 4503599627370496;
+        v = ey - 1075;
+    }
+    while ((yy & 1) == 0) {
+        yy = yy >> 1;
+        v = v + 1;
+    }
+    var yn = yy;
+    if (y < 0.0) { yn = 0 - yy; }
+    var n = 1;
+    var e = 0;
+    if (v >= 0) {
+        # An integer exponent yn·2^v; one this large leaves the range unless x is a power of two, and
+        # then only with u = 0, which is x = 1.
+        if (v > 20 || yy > 1048576) { return 0; }
+        var ni = yn << v;
+        if (a == 1) {
+            e = u * ni;
+        } else {
+            if (ni < 0 || ni > 63) { return 0; }
+            n = _im_cr_ipow(a, ni);
+            if (n == 0) { return 0; }
+            e = u * ni;
+        }
+    } else {
+        var s = 0 - v;
+        if (s > 30) { return 0; }
+        var p2 = 1 << s;
+        if (u % p2 != 0) { return 0; }
+        var us = u / p2;
+        if (a == 1) {
+            e = us * yn;
+        } else {
+            if (yn < 0 || s > 5) { return 0; }
+            var c = a;
+            for (var j = 0; j < s; j = j + 1) {
+                var r = _im_cr_isqrt(c);
+                if (r * r != c) { return 0; }
+                c = r;
+            }
+            if (yn > 63) { return 0; }
+            n = _im_cr_ipow(c, yn);
+            if (n == 0) { return 0; }
+            e = us * yn;
+        }
+    }
+    # n·2^e with n < 2^63, as n/2^60 in fixed point, rounded once.
+    var A[112];
+    _im_cr_zero(&A);
+    store64(&A, n >> 60);
+    store64(&A + 8, (n >> 32) & _IM_CR_MASK);
+    store64(&A + 16, (n >> 4) & _IM_CR_MASK);
+    store64(&A + 24, (n & 15) << 24);
+    var res: f64 = _im_cr_round(&A, e + 60, neg);
+    store64(out, _im_cr_word(res));
+    return 1;
+}
+
+# The slow path for x > 0 (x ≠ 1), finite y ≠ 0 with |y·log x| between 2^-60 and 746: exactly when
+# x^y is dyadic, else in fixed point.
+#must_use
+fn _im_cr_pow_slow(x: f64, y: f64, neg): f64 {
+    _im_cr_load();
+    var o[8];
+    if (_im_cr_pow_exact(x, y, neg, &o) == 1) {
+        var re: f64 = load64(&o);
+        return re;
+    }
+    var L[112];
+    var M[112];
+    var P[112];
+    var ls = _im_cr_log_fx(&L, x);
+    # |y| = my·2^q with 1 ≤ my < 2 (y is normal here: |y·log x| ≥ 2^-60 and |log x| < 746).
+    var wy = _im_cr_word(y) & 9223372036854775807;
+    var q = ((wy >> 52) & 2047) - 1023;
+    var my: f64 = _im_cr_from_word((wy & 4503599627370495) | (1023 << 52));
+    _im_cr_set(&M, my);
+    _im_cr_mul(&P, &M, &L);
+    _im_cr_shift(&P, &P, q);
+    var rs = ls;
+    if (y < 0.0) { rs = 1 - ls; }
+    var lh, ll = _im_cr_log_dd(x);
+    var lhf: f64 = lh;
+    var r0: f64 = y * lhf;
+    var qe: f64 = r0 * _IM_CR_INVLN2;
+    var res: f64 = _im_cr_exp_fx(&P, rs, qe, neg);
+    return res;
+}
+
+# x^y, correctly rounded, with the specials of C99 Annex F: 1 for y = ±0 or x = 1 (even with a NaN),
+# NaN for a NaN otherwise or a negative finite x with a non-integer y; the limits at y = ±∞, x = ±0 and
+# x = ±∞; a negative x with an odd integer y negates. +∞ on overflow, subnormal results rounded once.
+# Mirrors `f64::powf` with the exact result in place of libm's.
+#must_use
+fn _im_cr_pow(x: f64, y: f64): f64 {
+    if (y == 0.0) { return 1.0; }
+    if (x == 1.0) { return 1.0; }
+    if (x != x || y != y) {
+        var nan: f64 = x + y;
+        return nan;
+    }
+    var ax: f64 = f64_abs(x);
+    var ay: f64 = f64_abs(y);
+    var inf: f64 = _im_cr_from_word(9218868437227405312);
+    var nzero: f64 = _im_cr_from_word(0 - 9223372036854775807 - 1);
+    if (ay == inf) {
+        if (ax == 1.0) { return 1.0; }
+        if ((ax < 1.0 && y < 0.0) || (ax > 1.0 && y > 0.0)) { return inf; }
+        return 0.0;
+    }
+    var odd = _im_cr_is_odd(y);
+    if (ax == 0.0) {
+        if (y < 0.0) {
+            if (odd == 1) {
+                var pole: f64 = 1.0 / x;
+                return pole;
+            }
+            return inf;
+        }
+        if (odd == 1) { return x; }
+        return 0.0;
+    }
+    if (ax == inf) {
+        if (x < 0.0) {
+            if (y < 0.0) {
+                if (odd == 1) { return nzero; }
+                return 0.0;
+            }
+            if (odd == 1) {
+                var ninf: f64 = -inf;
+                return ninf;
+            }
+            return inf;
+        }
+        if (y < 0.0) { return 0.0; }
+        return inf;
+    }
+    var neg = 0;
+    if (x < 0.0) {
+        if (_im_cr_is_int(y) == 0) {
+            var zero: f64 = 0.0;
+            var dom: f64 = zero / zero;
+            return dom;
+        }
+        neg = odd;
+    }
+    if (ax == 1.0) {
+        if (neg == 1) { return 0.0 - 1.0; }
+        return 1.0;
+    }
+    var o[8];
+    if (_im_cr_pow_p1(ax, y, neg, &o, 0) == 1) {
+        var r1: f64 = load64(&o);
+        return r1;
+    }
+    _im_cr_pow_phase2_calls = _im_cr_pow_phase2_calls + 1;
+    if (_im_cr_pow_p1(ax, y, neg, &o, 1) == 1) {
+        var r2: f64 = load64(&o);
+        return r2;
+    }
+    _im_cr_pow_slow_calls = _im_cr_pow_slow_calls + 1;
+    var rs: f64 = _im_cr_pow_slow(ax, y, neg);
+    return rs;
 }

@@ -58,6 +58,14 @@ fn sources() -> Vec<Source> {
                  src/b2_types.cyr",
             )],
         },
+        Source {
+            file: "world.rs",
+            prefix: "_IM_",
+            excused: &[(
+                "MAX_SNAPSHOT_INDEX",
+                "the snapshot code's public cap on restored handle indices, carried with M6",
+            )],
+        },
     ]
 }
 
@@ -81,10 +89,15 @@ fn library_part(src: &str) -> &str {
     &src[..end]
 }
 
-/// Every `const` item (any visibility) in `src`'s library part.
+/// Every `const` item (any visibility) in `src`'s library part. An array literal may span lines up
+/// to its `];`; its elements are joined into one `[a, b, …]` literal.
 fn items(src: &str) -> Result<Vec<Item>, String> {
     let mut out = Vec::new();
-    for line in library_part(src).lines() {
+    let lines: Vec<&str> = library_part(src).lines().collect();
+    let mut li = 0;
+    while li < lines.len() {
+        let line = lines[li];
+        li += 1;
         let t = line.trim_start();
         let rest = [
             "pub(super) const ",
@@ -101,7 +114,16 @@ fn items(src: &str) -> Result<Vec<Item>, String> {
         let (ty, lit) = after
             .split_once('=')
             .ok_or_else(|| format!("unparsed const line: {line}"))?;
-        let literal = lit.trim().trim_end_matches(';').trim().to_string();
+        let mut literal = lit.trim().trim_end_matches(';').trim().to_string();
+        if literal == "[" {
+            let mut parts = Vec::new();
+            while li < lines.len() && !lines[li].trim_start().starts_with("];") {
+                parts.push(lines[li].trim().trim_end_matches(',').to_string());
+                li += 1;
+            }
+            li += 1;
+            literal = format!("[{}]", parts.join(", "));
+        }
         out.push(Item {
             name: name.trim().to_string(),
             ty: ty.trim().to_string(),
@@ -162,6 +184,26 @@ pub fn emit(root: &Path, provenance: &str) -> Result<String, String> {
             match it.ty.as_str() {
                 "f64" => {
                     let _ = writeln!(out, "var {cyr}: f64 = {};", f64_literal(&it.literal)?);
+                }
+                ty if ty.starts_with("[f64; ") => {
+                    // `[f64; N]`: one generated global per element, `_0` … `_{N-1}`.
+                    let inner = it.literal.trim_start_matches('[').trim_end_matches(']');
+                    let want: usize = ty["[f64; ".len()..ty.len() - 1]
+                        .trim()
+                        .parse()
+                        .map_err(|e| format!("{}: array type `{ty}`: {e}", s.file))?;
+                    let elems: Vec<&str> = inner.split(',').map(str::trim).collect();
+                    if elems.len() != want {
+                        return Err(format!(
+                            "{}: {} has {} elements, its type says {want}",
+                            s.file,
+                            it.name,
+                            elems.len()
+                        ));
+                    }
+                    for (k, e) in elems.iter().enumerate() {
+                        let _ = writeln!(out, "var {cyr}_{k}: f64 = {};", f64_literal(e)?);
+                    }
                 }
                 "usize" | "u32" | "i32" | "u64" | "i64" => {
                     let v: i64 = it.literal.replace('_', "").parse().map_err(|e| {

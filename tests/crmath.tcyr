@@ -1,4 +1,5 @@
-# crmath.tcyr — Cyrius-only tests of src/crmath.cyr, the correctly rounded exp, sin and cos (ADR 0011).
+# crmath.tcyr — Cyrius-only tests of src/crmath.cyr, the correctly rounded exp, sin, cos, hypot and pow
+# (ADR 0011 and its amendments).
 #
 # Against the oracle, the golden math and spring rows gate them at 0 ulp (tests/parity_2d.tcyr, with the
 # corrected oracle where glibc misrounds). These check what the corpus can't say directly: the IEEE special
@@ -190,6 +191,100 @@ fn main() {
         if (same(p1, p2) == 0) { sym = 0; }
     }
     assert_eq(sym, 1, "symmetric in order and sign");
+
+    test_group("pow_specials");
+    var pz: f64 = 0.0;
+    var pinf: f64 = 1.0 / pz;
+    var pnan: f64 = pz / pz;
+    var pnz: f64 = _im_cr_from_word(0 - 9223372036854775807 - 1);
+    var pninf: f64 = -pinf;
+    var q1: f64 = _im_cr_pow(pnan, 0.0);
+    var q2: f64 = _im_cr_pow(1.0, pnan);
+    var q3: f64 = _im_cr_pow(pnan, 1.0);
+    var q4: f64 = _im_cr_pow(2.0, pnan);
+    assert_eq(q1 == 1.0 && q2 == 1.0, 1, "x^0 and 1^y are 1, even with a NaN");
+    assert_eq(q3 != q3 && q4 != q4, 1, "NaN otherwise");
+    var q5: f64 = _im_cr_pow(-1.0, pinf);
+    var q6: f64 = _im_cr_pow(0.5, pinf);
+    var q7: f64 = _im_cr_pow(0.5, pninf);
+    var q8: f64 = _im_cr_pow(2.0, pninf);
+    assert_eq(q5 == 1.0 && q6 == 0.0 && q7 == pinf && q8 == 0.0, 1, "the limits at y = ±∞");
+    var q9: f64 = _im_cr_pow(pnz, -3.0);
+    var q10: f64 = _im_cr_pow(pnz, -2.0);
+    var q11: f64 = _im_cr_pow(pnz, 3.0);
+    var q12: f64 = _im_cr_pow(pnz, 2.5);
+    assert_eq(q9 == pninf && q10 == pinf, 1, "(-0)^-3 = -∞, (-0)^-2 = +∞");
+    assert_eq(_im_cr_word(q11) == _im_cr_word(pnz) && _im_cr_word(q12) == 0, 1, "(-0)^3 = -0, (-0)^2.5 = +0");
+    var q13: f64 = _im_cr_pow(pninf, 3.0);
+    var q14: f64 = _im_cr_pow(pninf, -3.0);
+    var q15: f64 = _im_cr_pow(pninf, 2.0);
+    var q16: f64 = _im_cr_pow(pinf, -0.5);
+    assert_eq(q13 == pninf && _im_cr_word(q14) == _im_cr_word(pnz), 1, "(-∞)^3 = -∞, (-∞)^-3 = -0");
+    assert_eq(q15 == pinf && _im_cr_word(q16) == 0, 1, "(-∞)^2 = +∞, (+∞)^-0.5 = +0");
+    var q17: f64 = _im_cr_pow(-8.0, 0.5);
+    var q18: f64 = _im_cr_pow(-2.0, 3.0);
+    var q19: f64 = _im_cr_pow(-2.0, -3.0);
+    var dmx: f64 = _im_cr_from_word(9218868437227405311);
+    var q20: f64 = _im_cr_pow(-1.0, dmx);
+    assert_eq(q17 != q17, 1, "a negative base with a non-integer exponent is NaN");
+    assert_eq(q18 == 0.0 - 8.0 && q19 == 0.0 - 0.125, 1, "a negative base takes the parity's sign");
+    assert_eq(q20 == 1.0, 1, "(-1)^DBL_MAX = 1 (ganita's pow gives +∞: ADR 0009)");
+
+    test_group("pow_exact_and_ties");
+    var t1: f64 = _im_cr_pow(25.0, 11.5);
+    assert_eq(_im_cr_word(t1), 4847330063900822262, "25^11.5 = 5^23, a 54-bit tie, rounds to even");
+    var tb1: f64 = _im_cr_pow2(0 - 215);
+    var tx1: f64 = 3.0 * tb1;
+    var t2: f64 = _im_cr_pow(tx1, 5.0);
+    var tb2: f64 = _im_cr_pow2(0 - 430);
+    var tx2: f64 = 9.0 * tb2;
+    var t3: f64 = _im_cr_pow(tx2, 2.5);
+    assert_eq(_im_cr_word(t2) == 122 && _im_cr_word(t3) == 122, 1, "subnormal ties (glibc 2.44: 121)");
+    var t4: f64 = _im_cr_pow(0.5, 1075.0);
+    var t5: f64 = _im_cr_pow(0.5, 1074.0);
+    assert_eq(_im_cr_word(t4) == 0 && _im_cr_word(t5) == 1, 1, "2^-1075 is a tie to 0; 2^-1074 exact");
+    var tx6: f64 = 0.9999999925494194;
+    var t6: f64 = _im_cr_pow(tx6, 2.0);
+    assert_eq(_im_cr_word(t6), 4607182418665799680, "(1 - 2^-27)^2 = 1 - 2^-26 + 2^-54, a tie");
+    var t7: f64 = _im_cr_pow(2.0, 0.5);
+    var t8: f64 = _im_cr_pow(4.0, -537.5);
+    assert_eq(_im_cr_word(t7) == 4609047870845172685 && _im_cr_word(t8) == 0, 1, "√2; 4^-537.5 = 2^-1075, a tie to 0");
+
+    test_group("pow_values");
+    var px1: f64 = 1.0000000000000002;
+    var v1: f64 = _im_cr_pow(px1, 4503599627370496.0);
+    var v2: f64 = _im_cr_pow(10.0, 308.25);
+    var v3: f64 = _im_cr_pow(10.0, 0.0 - 323.5);
+    var v4: f64 = _im_cr_pow(0.7, 0.0 - 1990.0);
+    var v5: f64 = _im_cr_pow(1.5, 1750.0);
+    var v6: f64 = _im_cr_pow(0.00001, 3.3333333333333335);
+    var ptiny: f64 = _im_cr_from_word(1);
+    var v7: f64 = _im_cr_pow(ptiny, 0.5);
+    assert_eq(_im_cr_word(v1), 4613303445314885481, "(1 + 2^-52)^(2^52), next to e");
+    assert_eq(_im_cr_word(v2), 9218771166294802899, "near overflow");
+    assert_eq(_im_cr_word(v3) == 1 && v4 == pinf, 1, "the subnormal floor and an overflow");
+    assert_eq(_im_cr_word(v5) == 9217098554343486296 && _im_cr_word(v6) == 4357468780335506004, 1, "MPFR's values");
+    assert_eq(_im_cr_word(v7), 2188749418902061056, "√(2^-1074)");
+
+    test_group("pow_fast_and_slow");
+    # The fast phase decides ordinary arguments; where both run, the slow path agrees with it.
+    var pb = _im_cr_pow_slow_calls;
+    var p2b = _im_cr_pow_phase2_calls;
+    var agree = 1;
+    for (var pk = 0; pk < 4000; pk = pk + 1) {
+        var lx: f64 = uniform(-9.0, 9.0);
+        var bx: f64 = _im_cr_exp(lx);
+        var by: f64 = uniform(-20.0, 20.0);
+        var pfast: f64 = _im_cr_pow(bx, by);
+        if (pk < 300) {
+            var pslow: f64 = _im_cr_pow_slow(bx, by, 0);
+            if (same(pfast, pslow) == 0) { agree = 0; }
+        }
+    }
+    assert_eq(agree, 1, "fast = slow on 300 arguments");
+    assert_eq(_im_cr_pow_slow_calls - pb < 4, 1, "the fast phases decide almost all of 4,000");
+    var p2n = _im_cr_pow_phase2_calls - p2b;
+    assert_eq(p2n < 40, 1, "phase 1 alone decides more than 99 % of them");
 
     return assert_summary();
 }

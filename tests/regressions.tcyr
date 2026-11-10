@@ -1,0 +1,640 @@
+# regressions.tcyr — the 2D tests of rust-old/tests/integration.rs (9) and rust-old/tests/regressions.rs
+# (26): cross-module use of the world and the pinned behaviours of the v1.4 audit, as class R references
+# (port plan §5). Not ported: regressions.rs's three snapshot tests (M6), its 3D-only
+# substeps_are_honoured_in_3d (M5) and xpbd_moves_kinematic_bodies (ADR 0008 #6).
+
+include "tests/lib_2d.cyr"
+
+var EPS: f64 = 0.000001;
+
+# 1 when |got − want| < eps.
+fn near(got: f64, want: f64, eps: f64): i64 {
+    var d: f64 = f64_abs(got - want);
+    if (d < eps) { return 1; }
+    return 0;
+}
+
+# The event record at p.
+fn as_event(p): *ImCollisionEvent { return p; }
+
+# A config with no gravity.
+fn zero_g(): ImWorldConfig {
+    var c: ImWorldConfig = ImWorldConfig_default();
+    c.gravity = ImVec3_zero();
+    return c;
+}
+
+# A body of type t at (x, y): its handle.
+fn body_at(w: *ImPhysicsWorld, t, x: f64, y: f64): i64 {
+    var d: ImBodyDesc = ImBodyDesc_default();
+    d.body_type = t;
+    d.position = ImVec3_new(x, y, 0.0);
+    return w.add_body(d);
+}
+
+# Adds a collider of shape s (material m, mass when has_mass) to body h.
+fn coll_m(w: *ImPhysicsWorld, h, s: ImColliderShape, m: ImPhysicsMaterial, has_mass, mass: f64): i64 {
+    var d: ImColliderDesc = ImColliderDesc_new(s);
+    d.material = m;
+    d.has_mass = has_mass;
+    d.mass = mass;
+    var t, c = w.add_collider(h, d);
+    return c;
+}
+
+fn coll(w: *ImPhysicsWorld, h, s: ImColliderShape): i64 {
+    return coll_m(w, h, s, ImPhysicsMaterial_default(), 0, 0.0);
+}
+
+# A material of restitution 1, the rest default.
+fn elastic(): ImPhysicsMaterial {
+    var m: ImPhysicsMaterial = ImPhysicsMaterial_default();
+    m.restitution = 1.0;
+    return m;
+}
+
+# n steps.
+fn steps(w: *ImPhysicsWorld, n) {
+    for (var i = 0; i < n; i = i + 1) { w.step(); }
+    return 0;
+}
+
+# The state of body h.
+fn state(w: *ImPhysicsWorld, h): ImBodyState {
+    var s: ImBodyState;
+    w.get_body_state(h, &s);
+    return s;
+}
+
+# A joint of type jt between a and b at the origin anchors.
+fn joint(a, b, jt: ImJointType): ImJointDesc {
+    var z2: ImVec2 = ImVec2_new(0.0, 0.0);
+    return ImJointDesc_new(a, b, jt, z2, z2);
+}
+
+# spring_joint_independent_of_iterations: a 1 kg ball on a soft spring of rest length 0 at x = 1, one
+# step of 0.01 s at `iters` velocity iterations: its x velocity.
+fn spring_run(iters): f64 {
+    var c: ImWorldConfig = zero_g();
+    c.velocity_iterations = iters;
+    c.timestep = 0.01;
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(c);
+    var a = body_at(&w, IM_BODY_STATIC, 0.0, 0.0);
+    var b = body_at(&w, IM_BODY_DYNAMIC, 1.0, 0.0);
+    coll_m(&w, b, ImColliderShape_ball(0.1), ImPhysicsMaterial_default(), 1, 1.0);
+    w.add_joint(joint(a, b, ImJointType_spring(0.0, 10.0, 0.0)));
+    w.step();
+    var s: ImBodyState = state(&w, b);
+    var vx: f64 = s.linear_velocity.x;
+    w.free();
+    return vx;
+}
+
+# joint_breaks_under_load: a 1 kg ball hung 1 below a static anchor on a distance joint that breaks
+# above `limit` N, after 30 steps: its y.
+fn break_run(limit: f64): f64 {
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    var a = body_at(&w, IM_BODY_STATIC, 0.0, 10.0);
+    var b = body_at(&w, IM_BODY_DYNAMIC, 0.0, 9.0);
+    coll_m(&w, b, ImColliderShape_ball(0.25), ImPhysicsMaterial_default(), 1, 1.0);
+    var d: ImJointDesc = joint(a, b, ImJointType_distance(1.0));
+    d.has_break_force = 1;
+    d.break_force = limit;
+    w.add_joint(d);
+    steps(&w, 30);
+    var s: ImBodyState = state(&w, b);
+    var y: f64 = s.position.y;
+    w.free();
+    return y;
+}
+
+# Runs the regression tests.
+fn main() {
+    alloc_init();
+    var z: ImVec3 = ImVec3_zero();
+    var s: ImBodyState;
+
+    # ── integration.rs ──
+    test_group("full_world_lifecycle");
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    var floor = body_at(&w, IM_BODY_STATIC, 0.0, -1.0);
+    coll_m(&w, floor, ImColliderShape_box(50.0, 1.0, 0.0), ImPhysicsMaterial_wood(), 0, 0.0);
+    var ball = body_at(&w, IM_BODY_DYNAMIC, 0.0, 10.0);
+    coll_m(&w, ball, ImColliderShape_ball(0.5), ImPhysicsMaterial_rubber(), 0, 0.0);
+    assert_eq(w.body_count(), 2, "two bodies");
+    steps(&w, 60);
+    assert_eq(w.current_step(), 60, "60 steps");
+    w.remove_body(ball);
+    assert_eq(w.body_count(), 1, "one left");
+    w.free();
+
+    test_group("joint_connects_bodies");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var ja = body_at(&w, IM_BODY_STATIC, 0.0, 5.0);
+    var jb = body_at(&w, IM_BODY_DYNAMIC, 0.0, 3.0);
+    w.add_joint(joint(ja, jb, ImJointType_spring(2.0, 100.0, 5.0)));
+    steps(&w, 10);
+    assert_eq(w.current_step(), 10, "steps with a spring joint");
+    w.free();
+
+    test_group("forces_and_impulses");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var fb = w.add_body(ImBodyDesc_default());
+    w.apply_force(fb, ImForce_gravity(10.0, 9.81));
+    w.apply_impulse(fb, ImImpulse_new(5.0, 0.0, 0.0));
+    w.step();
+    assert_eq(w.current_step(), 1, "one step");
+    w.free();
+
+    test_group("material_presets_are_distinct");
+    var ice: ImPhysicsMaterial = ImPhysicsMaterial_ice();
+    var rub: ImPhysicsMaterial = ImPhysicsMaterial_rubber();
+    var stl: ImPhysicsMaterial = ImPhysicsMaterial_steel();
+    var fi: f64 = ice.friction;
+    var fr: f64 = rub.friction;
+    var fs: f64 = stl.friction;
+    var rr: f64 = rub.restitution;
+    var rs: f64 = stl.restitution;
+    var di: f64 = ice.density;
+    var dr: f64 = rub.density;
+    var ds: f64 = stl.density;
+    assert_eq(fi < fr && fi < fs, 1, "ice is the slipperiest");
+    assert_eq(rr > rs, 1, "rubber bounces more than steel");
+    assert_eq(ds > dr && ds > di, 1, "steel is the densest");
+
+    test_group("unit_quantities_display");
+    var qn: ImQuantity = ImQuantity_newtons(9.81);
+    var sb = str_builder_new();
+    qn.fmt(sb);
+    var qs = str_builder_build(sb);
+    var has_n = 0;
+    for (var ci = 0; ci < str_len(qs); ci = ci + 1) {
+        if (load8(str_data(qs) + ci) == 78) { has_n = 1; }
+    }
+    assert_eq(has_n, 1, "N in the display");
+    var qd: ImQuantity = ImQuantity_degrees(90.0);
+    var rad: f64 = qd.to_radians();
+    assert_eq(near(rad, _IM_PI / 2.0, 0.0000000001), 1, "90° is π/2");
+
+    test_group("config_serde_roundtrip");
+    var cc: ImWorldConfig = ImWorldConfig_default();
+    cc.timestep = 1.0 / 120.0;
+    cc.gravity = ImVec3_new(0.0, -10.0, 0.0);
+    cc.velocity_iterations = 8;
+    cc.position_iterations = 3;
+    cc.deterministic = 1;
+    cc.step = 0;
+    var jb2 = str_builder_new();
+    cc.to_json(jb2);
+    var js = str_builder_build(jb2);
+    var back: ImWorldConfig = ImWorldConfig_default();
+    var tj, vj = ImWorldConfig_from_json(str_data(js), str_len(js), &back);
+    var bts: f64 = back.timestep;
+    var bgy: f64 = back.gravity.y;
+    assert_eq(is_ok(tj) == 1 && bts == 1.0 / 120.0 && bgy == 0.0 - 10.0 && back.velocity_iterations == 8, 1,
+      "reads back");
+
+    test_group("mixed_body_types");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    body_at(&w, IM_BODY_STATIC, 0.0, 0.0);
+    body_at(&w, IM_BODY_DYNAMIC, 0.0, 0.0);
+    body_at(&w, IM_BODY_KINEMATIC, 0.0, 0.0);
+    assert_eq(w.body_count(), 3, "three");
+    steps(&w, 10);
+    assert_eq(w.current_step(), 10, "ten steps");
+    w.free();
+
+    test_group("sensor_collider_creation");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var sbody = w.add_body(ImBodyDesc_default());
+    var sd: ImColliderDesc = ImColliderDesc_new(ImColliderShape_ball(5.0));
+    sd.is_sensor = 1;
+    var ts, vs = w.add_collider(sbody, sd);
+    w.step();
+    assert_eq(is_ok(ts), 1, "a sensor steps");
+    w.free();
+
+    test_group("deterministic_stepping");
+    var wa: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    var wb: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    for (var d1 = 0; d1 < 100; d1 = d1 + 1) {
+        wa.step();
+        wb.step();
+    }
+    assert_eq(wa.current_step() == wb.current_step() && wa.current_step() == 100, 1, "in step");
+    wa.free();
+    wb.free();
+
+    # ── regressions.rs ──
+    test_group("substep_force_acts_for_full_step");
+    var c4: ImWorldConfig = zero_g();
+    c4.sub_steps = 4;
+    w = ImPhysicsWorld_new(c4);
+    var sb4 = w.add_body(ImBodyDesc_default());
+    coll_m(&w, sb4, ImColliderShape_ball(0.5), ImPhysicsMaterial_default(), 1, 1.0);
+    w.apply_force(sb4, ImForce_new(10.0, 0.0, 0.0));
+    w.step();
+    s = state(&w, sb4);
+    var svx: f64 = s.linear_velocity.x;
+    assert_eq(near(svx, 10.0 / 60.0, 0.000000001), 1, "the force acts over the whole step");
+    w.free();
+
+    test_group("substep_reports_started_event");
+    var c4b: ImWorldConfig = ImWorldConfig_default();
+    c4b.sub_steps = 4;
+    w = ImPhysicsWorld_new(c4b);
+    var gnd = body_at(&w, IM_BODY_STATIC, 0.0, 0.0);
+    coll(&w, gnd, ImColliderShape_box(10.0, 0.5, 10.0));
+    var sbb = body_at(&w, IM_BODY_DYNAMIC, 0.0, 0.9);
+    coll(&w, sbb, ImColliderShape_ball(0.5));
+    w.step();
+    var ev, en = w.collision_events();
+    var started = 0;
+    for (var ei = 0; ei < en; ei = ei + 1) {
+        var e: *ImCollisionEvent = as_event(ev + ei * sizeof(ImCollisionEvent));
+        if (e.kind == IM_EVENT_STARTED) { started = 1; }
+    }
+    assert_eq(started, 1, "Started reported");
+    w.free();
+
+    test_group("static_to_dynamic_gains_mass");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var sd2 = body_at(&w, IM_BODY_STATIC, 0.0, 10.0);
+    coll(&w, sd2, ImColliderShape_ball(0.5));
+    w.set_body_type(sd2, IM_BODY_DYNAMIC);
+    steps(&w, 60);
+    s = state(&w, sd2);
+    var sdy: f64 = s.position.y;
+    assert_eq(sdy < 9.0, 1, "falls");
+    w.free();
+
+    test_group("particle_drag_is_quadratic");
+    w = ImPhysicsWorld_new(zero_g());
+    var dp: ImParticle = ImParticle_new(z, ImVec3_new(10.0, 0.0, 0.0), 10.0);
+    dp.with_drag(1.0);
+    w.spawn_particle(dp);
+    w.step();
+    var dps, dn = w.particles();
+    var dq: *ImParticle = _im_as_particle(dps);
+    var dvx: f64 = dq.velocity.x;
+    assert_eq(near(dvx, 10.0 - 100.0 / 60.0, 0.000000001), 1, "Δv = c·v²·dt");
+    w.free();
+
+    test_group("infinite_emitter_rate_terminates");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var zero: f64 = 0.0;
+    var inf: f64 = 1.0 / zero;
+    w.add_emitter(ImParticleEmitter_new(z, z, inf));
+    w.step();
+    assert_eq(w.particle_count() <= 100000, 1, "terminates");
+    w.free();
+
+    test_group("emitter_spread_axes_independent");
+    w = ImPhysicsWorld_new(zero_g());
+    var se: ImParticleEmitter = ImParticleEmitter_new(z, z, 600.0);
+    se.with_spread(ImVec3_new(1.0, 1.0, 0.0)).with_lifetime(100.0).with_radius(0.0);
+    w.add_emitter(se);
+    steps(&w, 50);
+    var sps, sn = w.particles();
+    var nf: f64 = f64_from(sn);
+    var mx: f64 = -0.0;
+    var my: f64 = -0.0;
+    for (var p1 = 0; p1 < sn; p1 = p1 + 1) {
+        var q1: *ImParticle = _im_as_particle(sps + p1 * sizeof(ImParticle));
+        var qx: f64 = q1.velocity.x;
+        var qy: f64 = q1.velocity.y;
+        mx = mx + qx;
+        my = my + qy;
+    }
+    mx = mx / nf;
+    my = my / nf;
+    var sxy: f64 = 0.0;
+    var sxx: f64 = 0.0;
+    var syy: f64 = 0.0;
+    for (var p2 = 0; p2 < sn; p2 = p2 + 1) {
+        var q2: *ImParticle = _im_as_particle(sps + p2 * sizeof(ImParticle));
+        var ux: f64 = q2.velocity.x;
+        var uy: f64 = q2.velocity.y;
+        var dx: f64 = ux - mx;
+        var dy: f64 = uy - my;
+        sxy = sxy + dx * dy;
+        sxx = sxx + dx * dx;
+        syy = syy + dy * dy;
+    }
+    var corr: f64 = sxy / f64_sqrt(sxx * syy);
+    var acorr: f64 = f64_abs(corr);
+    assert_eq(nf > 100.0 && acorr < 0.3, 1, "uncorrelated");
+    w.free();
+
+    test_group("particle_does_not_tunnel_into_box");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    floor = body_at(&w, IM_BODY_STATIC, 0.0, 0.0);
+    coll(&w, floor, ImColliderShape_box(50.0, 0.5, 50.0));
+    var tp: ImParticle = ImParticle_new(ImVec3_new(0.0, 2.5, 0.0), z, 100.0);
+    tp.with_radius(0.05);
+    w.spawn_particle(tp);
+    steps(&w, 240);
+    var tps, tn = w.particles();
+    var tq: *ImParticle = _im_as_particle(tps);
+    var ty: f64 = tq.position.y;
+    assert_eq(ty > 0.0, 1, "pushed out, not through");
+    w.free();
+
+    test_group("rope_holds_length_over_time");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var ra = body_at(&w, IM_BODY_STATIC, 0.0, 10.0);
+    var rb = body_at(&w, IM_BODY_DYNAMIC, 0.0, 8.0);
+    coll(&w, rb, ImColliderShape_ball(0.25));
+    w.add_joint(joint(ra, rb, ImJointType_rope(2.0)));
+    steps(&w, 300);
+    s = state(&w, rb);
+    var rpx: f64 = s.position.x;
+    var rpy: f64 = s.position.y;
+    var rvx: f64 = s.linear_velocity.x;
+    var rvy: f64 = s.linear_velocity.y;
+    var rdy: f64 = 10.0 - rpy;
+    var rdist: f64 = _im_hypot(rdy, rpx);
+    var rspeed: f64 = _im_hypot(rvx, rvy);
+    assert_eq(rdist < 2.05 && rspeed < 1.0, 1, "held at length, settled");
+    w.free();
+
+    test_group("spring_joint_independent_of_iterations");
+    var v1: f64 = spring_run(1);
+    var v8: f64 = spring_run(8);
+    var want: f64 = -0.1 / (1.0 + 10.0 * 0.01 * 0.01);
+    assert_eq(near(v1, want, 0.000000001) == 1 && near(v8, v1, 0.000000001) == 1, 1, "Δv = −k·x·dt/(1 + k·dt²/m)");
+
+    test_group("motor_with_bad_max_force_does_not_panic");
+    var nan: f64 = zero / zero;
+    for (var mi = 0; mi < 2; mi = mi + 1) {
+        var mf: f64 = -1.0;
+        if (mi == 1) { mf = nan; }
+        w = ImPhysicsWorld_new(ImWorldConfig_default());
+        var ma = body_at(&w, IM_BODY_STATIC, 0.0, 0.0);
+        var mb = body_at(&w, IM_BODY_DYNAMIC, 1.0, 0.0);
+        coll(&w, mb, ImColliderShape_ball(0.25));
+        var md: ImJointDesc = joint(ma, mb, ImJointType_revolute(ImVec2_new(0.0, 0.0), 0, 0.0, 0.0));
+        md.has_motor = 1;
+        md.motor = ImJointMotor_new(1.0, mf);
+        w.add_joint(md);
+        w.step();
+        s = state(&w, mb);
+        var mx1: f64 = s.position.x;
+        assert_eq(_im_is_finite(mx1), 1, "steps to a finite state");
+        w.free();
+    }
+
+    test_group("raycast_hits_rotated_box");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var rd: ImBodyDesc = ImBodyDesc_default();
+    rd.body_type = IM_BODY_STATIC;
+    rd.rotation = _IM_PI / 2.0;
+    var rbox = w.add_body(rd);
+    coll(&w, rbox, ImColliderShape_box(2.0, 0.1, 0.0));
+    var hit: ImRayHit;
+    var h1 = w.raycast(ImVec3_new(5.0, 1.5, 0.0), ImVec3_new(-1.0, 0.0, 0.0), 100.0, &hit);
+    var hd: f64 = hit.distance;
+    assert_eq(h1 == 1 && near(hd, 4.9, 0.000000001) == 1, 1, "hits at 4.9");
+    var h2 = w.raycast(ImVec3_new(1.5, 5.0, 0.0), ImVec3_new(0.0, -1.0, 0.0), 100.0, &hit);
+    assert_eq(h2, 0, "the unrotated box's point misses");
+    test_group("overlap_sphere_respects_rotation");
+    var ol: ImWordList = ImWordList_new();
+    w.overlap_sphere(ImVec3_new(1.5, 0.0, 0.0), 0.05, &ol);
+    var o1 = ol.len;
+    w.overlap_sphere(ImVec3_new(0.0, 1.5, 0.0), 0.05, &ol);
+    assert_eq(o1 == 0 && ol.len == 1, 1, "rotation respected");
+    ol.free();
+    w.free();
+
+    test_group("sleeping_body_does_not_drift");
+    w = ImPhysicsWorld_new(zero_g());
+    var dd: ImBodyDesc = ImBodyDesc_default();
+    dd.linear_velocity = ImVec3_new(0.005, 0.0, 0.0);
+    var db = w.add_body(dd);
+    coll(&w, db, ImColliderShape_ball(0.5));
+    steps(&w, 120);
+    var s1: ImBodyState = state(&w, db);
+    steps(&w, 120);
+    var s2: ImBodyState = state(&w, db);
+    var x1: f64 = s1.position.x;
+    var x2: f64 = s2.position.x;
+    assert_eq(s1.is_sleeping == 1 && x1 == x2, 1, "asleep and still");
+    w.free();
+
+    test_group("ball_rests_on_box_floor_either_order");
+    for (var order = 0; order < 2; order = order + 1) {
+        w = ImPhysicsWorld_new(ImWorldConfig_default());
+        if (order == 0) {
+            var f0 = body_at(&w, IM_BODY_STATIC, 0.0, 0.0);
+            coll(&w, f0, ImColliderShape_box(10.0, 0.5, 10.0));
+        }
+        var rball = body_at(&w, IM_BODY_DYNAMIC, 3.0, 3.0);
+        coll(&w, rball, ImColliderShape_ball(0.5));
+        if (order == 1) {
+            var f1 = body_at(&w, IM_BODY_STATIC, 0.0, 0.0);
+            coll(&w, f1, ImColliderShape_box(10.0, 0.5, 10.0));
+        }
+        steps(&w, 300);
+        s = state(&w, rball);
+        var ry: f64 = s.position.y;
+        var rvy2: f64 = s.linear_velocity.y;
+        var arv: f64 = f64_abs(rvy2);
+        assert_eq(near(ry, 1.0, 0.05) == 1 && arv < 0.1, 1, "rests at y = 1");
+        w.free();
+    }
+
+    test_group("elastic_ball_bounces_off_box");
+    w = ImPhysicsWorld_new(zero_g());
+    var ef = body_at(&w, IM_BODY_STATIC, 0.0, 0.0);
+    coll_m(&w, ef, ImColliderShape_box(10.0, 0.5, 10.0), elastic(), 0, 0.0);
+    var eb: ImBodyDesc = ImBodyDesc_default();
+    eb.position = ImVec3_new(0.0, 1.05, 0.0);
+    eb.linear_velocity = ImVec3_new(0.0, -10.0, 0.0);
+    var ebh = w.add_body(eb);
+    coll_m(&w, ebh, ImColliderShape_ball(0.5), elastic(), 0, 0.0);
+    steps(&w, 3);
+    s = state(&w, ebh);
+    var evy: f64 = s.linear_velocity.y;
+    assert_eq(evy > 9.0, 1, "bounces back");
+    w.free();
+
+    test_group("elastic_ball_bounces_off_ball");
+    w = ImPhysicsWorld_new(zero_g());
+    var eball = body_at(&w, IM_BODY_STATIC, 0.0, 0.0);
+    coll_m(&w, eball, ImColliderShape_ball(0.5), elastic(), 0, 0.0);
+    var ebh2 = w.add_body(eb);
+    coll_m(&w, ebh2, ImColliderShape_ball(0.5), elastic(), 0, 0.0);
+    steps(&w, 3);
+    s = state(&w, ebh2);
+    var evy2: f64 = s.linear_velocity.y;
+    assert_eq(evy2 > 9.0, 1, "bounces back at speed");
+    w.free();
+
+    test_group("pinned_box_swings");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var pin = body_at(&w, IM_BODY_STATIC, 0.0, 0.0);
+    var rod = body_at(&w, IM_BODY_DYNAMIC, 1.0, 0.0);
+    coll(&w, rod, ImColliderShape_box(1.0, 0.05, 0.0));
+    var pd: ImJointDesc = joint(pin, rod, ImJointType_revolute(ImVec2_new(0.0, 0.0), 0, 0.0, 0.0));
+    pd.local_anchor_b = ImVec2_new(-1.0, 0.0);
+    w.add_joint(pd);
+    steps(&w, 30);
+    s = state(&w, rod);
+    var prot: f64 = s.rotation;
+    var ppx: f64 = s.position.x;
+    var ppy: f64 = s.position.y;
+    var pc: f64 = _im_cos(prot);
+    var ps: f64 = _im_sin(prot);
+    var endx: f64 = ppx - pc;
+    var endy: f64 = ppy - ps;
+    var drift: f64 = _im_hypot(endx, endy);
+    assert_eq(prot < -0.3 && drift < 0.02, 1, "swings about the pivot");
+    w.free();
+
+    test_group("fixed_joint_locks_rotation");
+    w = ImPhysicsWorld_new(zero_g());
+    var fa = body_at(&w, IM_BODY_STATIC, 0.0, 0.0);
+    var fbx = body_at(&w, IM_BODY_DYNAMIC, 1.0, 0.0);
+    coll(&w, fbx, ImColliderShape_box(0.5, 0.5, 0.0));
+    var fd: ImJointDesc = joint(fa, fbx, ImJointType_fixed());
+    fd.local_anchor_a = ImVec2_new(1.0, 0.0);
+    w.add_joint(fd);
+    for (var ft = 0; ft < 30; ft = ft + 1) {
+        w.apply_torque(fbx, ImTorque_new(10.0));
+        w.step();
+    }
+    s = state(&w, fbx);
+    var frot: f64 = s.rotation;
+    var fpx: f64 = s.position.x;
+    var afr: f64 = f64_abs(frot);
+    assert_eq(afr < 0.01 && near(fpx, 1.0, 0.01) == 1, 1, "held");
+    w.free();
+
+    test_group("distance_joint_hangs_at_length");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var da = body_at(&w, IM_BODY_STATIC, 0.0, 10.0);
+    var dbb = body_at(&w, IM_BODY_DYNAMIC, 0.0, 8.0);
+    coll(&w, dbb, ImColliderShape_ball(0.25));
+    w.add_joint(joint(da, dbb, ImJointType_distance(2.0)));
+    steps(&w, 600);
+    s = state(&w, dbb);
+    var dpy: f64 = s.position.y;
+    var dvy: f64 = s.linear_velocity.y;
+    var adv: f64 = f64_abs(dvy);
+    assert_eq(near(10.0 - dpy, 2.0, 0.01) == 1 && adv < 0.1, 1, "at length, settled");
+    w.free();
+
+    test_group("revolute_motor_reaches_target_speed");
+    w = ImPhysicsWorld_new(zero_g());
+    var mra = body_at(&w, IM_BODY_STATIC, 0.0, 0.0);
+    var mrb = w.add_body(ImBodyDesc_default());
+    coll(&w, mrb, ImColliderShape_box(0.5, 0.5, 0.0));
+    var mrd: ImJointDesc = joint(mra, mrb, ImJointType_revolute(ImVec2_new(0.0, 0.0), 0, 0.0, 0.0));
+    mrd.has_motor = 1;
+    mrd.motor = ImJointMotor_new(2.0, 1000.0);
+    w.add_joint(mrd);
+    steps(&w, 10);
+    s = state(&w, mrb);
+    var mw: f64 = s.angular_velocity;
+    assert_eq(near(mw, 2.0, 0.000001), 1, "at the target speed");
+    w.free();
+
+    test_group("mouse_joint_reaches_target");
+    w = ImPhysicsWorld_new(zero_g());
+    var mbody = w.add_body(ImBodyDesc_default());
+    coll(&w, mbody, ImColliderShape_ball(0.25));
+    w.add_joint(joint(mbody, mbody, ImJointType_mouse(ImVec3_new(3.0, 1.0, 0.0), 200.0, 30.0, 1000.0)));
+    steps(&w, 240);
+    s = state(&w, mbody);
+    var mpx: f64 = s.position.x;
+    var mpy: f64 = s.position.y;
+    assert_eq(near(mpx, 3.0, 0.01) == 1 && near(mpy, 1.0, 0.01) == 1, 1, "at the target");
+    w.free();
+
+    test_group("joint_breaks_under_load");
+    var yb5: f64 = break_run(5.0);
+    var yb50: f64 = break_run(50.0);
+    assert_eq(yb5 < 8.0 && near(yb50, 9.0, 0.02) == 1, 1, "5 N breaks, 50 N holds");
+
+    test_group("box_stack_is_stable");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var sg = body_at(&w, IM_BODY_STATIC, 0.0, 0.0);
+    coll(&w, sg, ImColliderShape_box(10.0, 0.5, 0.0));
+    var first = 0;
+    for (var bi = 0; bi < 6; bi = bi + 1) {
+        var byy: f64 = 1.0 + f64_from(bi);
+        var bh = body_at(&w, IM_BODY_DYNAMIC, 0.0, byy);
+        coll(&w, bh, ImColliderShape_box(0.5, 0.5, 0.0));
+        if (bi == 0) { first = bh; }
+    }
+    steps(&w, 600);
+    var stable = 1;
+    var ba: *ImArena = w.backend._bodies();
+    for (var bj = 0; bj < 6; bj = bj + 1) {
+        var hj = ba.slot_handle(bj + 1);
+        s = state(&w, hj);
+        var sx: f64 = s.position.x;
+        var sy: f64 = s.position.y;
+        var sr: f64 = s.rotation;
+        var asx: f64 = f64_abs(sx);
+        var asr: f64 = f64_abs(sr);
+        var wanty: f64 = 1.0 + f64_from(bj);
+        if (!(asx < 0.05 && asr < 0.05 && near(sy, wanty, 0.1) == 1)) { stable = 0; }
+    }
+    assert_eq(first == ba.slot_handle(1) && stable == 1, 1, "upright and at rest");
+    w.free();
+
+    test_group("off_centre_box_rests_without_spin");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var og = body_at(&w, IM_BODY_STATIC, 0.0, 0.0);
+    coll(&w, og, ImColliderShape_box(10.0, 0.5, 10.0));
+    var ob = body_at(&w, IM_BODY_DYNAMIC, 8.0, 1.0);
+    coll(&w, ob, ImColliderShape_box(0.5, 0.5, 0.5));
+    steps(&w, 300);
+    s = state(&w, ob);
+    var ox: f64 = s.position.x;
+    var oy: f64 = s.position.y;
+    var orr: f64 = s.rotation;
+    var aor: f64 = f64_abs(orr);
+    assert_eq(near(ox, 8.0, 0.05) == 1 && near(oy, 1.0, 0.05) == 1 && aor < 0.05, 1, "rests, no spin");
+    w.free();
+
+    test_group("baumgarte_mode_resolves_penetration");
+    var cb: ImWorldConfig = zero_g();
+    cb.constraint_frequency = 0.0;
+    w = ImPhysicsWorld_new(cb);
+    var bg = body_at(&w, IM_BODY_STATIC, 0.0, 0.0);
+    coll(&w, bg, ImColliderShape_box(10.0, 0.5, 10.0));
+    var bb = body_at(&w, IM_BODY_DYNAMIC, 0.0, 0.9);
+    coll(&w, bb, ImColliderShape_ball(0.5));
+    steps(&w, 60);
+    s = state(&w, bb);
+    var bby: f64 = s.position.y;
+    assert_eq(bby > 0.98, 1, "pushed out");
+    w.free();
+
+    test_group("removing_support_wakes_sleepers");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var wg = body_at(&w, IM_BODY_STATIC, 0.0, 0.0);
+    coll(&w, wg, ImColliderShape_box(10.0, 0.5, 0.0));
+    var plank = body_at(&w, IM_BODY_DYNAMIC, 0.0, 1.0);
+    coll(&w, plank, ImColliderShape_box(2.0, 0.5, 0.0));
+    var top = body_at(&w, IM_BODY_DYNAMIC, 0.0, 2.0);
+    coll(&w, top, ImColliderShape_box(0.5, 0.5, 0.0));
+    steps(&w, 240);
+    s = state(&w, top);
+    var tsleep = s.is_sleeping;
+    var ty0: f64 = s.position.y;
+    w.remove_body(plank);
+    steps(&w, 60);
+    s = state(&w, top);
+    var ty1: f64 = s.position.y;
+    assert_eq(tsleep == 1 && ty1 < ty0 - 0.5, 1, "asleep, then falls");
+    w.free();
+
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);
