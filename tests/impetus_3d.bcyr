@@ -5,7 +5,8 @@
 #
 # M4 part 1: glam's value math (src/math3.cyr) beside hisab's allocating calls for the same operation (ADR 0012's
 # trade), the gyroscopic step, body integration, the mass recompute and a world AABB. M4 part 2: the narrowphase.
-# M4 part 3: the raycast.
+# M4 part 3: the raycast. M5 part 1: the 3D state, Rust's bodies/* and forces/apply_* loops (Rust's own numbers from the
+# 3D build), and get_body_state, which reads the rotation back through the correctly rounded atan2.
 
 include "tests/lib_3d.cyr"
 
@@ -280,6 +281,66 @@ fn bench_raycast() {
     return 0;
 }
 
+# bodies/* and forces/apply_*: the Rust benches' loops on an ImPhysicsState3d (PhysicsWorld's 3D calls are the
+# backend's). As in Rust, add_body and add_joint grow one world. which 6 is Cyrius-only: get_body_state.
+fn bench_state3(name, which) {
+    var st: ImPhysicsState3d = ImPhysicsState3d_new();
+    var a = st.add_body(ImBodyDesc_default());
+    var b2 = st.add_body(ImBodyDesc_default());
+    var bd: ImBodyDesc = ImBodyDesc_default();
+    bd.position = ImVec3_new(1.0, 2.0, 0.0);
+    var cd: ImColliderDesc = ImColliderDesc_new(ImColliderShape_ball(0.5));
+    var z2: ImVec2 = ImVec2_new(0.0, 0.0);
+    var jd: ImJointDesc = ImJointDesc_new(a, b2, ImJointType_spring(2.0, 100.0, 5.0), z2, z2);
+    var fo: ImForce = ImForce_new(10.0, -5.0, 0.0);
+    var im: ImImpulse = ImImpulse_new(0.0, 20.0, 0.0);
+    var rd: ImBodyDesc = ImBodyDesc_default();
+    rd.rotation = 0.7;
+    var rh = st.add_body(rd);
+    var bs: ImBodyState;
+    var bn = bench_new(name);
+    var reps = 100000;
+    bench_batch_start(bn);
+    for (var r = 0; r < reps; r = r + 1) {
+        if (which == 0) {
+            g_sink = st.add_body(ImBodyDesc_default());
+        } elif (which == 1) {
+            var h = st.add_body(ImBodyDesc_default());
+            st.remove_body(h);
+        } elif (which == 2) {
+            var h2 = st.add_body(bd);
+            var t, c = st.add_collider(h2, cd);
+            g_sink = c;
+        } elif (which == 3) {
+            var tj, j = st.add_joint(jd);
+            g_sink = j;
+        } elif (which == 4) {
+            st.apply_force(a, fo);
+        } elif (which == 5) {
+            st.apply_impulse(a, im);
+        } else {
+            var tg, ug = st.get_body_state(rh, &bs);
+            g_sink = tg;
+        }
+    }
+    bench_batch_stop(bn, reps);
+    bench_report(bn);
+    cd.shape.free();
+    st.free();
+    return 0;
+}
+
+fn bench_states3() {
+    bench_state3("bodies/add_body (3D)", 0);
+    bench_state3("bodies/add_remove_body (3D)", 1);
+    bench_state3("bodies/add_body_with_collider (3D)", 2);
+    bench_state3("bodies/add_joint (3D)", 3);
+    bench_state3("forces/apply_force (3D)", 4);
+    bench_state3("forces/apply_impulse (3D)", 5);
+    bench_state3("b3/get_body_state", 6);
+    return 0;
+}
+
 fn main() {
     alloc_init();
     bench_math3();
@@ -287,6 +348,7 @@ fn main() {
     bench_mass_and_aabb();
     bench_narrowphase();
     bench_raycast();
+    bench_states3();
     return 0;
 }
 

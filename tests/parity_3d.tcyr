@@ -350,10 +350,241 @@ fn _par_b3_ray(fp, fl): i64 {
     return 1;
 }
 
+# ── b3_state: the 3D backend's state (src/b3_state.cyr) ─────────────────────────────
+# A row is a script of ops on a fresh ImPhysicsState3d; its outputs are each op's result, then the backend dump in
+# `oracle_dump()`'s order. `b3::state_script_orphan` rows add a collider or a joint for a missing body, which the port
+# refuses (ADR 0008 #1): mapped, and counted.
+
+var _par_mapped3 = 0;
+var _par_map_orphan3 = 0;
+
+fn _par_got_body3d(rb: *ImRigidBody3d) {
+    _par_got_i(rb.handle);
+    _par_got_enum("BodyType.", body_type_name(rb.body_type));
+    _par_got_v3(rb.position);
+    _par_got_q4(rb.rotation);
+    _par_got_v3(rb.linear_velocity);
+    _par_got_v3(rb.angular_velocity);
+    var ld: f64 = rb.linear_damping;
+    var ad: f64 = rb.angular_damping;
+    var gs: f64 = rb.gravity_scale;
+    _par_got_f(ld);
+    _par_got_f(ad);
+    _par_got_i(rb.fixed_rotation);
+    _par_got_f(gs);
+    _par_got_v3(rb.force_accumulator);
+    _par_got_v3(rb.torque_accumulator);
+    var m: f64 = rb.mass;
+    var im: f64 = rb.inv_mass;
+    _par_got_f(m);
+    _par_got_f(im);
+    _par_got_m9(rb.inertia);
+    _par_got_m9(rb.inv_inertia);
+    _par_got_m9(rb.inv_inertia_world);
+    _par_got_v3(rb.pseudo_velocity);
+    _par_got_v3(rb.pseudo_angular_velocity);
+    var stm: f64 = rb.sleep_timer;
+    _par_got_i(rb.is_sleeping);
+    _par_got_f(stm);
+    return 0;
+}
+
+fn _par_got_collider3d(c: *ImCollider3d) {
+    _par_got_i(c.handle);
+    _par_got_i(c.body);
+    _par_got_shape(c.shape);
+    _par_got_v3(c.offset);
+    _par_got_material(c.material);
+    _par_got_i(c.is_sensor);
+    var ms: f64 = c.mass;
+    _par_got_opt_f(c.has_mass, ms);
+    _par_got_i(c.collision_layer);
+    _par_got_i(c.collision_mask);
+    return 0;
+}
+
+fn _par_got_joint3d(h, j: *ImJoint3d) {
+    _par_got_i(h);
+    _par_got_i(j.body_a);
+    _par_got_i(j.body_b);
+    _par_got_joint_type(j.joint_type);
+    _par_got_v3(j.local_anchor_a);
+    _par_got_v3(j.local_anchor_b);
+    _par_got_q4(j.reference_rotation);
+    if (j.has_motor == 1) {
+        var tv: f64 = j.motor.target_velocity;
+        var mf: f64 = j.motor.max_force;
+        _par_got_f(tv);
+        _par_got_f(mf);
+    } else {
+        _par_got_none();
+    }
+    var dm: f64 = j.damping;
+    var bf: f64 = j.break_force;
+    _par_got_f(dm);
+    _par_got_opt_f(j.has_break_force, bf);
+    return 0;
+}
+
+# The state's dump: arenas and values in slot order, body_colliders by handle, the tracker.
+fn _par_got_state3d(st: *ImPhysicsState3d) {
+    var ba: *ImArena = st._bodies();
+    _par_got_arena(ba);
+    _par_got_seq(ba.len());
+    for (var i = 0; i < ba.slot_count(); i = i + 1) {
+        var h = ba.slot_handle(i);
+        if (h != 0 - 1) { _par_got_body3d(_im_b3_as_body(ba.get(h))); }
+    }
+    var ca: *ImArena = st._colliders();
+    _par_got_arena(ca);
+    _par_got_seq(ca.len());
+    for (var c = 0; c < ca.slot_count(); c = c + 1) {
+        var ch = ca.slot_handle(c);
+        if (ch != 0 - 1) { _par_got_collider3d(_im_b3_as_coll(ca.get(ch))); }
+    }
+    var ja: *ImArena = st._joints();
+    _par_got_arena(ja);
+    _par_got_seq(ja.len());
+    for (var j = 0; j < ja.slot_count(); j = j + 1) {
+        var jh = ja.slot_handle(j);
+        if (jh != 0 - 1) { _par_got_joint3d(jh, _im_b3_as_joint(ja.get(jh))); }
+    }
+    # body_colliders: the live bodies in unsigned handle order (an insertion sort).
+    var n = ba.len();
+    var hs = fl_alloc(n * 8 + 8);
+    var cnt = 0;
+    for (var s = 0; s < ba.slot_count(); s = s + 1) {
+        var bh = ba.slot_handle(s);
+        if (bh != 0 - 1) {
+            var at = cnt;
+            while (at > 0 && _im_ult(bh, load64(hs + (at - 1) * 8)) == 1) {
+                store64(hs + at * 8, load64(hs + (at - 1) * 8));
+                at = at - 1;
+            }
+            store64(hs + at * 8, bh);
+            cnt = cnt + 1;
+        }
+    }
+    _par_got_seq(cnt);
+    for (var q = 0; q < cnt; q = q + 1) {
+        var b = load64(hs + q * 8);
+        _par_got_i(b);
+        var list: *ImWordList = st._list(_im_handle_index(b));
+        _par_got_seq(list.len);
+        for (var r = 0; r < list.len; r = r + 1) { _par_got_i(list.at(r)); }
+    }
+    fl_free(hs);
+    _par_got_pairlist(st.contact_tracker.prev);
+    _par_got_pairlist(st.contact_tracker.current);
+    _par_got_pairlist(st.contact_tracker.seen);
+    _par_got_i(st.contact_tracker.recorded);
+    return 0;
+}
+
+fn _par_b3_state(fp, fl): i64 {
+    var plain = _par_eq(fp, fl, "b3::state_script");
+    var orphan = _par_eq(fp, fl, "b3::state_script_orphan");
+    if (plain == 0 && orphan == 0) { return 0; }
+    var st: ImPhysicsState3d = ImPhysicsState3d_new();
+    var n = _par_in(0);
+    var k = 1;
+    var refused = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var op = _par_in_enum(k, "Op.", &_par_op_name, 13);
+        k = k + 1;
+        if (op == 0) {
+            var bd: ImBodyDesc = _par_in_body_desc(k);
+            k = k + 13;
+            _par_got_i(st.add_body(bd));
+        } elif (op == 1) {
+            var body = _par_in(k);
+            var cd: ImColliderDesc = ImColliderDesc_new(_im_shape(IM_SHAPE_BALL));
+            k = _par_in_collider_desc_at(k + 1, &cd);
+            var t1, v1 = st.add_collider(body, cd);
+            cd.shape.free();
+            if (is_ok(t1) == 1) { _par_got_i(v1); } else { _par_got_err(v1); refused = 1; }
+        } elif (op == 2) {
+            var jd: ImJointDesc = _par_in_joint_desc();
+            k = _par_in_joint_desc_at(k, &jd);
+            var t2, v2 = st.add_joint(jd);
+            if (is_ok(t2) == 1) { _par_got_i(v2); } else { _par_got_err(v2); refused = 1; }
+        } elif (op == 3 || op == 4) {
+            var fb = _par_in(k);
+            var vec: ImVec3 = ImVec3_zero();
+            var pt: ImVec3 = ImVec3_zero();
+            var has = 0;
+            k = _par_in_vec_point(k + 1, &vec, &has, &pt);
+            if (op == 3) {
+                var fo: ImForce;
+                fo.vector = vec;
+                fo.has_point = has;
+                fo.point = pt;
+                st.apply_force(fb, fo);
+            } else {
+                var im: ImImpulse;
+                im.vector = vec;
+                im.has_point = has;
+                im.point = pt;
+                st.apply_impulse(fb, im);
+            }
+        } elif (op == 5) {
+            var tb = _par_in(k);
+            var tv: f64 = _par_in(k + 1);
+            var tq: ImTorque;
+            tq.value = tv;
+            st.apply_torque(tb, tq);
+            k = k + 2;
+        } elif (op == 6) {
+            st.remove_body(_par_in(k));
+            _par_got_i(0);
+            k = k + 1;
+        } elif (op == 7) {
+            var t7, v7 = st.remove_collider(_par_in(k));
+            _par_got_unit(t7, v7);
+            k = k + 1;
+        } elif (op == 8) {
+            var t8, v8 = st.remove_joint(_par_in(k));
+            _par_got_unit(t8, v8);
+            k = k + 1;
+        } elif (op == 9) {
+            var bs: ImBodyState = _par_in_body_state(0);
+            var t9, v9 = st.get_body_state(_par_in(k), &bs);
+            if (is_ok(t9) == 1) { _par_got_body_state(bs); } else { _par_got_err(v9); }
+            k = k + 1;
+        } elif (op == 10) {
+            var sh = _par_in(k);
+            var ss: ImBodyState = _par_in_body_state(k + 1);
+            var t10, v10 = st.set_body_state(sh, ss);
+            _par_got_unit(t10, v10);
+            k = k + 12;
+        } elif (op == 11) {
+            var th = _par_in(k);
+            var ty = _par_in_enum(k + 1, "BodyType.", &body_type_name, 3);
+            var t11, v11 = st.set_body_type(th, ty);
+            _par_got_unit(t11, v11);
+            k = k + 2;
+        } elif (op == 12) {
+            _par_got_i(st.body_count());
+        } else {
+            st.free();
+            return 0;
+        }
+    }
+    _par_got_state3d(&st);
+    st.free();
+    if (orphan == 1 && refused == 1) {
+        _par_mapped3 = 8;
+        _par_map_orphan3 = _par_map_orphan3 + 1;
+    }
+    return 1;
+}
+
 # ── dispatch and hooks ──────────────────────────────────────────────────────────────
 
 fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_got_n = 0;
+    _par_mapped3 = 0;
+    if (_par_eq(mp, ml, "b3_state") == 1) { return _par_b3_state(fp, fl); }
     if (_par_eq(mp, ml, "b3_body") == 1) { return _par_b3_body(fp, fl); }
     if (_par_eq(mp, ml, "b3_math") == 1) { return _par_b3_math(fp, fl); }
     if (_par_eq(mp, ml, "b3_narrow") == 1) { return _par_b3_narrow(fp, fl); }
@@ -373,24 +604,36 @@ fn _par_shadows(mp, ml, fp, fl, cls) {
 fn _par_c_bound(fp, fl): i64 {
     if (_par_eq(fp, fl, "b3::body") == 1) { return 0; }
     if (_par_eq(fp, fl, "b3::raycast") == 1) { return 0; }
+    if (_par_eq(fp, fl, "b3::state_script") == 1) { return 0; }
+    if (_par_eq(fp, fl, "b3::state_script_orphan") == 1) { return 0; }
     if (_par_eq(fp, fl, "DQuat::from_rotation_x") == 1) { return 0; }
     if (_par_eq(fp, fl, "DQuat::from_rotation_y") == 1) { return 0; }
     if (_par_eq(fp, fl, "DQuat::from_rotation_z") == 1) { return 0; }
     return 0 - 1;
 }
 
-# No 3D row is accepted as a divergence: the 3D path is impetus-owned and exact (ADR 0012).
+# The ADR accepting a divergent row, or 0. The 3D math is impetus-owned and exact (ADR 0012); the one mapping is ADR
+# 0008 #1, a state script whose collider or joint for a missing body the port refuses.
 #must_use
 fn _par_accepted(fp, fl, ip, il): i64 {
+    if (_par_mapped3 == 8) { return 8; }
     return 0;
 }
 
+# ADR 0008's orphan mapping is counted, not printed row by row (summarised by _par_module_done).
 #must_use
 fn _par_accepted_quiet(adr): i64 {
+    if (adr == 8) { return 1; }
     return 0;
 }
 
 fn _par_module_done(mp, ml) {
+    if (_par_eq(mp, ml, "b3_state") == 1) {
+        print("  ADR 0008 #1 orphans: ", 23);
+        fmt_int(_par_map_orphan3);
+        println(" scripts add a collider or joint for a missing body, which the port refuses, accepted (ADR 8)");
+        return 0;
+    }
     if (_par_eq(mp, ml, "b3_math") != 1) { return 0; }
     print("  digest b3_math: 0x", 20);
     fmt_hex(_par_dg3);

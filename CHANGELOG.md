@@ -400,6 +400,41 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     nearest-hit group and a flat heap). The four state-level tests run on a test-local pair of arenas until M5.
   - Surface parity is 604/604 across 26 modules, with `PhysicsState3d::raycast` and `raycast_filtered` pending M5.
   - **M4 is done.** 3D: 4 modules, **28,026 ok, 0 failed, 2 accepted (ADR 0011)**. 2D unchanged at **98,874 ok**.
+- **Cyrius port, M5 part 1: correctly rounded atan2 and the 3D state** (`docs/development/port-parity.md` §20):
+  - **atan2** ([ADR 0011](docs/adr/0011-correctly-rounded-exp-sin-cos.md) amended). The 3D state reads a body's rotation
+    back as 2·atan2(q.z, q.w), and the port's atan2, ganita's on the atan polyfill, misrounds 25.70 % of ordinary
+    arguments. `src/crmath.cyr` gains `_im_cr_atan2`, correctly rounded on every input with C99 Annex F's specials:
+    - ratios below 2^-60 are the IEEE quotient, except at exact midpoints of the subnormal grid, which round toward
+      zero;
+    - phase 1 in double-double, from a generated atan(i/64) table and a series through t^11, decides 99.9 % of
+      arguments;
+    - the slow path is vectoring CORDIC in the 364-bit fixed point, each constant from its series, so there is no
+      static table.
+
+    It matches MPFR on 1,355,242 pairs; glibc 2.44 misrounds 0.56 % and 0.14 % of the two sets. The 1,200
+    `f64::atan2` rows are gated at 0 ulp (2 before). glibc misrounds one of them, so `math.cr.tsv` has 22 rows. The
+    old atan2 stays as an ungated shadow. `tests/crmath.tcyr` grows to 78 assertions, and atan2 joins ganita's
+    correctly rounded tier filing (8 more repro rows).
+  - `src/b3_state.cyr`: `ImPhysicsState3d` holds the body, collider and joint arenas, each body's collider list, the
+    contact tracker and the GJK scratch. It has:
+    - Rust's add, remove and `_at` methods, and the mass recompute over every collider;
+    - forces, impulses and torques, impulses through the world inverse inertia;
+    - `get_body_state`, `set_body_state` (a rotation about z) and `set_body_type`;
+    - `raycast` and `raycast_filtered` over `_im_b3_raycast`.
+
+    `add_collider` and `add_joint` refuse a body that isn't live (ADR 0008 #1).
+  - The golden `b3_state.tsv` holds 411 scripts on `PhysicsState3d`, each ending in the 3D backend dump
+    (`scripts/oracle/src/dump3d.rs`). The token writers both dumps use moved to `dumpcore.rs`, and the 2D corpus is
+    unchanged. Class C: 403 at 0 ulp; the 5 where glibc misrounds an atan2, cos or sin match the corrected oracle
+    (`b3_state.cr.tsv`); the 3 orphan scripts are accepted under ADR 0008 #1. `validate.py` replays every script on a
+    model of the 3D state.
+  - 25 assertions in `tests/b3_state.tcyr`: the state-level Rust tests that need no step (body counts, teleports, the
+    missing body, both type changes, colliders accumulating mass, the parallel-axis theorem with a removal, the
+    world-space angular impulse), with Cyrius-only refusal, joint, removal and flat-heap groups. The four state-level
+    raycast tests now run on `ImPhysicsState3d`.
+  - Surface parity is 627/627 across 27 modules; only the M6 snapshot functions are pending.
+  - **3D: 28,429 ok, 0 failed, 10 accepted (ADR 11: 7)**; 2D **98,873 ok, 0 failed, 7 pending, 166 accepted (ADR 11:
+    71)**, one atan2 row having moved to the corrected oracle. Identical digests on x86_64 ELF, x86_64 PE and aarch64.
 
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
@@ -466,6 +501,14 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
 - **The 3D raycast against Rust**: `queries/raycast_100_bodies` on the 3D build takes 21.1 µs a ray against Rust's
   2.28 µs (criterion, `--all-features`), 9.3×. Alone, a ray test costs 141 ns (box), 220 ns (ball) and 630 ns
   (capsule).
+- **Correctly rounded atan2 and the 3D state against Rust** (`docs/benchmarks-rust-v-cyrius.md`; Rust's benches run
+  on its 3D build):
+  - `math/atan2_cr` 634 ns, against ganita's 62 ns; `b3/get_body_state` 338 ns;
+  - `bodies/add_body` 113 ns → 2.42 µs, `add_remove_body` 66.5 ns → 1.20 µs, `add_body_with_collider` 309 ns →
+    5.56 µs, `add_joint` 32.4 ns → 1.56 µs;
+  - `forces/apply_force` 7.48 → 57 ns, `apply_impulse` 2.34 → 40 ns.
+
+  A 3D body record is 496 B against 2D's 224 B, and the arenas copy records with the byte-loop `memcpy` (S5).
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

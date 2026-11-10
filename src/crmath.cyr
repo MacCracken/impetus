@@ -1,5 +1,5 @@
-# crmath.cyr — correctly rounded exp, sin, cos and hypot (ADR 0011 and its hypot amendment; hypot
-# has its own section at the end).
+# crmath.cyr — correctly rounded exp, sin, cos, hypot, pow and atan2 (ADR 0011 and its amendments; hypot, pow and
+# atan2 have their own sections after exp, sin and cos).
 #
 # Round-to-nearest-even of the exact mathematical value, on every input, the same bits on every
 # target: only + − × ÷, the f64 rounding builtins and integer operations, no x87 and no polyfill.
@@ -1738,4 +1738,257 @@ fn _im_cr_pow(x: f64, y: f64): f64 {
     _im_cr_pow_slow_calls = _im_cr_pow_slow_calls + 1;
     var rs: f64 = _im_cr_pow_slow(ax, y, neg);
     return rs;
+}
+
+# ── atan2 ───────────────────────────────────────────────────────────────────────────
+# atan2(y, x), correctly rounded (ADR 0011, amended for atan2). The specials follow C99 Annex F, as glibc's do:
+# signed zeros and ±π for y = ±0, ±π/2 for x = ±0, ±π/4, ±3π/4 and ±π/2 for an infinite y, ±0 and ±π for an infinite
+# x. Otherwise, with r = a/b ≤ 1 for a = min(|x|, |y|) and b = max, the result is ±z where z = atan(r), π/2 − atan(r)
+# when |y| > |x|, and π − that when x < 0:
+# - r < 2^-60 with z = atan(r) itself: atan(r) = r − r³/3 + …, and r³/3 is below 2^-107·r, closer than r can come to
+#   a rounding midpoint without being one (r = num/den with two 53-bit odd parts). So the result is the IEEE quotient,
+#   except at an exact midpoint, where atan(r) < r rounds toward zero. A midpoint needs 54 significant bits, so it
+#   only occurs on the subnormal grid: num = A·2^α, den = B·2^β with A, B odd, B | A and α − β = −1075;
+# - phase 1, in double-double: r exactly (the quotient of num and den scaled by the same power of two, and its
+#   remainder by TwoProduct), c = i/64 nearest r, t = (r − c)/(1 + r·c) with |t| ≤ 2^-7, atan(r) = atan(c) + atan(t)
+#   from the generated table and t + t·p(t²) through t^11; then the quadrant moves with π/2 and π in double-double.
+#   Tested against 2^-63·|z| (the error is below about 2^-65.5·|z|): decides all but about 2^-10 of arguments;
+# - the slow path: vectoring CORDIC in the 364-bit fixed point on (b, a), which needs no division: 364 rotations by
+#   ±atan(2^-k) (each by its series in the fixed point as it is needed; 2^-k itself from k = 122), the angle then
+#   moved to its quadrant and rounded once. Absolute error below about 2^-345, relative below 2^-285 since z ≥ 2^-60
+#   there. atan2's hardest cases, like atan's, need about 2^-120, and there are no exact midpoints but the subnormal
+#   ones above (Lindemann–Weierstrass: atan of a nonzero rational is transcendental).
+
+var _im_cr_atan2_slow_calls = 0;
+
+# d = a·2^-k, truncated (d ≠ a), by whole limbs and a bit shift.
+fn _im_cr_shr(d, a, k) {
+    var q = k / 28;
+    var r = k % 28;
+    for (var j = 0; j < _IM_CR_L; j = j + 1) {
+        var src = j - q;
+        var v = 0;
+        if (src >= 0) {
+            v = load64(a + src * 8) >> r;
+            if (src >= 1 && r > 0) { v = v | ((load64(a + (src - 1) * 8) << (28 - r)) & _IM_CR_MASK); }
+        }
+        store64(d + j * 8, v);
+    }
+    return 0;
+}
+
+# T = atan(2^-k) for 0 ≤ k ≤ 364 in the fixed point: π/4 for k = 0 (π/2 halved), else Σ (−1)^n·2^(−k(2n + 1))/(2n + 1)
+# while the term's bit is within the fixed point (each term truncated: error below 2^-356); 2^-k alone from k = 122,
+# where the next term is below 2^-366. Computed as the slow path needs it, so crmath keeps no 14 KB table.
+fn _im_cr_atan_pow2(T, k) {
+    if (k == 0) {
+        _im_cr_div_small(T, &_im_cr_pio2, 2);
+        return 0;
+    }
+    var t[112];
+    _im_cr_zero(T);
+    var n = 0;
+    while (k * (2 * n + 1) <= 364) {
+        _im_cr_zero(&t);
+        var e = k * (2 * n + 1);
+        var j = (e + 27) / 28;
+        store64(&t + j * 8, 1 << (28 * j - e));
+        if (n > 0) { _im_cr_div_small(&t, &t, 2 * n + 1); }
+        if ((n & 1) == 0) { _im_cr_add(T, T, &t); } else { _im_cr_sub(T, T, &t); }
+        n = n + 1;
+    }
+    return 0;
+}
+
+# The slow path, for the scaled pair (0 ≤ num ≤ den, den in [1, 2)): z = atan(num/den) by vectoring CORDIC, moved to
+# its quadrant (swap: π/2 − z; neg_x: π − that) and rounded, negated when neg_y is 1.
+#must_use
+fn _im_cr_atan2_slow(num: f64, den: f64, swap, neg_x, neg_y): f64 {
+    _im_cr_load();
+    _im_cr_atan2_slow_calls = _im_cr_atan2_slow_calls + 1;
+    var X[112];
+    var Y[112];
+    var XS[112];
+    var YS[112];
+    var P[112];
+    var N[112];
+    var Z[112];
+    var AT[112];
+    _im_cr_set(&X, den);
+    _im_cr_set(&Y, num);
+    _im_cr_zero(&P);
+    _im_cr_zero(&N);
+    # Y is held as a magnitude and a sign (ys 1 for negative); X only grows.
+    var ys = 0;
+    var k = 0;
+    while (k < 364 && _im_cr_is_zero(&Y) == 0) {
+        _im_cr_shr(&XS, &X, k);
+        _im_cr_shr(&YS, &Y, k);
+        _im_cr_add(&X, &X, &YS);
+        var acc = &P;
+        if (ys == 1) { acc = &N; }
+        # Y ≥ 0: Y − X·2^-k and the angle grows by atan(2^-k); Y < 0: Y + X·2^-k and it shrinks.
+        ys = _im_cr_sadd(&Y, &Y, ys, &XS, 1 - ys);
+        _im_cr_atan_pow2(&AT, k);
+        _im_cr_add(acc, acc, &AT);
+        k = k + 1;
+    }
+    var zs = _im_cr_sadd(&Z, &P, 0, &N, 1);
+    if (swap == 1) { zs = _im_cr_sadd(&Z, &_im_cr_pio2, 0, &Z, 1 - zs); }
+    if (neg_x == 1) {
+        var PI[112];
+        _im_cr_add(&PI, &_im_cr_pio2, &_im_cr_pio2);
+        zs = _im_cr_sadd(&Z, &PI, 0, &Z, 1 - zs);
+    }
+    var neg = neg_y;
+    if (zs == 1) { neg = 1 - neg; }
+    var out: f64 = _im_cr_round(&Z, 0, neg);
+    return out;
+}
+
+# v, negated when neg is 1.
+#must_use
+fn _im_cr_signed(v: f64, neg): f64 {
+    if (neg == 1) { return -v; }
+    return v;
+}
+
+# A finite x ≠ 0 as m·2^e with m odd: (m, e).
+#must_use
+fn _im_cr_odd_split(x: f64) {
+    var w = _im_cr_word(x) & 9223372036854775807;
+    var ef = w >> 52;
+    var m = w & 4503599627370495;
+    var e = 0 - 1074;
+    if (ef > 0) {
+        m = m | 4503599627370496;
+        e = ef - 1075;
+    }
+    while ((m & 1) == 0) {
+        m = m >> 1;
+        e = e + 1;
+    }
+    return (m, e);
+}
+
+# atan(num/den) for 0 < num/den < 2^-60, given q, the IEEE quotient: q, except at an exact midpoint of the subnormal
+# grid, where atan(r) < r rounds to the neighbour toward zero.
+#must_use
+fn _im_cr_atan_tiny(num: f64, den: f64, q: f64): f64 {
+    var a, ea = _im_cr_odd_split(num);
+    var b, eb = _im_cr_odd_split(den);
+    if (ea - eb == 0 - 1075 && a % b == 0) { return _im_cr_from_word((a / b - 1) / 2); }
+    return q;
+}
+
+# The exponent e with 2^e ≤ x < 2^(e + 1), for a finite x > 0.
+#must_use
+fn _im_cr_ilogb(x: f64): i64 {
+    var w = _im_cr_word(x);
+    var ef = (w >> 52) & 2047;
+    if (ef > 0) { return ef - 1023; }
+    var m = w & 4503599627370495;
+    var b = 0;
+    while ((m >> (b + 1)) != 0) { b = b + 1; }
+    return b - 1074;
+}
+
+#must_use
+fn _im_cr_atan2(y: f64, x: f64): f64 {
+    if (y != y || x != x) {
+        var nn: f64 = y + x;
+        return nn;
+    }
+    _im_cr_load();
+    var neg_y = 0;
+    var neg_x = 0;
+    if (_im_cr_word(y) < 0) { neg_y = 1; }
+    if (_im_cr_word(x) < 0) { neg_x = 1; }
+    var ay: f64 = f64_abs(y);
+    var ax: f64 = f64_abs(x);
+    var zero: f64 = 0.0;
+    var inf: f64 = 1.0 / zero;
+    if (ay == 0.0) {
+        if (neg_x == 0) { return y; }
+        return _im_cr_signed(_IM_CR_PI_HI, neg_y);
+    }
+    if (ax == 0.0) { return _im_cr_signed(_IM_CR_PIO2_HI, neg_y); }
+    if (ay == inf) {
+        var vi: f64 = _IM_CR_PIO2_HI;
+        if (ax == inf) {
+            vi = _IM_CR_PIO4;
+            if (neg_x == 1) { vi = _IM_CR_PI3O4; }
+        }
+        return _im_cr_signed(vi, neg_y);
+    }
+    if (ax == inf) {
+        if (neg_x == 0) { return _im_cr_signed(0.0, neg_y); }
+        return _im_cr_signed(_IM_CR_PI_HI, neg_y);
+    }
+    var swap = 0;
+    var num: f64 = ay;
+    var den: f64 = ax;
+    if (ay > ax) {
+        swap = 1;
+        num = ax;
+        den = ay;
+    }
+    var q: f64 = num / den;
+    var tiny: f64 = _im_cr_pow2(0 - 60);
+    var e = _im_cr_ilogb(den);
+    var nums: f64 = _im_cr_ldexp(num, 0 - e);
+    var dens: f64 = _im_cr_ldexp(den, 0 - e);
+    var zh: f64 = q;
+    var zl: f64 = 0.0;
+    if (q < tiny) {
+        if (swap == 0 && neg_x == 0) { return _im_cr_signed(_im_cr_atan_tiny(num, den, q), neg_y); }
+        # atan(r) ≈ q within r³/3 + ulp(q)/2 < 2^-112, far below the quadrant moves' half-ulp.
+    } else {
+        var rh: f64 = nums / dens;
+        var p, pe = _im_cr_two_prod(rh, dens);
+        var pf: f64 = p;
+        var pef: f64 = pe;
+        var rem: f64 = (nums - pf) - pef;
+        var rl: f64 = rem / dens;
+        var fi: f64 = f64_floor(rh * 64.0 + 0.5);
+        var i = f64_to(fi);
+        var c: f64 = fi / 64.0;
+        var nh0: f64 = rh - c;
+        var nh, nl = _im_cr_two_sum(nh0, rl);
+        var rch, rcl = _im_cr_two_prod(rh, c);
+        var rclf: f64 = rcl;
+        var rlc: f64 = rl * c;
+        var dh, dl = _im_cr_dd_add(1.0, 0.0, rch, rclf + rlc);
+        var th, tl = _im_cr_dd_div(nh, nl, dh, dl);
+        var thf: f64 = th;
+        _im_cr_odd_load();
+        var c3: f64 = load64(&_im_cr_odd_inv + 16);
+        var c5: f64 = load64(&_im_cr_odd_inv + 32);
+        var c7: f64 = load64(&_im_cr_odd_inv + 48);
+        var c9: f64 = load64(&_im_cr_odd_inv + 64);
+        var c11: f64 = load64(&_im_cr_odd_inv + 80);
+        var t2: f64 = thf * thf;
+        var poly: f64 = t2 * (0.0 - c3 + t2 * (c5 + t2 * (0.0 - c7 + t2 * (c9 - t2 * c11))));
+        var tp: f64 = thf * poly;
+        var ah, al = _im_cr_dd_add(th, tl, tp, 0.0);
+        var cth: f64 = load64(&_im_cr_atant + i * 16);
+        var ctl: f64 = load64(&_im_cr_atant + i * 16 + 8);
+        var sh, sl = _im_cr_dd_add(cth, ctl, ah, al);
+        zh = sh;
+        zl = sl;
+    }
+    if (swap == 1) {
+        var wh, wl = _im_cr_dd_add(_IM_CR_PIO2_HI, _IM_CR_PIO2_LO, -zh, -zl);
+        zh = wh;
+        zl = wl;
+    }
+    if (neg_x == 1) {
+        var vh, vl = _im_cr_dd_add(_IM_CR_PI_HI, _IM_CR_PI_LO, -zh, -zl);
+        zh = vh;
+        zl = vl;
+    }
+    var azh: f64 = f64_abs(zh);
+    var err: f64 = azh * _im_cr_pow2(0 - 63);
+    if (_im_cr_rounds_to(zh, zl, err) == 1) { return _im_cr_signed(zh, neg_y); }
+    return _im_cr_atan2_slow(nums, dens, swap, neg_x, neg_y);
 }

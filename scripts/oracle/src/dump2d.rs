@@ -2,34 +2,12 @@
 //! in slot order, `body_colliders` in handle order, the manifolds in key order, the contact tracker. The
 //! state rows (`m_b2_state`) end with it, and the step rows (M3) will compare it frame by frame.
 
-use impetus::oracle::{ArenaDump, Backend2dDump, TrackerDump};
+use impetus::oracle::Backend2dDump;
+
+use crate::dumpcore::{arena, tracker};
 
 use crate::flat::{self, handle};
 use crate::tsv::{Tok, b, e, f, i};
-
-fn arena(t: &mut Vec<Tok>, a: &ArenaDump) {
-    t.push(Tok::V(a.slots.len()));
-    for s in &a.slots {
-        t.extend([b(s.occupied), i(s.generation)]);
-        t.push(s.next_free.map_or(Tok::None, i));
-    }
-    t.push(a.free_head.map_or(Tok::None, i));
-    t.push(b(a.free_list_stale));
-}
-
-fn pairs(t: &mut Vec<Tok>, p: &[(u64, u64)]) {
-    t.push(Tok::V(p.len()));
-    for &(a, bb) in p {
-        t.extend([handle(a), handle(bb)]);
-    }
-}
-
-fn tracker(t: &mut Vec<Tok>, k: &TrackerDump) {
-    pairs(t, &k.prev);
-    pairs(t, &k.current);
-    pairs(t, &k.seen);
-    t.push(b(k.recorded));
-}
 
 fn v2(t: &mut Vec<Tok>, v: [f64; 2]) {
     t.extend([f(v[0]), f(v[1])]);

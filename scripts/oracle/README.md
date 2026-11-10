@@ -48,7 +48,7 @@ harness reads the same files. This README records what is specific to impetus.
 | Module | Build | Milestone | Golden rows | Golden emitter | Generated Cyrius |
 |---|---|---|---|---|---|
 | `constants` | b2 | M0 | 3 | `src/m_constants.rs` | `src/constants.cyr` (`src/t_constants.rs`, with the completeness proof) |
-| `math` | b2 | M0 (+ `f64::signum`, M4) | 19,491 | `src/m_math.rs` | — |
+| `math` | b2 | M0 (+ `f64::signum`, M4) | 19,491 (+ 22 corrected) | `src/m_math.rs` | — |
 | `config`, `material`, `units`, `force` | b2 | M1a | 293, 2,046, 2,236, 1,308 | `src/m_<module>.rs` | — |
 | `fmtf`, `json` | b2 | M1b (json: + the particle types, M3) | 37,576, 1,092 | `src/m_fmtf.rs`, `src/m_json.rs` | — |
 | `spring`, `types` | b2 | M1b | 1,000, 1 | `src/m_spring.rs`, `src/m_types.rs` | — |
@@ -64,6 +64,7 @@ harness reads the same files. This README records what is specific to impetus.
 | `b3_narrow` | b3 | M4 | 16,340 | `src/m_b3_narrow.rs` | — |
 | `b3_ray` | b3 | M4 | 4,138 (+ 2 corrected) | `src/m_b3_ray.rs` | — |
 | `b3_body` | b3 | M4 | 234 | `src/m_b3_body.rs` | — |
+| `b3_state` | b3 | M5 | 411 (+ 5 corrected) | `src/m_b3_state.rs` | — |
 | (private constants) | b2 | M2 | — | — | `src/constants_private.cyr` (`src/t_private.rs`: every library `const` of `aabb_tree.rs`, `spatial_hash.rs`, `backend_2d/joints.rs`, `backend_2d/solver.rs`, `backend_2d/types.rs`, `backend_3d/narrowphase.rs`, `backend_3d/types.rs` and `world.rs`, emitted or excused (a
 function's local `const` counts, as `obb_obb_3d`'s `REL_TOL`); a `[f64; N]` array, which may span lines, becomes N globals `_0` … `_{N-1}`) |
 
@@ -132,6 +133,11 @@ impetus specifics:
   slots (occupied, generation, next free), free-list heads and staleness, every body, collider and joint field,
   `body_colliders` in handle order, the manifolds in key order and the tracker. `b2::state_script_orphan` rows add a
   collider or joint for a missing body (ADR 0008 #1).
+- 3D state rows (`b3_state.tsv`, the 3D build only) are the same scripts on `PhysicsState3d`, with 3D shapes,
+  positions, offsets and impulse points, and the backend dump of `src/dump3d.rs` (full quaternions, angular velocity
+  vectors and inertia tensors; no manifolds, which the 3D backend doesn't keep). Class C: `set_body_state` rotates
+  about z through `sin_cos`, and `get_body_state` returns 2·atan2(q.z, q.w). The arena, pair-list and tracker tokens
+  both dumps write are `src/dumpcore.rs`'s.
 - Single-step rows (`b2_step.tsv`, class S at class C, the 2D build only): inputs are the world config (`flat::config`,
   its `step` the frame index) and the backend dump at frame k, taken after that frame's forces; outputs are the dump at
   k + 1 and the frame's events. M3b's scenes give every collider collision mask 0, so nothing pairs and the contact
@@ -148,9 +154,9 @@ impetus specifics:
 
 ## The corrected oracle and the crmath tables (ADR 0011)
 
-exp, sin, cos and hypot are correctly rounded in the port (`src/crmath.cyr`), and glibc 2.44 is not (it misrounds
-about 0.1–0.3 % of their arguments). A class-C row's reference is therefore the **corrected oracle**: the oracle's own
-operations with every exp, sin and cos result correctly rounded. Where glibc rounded every call correctly, that is
+exp, sin, cos, hypot, pow and atan2 are correctly rounded in the port (`src/crmath.cyr`), and glibc 2.44 is not (it
+misrounds about 0.1–0.6 % of their arguments). A class-C row's reference is therefore the **corrected oracle**: the
+oracle's own operations with every exp, sin, cos, hypot, pow and atan2 result correctly rounded. Where glibc rounded every call correctly, that is
 the golden row and nothing is written. Where it didn't, `tests/golden/<module>.cr.tsv` holds the corrected outputs
 (kimiya's format, its ADR 0006):
 
@@ -165,7 +171,8 @@ corrected outputs only (accepted under ADR 11). A correction that matches no gol
 `validate.py` builds the corrected oracle with MPFR 4.x (`mpfr_ref.py`, ctypes on `libmpfr.so.6`, no Python
 package; copied from kimiya). It also renders `src/crmath_data.cyr` from `crtables.py`: 2/π, π/2 and ln 2 for the
 slow path, and the fast paths' split constants, all from π and ln 2 computed exactly in integer arithmetic and
-checked against MPFR to 2,048 bits.
+checked against MPFR to 2,048 bits; and for atan2, atan(i/64) for i = 0 … 64 in double-double (Euler's series in
+exact integer arithmetic) with π, π/2, π/4 and 3π/4, checked against MPFR's atan and atan2.
 
 ```sh
 python3 -I scripts/oracle/validate.py .           # checks both are current
@@ -223,6 +230,9 @@ Standard-library Python, run with `-I`. It never calls the oracle:
   the same on MPFR's writes `b3_ray.cr.tsv`;
 - every `b3_body` body is recomputed: `from_desc`, each collider's mass, inertia and centroid, the parallel-axis sum
   of `recompute_mass_properties`, the inverses and R·I⁻¹·Rᵀ;
+- every `b3_state` script is replayed on a Python model of the 3D state (the arenas, the mass recompute, the joints'
+  reference rotation, forces and impulses through R·I⁻¹·Rᵀ, the state's rotation through glibc's atan2), rebuilding
+  every result and dump token; the same on MPFR's writes `b3_state.cr.tsv`;
 - `src/constants_private.cyr` holds every library `const` of the ported modules, each equal to Python's parse of
   the Rust literal;
 - the corrected oracle and `src/crmath_data.cyr` are current (above).

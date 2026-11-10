@@ -1,4 +1,4 @@
-"""The tables of src/crmath.cyr, the correctly rounded exp, sin and cos (ADR 0011).
+"""The tables of src/crmath.cyr, the correctly rounded exp, sin, cos and atan2 (ADR 0011).
 
 π and ln 2 are computed here in exact integer arithmetic (Machin's formula; 2·atanh(1/3)), and
 `validate.py` checks them against MPFR. From them:
@@ -11,7 +11,9 @@
   so k·p1 is exact for |k| < 2^20; each later part the nearest double to what is left;
 - phase 1's: 64/ln 2; ln 2/64 as hi (36 bits) + lo; π/2 as c1 + c2 (33 bits each) + c3; 1/3! … 1/7!;
   the table 2^(j/64) (j < 64, hi + lo, by an exact integer 64th root) and sin and cos of i/64 (i < 52,
-  hi + lo, by their Taylor series in exact rationals).
+  hi + lo, by their Taylor series in exact rationals);
+- atan2's: π and π/2 as hi + lo, π/4 and 3π/4 nearest, and atan(i/64) (i ≤ 64, hi + lo, by Euler's series in
+  exact integer arithmetic).
 
 `render()` gives src/crmath_data.cyr's text. `python3 -I scripts/oracle/validate.py . --write`
 writes the file; without `--write` validate.py checks it is current.
@@ -118,6 +120,26 @@ def _sin_cos_rational(a, terms=40):
     return s, c
 
 
+ATAN_N = 64          # phase 1 of atan2: atan(i/64), i = 0 … 64
+
+
+def atan_frac(a, b, bits=400):
+    """atan(a/b) for integers 0 ≤ a ≤ b, as an exact rational: Euler's series
+    atan x = (x/(1 + x²))·Σ (2^(2n)·(n!)²/(2n + 1)!)·(x²/(1 + x²))^n, whose ratio x²/(1 + x²) ≤ 1/2 converges
+    even at x = 1, in fixed point to `bits` fraction bits, truncated at every term (error below the number of
+    terms)."""
+    s2 = a * a + b * b
+    one = 1 << bits
+    term = one
+    total = term
+    n = 1
+    while term:
+        term = term * (2 * n) * a * a // ((2 * n + 1) * s2)
+        total += term
+        n += 1
+    return Fraction(total * a * b, s2 * one)
+
+
 def _hi_lo(q):
     """q as hi + lo: the double nearest q, and the double nearest the remainder."""
     hi = Fraction(float(q))
@@ -173,6 +195,13 @@ def tables():
     for i in range(SINCOS_ROWS):
         sn, cs = _sin_cos_rational(Fraction(i, SINCOS_N))
         t["sincos"].append(_hi_lo(sn) + _hi_lo(cs))
+    # atan2: π and π/2 as hi + lo for phase 1's quadrant moves; π/4 and 3π/4 nearest for the specials; atan(i/64)
+    # as hi + lo, i = 0 … 64.
+    t["PI_HI"], t["PI_LO"] = _hi_lo(pi)
+    t["PIO2_HI"], t["PIO2_LO"] = _hi_lo(pio2)
+    t["PIO4"] = _double_bits(pi / 4)
+    t["PI3O4"] = _double_bits(3 * pi / 4)
+    t["atan"] = [_hi_lo(atan_frac(i, ATAN_N)) for i in range(ATAN_N + 1)]
     return t
 
 
@@ -197,6 +226,12 @@ DOUBLES = [
     ("F5", "1/5!, nearest"),
     ("F6", "1/6!, nearest"),
     ("F7", "1/7!, nearest"),
+    ("PI_HI", "π, nearest"),
+    ("PI_LO", "π − hi, nearest"),
+    ("PIO2_HI", "π/2, nearest"),
+    ("PIO2_LO", "π/2 − hi, nearest"),
+    ("PIO4", "π/4, nearest"),
+    ("PI3O4", "3π/4, nearest"),
 ]
 
 
@@ -223,9 +258,11 @@ def render():
         f"var _im_cr_exp2t[{16 * EXP2_N}];",
         f"# Phase 1 of sin and cos: sin(i/64) hi, lo, cos(i/64) hi, lo for i = 0 … {SINCOS_ROWS - 1} (32 bytes a row).",
         f"var _im_cr_sct[{32 * SINCOS_ROWS}];",
+        f"# Phase 1 of atan2: atan(i/64) hi, lo for i = 0 … {ATAN_N} (16 bytes a row).",
+        f"var _im_cr_atant[{16 * (ATAN_N + 1)}];",
         "var _im_cr_ready = 0;",
         "",
-        "# Fills the three tables, once.",
+        "# Fills the tables, once.",
         "fn _im_cr_load() {",
         "    if (_im_cr_ready == 1) { return 0; }",
     ]
@@ -238,6 +275,9 @@ def render():
     for i, row in enumerate(t["sincos"]):
         for c, v in enumerate(row):
             out.append(f"    store64(&_im_cr_sct + {32 * i + 8 * c}, 0x{v:016X});")
+    for i, (hi, lo) in enumerate(t["atan"]):
+        out.append(f"    store64(&_im_cr_atant + {16 * i}, 0x{hi:016X});")
+        out.append(f"    store64(&_im_cr_atant + {16 * i + 8}, 0x{lo:016X});")
     out += [
         "    _im_cr_ready = 1;",
         "    return 0;",

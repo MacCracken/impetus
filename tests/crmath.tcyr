@@ -286,6 +286,103 @@ fn main() {
     var p2n = _im_cr_pow_phase2_calls - p2b;
     assert_eq(p2n < 40, 1, "phase 1 alone decides more than 99 % of them");
 
+    test_group("atan2_specials");
+    # C99 Annex F: signed zeros, ±π, ±π/2, ±π/4 and ±3π/4.
+    var q_az: f64 = 0.0;
+    var q_anz: f64 = -0.0;
+    var q_ainf: f64 = 1.0 / q_az;
+    var q_aninf: f64 = -q_ainf;
+    var q_anan: f64 = q_az / q_az;
+    var q_pi_w = _im_cr_word(_IM_CR_PI_HI);
+    var q_pio2_w = _im_cr_word(_IM_CR_PIO2_HI);
+    var q_sgn = 0 - 9223372036854775807 - 1;
+    var q_s1: f64 = _im_cr_atan2(q_az, q_az);
+    var q_s2: f64 = _im_cr_atan2(q_anz, q_az);
+    var q_s3: f64 = _im_cr_atan2(q_az, q_anz);
+    var q_s4: f64 = _im_cr_atan2(q_anz, -1.0);
+    var q_s5: f64 = _im_cr_atan2(q_anz, 1.0);
+    assert_eq(_im_cr_word(q_s1) == 0 && _im_cr_word(q_s2) == q_sgn, 1, "atan2(±0, +0) = ±0");
+    assert_eq(_im_cr_word(q_s3) == q_pi_w && _im_cr_word(q_s4) == (q_pi_w | q_sgn), 1, "atan2(±0, −0 or −1) = ±π");
+    assert_eq(_im_cr_word(q_s5), q_sgn, "atan2(−0, 1) = −0");
+    var q_s6: f64 = _im_cr_atan2(1.0, q_anz);
+    var q_s7: f64 = _im_cr_atan2(-1.0, q_az);
+    var q_s8: f64 = _im_cr_atan2(q_ainf, 5.0);
+    var q_pio2_ok = _im_cr_word(q_s6) == q_pio2_w && _im_cr_word(q_s7) == (q_pio2_w | q_sgn);
+    assert_eq(q_pio2_ok && _im_cr_word(q_s8) == q_pio2_w, 1, "±π/2 for x = ±0 and an infinite y");
+    var q_s9: f64 = _im_cr_atan2(q_ainf, q_ainf);
+    var q_s10: f64 = _im_cr_atan2(q_aninf, q_aninf);
+    var q_pi3o4_w = _im_cr_word(_IM_CR_PI3O4) | q_sgn;
+    assert_eq(_im_cr_word(q_s9) == _im_cr_word(_IM_CR_PIO4) && _im_cr_word(q_s10) == q_pi3o4_w, 1, "π/4 and −3π/4");
+    var q_s11: f64 = _im_cr_atan2(-3.0, q_ainf);
+    var q_s12: f64 = _im_cr_atan2(3.0, q_aninf);
+    var q_s13: f64 = _im_cr_atan2(q_anan, 1.0);
+    var q_s14: f64 = _im_cr_atan2(1.0, q_anan);
+    assert_eq(_im_cr_word(q_s11) == q_sgn && _im_cr_word(q_s12) == q_pi_w, 1, "−0 and π for an infinite x");
+    assert_eq(q_s13 != q_s13 && q_s14 != q_s14, 1, "NaN in, NaN out");
+
+    test_group("atan2_tiny_and_ties");
+    # r < 2^-60: the IEEE quotient, except at an exact subnormal-grid midpoint, which rounds toward zero.
+    var q_u: f64 = _im_cr_from_word(1);
+    var q_t1: f64 = _im_cr_atan2(3.0 * q_u, 2.0);
+    var q_t2: f64 = _im_cr_atan2(-3.0 * q_u, 2.0);
+    var q_t3: f64 = _im_cr_atan2(5.0 * q_u, 2.0);
+    var q_t4: f64 = _im_cr_atan2(q_u, 2.0);
+    var q_t5: f64 = _im_cr_atan2(21.0 * q_u, 6.0);
+    assert_eq(_im_cr_word(q_t1), 1, "1.5·2^-1074 rounds down to 2^-1074 (the quotient ties up to 2)");
+    assert_eq(_im_cr_word(q_t2), q_sgn | 1, "and its negation");
+    assert_eq(_im_cr_word(q_t3) == 2 && _im_cr_word(q_t4) == 0, 1, "2.5 → 2, 0.5 → 0");
+    assert_eq(_im_cr_word(q_t5), 3, "21·2^-1074/6 = 7·2^-1075, a tie (B = 3 divides A = 21): 3, as MPFR");
+    var q_p100: f64 = _im_cr_pow2(0 - 100);
+    var q_t6: f64 = _im_cr_atan2(q_p100, 3.0);
+    var q_t7: f64 = _im_cr_atan2(q_p100, -3.0);
+    assert_eq(_im_cr_word(q_t6) == 4149316456684016981 && _im_cr_word(q_t7) == 4614256656552045848, 1,
+      "2^-100 against 3 and −3, MPFR's values");
+
+    test_group("atan2_values");
+    var q_w1: f64 = _im_cr_atan2(1.0, 2.0);
+    var q_w2: f64 = _im_cr_atan2(-7.0, -0.001);
+    var q_w3: f64 = _im_cr_atan2(0.75, 0.7500000000000002);
+    var q_gy: f64 = _im_cr_from_word(4589452743166928496);
+    var q_gx: f64 = _im_cr_from_word(4602970030937506456);
+    var q_w4: f64 = _im_cr_atan2(q_gy, q_gx);
+    assert_eq(_im_cr_word(q_w1) == 4602023952714414927 && _im_cr_word(q_w2) == 0 - 4613618336558729494, 1,
+      "MPFR's values");
+    assert_eq(_im_cr_word(q_w3), 4605249457297304855, "near π/4, MPFR's value");
+    assert_eq(_im_cr_word(q_w4), 4593613140084300459, "the math row glibc 2.44 misrounds, as MPFR");
+
+    test_group("atan2_fast_and_slow");
+    # Phase 1 decides almost every argument; where both run, the slow path (CORDIC) agrees with it.
+    var q_ab = _im_cr_atan2_slow_calls;
+    var q_aagree = 1;
+    for (var q_ak = 0; q_ak < 4000; q_ak = q_ak + 1) {
+        var q_ay0: f64 = uniform(-4.0, 4.0);
+        var q_ax0: f64 = uniform(-4.0, 4.0);
+        var q_af: f64 = _im_cr_atan2(q_ay0, q_ax0);
+        if (q_ak < 200) {
+            var q_aay: f64 = f64_abs(q_ay0);
+            var q_aax: f64 = f64_abs(q_ax0);
+            var q_swp = 0;
+            var q_anum: f64 = q_aay;
+            var q_aden: f64 = q_aax;
+            if (q_aay > q_aax) {
+                q_swp = 1;
+                q_anum = q_aax;
+                q_aden = q_aay;
+            }
+            var q_ae = _im_cr_ilogb(q_aden);
+            var q_nx = 0;
+            var q_ny = 0;
+            if (q_ax0 < 0.0) { q_nx = 1; }
+            if (q_ay0 < 0.0) { q_ny = 1; }
+            var q_anum_s: f64 = _im_cr_ldexp(q_anum, 0 - q_ae);
+            var q_aden_s: f64 = _im_cr_ldexp(q_aden, 0 - q_ae);
+            var q_aslow: f64 = _im_cr_atan2_slow(q_anum_s, q_aden_s, q_swp, q_nx, q_ny);
+            if (same(q_af, q_aslow) == 0) { q_aagree = 0; }
+        }
+    }
+    assert_eq(q_aagree, 1, "fast = slow on 200 arguments");
+    assert_eq(_im_cr_atan2_slow_calls - q_ab < 200 + 20, 1, "phase 1 decides more than 99 % of 4,000");
+
     return assert_summary();
 }
 

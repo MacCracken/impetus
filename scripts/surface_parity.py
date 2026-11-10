@@ -35,10 +35,11 @@ MODULES = [
     "aabb_tree", "spatial_hash", "backend_2d/types", "backend_2d/narrowphase",
     "backend_2d/raycast", "backend_2d/state", "backend_2d/joints", "backend_2d/solver",
     "particle", "world", "backend_3d/types", "backend_3d/narrowphase", "backend_3d/raycast",
+    "backend_3d/state",
 ]
 PENDING_MODULES = {
     "backend_2d/tests": "M3",
-    "backend_3d/solver": "M5", "backend_3d/joints": "M5", "backend_3d/state": "M5",
+    "backend_3d/solver": "M5", "backend_3d/joints": "M5",
     "backend_3d/tests": "M5", "serialize": "M6",
 }
 DEFERRED_MODULES = {"bridge": "until a Cyrius consumer exists (port plan §3.2)"}
@@ -114,9 +115,6 @@ PRIVATE_PREFIX = {"backend_2d/types": "_IM_B2_", "backend_3d/types": "_IM_B3_", 
 PENDING_CONSTS = {"MAX_SNAPSHOT_INDEX": "M6, with the snapshot module"}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
 PENDING_FNS = {
-    # The loop is _im_b3_raycast (src/b3_raycast.cyr), over the arenas M5's state passes in.
-    "PhysicsState3d::raycast": "M5, a method of the 3D state over _im_b3_raycast",
-    "PhysicsState3d::raycast_filtered": "M5, a method of the 3D state over _im_b3_raycast",
     "PhysicsWorld::snapshot": "M6, with the snapshot module",
     "PhysicsWorld::restore": "M6 (ADR 0008 #2: one fallible restore)",
     "PhysicsWorld::try_restore": "M6 (ADR 0008 #2: one fallible restore)",

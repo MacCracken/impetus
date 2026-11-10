@@ -1,0 +1,440 @@
+# b3_state.cyr — the 3D backend's state (port of rust-old/src/backend_3d/state.rs, and the raycast methods of
+# backend_3d/raycast.rs's `impl PhysicsState3d`).
+#
+# ImPhysicsState3d owns the bodies, colliders and joints (generational arenas, so its handles are Rust's handle for
+# handle), each body's collider list, the contact tracker, and the narrowphase's GJK scratch (reused from step to
+# step, M5 part 3). As in 2D, Rust's `body_colliders` map gets an entry only through `add_body` once `add_collider`
+# refuses a missing body (ADR 0008 #1), so it holds exactly the live bodies: the port keeps each list beside its
+# body's arena slot, and a dump sorts them by handle as the BTreeMap iterates. A collider owns its shape's arrays,
+# freed when it is removed.
+#
+# Mutations follow Rust's order: unlike the 2D state, `add_collider` inserts the collider and then recomputes the
+# body's mass from all of its colliders (`recompute_mass_properties`, src/b3_types.cyr's three steps). The 3D state
+# wakes no neighbours on a removal and keeps no manifolds. Every allocation failure is a value: an add returns
+# Err(IM_ERR_PHYSICS) (Rust has no such path), nothing aborts.
+
+#must_use
+fn _im_b3_as_joint(p): *ImJoint3d { return p; }
+
+#must_use
+fn _im_b3_as_list(p): *ImWordList { return p; }
+
+# Wakes the body record at rb.
+fn _im_b3_wake(rb: *ImRigidBody3d) {
+    rb.is_sleeping = 0;
+    rb.sleep_timer = 0.0;
+    return 0;
+}
+
+# `bodies`, `colliders` and `joints` are *ImArena words; `body_colliders` is one ImWordList record (three words) per
+# body slot, `list_slots` of them. Mirrors `PhysicsState3d`.
+struct ImPhysicsState3d {
+    bodies;
+    colliders;
+    joints;
+    body_colliders;
+    list_slots;
+    contact_tracker: ImContactTracker;
+    gjk: ImGjkScratch3d;
+}
+
+# An empty state. Its arenas are 0 when there is no memory (every operation then refuses). Mirrors
+# `PhysicsState3d::new`.
+#must_use
+fn ImPhysicsState3d_new(): ImPhysicsState3d {
+    var s: ImPhysicsState3d;
+    s.bodies = ImArena_new(sizeof(ImRigidBody3d));
+    s.colliders = ImArena_new(sizeof(ImCollider3d));
+    s.joints = ImArena_new(sizeof(ImJoint3d));
+    s.body_colliders = 0;
+    s.list_slots = 0;
+    s.contact_tracker = ImContactTracker_new();
+    s.gjk = ImGjkScratch3d_new();
+    return s;
+}
+
+# A joint's keep-test for `ImArena::retain`: 1 unless the joint names the body `ctx`.
+#must_use
+fn _im_b3_joint_keep(h, jp, ctx): i64 {
+    var j: *ImJoint3d = _im_b3_as_joint(jp);
+    if (j.body_a == ctx || j.body_b == ctx) { return 0; }
+    return 1;
+}
+
+impl ImPhysicsState3d {
+    #must_use
+    fn _bodies(self): *ImArena { return _im_as_arena(self.bodies); }
+    #must_use
+    fn _colliders(self): *ImArena { return _im_as_arena(self.colliders); }
+    #must_use
+    fn _joints(self): *ImArena { return _im_as_arena(self.joints); }
+
+    # The live body record at handle h, or 0.
+    #must_use
+    fn _body(self, h): *ImRigidBody3d {
+        if (self.bodies == 0) { return _im_b3_as_body(0); }
+        return _im_b3_as_body(self._bodies().get(h));
+    }
+
+    # Body slot i's collider list, the list buffer grown to slot i first; 0 when there is no memory.
+    #must_use
+    fn _list(self, i): *ImWordList {
+        if (i >= self.list_slots) {
+            var n = self.list_slots * 2;
+            if (n < i + 1) { n = i + 1; }
+            if (n < 8) { n = 8; }
+            var p = fl_alloc(n * 24);
+            if (p == 0) { return _im_b3_as_list(0); }
+            for (var k = 0; k < self.list_slots * 3; k = k + 1) {
+                store64(p + k * 8, load64(self.body_colliders + k * 8));
+            }
+            for (var z = self.list_slots * 3; z < n * 3; z = z + 1) { store64(p + z * 8, 0); }
+            if (self.body_colliders != 0) { fl_free(self.body_colliders); }
+            self.body_colliders = p;
+            self.list_slots = n;
+        }
+        return _im_b3_as_list(self.body_colliders + i * 24);
+    }
+
+    # Adds a body and returns its handle (-1 when there is no memory). Mirrors `add_body`.
+    fn add_body(self, desc: ImBodyDesc): i64 {
+        if (self.bodies == 0) { return 0 - 1; }
+        var rb: ImRigidBody3d = ImRigidBody3d_from_desc(0, desc);
+        var ar: *ImArena = self._bodies();
+        var h = ar.insert(&rb);
+        if (h == 0 - 1) { return h; }
+        var p: *ImRigidBody3d = self._body(h);
+        p.handle = h;
+        var list: *ImWordList = self._list(_im_handle_index(h));
+        if (list != 0) { list.len = 0; }
+        return h;
+    }
+
+    # Adds a collider to body `body` and recomputes the body's mass from all of its colliders: Ok(handle), or
+    # Err(IM_ERR_BODY_NOT_FOUND) for a body that isn't live (ADR 0008 #1: Rust stores an orphan). Mirrors
+    # `add_collider`.
+    fn add_collider(self, body, desc: ImColliderDesc): Result {
+        if (self._body(body) == 0) { return Err(IM_ERR_BODY_NOT_FOUND); }
+        var list: *ImWordList = self._list(_im_handle_index(body));
+        if (list == 0) { return Err(IM_ERR_PHYSICS); }
+        var c: ImCollider3d = ImCollider3d_from_desc(0, body, desc);
+        var ca: *ImArena = self._colliders();
+        var h = ca.insert(&c);
+        if (h == 0 - 1) {
+            c.free();
+            return Err(IM_ERR_PHYSICS);
+        }
+        var cp: *ImCollider3d = _im_b3_as_coll(ca.get(h));
+        cp.handle = h;
+        if (list.push(h) == 0) { return Err(IM_ERR_PHYSICS); }
+        self.recompute_mass_properties(body);
+        return Ok(h);
+    }
+
+    # Sets a body's mass and inertia from its colliders (each collider's inertia shifted to the body origin by the
+    # parallel-axis theorem), then its inverses and world inverse inertia; a static or kinematic body gets none.
+    # Mirrors `recompute_mass_properties`.
+    fn recompute_mass_properties(self, body) {
+        var rb: *ImRigidBody3d = self._body(body);
+        if (rb == 0) { return 0; }
+        _im_b3_mass_reset(rb);
+        var list: *ImWordList = self._list(_im_handle_index(body));
+        if (list != 0) {
+            var ca: *ImArena = self._colliders();
+            for (var i = 0; i < list.len; i = i + 1) {
+                var cp: *ImCollider3d = _im_b3_as_coll(ca.get(list.at(i)));
+                if (cp != 0) { _im_b3_mass_add(rb, cp); }
+            }
+        }
+        _im_b3_mass_finish(rb);
+        return 0;
+    }
+
+    # The joint a descriptor makes: its fields, the anchors at z = 0, and the reference rotation
+    # normalize(q_a⁻¹·q_b) (identity for a body that isn't live). Mirrors `joint_from_desc`.
+    #must_use
+    fn _joint_from_desc(self, desc: *ImJointDesc): ImJoint3d {
+        var j: ImJoint3d;
+        var qa: ImQuat = ImQuat_identity();
+        var qb: ImQuat = ImQuat_identity();
+        var pa: *ImRigidBody3d = self._body(desc.body_a);
+        var pb: *ImRigidBody3d = self._body(desc.body_b);
+        if (pa != 0) { qa = pa.rotation; }
+        if (pb != 0) { qb = pb.rotation; }
+        var rel: ImQuat = ImQuat_mul_quat(ImQuat_inverse(qa), qb);
+        var ax: f64 = desc.local_anchor_a.x;
+        var ay: f64 = desc.local_anchor_a.y;
+        var bx: f64 = desc.local_anchor_b.x;
+        var by: f64 = desc.local_anchor_b.y;
+        var damping: f64 = desc.damping;
+        var bf: f64 = desc.break_force;
+        j.body_a = desc.body_a;
+        j.body_b = desc.body_b;
+        j.joint_type = desc.joint_type;
+        j.local_anchor_a = ImVec3_new(ax, ay, 0.0);
+        j.local_anchor_b = ImVec3_new(bx, by, 0.0);
+        j.reference_rotation = ImQuat_normalize(rel);
+        j.has_motor = desc.has_motor;
+        j.motor = desc.motor;
+        j.damping = damping;
+        j.has_break_force = desc.has_break_force;
+        j.break_force = bf;
+        return j;
+    }
+
+    # Adds a joint: Ok(handle), or Err(IM_ERR_BODY_NOT_FOUND) when either body isn't live (ADR 0008 #1). Mirrors
+    # `add_joint`.
+    fn add_joint(self, desc: ImJointDesc): Result {
+        if (self._body(desc.body_a) == 0 || self._body(desc.body_b) == 0) { return Err(IM_ERR_BODY_NOT_FOUND); }
+        var j: ImJoint3d = self._joint_from_desc(&desc);
+        var h = self._joints().insert(&j);
+        if (h == 0 - 1) { return Err(IM_ERR_PHYSICS); }
+        return Ok(h);
+    }
+
+    # Wakes the body and adds the force (and its torque p × f about the body origin, when it has a point). Mirrors
+    # `apply_force`.
+    fn apply_force(self, body, f: ImForce) {
+        var rb: *ImRigidBody3d = self._body(body);
+        if (rb == 0) { return 0; }
+        _im_b3_wake(rb);
+        var fv: ImVec3 = f.vector;
+        rb.force_accumulator = rb.force_accumulator + fv;
+        if (f.has_point == 1) {
+            var p: ImVec3 = f.point;
+            var t: ImVec3 = ImVec3_cross(p, fv);
+            rb.torque_accumulator = rb.torque_accumulator + t;
+        }
+        return 0;
+    }
+
+    # For a dynamic body with mass: wakes it and changes its velocity by impulse · inv_mass, and its spin by the world
+    # inverse inertia times p × impulse when the impulse has a point. Mirrors `apply_impulse`.
+    fn apply_impulse(self, body, imp: ImImpulse) {
+        var rb: *ImRigidBody3d = self._body(body);
+        if (rb == 0) { return 0; }
+        var im: f64 = rb.inv_mass;
+        if (rb.is_dynamic() == 0 || !(im > 0.0)) { return 0; }
+        _im_b3_wake(rb);
+        var iv: ImVec3 = imp.vector;
+        var dv: ImVec3 = ImVec3_scale(iv, im);
+        rb.linear_velocity = rb.linear_velocity + dv;
+        if (imp.has_point == 1) {
+            var p: ImVec3 = imp.point;
+            var ang: ImVec3 = ImVec3_cross(p, iv);
+            var iw: ImMat3 = rb.compute_inv_inertia_world();
+            var dw: ImVec3 = ImMat3_mul_vec3(iw, ang);
+            rb.angular_velocity = rb.angular_velocity + dw;
+        }
+        return 0;
+    }
+
+    # Wakes the body and adds the torque about z. Mirrors `apply_torque`.
+    fn apply_torque(self, body, t: ImTorque) {
+        var rb: *ImRigidBody3d = self._body(body);
+        if (rb == 0) { return 0; }
+        _im_b3_wake(rb);
+        var v: f64 = t.value;
+        var z: f64 = rb.torque_accumulator.z;
+        rb.torque_accumulator.z = z + v;
+        return 0;
+    }
+
+    # Removes a body with its colliders (and their tracked pairs) and its joints. A handle that isn't live removes
+    # nothing but the joints that name it. Mirrors `remove_body`.
+    fn remove_body(self, handle) {
+        if (self.bodies == 0) { return 0; }
+        if (self._bodies().remove(handle, 0) == 1) {
+            var list: *ImWordList = self._list(_im_handle_index(handle));
+            if (list != 0) {
+                var ca: *ImArena = self._colliders();
+                for (var i = 0; i < list.len; i = i + 1) {
+                    var chd = list.at(i);
+                    var cp: *ImCollider3d = _im_b3_as_coll(ca.get(chd));
+                    if (cp != 0) {
+                        cp.free();
+                        ca.remove(chd, 0);
+                    }
+                }
+                self.contact_tracker.forget_colliders(list.data, list.len);
+                list.len = 0;
+            }
+        }
+        self._joints().retain(&_im_b3_joint_keep, handle);
+        return 0;
+    }
+
+    # Removes a collider, forgets its tracked pairs and recomputes its body's mass: Ok(0), or
+    # Err(IM_ERR_COLLIDER_NOT_FOUND). Mirrors `remove_collider`.
+    fn remove_collider(self, handle): Result {
+        if (self.colliders == 0) { return Err(IM_ERR_COLLIDER_NOT_FOUND); }
+        var ca: *ImArena = self._colliders();
+        var cp: *ImCollider3d = _im_b3_as_coll(ca.get(handle));
+        if (cp == 0) { return Err(IM_ERR_COLLIDER_NOT_FOUND); }
+        var body = cp.body;
+        cp.free();
+        ca.remove(handle, 0);
+        if (self._body(body) != 0) {
+            var list: *ImWordList = self._list(_im_handle_index(body));
+            if (list != 0) {
+                var w = 0;
+                for (var i = 0; i < list.len; i = i + 1) {
+                    var x = list.at(i);
+                    if (x != handle) {
+                        store64(list.data + w * 8, x);
+                        w = w + 1;
+                    }
+                }
+                list.len = w;
+            }
+        }
+        var one[8];
+        store64(&one, handle);
+        self.contact_tracker.forget_colliders(&one, 1);
+        self.recompute_mass_properties(body);
+        return Ok(0);
+    }
+
+    # Removes a joint: Ok(0), or Err(IM_ERR_JOINT_NOT_FOUND). Mirrors `remove_joint`.
+    fn remove_joint(self, handle): Result {
+        if (self.joints == 0) { return Err(IM_ERR_JOINT_NOT_FOUND); }
+        if (self._joints().remove(handle, 0) == 0) { return Err(IM_ERR_JOINT_NOT_FOUND); }
+        return Ok(0);
+    }
+
+    # Places a body at a given handle (snapshot restore): 1, or 0 when the slot is taken or there is no memory.
+    # Mirrors `add_body_at`.
+    fn add_body_at(self, handle, desc: ImBodyDesc): i64 {
+        if (self.bodies == 0) { return 0; }
+        var rb: ImRigidBody3d = ImRigidBody3d_from_desc(handle, desc);
+        if (self._bodies().insert_at(handle, &rb) == 0) { return 0; }
+        var list: *ImWordList = self._list(_im_handle_index(handle));
+        if (list != 0) { list.len = 0; }
+        return 1;
+    }
+
+    # Places a collider at a given handle and recomputes its body's mass: Ok(0), Err(IM_ERR_BODY_NOT_FOUND) for a
+    # body that isn't live (ADR 0008 #1), or Err(IM_ERR_PHYSICS) when the slot is taken. Mirrors `add_collider_at`.
+    fn add_collider_at(self, handle, body, desc: ImColliderDesc): Result {
+        if (self._body(body) == 0) { return Err(IM_ERR_BODY_NOT_FOUND); }
+        var list: *ImWordList = self._list(_im_handle_index(body));
+        if (list == 0) { return Err(IM_ERR_PHYSICS); }
+        var c: ImCollider3d = ImCollider3d_from_desc(handle, body, desc);
+        if (self._colliders().insert_at(handle, &c) == 0) {
+            c.free();
+            return Err(IM_ERR_PHYSICS);
+        }
+        if (list.push(handle) == 0) { return Err(IM_ERR_PHYSICS); }
+        self.recompute_mass_properties(body);
+        return Ok(0);
+    }
+
+    # Places a joint at a given handle: Ok(0), Err(IM_ERR_BODY_NOT_FOUND) (ADR 0008 #1), or Err(IM_ERR_PHYSICS) when
+    # the slot is taken. Mirrors `add_joint_at`.
+    fn add_joint_at(self, handle, desc: ImJointDesc): Result {
+        if (self._body(desc.body_a) == 0 || self._body(desc.body_b) == 0) { return Err(IM_ERR_BODY_NOT_FOUND); }
+        var j: ImJoint3d = self._joint_from_desc(&desc);
+        if (self._joints().insert_at(handle, &j) == 0) { return Err(IM_ERR_PHYSICS); }
+        return Ok(0);
+    }
+
+    # The number of live bodies. Mirrors `body_count`.
+    #must_use
+    fn body_count(self): i64 {
+        if (self.bodies == 0) { return 0; }
+        return self._bodies().len();
+    }
+
+    # The body's public state into out, its rotation as 2·atan2(q.z, q.w) (correctly rounded, ADR 0011) and its
+    # angular velocity's z: Ok(0), or Err(IM_ERR_BODY_NOT_FOUND). Mirrors `get_body_state`.
+    fn get_body_state(self, handle, out: *ImBodyState): Result {
+        var rb: *ImRigidBody3d = self._body(handle);
+        if (rb == 0) { return Err(IM_ERR_BODY_NOT_FOUND); }
+        var qz: f64 = rb.rotation.z;
+        var qw: f64 = rb.rotation.w;
+        var a: f64 = _im_atan2(qz, qw);
+        var w: f64 = rb.angular_velocity.z;
+        out.handle = rb.handle;
+        out.body_type = rb.body_type;
+        out.position = rb.position;
+        out.rotation = a * 2.0;
+        out.linear_velocity = rb.linear_velocity;
+        out.angular_velocity = w;
+        out.is_sleeping = rb.is_sleeping;
+        return Ok(0);
+    }
+
+    # Teleports the body to a state (position, rotation about z, linear velocity, spin about z; its type and sleep
+    # flag ignored), wakes it and refreshes its world inverse inertia: Ok(0), or Err(IM_ERR_BODY_NOT_FOUND). Mirrors
+    # `set_body_state`.
+    fn set_body_state(self, handle, st: ImBodyState): Result {
+        var rb: *ImRigidBody3d = self._body(handle);
+        if (rb == 0) { return Err(IM_ERR_BODY_NOT_FOUND); }
+        var rot: f64 = st.rotation;
+        var w: f64 = st.angular_velocity;
+        rb.position = st.position;
+        rb.rotation = ImQuat_from_rotation_z(rot);
+        rb.linear_velocity = st.linear_velocity;
+        rb.angular_velocity = ImVec3_new(0.0, 0.0, w);
+        _im_b3_wake(rb);
+        rb.update_inertia_world();
+        return Ok(0);
+    }
+
+    # Changes a body's type, wakes it, stops a static or kinematic one, and recomputes its mass (only a dynamic body
+    # has any): Ok(0), or Err(IM_ERR_BODY_NOT_FOUND). Mirrors `set_body_type`.
+    fn set_body_type(self, handle, t): Result {
+        var rb: *ImRigidBody3d = self._body(handle);
+        if (rb == 0) { return Err(IM_ERR_BODY_NOT_FOUND); }
+        rb.body_type = t;
+        _im_b3_wake(rb);
+        if (t == IM_BODY_STATIC || t == IM_BODY_KINEMATIC) {
+            rb.linear_velocity = ImVec3_zero();
+            rb.angular_velocity = ImVec3_zero();
+        }
+        self.recompute_mass_properties(handle);
+        return Ok(0);
+    }
+
+    # ── queries ──
+
+    # The nearest hit within max_dist of the ray, over every collider (none filtered): 1 with *out, or 0. Mirrors
+    # `raycast` (src/b3_raycast.cyr's `_im_b3_raycast`).
+    fn raycast(self, origin: ImVec3, direction: ImVec3, max_dist: f64, out: *ImRayHit): i64 {
+        if (self.colliders == 0 || self.bodies == 0) { return 0; }
+        return _im_b3_raycast(self._bodies(), self._colliders(), origin, direction, max_dist, 0, 0, out);
+    }
+
+    # As `raycast`, over the colliders whose layer shares a bit with mask. Mirrors `raycast_filtered`.
+    fn raycast_filtered(self, origin: ImVec3, direction: ImVec3, max_dist: f64, mask, out: *ImRayHit): i64 {
+        if (self.colliders == 0 || self.bodies == 0) { return 0; }
+        return _im_b3_raycast(self._bodies(), self._colliders(), origin, direction, max_dist, 1, mask, out);
+    }
+
+    # Releases everything the state owns: the colliders' shapes, the arenas, the lists, the tracker and the scratch.
+    fn free(self) {
+        if (self.colliders != 0) {
+            var ca: *ImArena = self._colliders();
+            for (var s = 0; s < ca.slot_count(); s = s + 1) {
+                var h = ca.slot_handle(s);
+                if (h != 0 - 1) { _im_b3_as_coll(ca.get(h)).free(); }
+            }
+            ca.free();
+        }
+        if (self.bodies != 0) { self._bodies().free(); }
+        if (self.joints != 0) { self._joints().free(); }
+        for (var i = 0; i < self.list_slots; i = i + 1) {
+            var l: *ImWordList = _im_b3_as_list(self.body_colliders + i * 24);
+            l.free();
+        }
+        if (self.body_colliders != 0) { fl_free(self.body_colliders); }
+        self.colliders = 0;
+        self.bodies = 0;
+        self.joints = 0;
+        self.body_colliders = 0;
+        self.list_slots = 0;
+        self.contact_tracker.free();
+        self.gjk.free();
+        return 0;
+    }
+}

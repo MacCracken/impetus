@@ -810,6 +810,65 @@ fails when either drifts from `cyrius.cyml`.
   b3_ray; 2D unchanged at **98,874 ok, 0 failed, 7 pending, 165 accepted**. Surface parity is 604 across 26 modules.
   Pending M5: the two 3D state raycast methods; M6: the 3 snapshot functions.
 
+## 20. M5a: correctly rounded atan2 and the 3D state (2026-11-09, ADR 0011 amended)
+
+- **atan2 first.** The 3D state's `get_body_state` returns a body's rotation as 2·atan2(q.z, q.w). The port's atan2
+  was ganita's on the atan polyfill, which misrounds 25.70 % of ordinary arguments, so the `f64::atan2` rows had a
+  2-ulp bound and the 3D state's rows could not have been gated at 0. The maintainer chose a correctly rounded atan2
+  before the state, as for pow (§16). `_im_cr_atan2` (ADR 0011's amendment has the design):
+  - r = min/max of |y| and |x|. Below 2^-60, with no quadrant move, the answer is the IEEE quotient, except at an exact
+    midpoint of the subnormal grid (num = A·2^α, den = B·2^β, A and B odd, B | A, α − β = −1075), which rounds
+    toward zero;
+  - phase 1 in double-double: r exactly with its remainder, c = i/64, t = (r − c)/(1 + rc), atan(c) from a generated
+    table, the series through t^11, the quadrant moves with π and π/2 in double-double. Tested against 2^-63·|z|, it
+    decides 99.9 % of arguments;
+  - the slow path: vectoring CORDIC in the 364-bit fixed point, each atan(2^-k) from its series on demand, so there
+    is no static table.
+
+  It matches MPFR on 1,355,242 pairs in two seeded sets (wide magnitudes, |y| ≈ |x|, ratios at the threshold and at
+  the table's boundaries, constructed subnormal ties, random bit patterns, the specials). glibc 2.44 misrounds 0.56 %
+  and 0.14 % of the two sets. `tests/crmath.tcyr` adds the specials, the tiny path and its ties, MPFR values, and fast
+  = slow over a sweep (78 assertions).
+- **The atan2 rows.** All 1,200 `f64::atan2` rows are gated at 0 ulp (the bound was 2). glibc misrounds one, so
+  `math.cr.tsv` grows to 22 rows and the 2D corpus moves one row from ok to the corrected oracle. The former atan2 stays
+  in the harness as an ungated shadow, `f64::atan2 ~ atan polyfill`, 1 ulp off on 239 rows.
+- **`src/b3_state.cyr`**, `ImPhysicsState3d`: the body, collider and joint arenas, each body's collider list (a
+  word list per body slot), the contact tracker and the world-owned GJK scratch.
+  - Rust's add, remove and `_at` methods. A body's removal forgets its tracker pairs and takes its colliders and joints;
+    a joint's keeps normalize(q_a⁻¹·q_b) and its anchors at z = 0.
+  - `recompute_mass_properties` over every collider, with M4's three steps.
+  - Forces add p × f to the torque; impulses go through R·I⁻¹·Rᵀ; torques act about z.
+  - `get_body_state` (rotation 2·atan2(q.z, q.w), angular velocity's z), `set_body_state` (`from_rotation_z`; wakes
+    the body and refreshes its world inverse inertia) and `set_body_type`.
+  - `raycast` and `raycast_filtered` over `_im_b3_raycast`.
+  - `add_collider` and `add_joint` return a Result and refuse a body that isn't live (ADR 0008 #1).
+- **`b3_state.tsv`**, 411 scripts on `PhysicsState3d` through the public world API, each ending in the 3D backend
+  dump (`scripts/oracle/src/dump3d.rs`: full quaternions, angular velocity vectors and both inertia tensors; the 3D
+  backend keeps no manifolds). The token writers both dumps share moved to `dumpcore.rs`, and the 2D corpus is
+  byte-identical. The scripts:
+  - an empty world, slot reuse and the LIFO free list;
+  - mass: colliders adding up through the parallel-axis shift, a removal's recompute, `set_body_type` both ways;
+  - forces, impulses and torques with and without points, on static, dynamic and sleeping bodies, and the wakes;
+  - joints' reference rotations, removals that wake both bodies, a body's removal taking its joints and colliders;
+  - teleports, and the missing-body errors of get, set and `set_body_type`;
+  - 3 orphan scripts (`b3::state_script_orphan`);
+  - 400 seeded scripts of 5–30 ops over live and stale handles, every shape kind, rotations and offsets.
+
+  Class C. 403 scripts at 0 ulp (100,842 floats). The 5 where glibc misrounds an atan2, a cos or a sin match the
+  corrected oracle (`b3_state.cr.tsv`), and the 3 orphan scripts are mapped and accepted (ADR 0008 #1).
+- **The transcription.** `validate.py` replays every script on a Python model of the 3D state on glibc's sin, cos and
+  atan2, and on MPFR's for the corrected oracle.
+- **Rust tests.** `tests/b3_state.tcyr` ports the state-level tests of `backend_3d/tests.rs` that need no step (body
+  counts, teleports, the missing body, both type changes, colliders accumulating mass, the parallel-axis theorem with
+  its removal, the world-space angular impulse), with Cyrius-only groups for the refusals, a joint's reference
+  rotation, removals and a flat heap: 25 assertions. The four state-level raycast tests now run on
+  `ImPhysicsState3d`. The stepping ones (`remove_cleans_collision_pairs_3d`,
+  `static_body_switched_to_dynamic_gains_mass`) wait for the step.
+- **Result:** 3D **28,429 ok, 0 failed, 10 accepted (ADR 11: 7)** over 5 modules; 2D **98,873 ok, 0 failed, 7
+  pending, 166 accepted (ADR 11: 71)**. The same on x86_64 ELF, x86_64 PE and aarch64, with equal digests;
+  `f64::atan2`'s, now the correctly rounded one, is `0x6b403ab79185f15f` on all three. On aarch64 only the native
+  shadows differ. Surface parity is 627 across 27 modules, with the M6 snapshot functions the only ones pending.
+
 ## How to reproduce
 
 ```sh

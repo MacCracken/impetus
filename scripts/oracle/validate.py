@@ -640,6 +640,18 @@ def _logged_pow(log):
     return f
 
 
+def _logged_atan2(log):
+    """MPFR's correctly rounded atan2(y, x), recording each call glibc rounds otherwise into `log`."""
+    def f(y, x):
+        want = MPFR.cr2("atan2", y, x)
+        got = _LIBM.atan2(y, x)
+        if not same(got, want):
+            log.append(f"atan2(f:{bits(y):016x}, f:{bits(x):016x}) glibc f:{bits(got):016x} "
+                       f"correctly rounded f:{bits(want):016x}")
+        return want
+    return f
+
+
 def corrections(module, rows):
     """(fn, inputs text, corrected outputs text, note) for every row of `module` whose outputs change
     when every exp, sin and cos result is correctly rounded."""
@@ -647,7 +659,7 @@ def corrections(module, rows):
     for fn, cls, ins, outs, note in rows:
         log = []
         prim = {nm: _logged(nm, log) for nm in ("exp", "sin", "cos")}
-        if module == "math" and fn in ("f64::hypot", "f64::powf"):
+        if module == "math" and fn in ("f64::hypot", "f64::powf", "f64::atan2"):
             nm = fn[5:].rstrip("f")
             x, y = tok_f(ins[0]), tok_f(ins[1])
             want = [MPFR.cr2(nm, x, y)]
@@ -681,6 +693,12 @@ def corrections(module, rows):
             if not _same_tokens(outs, toks):
                 seen = list(dict.fromkeys(log))
                 out.append((fn, " ".join(ins), " ".join(toks), "oracle " + " ".join(outs) + "; " + "; ".join(seen)))
+            continue
+        elif module == "b3_state":
+            toks = _b3_state_row(ins, prim["sin"], prim["cos"], _logged_atan2(log))
+            if not _same_tokens(outs, toks):
+                seen = list(dict.fromkeys(log))
+                out.append((fn, " ".join(ins), " ".join(toks), "oracle (dump); " + "; ".join(seen)))
             continue
         elif module == "b3_ray":
             toks = _b3_ray_tokens(ins, prim["sin"], prim["cos"])
@@ -772,6 +790,13 @@ def check_tables(root):
     for i, (sh, sl, ch, cl) in enumerate(t["sincos"]):
         if sh != MPFR.bits(MPFR.cr("sin", i / 64)) or ch != MPFR.bits(MPFR.cr("cos", i / 64)):
             fail(f"crtables: sin or cos of {i}/64 hi is not MPFR's correctly rounded value")
+    for i, (hi, lo) in enumerate(t["atan"]):
+        if hi != MPFR.bits(MPFR.cr("atan", i / 64)):
+            fail(f"crtables: atan({i}/64) hi is not MPFR's correctly rounded value")
+    for name, want in (("PI_HI", MPFR.atan2(0.0, -1.0)), ("PIO2_HI", MPFR.atan2(1.0, 0.0)),
+                       ("PIO4", MPFR.atan2(1.0, 1.0)), ("PI3O4", MPFR.atan2(1.0, -1.0))):
+        if t[name] != MPFR.bits(want):
+            fail(f"crtables: {name} is not MPFR's correctly rounded value")
     path = root / "src/crmath_data.cyr"
     text = CRTABLES.render()
     if WRITE:
@@ -1348,6 +1373,8 @@ _LIBM.hypot.restype = _ct.c_double
 _LIBM.hypot.argtypes = [_ct.c_double, _ct.c_double]
 _LIBM.pow.restype = _ct.c_double
 _LIBM.pow.argtypes = [_ct.c_double, _ct.c_double]
+_LIBM.atan2.restype = _ct.c_double
+_LIBM.atan2.argtypes = [_ct.c_double, _ct.c_double]
 
 
 def _glibc_pow(x, y):
@@ -4758,6 +4785,229 @@ def check_b3_ray(rows):
     return len(rows)
 
 
+# ── b3_state: the 3D backend's state (M5 part 1) ────────────────────────────────────
+# state.rs on the 3D types: bodies with a quaternion and inertia tensors, the mass recompute over every collider on
+# each add or removal, joints with their reference rotation, and no neighbour waking. sin, cos and atan2 are
+# parameters: glibc's for the check, MPFR's for the corrected oracle.
+
+def _b3_inv_world(b):
+    """RigidBody3d::compute_inv_inertia_world."""
+    if b["type"] != "e:BodyType.Dynamic" or b["fixed"]:
+        return _ZERO3
+    r = _m_from_quat(b["rot"])
+    return _m_mul(_m_mul(r, b["inv_inertia"]), _m_transpose(r))
+
+
+def _b3_state_row(ins, sin, cos, atan2):
+    """The outputs of a 3D state script: each op's result, then the backend dump."""
+    bodies, colls, joints = _Arena(), _Arena(), _Arena()
+    lists = {}
+    out = []
+    rot_z = lambda a: (0.0, 0.0, sin(a * 0.5), cos(a * 0.5))
+
+    def wake(b):
+        b["sleeping"], b["sleep_timer"] = False, 0.0
+
+    def recompute(h):
+        mass, inertia = 0.0, _ZERO3
+        for ch in lists.get(h, []):
+            c = colls.get(ch)
+            if c is not None:
+                cm = _b3_mass(c["shp"], c["density"], c["explicit"])
+                mass += cm
+                shift = _b3_parallel_axis(cm, _v_add(c["off"], _b3_centroid(c["shp"])))
+                inertia = _m_add(inertia, _m_add(_b3_inertia(c["shp"], cm), shift))
+        b = bodies.get(h)
+        if b is None:
+            return
+        dyn = b["type"] == "e:BodyType.Dynamic"
+        if not dyn or mass <= 0.0:
+            b["mass"], b["inertia"] = (mass, inertia) if dyn else (0.0, _ZERO3)
+            b["inv_mass"], b["inv_inertia"] = 0.0, _ZERO3
+        else:
+            b["mass"], b["inertia"], b["inv_mass"] = mass, inertia, _np_div(1.0, mass)
+            det = _v_dot(inertia[2], _v_cross(inertia[0], inertia[1]))
+            ok = not b["fixed"] and math.isfinite(det) and det > 0.0
+            b["inv_inertia"] = _m_inverse(inertia) if ok else _ZERO3
+        b["world"] = _b3_inv_world(b)
+
+    n = int(ins[0][2:])
+    k = 1
+    for _ in range(n):
+        op = ins[k].split(".", 1)[1]
+        k += 1
+        if op == "AddBody":
+            d = ins[k:k + 13]
+            k += 13
+            b = {"type": d[0], "pos": tuple(tok_f(t) for t in d[1:4]), "rot": rot_z(tok_f(d[4])),
+                 "vel": tuple(tok_f(t) for t in d[5:8]), "w": (0.0, 0.0, tok_f(d[8])), "ld": tok_f(d[9]),
+                 "ad": tok_f(d[10]), "fixed": tok_i(d[11]) == 1, "gs": 1.0 if d[12] == "n:" else tok_f(d[12]),
+                 "force": (0.0, 0.0, 0.0), "torque": (0.0, 0.0, 0.0), "mass": 0.0, "inv_mass": 0.0,
+                 "inertia": _ZERO3, "inv_inertia": _ZERO3, "world": _ZERO3, "sleeping": False, "sleep_timer": 0.0}
+            h = bodies.insert(b)
+            b["handle"] = h
+            lists[h] = []
+            out.append(_st_h(h))
+        elif op == "AddCollider":
+            body = _st_word(ins[k])
+            s0 = k + 1
+            shp, k2 = _b3_shape(ins, s0)
+            mat = ins[k2 + 3:k2 + 10]
+            c = {"body": body, "shape": ins[s0:k2], "shp": shp, "off": tuple(tok_f(t) for t in ins[k2:k2 + 3]),
+                 "mat": mat, "density": tok_f(mat[2]), "sensor": ins[k2 + 10], "mass_tok": ins[k2 + 11],
+                 "explicit": None if ins[k2 + 11] == "n:" else tok_f(ins[k2 + 11]), "layer": ins[k2 + 12],
+                 "mask": ins[k2 + 13]}
+            k = k2 + 14
+            h = colls.insert(c)
+            c["handle"] = h
+            lists.setdefault(body, []).append(h)
+            recompute(body)
+            out.append(_st_h(h))
+        elif op == "AddJoint":
+            a, bb = _st_word(ins[k]), _st_word(ins[k + 1])
+            ke = _st_joint_type_end(ins, k + 2)
+            jt = ins[k + 2:ke]
+            an = [tok_f(t) for t in ins[ke:ke + 4]]
+            k = ke + 4
+            motor = ins[k:k + 1] if ins[k] == "n:" else ins[k:k + 2]
+            k += len(motor)
+            damping, brk = ins[k], ins[k + 1]
+            k += 2
+            qa = bodies.get(a)["rot"] if bodies.get(a) is not None else (0.0, 0.0, 0.0, 1.0)
+            qb = bodies.get(bb)["rot"] if bodies.get(bb) is not None else (0.0, 0.0, 0.0, 1.0)
+            ref = _q_normalize(_q_mul(_q_inv(qa), qb))
+            j = {"a": a, "b": bb, "jt": jt, "anchors": (an[0], an[1], 0.0, an[2], an[3], 0.0), "ref": ref,
+                 "motor": motor, "damping": damping, "brk": brk}
+            out.append(_st_h(joints.insert(j)))
+        elif op in ("ApplyForce", "ApplyImpulse"):
+            h = _st_word(ins[k])
+            v = tuple(tok_f(t) for t in ins[k + 1:k + 4])
+            pt = None if ins[k + 4] == "n:" else tuple(tok_f(t) for t in ins[k + 4:k + 7])
+            k += 5 if pt is None else 7
+            b = bodies.get(h)
+            if b is None:
+                continue
+            if op == "ApplyForce":
+                wake(b)
+                b["force"] = _v_add(b["force"], v)
+                if pt is not None:
+                    b["torque"] = _v_add(b["torque"], _v_cross(pt, v))
+            elif b["type"] == "e:BodyType.Dynamic" and b["inv_mass"] > 0.0:
+                wake(b)
+                b["vel"] = _v_add(b["vel"], _v_scale(v, b["inv_mass"]))
+                if pt is not None:
+                    b["w"] = _v_add(b["w"], _m_mul_vec3(_b3_inv_world(b), _v_cross(pt, v)))
+        elif op == "ApplyTorque":
+            b = bodies.get(_st_word(ins[k]))
+            if b is not None:
+                wake(b)
+                t = b["torque"]
+                b["torque"] = (t[0], t[1], t[2] + tok_f(ins[k + 1]))
+            k += 2
+        elif op == "RemoveBody":
+            h = _st_word(ins[k])
+            k += 1
+            bodies.remove(h)
+            if h in lists:
+                for ch in lists.pop(h):
+                    colls.remove(ch)
+            joints.retain(lambda j, h=h: j["a"] != h and j["b"] != h)
+            out.append("i:0")
+        elif op == "RemoveCollider":
+            h = _st_word(ins[k])
+            k += 1
+            c = colls.remove(h)
+            if c is None:
+                out.append("E:ColliderNotFound")
+                continue
+            if c["body"] in lists:
+                lists[c["body"]] = [x for x in lists[c["body"]] if x != h]
+            recompute(c["body"])
+            out.append("i:0")
+        elif op == "RemoveJoint":
+            h = _st_word(ins[k])
+            k += 1
+            out.append("E:JointNotFound" if joints.remove(h) is None else "i:0")
+        elif op == "GetBodyState":
+            b = bodies.get(_st_word(ins[k]))
+            k += 1
+            if b is None:
+                out.append("E:BodyNotFound")
+                continue
+            q = b["rot"]
+            out += [_st_h(b["handle"]), b["type"]] + [_st_f(x) for x in (*b["pos"], atan2(q[2], q[3]) * 2.0,
+                                                                         *b["vel"], b["w"][2])]
+            out.append(f"i:{int(b['sleeping'])}")
+        elif op == "SetBodyState":
+            b = bodies.get(_st_word(ins[k]))
+            st = ins[k + 1:k + 12]
+            k += 12
+            if b is None:
+                out.append("E:BodyNotFound")
+                continue
+            b["pos"], b["rot"] = tuple(tok_f(t) for t in st[2:5]), rot_z(tok_f(st[5]))
+            b["vel"], b["w"] = tuple(tok_f(t) for t in st[6:9]), (0.0, 0.0, tok_f(st[9]))
+            wake(b)
+            b["world"] = _b3_inv_world(b)
+            out.append("i:0")
+        elif op == "SetBodyType":
+            h = _st_word(ins[k])
+            t = ins[k + 1]
+            k += 2
+            b = bodies.get(h)
+            if b is None:
+                out.append("E:BodyNotFound")
+                continue
+            b["type"] = t
+            wake(b)
+            if t in ("e:BodyType.Static", "e:BodyType.Kinematic"):
+                b["vel"], b["w"] = (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
+            recompute(h)
+            out.append("i:0")
+        elif op == "BodyCount":
+            out.append(f"i:{len(bodies.values())}")
+        else:
+            fail(f"b3_state: unknown op {op}")
+            return out
+    if k != len(ins):
+        fail(f"b3_state: {len(ins) - k} input tokens left over")
+    F = lambda *vals: [_st_f(x) for x in vals]
+    M = lambda m: F(*m[0], *m[1], *m[2])
+    out += bodies.tokens() + [f"v:{len(bodies.values())}"]
+    for h, b in bodies.values():
+        out += [_st_h(h), b["type"]] + F(*b["pos"], *b["rot"], *b["vel"], *b["w"], b["ld"], b["ad"])
+        out += [f"i:{int(b['fixed'])}"] + F(b["gs"], *b["force"], *b["torque"], b["mass"], b["inv_mass"])
+        out += M(b["inertia"]) + M(b["inv_inertia"]) + M(b["world"]) + F(*(0.0,) * 6)
+        out += [f"i:{int(b['sleeping'])}"] + F(b["sleep_timer"])
+    out += colls.tokens() + [f"v:{len(colls.values())}"]
+    for h, c in colls.values():
+        out += [_st_h(h), _st_h(c["body"])] + c["shape"] + F(*c["off"])
+        out += c["mat"] + [c["sensor"], c["mass_tok"], c["layer"], c["mask"]]
+    out += joints.tokens() + [f"v:{len(joints.values())}"]
+    for h, j in joints.values():
+        out += [_st_h(h), _st_h(j["a"]), _st_h(j["b"])] + j["jt"] + F(*j["anchors"], *j["ref"]) + j["motor"]
+        out += [j["damping"], j["brk"]]
+    out.append(f"v:{len(lists)}")
+    for h in sorted(lists):
+        out += [_st_h(h), f"v:{len(lists[h])}"] + [_st_h(x) for x in lists[h]]
+    out += ["v:0", "v:0", "v:0", "i:0"]
+    return out
+
+
+def check_b3_state(rows):
+    """Replays every 3D state script on the model, on glibc's sin, cos and atan2."""
+    for fn, cls, ins, outs, note in rows:
+        if fn not in ("b3::state_script", "b3::state_script_orphan"):
+            fail(f"b3_state: unknown function {fn}")
+            continue
+        want = _b3_state_row(ins, _glibc("sin"), _glibc("cos"), _LIBM.atan2)
+        if not _same_tokens(outs, want):
+            first = next((i for i, (a, b) in enumerate(zip(outs, want)) if a != b), min(len(outs), len(want)))
+            fail(f"b3_state: {note[:120]}: the model differs at output {first}: "
+                 f"{' '.join(outs[first:first + 4])} vs {' '.join(want[first:first + 4])}")
+    return len(rows)
+
+
 def main():
     root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
     check_tables(root)
@@ -4774,7 +5024,7 @@ def main():
         rows = read_module(golden / f"{name}.tsv")
         total += len(rows)
         if name in ("math", "spring", "b2_narrow", "b2_ray", "b2_step", "b2_contact", "world_step", "b3_math",
-                    "b3_body", "b3_ray"):
+                    "b3_body", "b3_ray", "b3_state"):
             check_corrections(root, name, golden / f"{name}.tsv", rows)
         if name == "constants":
             check_constants(root, rows)
@@ -4799,6 +5049,8 @@ def main():
             print(f"b2_ray: {check_b2_ray(rows)} rows recomputed (a transcription on glibc's sin, cos, hypot)")
         elif name == "b2_narrow":
             print(f"b2_narrow: {check_b2_narrow(rows)} rows recomputed (a transcription on Python's libm)")
+        elif name == "b3_state":
+            print(f"b3_state: {check_b3_state(rows)} scripts replayed on a model of the 3D state")
         elif name == "b3_ray":
             print(f"b3_ray: {check_b3_ray(rows)} rays recomputed (raycast_impl on glibc's sin and cos)")
         elif name == "b3_narrow":

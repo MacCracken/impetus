@@ -1,0 +1,234 @@
+# b3_state.tcyr — the ported Rust tests of rust-old/src/backend_3d/state.rs (M5 part 1): the state-level tests of
+# backend_3d/tests.rs that need no step (body counts, teleports, type changes, the mass recompute over colliders,
+# the parallel-axis theorem with a removal, the world-space impulse), plus Cyrius-only tests of the ADR 0008 #1
+# refusals, removals, joints' reference rotation and a flat heap. The tests that step the state arrive with the
+# solver (M5 part 2).
+
+include "tests/lib_3d.cyr"
+
+var eps: f64 = 0.000001;
+
+fn near(got: f64, want: f64, tol: f64): i64 {
+    var d: f64 = f64_abs(got - want);
+    if (d < tol) { return 1; }
+    return 0;
+}
+
+fn v(x: f64, y: f64, z: f64): ImVec3 { return ImVec3_new(x, y, z); }
+
+fn ball_desc(r: f64, off: ImVec3, has_m, m: f64): ImColliderDesc {
+    var d: ImColliderDesc = ImColliderDesc_new(ImColliderShape_ball(r));
+    d.offset = off;
+    d.has_mass = has_m;
+    d.mass = m;
+    return d;
+}
+
+fn main() {
+    alloc_init();
+    var zero: ImVec3 = ImVec3_zero();
+
+    test_group("body_count_3d");
+    var s1: ImPhysicsState3d = ImPhysicsState3d_new();
+    assert_eq(s1.body_count(), 0, "empty");
+    var h1 = s1.add_body(ImBodyDesc_default());
+    assert_eq(s1.body_count(), 1, "one");
+    s1.remove_body(h1);
+    assert_eq(s1.body_count(), 0, "removed");
+    s1.free();
+
+    test_group("set_body_state_teleports");
+    var s2: ImPhysicsState3d = ImPhysicsState3d_new();
+    var h2 = s2.add_body(ImBodyDesc_default());
+    var d2: ImColliderDesc = ball_desc(0.5, zero, 0, 0.0);
+    var r2t, r2v = s2.add_collider(h2, d2);
+    d2.shape.free();
+    var ns: ImBodyState;
+    ns.handle = h2;
+    ns.body_type = IM_BODY_DYNAMIC;
+    ns.position = v(10.0, 20.0, 30.0);
+    ns.rotation = 1.0;
+    ns.linear_velocity = v(1.0, 2.0, 3.0);
+    ns.angular_velocity = 0.5;
+    ns.is_sleeping = 0;
+    var t2, u2 = s2.set_body_state(h2, ns);
+    var rb2: *ImRigidBody3d = s2._body(h2);
+    assert_eq(is_ok(t2), 1, "Ok");
+    assert_eq(near(rb2.position.x, 10.0, eps) + near(rb2.position.y, 20.0, eps) + near(rb2.position.z, 30.0, eps), 3,
+      "moved");
+    assert_eq(rb2.is_sleeping, 0, "awake");
+    # Cyrius-only: the state reads back through 2·atan2(q.z, q.w), correctly rounded.
+    var bs: ImBodyState;
+    var t2b, u2b = s2.get_body_state(h2, &bs);
+    var rot: f64 = bs.rotation;
+    var w: f64 = bs.angular_velocity;
+    assert_eq(near(rot, 1.0, 0.000000000000001) + near(w, 0.5, eps), 2, "rotation and spin read back");
+    s2.free();
+
+    test_group("set_body_state_not_found");
+    var s3: ImPhysicsState3d = ImPhysicsState3d_new();
+    var t3, u3 = s3.set_body_state(999, ns);
+    var t3b, u3b = s3.get_body_state(999, &bs);
+    var t3c, u3c = s3.set_body_type(999, IM_BODY_STATIC);
+    assert_eq(is_ok(t3) + is_ok(t3b) + is_ok(t3c), 0, "every one refused");
+    assert_eq(u3 == IM_ERR_BODY_NOT_FOUND && u3b == IM_ERR_BODY_NOT_FOUND, 1, "BodyNotFound");
+    s3.free();
+
+    test_group("set_body_type_dynamic_to_static");
+    var s4: ImPhysicsState3d = ImPhysicsState3d_new();
+    var bd4: ImBodyDesc = ImBodyDesc_default();
+    bd4.linear_velocity = v(5.0, 0.0, 0.0);
+    var h4 = s4.add_body(bd4);
+    var d4: ImColliderDesc = ball_desc(0.5, zero, 0, 0.0);
+    var r4t, r4v = s4.add_collider(h4, d4);
+    d4.shape.free();
+    var t4, u4 = s4.set_body_type(h4, IM_BODY_STATIC);
+    var rb4: *ImRigidBody3d = s4._body(h4);
+    var im4: f64 = rb4.inv_mass;
+    var vx4: f64 = rb4.linear_velocity.x;
+    assert_eq(rb4.body_type == IM_BODY_STATIC && im4 == 0.0 && vx4 == 0.0, 1, "static, no mass, stopped");
+    s4.free();
+
+    test_group("set_body_type_static_to_dynamic");
+    var s5: ImPhysicsState3d = ImPhysicsState3d_new();
+    var h5 = s5.add_body(ImBodyDesc_default());
+    var d5: ImColliderDesc = ball_desc(0.5, zero, 0, 0.0);
+    var r5t, r5v = s5.add_collider(h5, d5);
+    d5.shape.free();
+    var m5: f64 = s5._body(h5).mass;
+    assert_eq(m5 > 0.0, 1, "mass before");
+    var t5a, u5a = s5.set_body_type(h5, IM_BODY_STATIC);
+    var t5b, u5b = s5.set_body_type(h5, IM_BODY_DYNAMIC);
+    var im5: f64 = s5._body(h5).inv_mass;
+    assert_eq(im5 > 0.0 && s5._body(h5).body_type == IM_BODY_DYNAMIC, 1, "mass again");
+    s5.free();
+
+    test_group("multiple_colliders_accumulate_mass_3d");
+    var s6: ImPhysicsState3d = ImPhysicsState3d_new();
+    var h6 = s6.add_body(ImBodyDesc_default());
+    var d6a: ImColliderDesc = ball_desc(1.0, zero, 0, 0.0);
+    var r6a, c6a = s6.add_collider(h6, d6a);
+    var first: f64 = s6._body(h6).mass;
+    var d6b: ImColliderDesc = ball_desc(1.0, v(2.0, 0.0, 0.0), 0, 0.0);
+    var r6b, c6b = s6.add_collider(h6, d6b);
+    var both: f64 = s6._body(h6).mass;
+    assert_eq(near(both, 2.0 * first, eps), 1, "twice the mass");
+    d6a.shape.free();
+    d6b.shape.free();
+    s6.free();
+
+    test_group("offset_colliders_use_parallel_axis_theorem");
+    var s7: ImPhysicsState3d = ImPhysicsState3d_new();
+    var h7 = s7.add_body(ImBodyDesc_default());
+    var d7a: ImColliderDesc = ball_desc(1.0, v(-2.0, 0.0, 0.0), 1, 1.0);
+    var d7b: ImColliderDesc = ball_desc(1.0, v(2.0, 0.0, 0.0), 1, 1.0);
+    var r7a, c7a = s7.add_collider(h7, d7a);
+    var r7b, c7b = s7.add_collider(h7, d7b);
+    var rb7: *ImRigidBody3d = s7._body(h7);
+    assert_eq(near(rb7.inertia.x.x, 0.8, eps), 1, "about the line of centres");
+    assert_eq(near(rb7.inertia.y.y, 8.8, eps) + near(rb7.inertia.z.z, 8.8, eps), 2, "across it");
+    d7a.shape.free();
+    d7b.shape.free();
+    s7.free();
+    var s8: ImPhysicsState3d = ImPhysicsState3d_new();
+    var h8 = s8.add_body(ImBodyDesc_default());
+    var d8: ImColliderDesc = ball_desc(1.0, v(1.0, 1.0, 0.0), 1, 1.0);
+    var r8t, c8 = s8.add_collider(h8, d8);
+    d8.shape.free();
+    var rb8: *ImRigidBody3d = s8._body(h8);
+    assert_eq(near(rb8.inertia.x.y, -1.0, eps) + near(rb8.inertia.z.z, 2.4, eps), 2, "the off-diagonal term");
+    var t8, u8 = s8.remove_collider(c8);
+    var m8: f64 = rb8.mass;
+    var im8: f64 = rb8.inv_mass;
+    assert_eq(is_ok(t8) == 1 && m8 == 0.0 && im8 == 0.0, 1, "removing it recomputes: no mass");
+    s8.free();
+
+    test_group("angular_impulse_uses_world_space_inertia");
+    var s9: ImPhysicsState3d = ImPhysicsState3d_new();
+    var bd9: ImBodyDesc = ImBodyDesc_default();
+    bd9.rotation = _IM_PI / 2.0;
+    var h9 = s9.add_body(bd9);
+    var d9: ImColliderDesc = ImColliderDesc_new(ImColliderShape_box(2.0, 0.5, 0.5));
+    var r9t, r9v = s9.add_collider(h9, d9);
+    d9.shape.free();
+    var i_long: f64 = s9._body(h9).inertia.x.x;
+    var imp: ImImpulse;
+    imp.vector = v(0.0, 0.0, 1.0);
+    imp.has_point = 1;
+    imp.point = v(1.0, 0.0, 0.0);
+    s9.apply_impulse(h9, imp);
+    var w9: ImVec3 = s9._body(h9).angular_velocity;
+    var tight: f64 = 0.000000001;
+    assert_eq(near(w9.y, -1.0 / i_long, tight), 1, "−1/I_long about y");
+    assert_eq(near(w9.x, 0.0, tight) + near(w9.z, 0.0, tight), 2, "nothing about x or z");
+    s9.free();
+
+    test_group("orphans_refused");
+    # ADR 0008 #1: a collider or joint for a body that isn't live is refused (Rust stores an orphan).
+    var s10: ImPhysicsState3d = ImPhysicsState3d_new();
+    var d10: ImColliderDesc = ball_desc(0.5, zero, 0, 0.0);
+    var t10, u10 = s10.add_collider(7, d10);
+    var h10 = s10.add_body(ImBodyDesc_default());
+    var jd: ImJointDesc = ImJointDesc_new(h10, 1234, ImJointType_fixed(), ImVec2_new(0.0, 0.0), ImVec2_new(0.0, 0.0));
+    var t10b, u10b = s10.add_joint(jd);
+    assert_eq(is_ok(t10) + is_ok(t10b), 0, "both refused");
+    assert_eq(u10 == IM_ERR_BODY_NOT_FOUND && u10b == IM_ERR_BODY_NOT_FOUND, 1, "BodyNotFound");
+    d10.shape.free();
+    s10.free();
+
+    test_group("joint_reference_rotation_and_removals");
+    # Cyrius-only: a joint keeps normalize(q_a⁻¹·q_b); removing a body takes its colliders and joints.
+    var s11: ImPhysicsState3d = ImPhysicsState3d_new();
+    var ba: ImBodyDesc = ImBodyDesc_default();
+    ba.rotation = 0.3;
+    var bb: ImBodyDesc = ImBodyDesc_default();
+    bb.rotation = 1.1;
+    var ha = s11.add_body(ba);
+    var hb = s11.add_body(bb);
+    var d11: ImColliderDesc = ball_desc(0.5, zero, 0, 0.0);
+    var r11t, c11 = s11.add_collider(hb, d11);
+    d11.shape.free();
+    var z2: ImVec2 = ImVec2_new(0.0, 0.0);
+    var jt, jh = s11.add_joint(ImJointDesc_new(ha, hb, ImJointType_fixed(), z2, z2));
+    var j: *ImJoint3d = _im_b3_as_joint(s11._joints().get(jh));
+    var angle: f64 = _im_atan2(j.reference_rotation.z, j.reference_rotation.w);
+    assert_eq(near(angle * 2.0, 0.8, 0.000000000000001), 1, "the relative rotation, 0.8 about z");
+    s11.remove_body(hb);
+    assert_eq(s11._joints().len() == 0 && s11._colliders().len() == 0, 1, "its joint and collider go with it");
+    var t11, u11 = s11.remove_collider(c11);
+    var t11b, u11b = s11.remove_joint(jh);
+    assert_eq(u11 == IM_ERR_COLLIDER_NOT_FOUND && u11b == IM_ERR_JOINT_NOT_FOUND, 1, "then not found");
+    s11.free();
+
+    test_group("flat_heap_state");
+    # After its first round, the same adds and removals reuse the arenas' and lists' storage.
+    var s12: ImPhysicsState3d = ImPhysicsState3d_new();
+    var d12: ImColliderDesc = ImColliderDesc_new(ImColliderShape_box(0.5, 0.5, 0.5));
+    var heap0 = 0;
+    var arena0 = 0;
+    var pos0 = 0;
+    for (var round = 0; round < 3; round = round + 1) {
+        if (round == 1) {
+            heap0 = alloc_used();
+            arena0 = _fl_arena;
+            pos0 = _fl_arena_pos;
+        }
+        for (var k = 0; k < 20; k = k + 1) {
+            var hk = s12.add_body(ImBodyDesc_default());
+            var rkt, rkv = s12.add_collider(hk, d12);
+        }
+        for (var k2 = 0; k2 < 20; k2 = k2 + 1) {
+            var hs = s12._bodies().slot_handle(k2);
+            if (hs != 0 - 1) { s12.remove_body(hs); }
+        }
+    }
+    assert_eq(alloc_used() == heap0 && _fl_arena == arena0 && _fl_arena_pos == pos0, 1, "no growth");
+    d12.shape.free();
+    s12.free();
+
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

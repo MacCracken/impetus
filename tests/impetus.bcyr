@@ -277,6 +277,30 @@ fn bench_pow_cr() {
     return 0;
 }
 
+# math/atan2_cr: the correctly rounded atan2 (ADR 0011, amended) on a spread of angles, against ganita's on the native
+# atan (x87 on x86_64) that the port used to shadow.
+fn bench_atan2_cr() {
+    var b = bench_new("math/atan2_cr");
+    bench_batch_start(b);
+    for (var i = 0; i < NS; i = i + 1) {
+        var y: f64 = 0.3 + f64_from(i & 1023) * 0.0017;
+        var r: f64 = _im_atan2(y, -0.8);
+        g_sink = _im_bits(r);
+    }
+    bench_batch_stop(b, NS);
+    bench_report(b);
+    var g = bench_new("math/atan2_ganita");
+    bench_batch_start(g);
+    for (var j = 0; j < NS; j = j + 1) {
+        var y2: f64 = 0.3 + f64_from(j & 1023) * 0.0017;
+        var r2: f64 = ganita_f64_atan2(y2, -0.8);
+        g_sink = _im_bits(r2);
+    }
+    bench_batch_stop(g, NS);
+    bench_report(g);
+    return 0;
+}
+
 fn bench_exp_cr() {
     var b = bench_new("math/exp_cr");
     var x: f64 = -0.3;
@@ -818,6 +842,7 @@ fn main(): i64 {
     bench_sin_cos_cr();
     bench_hypot_cr();
     bench_pow_cr();
+    bench_atan2_cr();
     bench_aabb_tree_row();
     bench_spatial_hash_row();
     bench_b2_add_collider_mass();

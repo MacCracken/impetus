@@ -385,3 +385,36 @@ bench history holds only the default 2D build.
 position and runs the ray test. Ninety of the hundred balls are rejected at the discriminant. As in the narrowphase,
 the cost is struct-valued helper calls copying their arguments. Not pursued here: M5's step is where the queries
 meet the rest of the pipeline.
+
+## M5 part 1: correctly rounded atan2 and the 3D state (2026-11-09)
+
+x86_64 ELF; `tests/impetus.bcyr` for atan2, `tests/impetus_3d.bcyr` for the state. Rust's `bodies/*` and
+`forces/apply_*` were run on the 3D build for these rows (criterion, `cargo bench --all-features -- 'bodies/|forces/apply'`,
+medians). The bench history holds only the default 2D build. Cyrius is 100,000 iterations of the Rust benches' own
+loops on `ImPhysicsState3d`; as in Rust, `add_body` and `add_joint` grow one world.
+
+| Bench | Body | Rust (3D build) | Cyrius | Ratio |
+|---|---|---|---|---|
+| `bodies/add_body` (3D) | a default body | 113 ns | 2.42 µs | 21× |
+| `bodies/add_remove_body` (3D) | add, then remove | 66.5 ns | 1.20 µs | 18× |
+| `bodies/add_body_with_collider` (3D) | a body and a ball, the mass recompute | 309 ns | 5.56 µs | 18× |
+| `bodies/add_joint` (3D) | a spring between two bodies | 32.4 ns | 1.56 µs | 48× |
+| `forces/apply_force` (3D) | no point | 7.48 ns | 57 ns | 7.6× |
+| `forces/apply_impulse` (3D) | no point | 2.34 ns | 40 ns | 17× |
+| `b3/get_body_state` | a body rotated 0.7 about z, its rotation through atan2 | — | 338 ns | — |
+| `math/atan2_cr` | the correctly rounded atan2, y in [0.3, 2.0), x = −0.8 (a quadrant move) | — | 634 ns | — |
+| `math/atan2_ganita` | `ganita_f64_atan2`, the same arguments | — | 62 ns | — |
+
+**Reading it.**
+- **The 3D records are bigger, and the arenas copy them a byte at a time (S5).** A 3D body is 496 B against the 2D
+  body's 224 B, which is most of why `add_body` is twice the 2D row (1.20 µs) while Rust's grows only from 81.7 to
+  113 ns. A collider is 328 B and a joint 280 B.
+- **`add_joint` is again the worst ratio.** Its reference rotation is one quaternion inverse, product and normalize,
+  but the record is built by value and copied twice, as in 2D (1.22 µs).
+- **`apply_force` and `apply_impulse` are within a few ns of the 2D rows** (45 and 41 ns): three words read through a
+  typed pointer, the sums built by value.
+- **atan2 costs 10× ganita's** (627–634 ns across runs), for 0 ulp where ganita's misrounds about a quarter of
+  ordinary arguments. It is off the step path: only `get_body_state` and, in M6, the snapshot call it. Its double-double
+  phase 1 decides 99.9 % of calls; where that time goes is not profiled yet.
+
+These are first numbers, measured and not gated. S5 (a word-at-a-time `memcpy`) would cut most of the state's gap.

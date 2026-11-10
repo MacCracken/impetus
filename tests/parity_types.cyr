@@ -534,3 +534,72 @@ fn _par_got_point_query(q: ImPointQuery) {
     _par_got_i(q.is_inside);
     return 0;
 }
+
+# ── the backend states' scripts and dumps (shared by b2_state and b3_state) ─────────────
+
+# The op names of a state script, `e:Op.<Name>`.
+fn _par_op_name(i): i64 {
+    if (i == 0) { return "AddBody"; }
+    if (i == 1) { return "AddCollider"; }
+    if (i == 2) { return "AddJoint"; }
+    if (i == 3) { return "ApplyForce"; }
+    if (i == 4) { return "ApplyImpulse"; }
+    if (i == 5) { return "ApplyTorque"; }
+    if (i == 6) { return "RemoveBody"; }
+    if (i == 7) { return "RemoveCollider"; }
+    if (i == 8) { return "RemoveJoint"; }
+    if (i == 9) { return "GetBodyState"; }
+    if (i == 10) { return "SetBodyState"; }
+    if (i == 11) { return "SetBodyType"; }
+    if (i == 12) { return "BodyCount"; }
+    return "Unknown";
+}
+
+# A vector and an optional point (`n:` or three floats) at token k into v, *has and p; the token after.
+fn _par_in_vec_point(k, v: *ImVec3, has, p: *ImVec3): i64 {
+    var x: ImVec3 = _par_in_v3(k);
+    memcpy(v, &x, sizeof(ImVec3));
+    if (_par_in_is_none(k + 3) == 1) {
+        store64(has, 0);
+        return k + 4;
+    }
+    store64(has, 1);
+    var q: ImVec3 = _par_in_v3(k + 3);
+    memcpy(p, &q, sizeof(ImVec3));
+    return k + 6;
+}
+
+# An optional u32 word (-1 for none).
+fn _par_got_opt_i(x) {
+    if (x == 0 - 1) { _par_got_none(); } else { _par_got_i(x); }
+    return 0;
+}
+
+# An arena's slots, free-list head and staleness, as `ArenaDump`.
+fn _par_got_arena(ar: *ImArena) {
+    _par_got_seq(ar.slot_count());
+    for (var i = 0; i < ar.slot_count(); i = i + 1) {
+        var m = ar._meta(i);
+        _par_got_i(load64(m));
+        _par_got_i(load64(m + 8));
+        _par_got_opt_i(load64(m + 16));
+    }
+    _par_got_opt_i(ar.free_head);
+    _par_got_i(ar.free_list_stale);
+    return 0;
+}
+
+fn _par_got_pairlist(pl: *ImPairList) {
+    _par_got_seq(pl.len);
+    for (var i = 0; i < pl.len; i = i + 1) {
+        _par_got_i(pl.first(i));
+        _par_got_i(pl.second(i));
+    }
+    return 0;
+}
+
+# 0 for Ok, else the error token.
+fn _par_got_unit(t, v) {
+    if (is_ok(t) == 1) { _par_got_i(0); } else { _par_got_err(v); }
+    return 0;
+}

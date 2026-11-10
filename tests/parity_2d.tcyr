@@ -84,6 +84,32 @@ fn _par_dg_print(slot, name) {
     return 0;
 }
 
+# A shadow: the port's atan2 before ADR 0011's atan2 amendment, ganita_f64_atan2 (1.2.15) with `_f64_atan_polyfill`
+# in place of the `f64_atan` builtin, the same bits on every target (port-parity.md §2). The whole C99 Annex F
+# table, signs of zero included, as ganita. Words in, word out.
+#must_use
+fn _par_atan2_poly(y, x): i64 {
+    var ay = y & 0x7FFFFFFFFFFFFFFF;
+    var ax = x & 0x7FFFFFFFFFFFFFFF;
+    if (ay > 0x7FF0000000000000) { return y; }
+    if (ax > 0x7FF0000000000000) { return x; }
+    var ysign = y & 0x8000000000000000;
+    var xneg = (x >> 63) & 1;
+    if (ay == 0) {
+        if (xneg == 1) { return F64_PI | ysign; }
+        return y;
+    }
+    if (ax == 0) { return F64_PI_2 | ysign; }
+    if ((ay == 0x7FF0000000000000) && (ax == 0x7FF0000000000000)) {
+        if (xneg == 1) { return _F64_3PI_4 | ysign; }
+        return F64_PI_4 | ysign;
+    }
+    var q = _f64_atan_polyfill(f64_div(y, x));
+    if (xneg == 0) { return q; }
+    if (ysign != 0) { return f64_sub(q, F64_PI); }
+    return f64_add(q, F64_PI);
+}
+
 # ── dispatch ────────────────────────────────────────────────────────────────────────
 # Each module's dispatcher fills the got list for one row. It returns 1 when it handled the
 # function, 0 when the function is pending (not ported), or -1 when the inputs are unusable (a
@@ -138,8 +164,12 @@ fn _par_math(fp, fl): i64 {
     if (_par_eq(fp, fl, "f64::powi3") == 1) { var r: f64 = _im_powi3(x); _par_got_f(r); return 1; }
     if (_par_in_n < 2) { return 0; }
     var y: f64 = _par_in(1);
-    # Rust's y.atan2(x) is the golden f64::atan2(y, x): inputs in C order.
-    if (_par_eq(fp, fl, "f64::atan2") == 1) { _par_got_f(_im_atan2(_par_in(0), _par_in(1))); return 1; }
+    # Rust's y.atan2(x) is the golden f64::atan2(y, x): inputs in C order (x here is atan2's y).
+    if (_par_eq(fp, fl, "f64::atan2") == 1) {
+        var ra: f64 = _im_atan2(x, y);
+        _par_got_f(ra);
+        return 1;
+    }
     if (_par_eq(fp, fl, "f64::hypot") == 1) { var r: f64 = _im_hypot(x, y); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::powf") == 1) { var r: f64 = _im_powf(x, y); _par_got_f(r); return 1; }
     if (_par_eq(fp, fl, "f64::max") == 1) { var r: f64 = _im_max(x, y); _par_got_f(r); return 1; }
@@ -696,57 +726,6 @@ fn _par_in_f(k): f64 {
 
 var _par_map_orphan = 0;
 
-fn _par_op_name(i): i64 {
-    if (i == 0) { return "AddBody"; }
-    if (i == 1) { return "AddCollider"; }
-    if (i == 2) { return "AddJoint"; }
-    if (i == 3) { return "ApplyForce"; }
-    if (i == 4) { return "ApplyImpulse"; }
-    if (i == 5) { return "ApplyTorque"; }
-    if (i == 6) { return "RemoveBody"; }
-    if (i == 7) { return "RemoveCollider"; }
-    if (i == 8) { return "RemoveJoint"; }
-    if (i == 9) { return "GetBodyState"; }
-    if (i == 10) { return "SetBodyState"; }
-    if (i == 11) { return "SetBodyType"; }
-    if (i == 12) { return "BodyCount"; }
-    return "Unknown";
-}
-
-# A vector and an optional point (`n:` or three floats) at token k into v, *has and p; the token after.
-fn _par_in_vec_point(k, v: *ImVec3, has, p: *ImVec3): i64 {
-    var x: ImVec3 = _par_in_v3(k);
-    memcpy(v, &x, sizeof(ImVec3));
-    if (_par_in_is_none(k + 3) == 1) {
-        store64(has, 0);
-        return k + 4;
-    }
-    store64(has, 1);
-    var q: ImVec3 = _par_in_v3(k + 3);
-    memcpy(p, &q, sizeof(ImVec3));
-    return k + 6;
-}
-
-# An optional u32 word (-1 for none).
-fn _par_got_opt_i(x) {
-    if (x == 0 - 1) { _par_got_none(); } else { _par_got_i(x); }
-    return 0;
-}
-
-# An arena's slots, free-list head and staleness, as `ArenaDump`.
-fn _par_got_arena(ar: *ImArena) {
-    _par_got_seq(ar.slot_count());
-    for (var i = 0; i < ar.slot_count(); i = i + 1) {
-        var m = ar._meta(i);
-        _par_got_i(load64(m));
-        _par_got_i(load64(m + 8));
-        _par_got_opt_i(load64(m + 16));
-    }
-    _par_got_opt_i(ar.free_head);
-    _par_got_i(ar.free_list_stale);
-    return 0;
-}
-
 fn _par_got_body2d(rb: *ImRigidBody2d) {
     var f[24];
     _par_got_i(rb.handle);
@@ -830,15 +809,6 @@ fn _par_got_joint2d(h, j: *ImJoint2d) {
     return 0;
 }
 
-fn _par_got_pairlist(pl: *ImPairList) {
-    _par_got_seq(pl.len);
-    for (var i = 0; i < pl.len; i = i + 1) {
-        _par_got_i(pl.first(i));
-        _par_got_i(pl.second(i));
-    }
-    return 0;
-}
-
 # The state's dump: arenas and values in slot order, body_colliders by handle, manifolds, tracker.
 fn _par_got_state(st: *ImPhysicsState2d) {
     var ba: *ImArena = st._bodies();
@@ -907,12 +877,6 @@ fn _par_got_state(st: *ImPhysicsState2d) {
     _par_got_pairlist(st.contact_tracker.current);
     _par_got_pairlist(st.contact_tracker.seen);
     _par_got_i(st.contact_tracker.recorded);
-    return 0;
-}
-
-# 0 for Ok, else the error token.
-fn _par_got_unit(t, v) {
-    if (is_ok(t) == 1) { _par_got_i(0); } else { _par_got_err(v); }
     return 0;
 }
 
@@ -1864,6 +1828,9 @@ fn _par_shadows(mp, ml, fp, fl, cls) {
     var y: f64 = _par_in(1);
     if (_par_eq(fp, fl, "f64::atan2") == 1) {
         _par_got_n = 0;
+        _par_got_f(_par_atan2_poly(_par_in(0), _par_in(1)));
+        _par_shadow_record("f64::atan2 ~ atan polyfill", cls);
+        _par_got_n = 0;
         var r: f64 = ganita_f64_atan2(x, y);
         _par_got_f(r);
         _par_shadow_record("f64::atan2 ~ ganita_f64_atan2", cls);
@@ -1918,7 +1885,7 @@ fn _par_c_bound(fp, fl): i64 {
     if (_par_eq(fp, fl, "b2::raycast") == 1) { return 0; }
     if (_par_eq(fp, fl, "b2::step") == 1) { return 0; }
     if (_par_eq(fp, fl, "world::step") == 1) { return 0; }
-    if (_par_eq(fp, fl, "f64::atan2") == 1) { return 2; }
+    if (_par_eq(fp, fl, "f64::atan2") == 1) { return 0; }
     if (_par_eq(fp, fl, "f64::hypot") == 1) { return 0; }
     if (_par_eq(fp, fl, "f64::powf") == 1) { return 0; }
     return 0 - 1;

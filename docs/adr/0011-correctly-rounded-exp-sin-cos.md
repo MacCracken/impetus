@@ -199,3 +199,42 @@ known in general:
 - **Cost.** 755 ns a call against ganita's 200 ns (`math/pow_cr`). The first design, phase 2 alone, cost 5.4 µs.
 - **For a Rust 1.x user:** results differ in the last bit wherever glibc misrounds a `pow`.
 - **Upstream.** Added to ganita's correctly rounded tier filing (2026-11-09), with 8 more repro rows.
+
+## Amendment — M5 (2026-11-09): atan2 joins exp, sin, cos, hypot and pow
+
+**Context.** The 3D backend's `get_body_state` returns a body's rotation as `atan2(q.z, q.w)·2`, and the 3D
+world's snapshot does the same (M6). The port's atan2 was ganita's on `_f64_atan_polyfill`, which misrounds 25.70 % of
+100,000 ordinary arguments (y, x in [−10, 10]; `ganita_f64_atan2` on x86_64, 24.82 %; glibc 0.093 %). So the
+`f64::atan2` rows had a 2-ulp bound, and the 3D state's rows could not have been held at 0. As for pow, the user chose
+a correctly rounded atan2 before the 3D state.
+
+**Decision.** `src/crmath.cyr` gains `_im_cr_atan2`, correctly rounded on every input, with C99 Annex F's specials.
+`_im_atan2` calls it, and the `f64::atan2` rows and every 3D row are gated at 0 ulp against the corrected oracle,
+which now corrects atan2 with MPFR as well. With r = min/max of |y| and |x|:
+- **Tiny ratios.** For r < 2^-60 with no quadrant move, the answer is the IEEE quotient, except at an exact midpoint
+  of the subnormal grid. There atan(r) < r rounds toward zero. r³/3 is below 2^-107·r, closer than r = num/den can
+  come to a midpoint without being one. A midpoint needs 54 significant bits, so only the subnormal grid has them,
+  exactly when num = A·2^α and den = B·2^β (A, B odd) with B | A and α − β = −1075.
+- **Phase 1, in double-double.** r exactly: the quotient after scaling both operands by one power of two, plus its
+  remainder by TwoProduct. Then c = i/64 nearest r and t = (r − c)/(1 + rc), |t| ≤ 2^-7. atan(r) = atan(c) +
+  atan(t), with atan(c) from a generated table (Euler's series in exact integer arithmetic, checked against MPFR) and
+  t + t·p(t²) through t^11. The quadrant moves use π/2 and π in double-double. It is tested against 2^-63·|z| (the
+  error is below about 2^-65.5·|z|) and decides 99.9 % of arguments.
+- **The slow path** is vectoring CORDIC in the 364-bit fixed point. It rotates (b, a) by ±atan(2^-k) 364 times, with
+  no division. Each constant comes from its series as it is needed, so there is no 14 KB static table (which tipped
+  the compile's large-static-data warning). The angle is moved to its quadrant and rounded once. Absolute error is
+  below about 2^-345, relative below 2^-285, since z ≥ 2^-60 there.
+
+atan2 has no exact midpoints but the subnormal ones (Lindemann–Weierstrass: atan of a nonzero rational is
+transcendental). Its hardest cases, like atan's, need about 2^-120.
+
+**Consequences.**
+- **Verified against MPFR.** 1,355,242 pairs on the final code match, in two seeded sets. They cover wide magnitudes,
+  |y| ≈ |x|, ratios at the 2^-60 threshold and at the table's c = i/64 boundaries, subnormal results with constructed
+  exact ties, random bit patterns and the specials. glibc 2.44 misrounds 0.56 % and 0.14 % of the two sets. The slow
+  path ran on 0.1 %.
+- **The golden rows.** All 1,200 `f64::atan2` rows are at 0 ulp. glibc misrounds one, so `math.cr.tsv` gains it. The
+  former atan2 stays in the harness as an ungated shadow, 1 ulp off on 239 rows.
+- **Cost.** 627 ns a call against `ganita_f64_atan2`'s 61 ns (`math/atan2_cr`). atan2 is not on the step path.
+- **For a Rust 1.x user:** results differ in the last bit wherever glibc misrounds an `atan2`.
+- **Upstream.** Added to ganita's correctly rounded tier filing (2026-11-09), with 8 more repro rows (48 in all).

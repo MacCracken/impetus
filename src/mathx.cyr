@@ -6,9 +6,8 @@
 #   second operand when the first is NaN, and NaN when the second is);
 # - the predicates have no public stdlib counterpart;
 # - to_radians and the literal-exponent powi are Rust's exact operation order;
-# - exp, sin and cos are correctly rounded (src/crmath.cyr, ADR 0011), the same bits on every target;
-# - atan2 is ganita's on the atan polyfill, the same bits on every target (the native f64_atan is
-#   x87 on x86_64); hypot is ganita's. Both are within K = 2 ulp of glibc (port-parity.md §2).
+# - exp, sin, cos, hypot, pow and atan2 are correctly rounded (src/crmath.cyr, ADR 0011 and its amendments), the
+#   same bits on every target.
 
 # π/180 as Rust folds `consts::PI / 180.0`: the double nearest, pinned by the to_radians rows.
 var _IM_RADS_PER_DEG: f64 = 0.017453292519943295;
@@ -143,28 +142,10 @@ fn _im_cos(x: f64): f64 {
     return r;
 }
 
-# The angle of (x, y) in [−π, π]: ganita_f64_atan2 (1.2.15) with `_f64_atan_polyfill` in place of
-# the `f64_atan` builtin, so the same bits on every target (port-parity.md §2). The whole C99
-# Annex F table, signs of zero included, as ganita. Words in, word out. Stands for `y.atan2(x)`.
+# The angle of (x, y) in [−π, π], correctly rounded (src/crmath.cyr, ADR 0011 as amended for atan2), C99 Annex F's
+# specials and signs of zero included. Stands for `y.atan2(x)`.
 #must_use
-fn _im_atan2(y, x): i64 {
-    var ay = y & 0x7FFFFFFFFFFFFFFF;
-    var ax = x & 0x7FFFFFFFFFFFFFFF;
-    if (ay > 0x7FF0000000000000) { return y; }
-    if (ax > 0x7FF0000000000000) { return x; }
-    var ysign = y & 0x8000000000000000;
-    var xneg = (x >> 63) & 1;
-    if (ay == 0) {
-        if (xneg == 1) { return F64_PI | ysign; }
-        return y;
-    }
-    if (ax == 0) { return F64_PI_2 | ysign; }
-    if ((ay == 0x7FF0000000000000) && (ax == 0x7FF0000000000000)) {
-        if (xneg == 1) { return _F64_3PI_4 | ysign; }
-        return F64_PI_4 | ysign;
-    }
-    var q = _f64_atan_polyfill(f64_div(y, x));
-    if (xneg == 0) { return q; }
-    if (ysign != 0) { return f64_sub(q, F64_PI); }
-    return f64_add(q, F64_PI);
+fn _im_atan2(y: f64, x: f64): f64 {
+    var r: f64 = _im_cr_atan2(y, x);
+    return r;
 }

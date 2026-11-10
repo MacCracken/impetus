@@ -263,6 +263,12 @@ var _IM_CR_F4: f64 = 0x3FA5555555555555;  # 1/4!, nearest
 var _IM_CR_F5: f64 = 0x3F81111111111111;  # 1/5!, nearest
 var _IM_CR_F6: f64 = 0x3F56C16C16C16C17;  # 1/6!, nearest
 var _IM_CR_F7: f64 = 0x3F2A01A01A01A01A;  # 1/7!, nearest
+var _IM_CR_PI_HI: f64 = 0x400921FB54442D18;  # π, nearest
+var _IM_CR_PI_LO: f64 = 0x3CA1A62633145C07;  # π − hi, nearest
+var _IM_CR_PIO2_HI: f64 = 0x3FF921FB54442D18;  # π/2, nearest
+var _IM_CR_PIO2_LO: f64 = 0x3C91A62633145C07;  # π/2 − hi, nearest
+var _IM_CR_PIO4: f64 = 0x3FE921FB54442D18;  # π/4, nearest
+var _IM_CR_PI3O4: f64 = 0x4002D97C7F3321D2;  # 3π/4, nearest
 
 # 2/π in 56 chunks of 28 bits: chunk n is bits 28n + 1 … 28n + 28 after the binary point.
 var _im_cr_2opi[448];
@@ -273,9 +279,11 @@ var _im_cr_ln2[112];
 var _im_cr_exp2t[1024];
 # Phase 1 of sin and cos: sin(i/64) hi, lo, cos(i/64) hi, lo for i = 0 … 51 (32 bytes a row).
 var _im_cr_sct[1664];
+# Phase 1 of atan2: atan(i/64) hi, lo for i = 0 … 64 (16 bytes a row).
+var _im_cr_atant[1040];
 var _im_cr_ready = 0;
 
-# Fills the three tables, once.
+# Fills the tables, once.
 fn _im_cr_load() {
     if (_im_cr_ready == 1) { return 0; }
     store64(&_im_cr_2opi + 0, 0xA2F9836);
@@ -698,14 +706,144 @@ fn _im_cr_load() {
     store64(&_im_cr_sct + 1640, 0xBC70E729857FAD53);
     store64(&_im_cr_sct + 1648, 0x3FE65DC1FDEB8CBA);
     store64(&_im_cr_sct + 1656, 0xBC597C1B47337C77);
+    store64(&_im_cr_atant + 0, 0x0000000000000000);
+    store64(&_im_cr_atant + 8, 0x0000000000000000);
+    store64(&_im_cr_atant + 16, 0x3F8FFF555BBB729B);
+    store64(&_im_cr_atant + 24, 0xBC2220C39D4DFF50);
+    store64(&_im_cr_atant + 32, 0x3F9FFD55BBA97625);
+    store64(&_im_cr_atant + 40, 0xBC35EC431444912C);
+    store64(&_im_cr_atant + 48, 0x3FA7FB818430DA2A);
+    store64(&_im_cr_atant + 56, 0xBC086EF8F794F105);
+    store64(&_im_cr_atant + 64, 0x3FAFF55BB72CFDEA);
+    store64(&_im_cr_atant + 72, 0xBC3C934D86D23F1D);
+    store64(&_im_cr_atant + 80, 0x3FB3F59F0E7C559D);
+    store64(&_im_cr_atant + 88, 0x3C5AC4CE285DF847);
+    store64(&_im_cr_atant + 96, 0x3FB7EE182602F10F);
+    store64(&_im_cr_atant + 104, 0xBC5CFB654C0C3D98);
+    store64(&_im_cr_atant + 112, 0x3FBBE39EBE6F07C3);
+    store64(&_im_cr_atant + 120, 0x3C5F7B8F29A05987);
+    store64(&_im_cr_atant + 128, 0x3FBFD5BA9AAC2F6E);
+    store64(&_im_cr_atant + 136, 0xBC4CD37686760C17);
+    store64(&_im_cr_atant + 144, 0x3FC1E1FAFB043727);
+    store64(&_im_cr_atant + 152, 0xBC4B485914DACF8C);
+    store64(&_im_cr_atant + 160, 0x3FC3D6EEE8C6626C);
+    store64(&_im_cr_atant + 168, 0x3C661A3B0CE9281B);
+    store64(&_im_cr_atant + 176, 0x3FC5C9811E3EC26A);
+    store64(&_im_cr_atant + 184, 0xBC5054AB2C010F3D);
+    store64(&_im_cr_atant + 192, 0x3FC7B97B4BCE5B02);
+    store64(&_im_cr_atant + 200, 0x3C5347B0B4F881CA);
+    store64(&_im_cr_atant + 208, 0x3FC9A6A8E96C8626);
+    store64(&_im_cr_atant + 216, 0x3C4CF601E7B4348E);
+    store64(&_im_cr_atant + 224, 0x3FCB90D7529260A2);
+    store64(&_im_cr_atant + 232, 0x3C217B10D2E0E5AB);
+    store64(&_im_cr_atant + 240, 0x3FCD77D5DF205736);
+    store64(&_im_cr_atant + 248, 0x3C6C648D1534597E);
+    store64(&_im_cr_atant + 256, 0x3FCF5B75F92C80DD);
+    store64(&_im_cr_atant + 264, 0x3C68AB6E3CF7AFBD);
+    store64(&_im_cr_atant + 272, 0x3FD09DC597D86362);
+    store64(&_im_cr_atant + 280, 0x3C762E47390CB865);
+    store64(&_im_cr_atant + 288, 0x3FD18BF5A30BF178);
+    store64(&_im_cr_atant + 296, 0x3C630CA4748B1BF9);
+    store64(&_im_cr_atant + 304, 0x3FD278372057EF46);
+    store64(&_im_cr_atant + 312, 0xBC7077CDD36DFC81);
+    store64(&_im_cr_atant + 320, 0x3FD362773707EBCC);
+    store64(&_im_cr_atant + 328, 0xBC6963A544B672D8);
+    store64(&_im_cr_atant + 336, 0x3FD44AA436C2AF0A);
+    store64(&_im_cr_atant + 344, 0xBC75D5E43C55B3BA);
+    store64(&_im_cr_atant + 352, 0x3FD530AD9951CD4A);
+    store64(&_im_cr_atant + 360, 0xBC62566480884082);
+    store64(&_im_cr_atant + 368, 0x3FD614840309CFE2);
+    store64(&_im_cr_atant + 376, 0xBC7A725715711F00);
+    store64(&_im_cr_atant + 384, 0x3FD6F61941E4DEF1);
+    store64(&_im_cr_atant + 392, 0xBC7C63AAE6F6E918);
+    store64(&_im_cr_atant + 400, 0x3FD7D5604B63B3F7);
+    store64(&_im_cr_atant + 408, 0x3C769C885C2B249A);
+    store64(&_im_cr_atant + 416, 0x3FD8B24D394A1B25);
+    store64(&_im_cr_atant + 424, 0x3C7B6D0BA3748FA8);
+    store64(&_im_cr_atant + 432, 0x3FD98CD5454D6B18);
+    store64(&_im_cr_atant + 440, 0x3C79E6C988FD0A77);
+    store64(&_im_cr_atant + 448, 0x3FDA64EEC3CC23FD);
+    store64(&_im_cr_atant + 456, 0xBC724DEC1B50B7FF);
+    store64(&_im_cr_atant + 464, 0x3FDB3A911DA65C6C);
+    store64(&_im_cr_atant + 472, 0x3C7AE187B1CA5040);
+    store64(&_im_cr_atant + 480, 0x3FDC0DB4C94EC9F0);
+    store64(&_im_cr_atant + 488, 0xBC7CC1CE70934C34);
+    store64(&_im_cr_atant + 496, 0x3FDCDE53432C1351);
+    store64(&_im_cr_atant + 504, 0xBC7A2CFA4418F1AD);
+    store64(&_im_cr_atant + 512, 0x3FDDAC670561BB4F);
+    store64(&_im_cr_atant + 520, 0x3C7A2B7F222F65E2);
+    store64(&_im_cr_atant + 528, 0x3FDE77EB7F175A34);
+    store64(&_im_cr_atant + 536, 0x3C70E53DC1BF3435);
+    store64(&_im_cr_atant + 544, 0x3FDF40DD0B541418);
+    store64(&_im_cr_atant + 552, 0xBC6A3992DC382A23);
+    store64(&_im_cr_atant + 560, 0x3FE0039C73C1A40C);
+    store64(&_im_cr_atant + 568, 0xBC8B32C949C9D593);
+    store64(&_im_cr_atant + 576, 0x3FE0657E94DB30D0);
+    store64(&_im_cr_atant + 584, 0xBC7D5B495F6349E6);
+    store64(&_im_cr_atant + 592, 0x3FE0C6145B5B43DA);
+    store64(&_im_cr_atant + 600, 0x3C5974FA13B5404F);
+    store64(&_im_cr_atant + 608, 0x3FE1255D9BFBD2A9);
+    store64(&_im_cr_atant + 616, 0xBC52BDAEE1C0EE35);
+    store64(&_im_cr_atant + 624, 0x3FE1835A88BE7C13);
+    store64(&_im_cr_atant + 632, 0x3C8C621CEC00C301);
+    store64(&_im_cr_atant + 640, 0x3FE1E00BABDEFEB4);
+    store64(&_im_cr_atant + 648, 0xBC5928DF287A668F);
+    store64(&_im_cr_atant + 656, 0x3FE23B71E2CC9E6A);
+    store64(&_im_cr_atant + 664, 0x3C6C421C9F38224E);
+    store64(&_im_cr_atant + 672, 0x3FE2958E59308E31);
+    store64(&_im_cr_atant + 680, 0xBC709E73B0C6C087);
+    store64(&_im_cr_atant + 688, 0x3FE2EE628406CBCA);
+    store64(&_im_cr_atant + 696, 0x3C8C5D5E9FF0CF8D);
+    store64(&_im_cr_atant + 704, 0x3FE345F01CCE37BB);
+    store64(&_im_cr_atant + 712, 0x3C81021137C71102);
+    store64(&_im_cr_atant + 720, 0x3FE39C391CD4171A);
+    store64(&_im_cr_atant + 728, 0xBC82304331D8BF46);
+    store64(&_im_cr_atant + 736, 0x3FE3F13FB89E96F4);
+    store64(&_im_cr_atant + 744, 0x3C7ECF8B492644F0);
+    store64(&_im_cr_atant + 752, 0x3FE445065B795B56);
+    store64(&_im_cr_atant + 760, 0xBC7F76D0163F79C8);
+    store64(&_im_cr_atant + 768, 0x3FE4978FA3269EE1);
+    store64(&_im_cr_atant + 776, 0x3C72419A87F2A458);
+    store64(&_im_cr_atant + 784, 0x3FE4E8DE5BB6EC04);
+    store64(&_im_cr_atant + 792, 0x3C84A33DBEB3796C);
+    store64(&_im_cr_atant + 800, 0x3FE538F57B89061F);
+    store64(&_im_cr_atant + 808, 0xBC81BB74ABDA520C);
+    store64(&_im_cr_atant + 816, 0x3FE587D81F732FBB);
+    store64(&_im_cr_atant + 824, 0xBC75E5C9D8C5A950);
+    store64(&_im_cr_atant + 832, 0x3FE5D58987169B18);
+    store64(&_im_cr_atant + 840, 0x3C60028E4BC5E7CA);
+    store64(&_im_cr_atant + 848, 0x3FE6220D115D7B8E);
+    store64(&_im_cr_atant + 856, 0xBC62B785350EE8C1);
+    store64(&_im_cr_atant + 864, 0x3FE66D663923E087);
+    store64(&_im_cr_atant + 872, 0xBC76EA6FEBE8BBBA);
+    store64(&_im_cr_atant + 880, 0x3FE6B798920B3D99);
+    store64(&_im_cr_atant + 888, 0xBC8A80386188C50E);
+    store64(&_im_cr_atant + 896, 0x3FE700A7C5784634);
+    store64(&_im_cr_atant + 904, 0xBC78C34D25AADEF6);
+    store64(&_im_cr_atant + 912, 0x3FE748978FBA8E0F);
+    store64(&_im_cr_atant + 920, 0x3C47B2A6165884A1);
+    store64(&_im_cr_atant + 928, 0x3FE78F6BBD5D315E);
+    store64(&_im_cr_atant + 936, 0x3C8406A089803740);
+    store64(&_im_cr_atant + 944, 0x3FE7D528289FA093);
+    store64(&_im_cr_atant + 952, 0x3C8560821E2F3AA9);
+    store64(&_im_cr_atant + 960, 0x3FE819D0B7158A4D);
+    store64(&_im_cr_atant + 968, 0xBC7BF76229D3B917);
+    store64(&_im_cr_atant + 976, 0x3FE85D69576CC2C5);
+    store64(&_im_cr_atant + 984, 0x3C66B66E7FC8B8C3);
+    store64(&_im_cr_atant + 992, 0x3FE89FF5FF57F1F8);
+    store64(&_im_cr_atant + 1000, 0xBC855B9A5E177A1B);
+    store64(&_im_cr_atant + 1008, 0x3FE8E17AA99CC05E);
+    store64(&_im_cr_atant + 1016, 0xBC7EC182AB042F61);
+    store64(&_im_cr_atant + 1024, 0x3FE921FB54442D18);
+    store64(&_im_cr_atant + 1032, 0x3C81A62633145C07);
     _im_cr_ready = 1;
     return 0;
 }
 
 # --- crmath.cyr ---
 
-# crmath.cyr — correctly rounded exp, sin, cos and hypot (ADR 0011 and its hypot amendment; hypot
-# has its own section at the end).
+# crmath.cyr — correctly rounded exp, sin, cos, hypot, pow and atan2 (ADR 0011 and its amendments; hypot, pow and
+# atan2 have their own sections after exp, sin and cos).
 #
 # Round-to-nearest-even of the exact mathematical value, on every input, the same bits on every
 # target: only + − × ÷, the f64 rounding builtins and integer operations, no x87 and no polyfill.
@@ -2446,6 +2584,259 @@ fn _im_cr_pow(x: f64, y: f64): f64 {
     return rs;
 }
 
+# ── atan2 ───────────────────────────────────────────────────────────────────────────
+# atan2(y, x), correctly rounded (ADR 0011, amended for atan2). The specials follow C99 Annex F, as glibc's do:
+# signed zeros and ±π for y = ±0, ±π/2 for x = ±0, ±π/4, ±3π/4 and ±π/2 for an infinite y, ±0 and ±π for an infinite
+# x. Otherwise, with r = a/b ≤ 1 for a = min(|x|, |y|) and b = max, the result is ±z where z = atan(r), π/2 − atan(r)
+# when |y| > |x|, and π − that when x < 0:
+# - r < 2^-60 with z = atan(r) itself: atan(r) = r − r³/3 + …, and r³/3 is below 2^-107·r, closer than r can come to
+#   a rounding midpoint without being one (r = num/den with two 53-bit odd parts). So the result is the IEEE quotient,
+#   except at an exact midpoint, where atan(r) < r rounds toward zero. A midpoint needs 54 significant bits, so it
+#   only occurs on the subnormal grid: num = A·2^α, den = B·2^β with A, B odd, B | A and α − β = −1075;
+# - phase 1, in double-double: r exactly (the quotient of num and den scaled by the same power of two, and its
+#   remainder by TwoProduct), c = i/64 nearest r, t = (r − c)/(1 + r·c) with |t| ≤ 2^-7, atan(r) = atan(c) + atan(t)
+#   from the generated table and t + t·p(t²) through t^11; then the quadrant moves with π/2 and π in double-double.
+#   Tested against 2^-63·|z| (the error is below about 2^-65.5·|z|): decides all but about 2^-10 of arguments;
+# - the slow path: vectoring CORDIC in the 364-bit fixed point on (b, a), which needs no division: 364 rotations by
+#   ±atan(2^-k) (each by its series in the fixed point as it is needed; 2^-k itself from k = 122), the angle then
+#   moved to its quadrant and rounded once. Absolute error below about 2^-345, relative below 2^-285 since z ≥ 2^-60
+#   there. atan2's hardest cases, like atan's, need about 2^-120, and there are no exact midpoints but the subnormal
+#   ones above (Lindemann–Weierstrass: atan of a nonzero rational is transcendental).
+
+var _im_cr_atan2_slow_calls = 0;
+
+# d = a·2^-k, truncated (d ≠ a), by whole limbs and a bit shift.
+fn _im_cr_shr(d, a, k) {
+    var q = k / 28;
+    var r = k % 28;
+    for (var j = 0; j < _IM_CR_L; j = j + 1) {
+        var src = j - q;
+        var v = 0;
+        if (src >= 0) {
+            v = load64(a + src * 8) >> r;
+            if (src >= 1 && r > 0) { v = v | ((load64(a + (src - 1) * 8) << (28 - r)) & _IM_CR_MASK); }
+        }
+        store64(d + j * 8, v);
+    }
+    return 0;
+}
+
+# T = atan(2^-k) for 0 ≤ k ≤ 364 in the fixed point: π/4 for k = 0 (π/2 halved), else Σ (−1)^n·2^(−k(2n + 1))/(2n + 1)
+# while the term's bit is within the fixed point (each term truncated: error below 2^-356); 2^-k alone from k = 122,
+# where the next term is below 2^-366. Computed as the slow path needs it, so crmath keeps no 14 KB table.
+fn _im_cr_atan_pow2(T, k) {
+    if (k == 0) {
+        _im_cr_div_small(T, &_im_cr_pio2, 2);
+        return 0;
+    }
+    var t[112];
+    _im_cr_zero(T);
+    var n = 0;
+    while (k * (2 * n + 1) <= 364) {
+        _im_cr_zero(&t);
+        var e = k * (2 * n + 1);
+        var j = (e + 27) / 28;
+        store64(&t + j * 8, 1 << (28 * j - e));
+        if (n > 0) { _im_cr_div_small(&t, &t, 2 * n + 1); }
+        if ((n & 1) == 0) { _im_cr_add(T, T, &t); } else { _im_cr_sub(T, T, &t); }
+        n = n + 1;
+    }
+    return 0;
+}
+
+# The slow path, for the scaled pair (0 ≤ num ≤ den, den in [1, 2)): z = atan(num/den) by vectoring CORDIC, moved to
+# its quadrant (swap: π/2 − z; neg_x: π − that) and rounded, negated when neg_y is 1.
+#must_use
+fn _im_cr_atan2_slow(num: f64, den: f64, swap, neg_x, neg_y): f64 {
+    _im_cr_load();
+    _im_cr_atan2_slow_calls = _im_cr_atan2_slow_calls + 1;
+    var X[112];
+    var Y[112];
+    var XS[112];
+    var YS[112];
+    var P[112];
+    var N[112];
+    var Z[112];
+    var AT[112];
+    _im_cr_set(&X, den);
+    _im_cr_set(&Y, num);
+    _im_cr_zero(&P);
+    _im_cr_zero(&N);
+    # Y is held as a magnitude and a sign (ys 1 for negative); X only grows.
+    var ys = 0;
+    var k = 0;
+    while (k < 364 && _im_cr_is_zero(&Y) == 0) {
+        _im_cr_shr(&XS, &X, k);
+        _im_cr_shr(&YS, &Y, k);
+        _im_cr_add(&X, &X, &YS);
+        var acc = &P;
+        if (ys == 1) { acc = &N; }
+        # Y ≥ 0: Y − X·2^-k and the angle grows by atan(2^-k); Y < 0: Y + X·2^-k and it shrinks.
+        ys = _im_cr_sadd(&Y, &Y, ys, &XS, 1 - ys);
+        _im_cr_atan_pow2(&AT, k);
+        _im_cr_add(acc, acc, &AT);
+        k = k + 1;
+    }
+    var zs = _im_cr_sadd(&Z, &P, 0, &N, 1);
+    if (swap == 1) { zs = _im_cr_sadd(&Z, &_im_cr_pio2, 0, &Z, 1 - zs); }
+    if (neg_x == 1) {
+        var PI[112];
+        _im_cr_add(&PI, &_im_cr_pio2, &_im_cr_pio2);
+        zs = _im_cr_sadd(&Z, &PI, 0, &Z, 1 - zs);
+    }
+    var neg = neg_y;
+    if (zs == 1) { neg = 1 - neg; }
+    var out: f64 = _im_cr_round(&Z, 0, neg);
+    return out;
+}
+
+# v, negated when neg is 1.
+#must_use
+fn _im_cr_signed(v: f64, neg): f64 {
+    if (neg == 1) { return -v; }
+    return v;
+}
+
+# A finite x ≠ 0 as m·2^e with m odd: (m, e).
+#must_use
+fn _im_cr_odd_split(x: f64) {
+    var w = _im_cr_word(x) & 9223372036854775807;
+    var ef = w >> 52;
+    var m = w & 4503599627370495;
+    var e = 0 - 1074;
+    if (ef > 0) {
+        m = m | 4503599627370496;
+        e = ef - 1075;
+    }
+    while ((m & 1) == 0) {
+        m = m >> 1;
+        e = e + 1;
+    }
+    return (m, e);
+}
+
+# atan(num/den) for 0 < num/den < 2^-60, given q, the IEEE quotient: q, except at an exact midpoint of the subnormal
+# grid, where atan(r) < r rounds to the neighbour toward zero.
+#must_use
+fn _im_cr_atan_tiny(num: f64, den: f64, q: f64): f64 {
+    var a, ea = _im_cr_odd_split(num);
+    var b, eb = _im_cr_odd_split(den);
+    if (ea - eb == 0 - 1075 && a % b == 0) { return _im_cr_from_word((a / b - 1) / 2); }
+    return q;
+}
+
+# The exponent e with 2^e ≤ x < 2^(e + 1), for a finite x > 0.
+#must_use
+fn _im_cr_ilogb(x: f64): i64 {
+    var w = _im_cr_word(x);
+    var ef = (w >> 52) & 2047;
+    if (ef > 0) { return ef - 1023; }
+    var m = w & 4503599627370495;
+    var b = 0;
+    while ((m >> (b + 1)) != 0) { b = b + 1; }
+    return b - 1074;
+}
+
+#must_use
+fn _im_cr_atan2(y: f64, x: f64): f64 {
+    if (y != y || x != x) {
+        var nn: f64 = y + x;
+        return nn;
+    }
+    _im_cr_load();
+    var neg_y = 0;
+    var neg_x = 0;
+    if (_im_cr_word(y) < 0) { neg_y = 1; }
+    if (_im_cr_word(x) < 0) { neg_x = 1; }
+    var ay: f64 = f64_abs(y);
+    var ax: f64 = f64_abs(x);
+    var zero: f64 = 0.0;
+    var inf: f64 = 1.0 / zero;
+    if (ay == 0.0) {
+        if (neg_x == 0) { return y; }
+        return _im_cr_signed(_IM_CR_PI_HI, neg_y);
+    }
+    if (ax == 0.0) { return _im_cr_signed(_IM_CR_PIO2_HI, neg_y); }
+    if (ay == inf) {
+        var vi: f64 = _IM_CR_PIO2_HI;
+        if (ax == inf) {
+            vi = _IM_CR_PIO4;
+            if (neg_x == 1) { vi = _IM_CR_PI3O4; }
+        }
+        return _im_cr_signed(vi, neg_y);
+    }
+    if (ax == inf) {
+        if (neg_x == 0) { return _im_cr_signed(0.0, neg_y); }
+        return _im_cr_signed(_IM_CR_PI_HI, neg_y);
+    }
+    var swap = 0;
+    var num: f64 = ay;
+    var den: f64 = ax;
+    if (ay > ax) {
+        swap = 1;
+        num = ax;
+        den = ay;
+    }
+    var q: f64 = num / den;
+    var tiny: f64 = _im_cr_pow2(0 - 60);
+    var e = _im_cr_ilogb(den);
+    var nums: f64 = _im_cr_ldexp(num, 0 - e);
+    var dens: f64 = _im_cr_ldexp(den, 0 - e);
+    var zh: f64 = q;
+    var zl: f64 = 0.0;
+    if (q < tiny) {
+        if (swap == 0 && neg_x == 0) { return _im_cr_signed(_im_cr_atan_tiny(num, den, q), neg_y); }
+        # atan(r) ≈ q within r³/3 + ulp(q)/2 < 2^-112, far below the quadrant moves' half-ulp.
+    } else {
+        var rh: f64 = nums / dens;
+        var p, pe = _im_cr_two_prod(rh, dens);
+        var pf: f64 = p;
+        var pef: f64 = pe;
+        var rem: f64 = (nums - pf) - pef;
+        var rl: f64 = rem / dens;
+        var fi: f64 = f64_floor(rh * 64.0 + 0.5);
+        var i = f64_to(fi);
+        var c: f64 = fi / 64.0;
+        var nh0: f64 = rh - c;
+        var nh, nl = _im_cr_two_sum(nh0, rl);
+        var rch, rcl = _im_cr_two_prod(rh, c);
+        var rclf: f64 = rcl;
+        var rlc: f64 = rl * c;
+        var dh, dl = _im_cr_dd_add(1.0, 0.0, rch, rclf + rlc);
+        var th, tl = _im_cr_dd_div(nh, nl, dh, dl);
+        var thf: f64 = th;
+        _im_cr_odd_load();
+        var c3: f64 = load64(&_im_cr_odd_inv + 16);
+        var c5: f64 = load64(&_im_cr_odd_inv + 32);
+        var c7: f64 = load64(&_im_cr_odd_inv + 48);
+        var c9: f64 = load64(&_im_cr_odd_inv + 64);
+        var c11: f64 = load64(&_im_cr_odd_inv + 80);
+        var t2: f64 = thf * thf;
+        var poly: f64 = t2 * (0.0 - c3 + t2 * (c5 + t2 * (0.0 - c7 + t2 * (c9 - t2 * c11))));
+        var tp: f64 = thf * poly;
+        var ah, al = _im_cr_dd_add(th, tl, tp, 0.0);
+        var cth: f64 = load64(&_im_cr_atant + i * 16);
+        var ctl: f64 = load64(&_im_cr_atant + i * 16 + 8);
+        var sh, sl = _im_cr_dd_add(cth, ctl, ah, al);
+        zh = sh;
+        zl = sl;
+    }
+    if (swap == 1) {
+        var wh, wl = _im_cr_dd_add(_IM_CR_PIO2_HI, _IM_CR_PIO2_LO, -zh, -zl);
+        zh = wh;
+        zl = wl;
+    }
+    if (neg_x == 1) {
+        var vh, vl = _im_cr_dd_add(_IM_CR_PI_HI, _IM_CR_PI_LO, -zh, -zl);
+        zh = vh;
+        zl = vl;
+    }
+    var azh: f64 = f64_abs(zh);
+    var err: f64 = azh * _im_cr_pow2(0 - 63);
+    if (_im_cr_rounds_to(zh, zl, err) == 1) { return _im_cr_signed(zh, neg_y); }
+    return _im_cr_atan2_slow(nums, dens, swap, neg_x, neg_y);
+}
+
 # --- mathx.cyr ---
 
 # mathx.cyr — impetus's math helpers: Rust std semantics on top of the Cyrius builtins.
@@ -2456,9 +2847,8 @@ fn _im_cr_pow(x: f64, y: f64): f64 {
 #   second operand when the first is NaN, and NaN when the second is);
 # - the predicates have no public stdlib counterpart;
 # - to_radians and the literal-exponent powi are Rust's exact operation order;
-# - exp, sin and cos are correctly rounded (src/crmath.cyr, ADR 0011), the same bits on every target;
-# - atan2 is ganita's on the atan polyfill, the same bits on every target (the native f64_atan is
-#   x87 on x86_64); hypot is ganita's. Both are within K = 2 ulp of glibc (port-parity.md §2).
+# - exp, sin, cos, hypot, pow and atan2 are correctly rounded (src/crmath.cyr, ADR 0011 and its amendments), the
+#   same bits on every target.
 
 # π/180 as Rust folds `consts::PI / 180.0`: the double nearest, pinned by the to_radians rows.
 var _IM_RADS_PER_DEG: f64 = 0.017453292519943295;
@@ -2593,30 +2983,12 @@ fn _im_cos(x: f64): f64 {
     return r;
 }
 
-# The angle of (x, y) in [−π, π]: ganita_f64_atan2 (1.2.15) with `_f64_atan_polyfill` in place of
-# the `f64_atan` builtin, so the same bits on every target (port-parity.md §2). The whole C99
-# Annex F table, signs of zero included, as ganita. Words in, word out. Stands for `y.atan2(x)`.
+# The angle of (x, y) in [−π, π], correctly rounded (src/crmath.cyr, ADR 0011 as amended for atan2), C99 Annex F's
+# specials and signs of zero included. Stands for `y.atan2(x)`.
 #must_use
-fn _im_atan2(y, x): i64 {
-    var ay = y & 0x7FFFFFFFFFFFFFFF;
-    var ax = x & 0x7FFFFFFFFFFFFFFF;
-    if (ay > 0x7FF0000000000000) { return y; }
-    if (ax > 0x7FF0000000000000) { return x; }
-    var ysign = y & 0x8000000000000000;
-    var xneg = (x >> 63) & 1;
-    if (ay == 0) {
-        if (xneg == 1) { return F64_PI | ysign; }
-        return y;
-    }
-    if (ax == 0) { return F64_PI_2 | ysign; }
-    if ((ay == 0x7FF0000000000000) && (ax == 0x7FF0000000000000)) {
-        if (xneg == 1) { return _F64_3PI_4 | ysign; }
-        return F64_PI_4 | ysign;
-    }
-    var q = _f64_atan_polyfill(f64_div(y, x));
-    if (xneg == 0) { return q; }
-    if (ysign != 0) { return f64_sub(q, F64_PI); }
-    return f64_add(q, F64_PI);
+fn _im_atan2(y: f64, x: f64): f64 {
+    var r: f64 = _im_cr_atan2(y, x);
+    return r;
 }
 
 # --- fmtf.cyr ---
@@ -8862,6 +9234,449 @@ fn _im_b3_raycast(bodies: *ImArena, colliders: *ImArena, origin: ImVec3, directi
     out.normal = bn;
     out.distance = bt;
     return 1;
+}
+
+# --- b3_state.cyr ---
+
+# b3_state.cyr — the 3D backend's state (port of rust-old/src/backend_3d/state.rs, and the raycast methods of
+# backend_3d/raycast.rs's `impl PhysicsState3d`).
+#
+# ImPhysicsState3d owns the bodies, colliders and joints (generational arenas, so its handles are Rust's handle for
+# handle), each body's collider list, the contact tracker, and the narrowphase's GJK scratch (reused from step to
+# step, M5 part 3). As in 2D, Rust's `body_colliders` map gets an entry only through `add_body` once `add_collider`
+# refuses a missing body (ADR 0008 #1), so it holds exactly the live bodies: the port keeps each list beside its
+# body's arena slot, and a dump sorts them by handle as the BTreeMap iterates. A collider owns its shape's arrays,
+# freed when it is removed.
+#
+# Mutations follow Rust's order: unlike the 2D state, `add_collider` inserts the collider and then recomputes the
+# body's mass from all of its colliders (`recompute_mass_properties`, src/b3_types.cyr's three steps). The 3D state
+# wakes no neighbours on a removal and keeps no manifolds. Every allocation failure is a value: an add returns
+# Err(IM_ERR_PHYSICS) (Rust has no such path), nothing aborts.
+
+#must_use
+fn _im_b3_as_joint(p): *ImJoint3d { return p; }
+
+#must_use
+fn _im_b3_as_list(p): *ImWordList { return p; }
+
+# Wakes the body record at rb.
+fn _im_b3_wake(rb: *ImRigidBody3d) {
+    rb.is_sleeping = 0;
+    rb.sleep_timer = 0.0;
+    return 0;
+}
+
+# `bodies`, `colliders` and `joints` are *ImArena words; `body_colliders` is one ImWordList record (three words) per
+# body slot, `list_slots` of them. Mirrors `PhysicsState3d`.
+struct ImPhysicsState3d {
+    bodies;
+    colliders;
+    joints;
+    body_colliders;
+    list_slots;
+    contact_tracker: ImContactTracker;
+    gjk: ImGjkScratch3d;
+}
+
+# An empty state. Its arenas are 0 when there is no memory (every operation then refuses). Mirrors
+# `PhysicsState3d::new`.
+#must_use
+fn ImPhysicsState3d_new(): ImPhysicsState3d {
+    var s: ImPhysicsState3d;
+    s.bodies = ImArena_new(sizeof(ImRigidBody3d));
+    s.colliders = ImArena_new(sizeof(ImCollider3d));
+    s.joints = ImArena_new(sizeof(ImJoint3d));
+    s.body_colliders = 0;
+    s.list_slots = 0;
+    s.contact_tracker = ImContactTracker_new();
+    s.gjk = ImGjkScratch3d_new();
+    return s;
+}
+
+# A joint's keep-test for `ImArena::retain`: 1 unless the joint names the body `ctx`.
+#must_use
+fn _im_b3_joint_keep(h, jp, ctx): i64 {
+    var j: *ImJoint3d = _im_b3_as_joint(jp);
+    if (j.body_a == ctx || j.body_b == ctx) { return 0; }
+    return 1;
+}
+
+impl ImPhysicsState3d {
+    #must_use
+    fn _bodies(self): *ImArena { return _im_as_arena(self.bodies); }
+    #must_use
+    fn _colliders(self): *ImArena { return _im_as_arena(self.colliders); }
+    #must_use
+    fn _joints(self): *ImArena { return _im_as_arena(self.joints); }
+
+    # The live body record at handle h, or 0.
+    #must_use
+    fn _body(self, h): *ImRigidBody3d {
+        if (self.bodies == 0) { return _im_b3_as_body(0); }
+        return _im_b3_as_body(self._bodies().get(h));
+    }
+
+    # Body slot i's collider list, the list buffer grown to slot i first; 0 when there is no memory.
+    #must_use
+    fn _list(self, i): *ImWordList {
+        if (i >= self.list_slots) {
+            var n = self.list_slots * 2;
+            if (n < i + 1) { n = i + 1; }
+            if (n < 8) { n = 8; }
+            var p = fl_alloc(n * 24);
+            if (p == 0) { return _im_b3_as_list(0); }
+            for (var k = 0; k < self.list_slots * 3; k = k + 1) {
+                store64(p + k * 8, load64(self.body_colliders + k * 8));
+            }
+            for (var z = self.list_slots * 3; z < n * 3; z = z + 1) { store64(p + z * 8, 0); }
+            if (self.body_colliders != 0) { fl_free(self.body_colliders); }
+            self.body_colliders = p;
+            self.list_slots = n;
+        }
+        return _im_b3_as_list(self.body_colliders + i * 24);
+    }
+
+    # Adds a body and returns its handle (-1 when there is no memory). Mirrors `add_body`.
+    fn add_body(self, desc: ImBodyDesc): i64 {
+        if (self.bodies == 0) { return 0 - 1; }
+        var rb: ImRigidBody3d = ImRigidBody3d_from_desc(0, desc);
+        var ar: *ImArena = self._bodies();
+        var h = ar.insert(&rb);
+        if (h == 0 - 1) { return h; }
+        var p: *ImRigidBody3d = self._body(h);
+        p.handle = h;
+        var list: *ImWordList = self._list(_im_handle_index(h));
+        if (list != 0) { list.len = 0; }
+        return h;
+    }
+
+    # Adds a collider to body `body` and recomputes the body's mass from all of its colliders: Ok(handle), or
+    # Err(IM_ERR_BODY_NOT_FOUND) for a body that isn't live (ADR 0008 #1: Rust stores an orphan). Mirrors
+    # `add_collider`.
+    fn add_collider(self, body, desc: ImColliderDesc): Result {
+        if (self._body(body) == 0) { return Err(IM_ERR_BODY_NOT_FOUND); }
+        var list: *ImWordList = self._list(_im_handle_index(body));
+        if (list == 0) { return Err(IM_ERR_PHYSICS); }
+        var c: ImCollider3d = ImCollider3d_from_desc(0, body, desc);
+        var ca: *ImArena = self._colliders();
+        var h = ca.insert(&c);
+        if (h == 0 - 1) {
+            c.free();
+            return Err(IM_ERR_PHYSICS);
+        }
+        var cp: *ImCollider3d = _im_b3_as_coll(ca.get(h));
+        cp.handle = h;
+        if (list.push(h) == 0) { return Err(IM_ERR_PHYSICS); }
+        self.recompute_mass_properties(body);
+        return Ok(h);
+    }
+
+    # Sets a body's mass and inertia from its colliders (each collider's inertia shifted to the body origin by the
+    # parallel-axis theorem), then its inverses and world inverse inertia; a static or kinematic body gets none.
+    # Mirrors `recompute_mass_properties`.
+    fn recompute_mass_properties(self, body) {
+        var rb: *ImRigidBody3d = self._body(body);
+        if (rb == 0) { return 0; }
+        _im_b3_mass_reset(rb);
+        var list: *ImWordList = self._list(_im_handle_index(body));
+        if (list != 0) {
+            var ca: *ImArena = self._colliders();
+            for (var i = 0; i < list.len; i = i + 1) {
+                var cp: *ImCollider3d = _im_b3_as_coll(ca.get(list.at(i)));
+                if (cp != 0) { _im_b3_mass_add(rb, cp); }
+            }
+        }
+        _im_b3_mass_finish(rb);
+        return 0;
+    }
+
+    # The joint a descriptor makes: its fields, the anchors at z = 0, and the reference rotation
+    # normalize(q_a⁻¹·q_b) (identity for a body that isn't live). Mirrors `joint_from_desc`.
+    #must_use
+    fn _joint_from_desc(self, desc: *ImJointDesc): ImJoint3d {
+        var j: ImJoint3d;
+        var qa: ImQuat = ImQuat_identity();
+        var qb: ImQuat = ImQuat_identity();
+        var pa: *ImRigidBody3d = self._body(desc.body_a);
+        var pb: *ImRigidBody3d = self._body(desc.body_b);
+        if (pa != 0) { qa = pa.rotation; }
+        if (pb != 0) { qb = pb.rotation; }
+        var rel: ImQuat = ImQuat_mul_quat(ImQuat_inverse(qa), qb);
+        var ax: f64 = desc.local_anchor_a.x;
+        var ay: f64 = desc.local_anchor_a.y;
+        var bx: f64 = desc.local_anchor_b.x;
+        var by: f64 = desc.local_anchor_b.y;
+        var damping: f64 = desc.damping;
+        var bf: f64 = desc.break_force;
+        j.body_a = desc.body_a;
+        j.body_b = desc.body_b;
+        j.joint_type = desc.joint_type;
+        j.local_anchor_a = ImVec3_new(ax, ay, 0.0);
+        j.local_anchor_b = ImVec3_new(bx, by, 0.0);
+        j.reference_rotation = ImQuat_normalize(rel);
+        j.has_motor = desc.has_motor;
+        j.motor = desc.motor;
+        j.damping = damping;
+        j.has_break_force = desc.has_break_force;
+        j.break_force = bf;
+        return j;
+    }
+
+    # Adds a joint: Ok(handle), or Err(IM_ERR_BODY_NOT_FOUND) when either body isn't live (ADR 0008 #1). Mirrors
+    # `add_joint`.
+    fn add_joint(self, desc: ImJointDesc): Result {
+        if (self._body(desc.body_a) == 0 || self._body(desc.body_b) == 0) { return Err(IM_ERR_BODY_NOT_FOUND); }
+        var j: ImJoint3d = self._joint_from_desc(&desc);
+        var h = self._joints().insert(&j);
+        if (h == 0 - 1) { return Err(IM_ERR_PHYSICS); }
+        return Ok(h);
+    }
+
+    # Wakes the body and adds the force (and its torque p × f about the body origin, when it has a point). Mirrors
+    # `apply_force`.
+    fn apply_force(self, body, f: ImForce) {
+        var rb: *ImRigidBody3d = self._body(body);
+        if (rb == 0) { return 0; }
+        _im_b3_wake(rb);
+        var fv: ImVec3 = f.vector;
+        rb.force_accumulator = rb.force_accumulator + fv;
+        if (f.has_point == 1) {
+            var p: ImVec3 = f.point;
+            var t: ImVec3 = ImVec3_cross(p, fv);
+            rb.torque_accumulator = rb.torque_accumulator + t;
+        }
+        return 0;
+    }
+
+    # For a dynamic body with mass: wakes it and changes its velocity by impulse · inv_mass, and its spin by the world
+    # inverse inertia times p × impulse when the impulse has a point. Mirrors `apply_impulse`.
+    fn apply_impulse(self, body, imp: ImImpulse) {
+        var rb: *ImRigidBody3d = self._body(body);
+        if (rb == 0) { return 0; }
+        var im: f64 = rb.inv_mass;
+        if (rb.is_dynamic() == 0 || !(im > 0.0)) { return 0; }
+        _im_b3_wake(rb);
+        var iv: ImVec3 = imp.vector;
+        var dv: ImVec3 = ImVec3_scale(iv, im);
+        rb.linear_velocity = rb.linear_velocity + dv;
+        if (imp.has_point == 1) {
+            var p: ImVec3 = imp.point;
+            var ang: ImVec3 = ImVec3_cross(p, iv);
+            var iw: ImMat3 = rb.compute_inv_inertia_world();
+            var dw: ImVec3 = ImMat3_mul_vec3(iw, ang);
+            rb.angular_velocity = rb.angular_velocity + dw;
+        }
+        return 0;
+    }
+
+    # Wakes the body and adds the torque about z. Mirrors `apply_torque`.
+    fn apply_torque(self, body, t: ImTorque) {
+        var rb: *ImRigidBody3d = self._body(body);
+        if (rb == 0) { return 0; }
+        _im_b3_wake(rb);
+        var v: f64 = t.value;
+        var z: f64 = rb.torque_accumulator.z;
+        rb.torque_accumulator.z = z + v;
+        return 0;
+    }
+
+    # Removes a body with its colliders (and their tracked pairs) and its joints. A handle that isn't live removes
+    # nothing but the joints that name it. Mirrors `remove_body`.
+    fn remove_body(self, handle) {
+        if (self.bodies == 0) { return 0; }
+        if (self._bodies().remove(handle, 0) == 1) {
+            var list: *ImWordList = self._list(_im_handle_index(handle));
+            if (list != 0) {
+                var ca: *ImArena = self._colliders();
+                for (var i = 0; i < list.len; i = i + 1) {
+                    var chd = list.at(i);
+                    var cp: *ImCollider3d = _im_b3_as_coll(ca.get(chd));
+                    if (cp != 0) {
+                        cp.free();
+                        ca.remove(chd, 0);
+                    }
+                }
+                self.contact_tracker.forget_colliders(list.data, list.len);
+                list.len = 0;
+            }
+        }
+        self._joints().retain(&_im_b3_joint_keep, handle);
+        return 0;
+    }
+
+    # Removes a collider, forgets its tracked pairs and recomputes its body's mass: Ok(0), or
+    # Err(IM_ERR_COLLIDER_NOT_FOUND). Mirrors `remove_collider`.
+    fn remove_collider(self, handle): Result {
+        if (self.colliders == 0) { return Err(IM_ERR_COLLIDER_NOT_FOUND); }
+        var ca: *ImArena = self._colliders();
+        var cp: *ImCollider3d = _im_b3_as_coll(ca.get(handle));
+        if (cp == 0) { return Err(IM_ERR_COLLIDER_NOT_FOUND); }
+        var body = cp.body;
+        cp.free();
+        ca.remove(handle, 0);
+        if (self._body(body) != 0) {
+            var list: *ImWordList = self._list(_im_handle_index(body));
+            if (list != 0) {
+                var w = 0;
+                for (var i = 0; i < list.len; i = i + 1) {
+                    var x = list.at(i);
+                    if (x != handle) {
+                        store64(list.data + w * 8, x);
+                        w = w + 1;
+                    }
+                }
+                list.len = w;
+            }
+        }
+        var one[8];
+        store64(&one, handle);
+        self.contact_tracker.forget_colliders(&one, 1);
+        self.recompute_mass_properties(body);
+        return Ok(0);
+    }
+
+    # Removes a joint: Ok(0), or Err(IM_ERR_JOINT_NOT_FOUND). Mirrors `remove_joint`.
+    fn remove_joint(self, handle): Result {
+        if (self.joints == 0) { return Err(IM_ERR_JOINT_NOT_FOUND); }
+        if (self._joints().remove(handle, 0) == 0) { return Err(IM_ERR_JOINT_NOT_FOUND); }
+        return Ok(0);
+    }
+
+    # Places a body at a given handle (snapshot restore): 1, or 0 when the slot is taken or there is no memory.
+    # Mirrors `add_body_at`.
+    fn add_body_at(self, handle, desc: ImBodyDesc): i64 {
+        if (self.bodies == 0) { return 0; }
+        var rb: ImRigidBody3d = ImRigidBody3d_from_desc(handle, desc);
+        if (self._bodies().insert_at(handle, &rb) == 0) { return 0; }
+        var list: *ImWordList = self._list(_im_handle_index(handle));
+        if (list != 0) { list.len = 0; }
+        return 1;
+    }
+
+    # Places a collider at a given handle and recomputes its body's mass: Ok(0), Err(IM_ERR_BODY_NOT_FOUND) for a
+    # body that isn't live (ADR 0008 #1), or Err(IM_ERR_PHYSICS) when the slot is taken. Mirrors `add_collider_at`.
+    fn add_collider_at(self, handle, body, desc: ImColliderDesc): Result {
+        if (self._body(body) == 0) { return Err(IM_ERR_BODY_NOT_FOUND); }
+        var list: *ImWordList = self._list(_im_handle_index(body));
+        if (list == 0) { return Err(IM_ERR_PHYSICS); }
+        var c: ImCollider3d = ImCollider3d_from_desc(handle, body, desc);
+        if (self._colliders().insert_at(handle, &c) == 0) {
+            c.free();
+            return Err(IM_ERR_PHYSICS);
+        }
+        if (list.push(handle) == 0) { return Err(IM_ERR_PHYSICS); }
+        self.recompute_mass_properties(body);
+        return Ok(0);
+    }
+
+    # Places a joint at a given handle: Ok(0), Err(IM_ERR_BODY_NOT_FOUND) (ADR 0008 #1), or Err(IM_ERR_PHYSICS) when
+    # the slot is taken. Mirrors `add_joint_at`.
+    fn add_joint_at(self, handle, desc: ImJointDesc): Result {
+        if (self._body(desc.body_a) == 0 || self._body(desc.body_b) == 0) { return Err(IM_ERR_BODY_NOT_FOUND); }
+        var j: ImJoint3d = self._joint_from_desc(&desc);
+        if (self._joints().insert_at(handle, &j) == 0) { return Err(IM_ERR_PHYSICS); }
+        return Ok(0);
+    }
+
+    # The number of live bodies. Mirrors `body_count`.
+    #must_use
+    fn body_count(self): i64 {
+        if (self.bodies == 0) { return 0; }
+        return self._bodies().len();
+    }
+
+    # The body's public state into out, its rotation as 2·atan2(q.z, q.w) (correctly rounded, ADR 0011) and its
+    # angular velocity's z: Ok(0), or Err(IM_ERR_BODY_NOT_FOUND). Mirrors `get_body_state`.
+    fn get_body_state(self, handle, out: *ImBodyState): Result {
+        var rb: *ImRigidBody3d = self._body(handle);
+        if (rb == 0) { return Err(IM_ERR_BODY_NOT_FOUND); }
+        var qz: f64 = rb.rotation.z;
+        var qw: f64 = rb.rotation.w;
+        var a: f64 = _im_atan2(qz, qw);
+        var w: f64 = rb.angular_velocity.z;
+        out.handle = rb.handle;
+        out.body_type = rb.body_type;
+        out.position = rb.position;
+        out.rotation = a * 2.0;
+        out.linear_velocity = rb.linear_velocity;
+        out.angular_velocity = w;
+        out.is_sleeping = rb.is_sleeping;
+        return Ok(0);
+    }
+
+    # Teleports the body to a state (position, rotation about z, linear velocity, spin about z; its type and sleep
+    # flag ignored), wakes it and refreshes its world inverse inertia: Ok(0), or Err(IM_ERR_BODY_NOT_FOUND). Mirrors
+    # `set_body_state`.
+    fn set_body_state(self, handle, st: ImBodyState): Result {
+        var rb: *ImRigidBody3d = self._body(handle);
+        if (rb == 0) { return Err(IM_ERR_BODY_NOT_FOUND); }
+        var rot: f64 = st.rotation;
+        var w: f64 = st.angular_velocity;
+        rb.position = st.position;
+        rb.rotation = ImQuat_from_rotation_z(rot);
+        rb.linear_velocity = st.linear_velocity;
+        rb.angular_velocity = ImVec3_new(0.0, 0.0, w);
+        _im_b3_wake(rb);
+        rb.update_inertia_world();
+        return Ok(0);
+    }
+
+    # Changes a body's type, wakes it, stops a static or kinematic one, and recomputes its mass (only a dynamic body
+    # has any): Ok(0), or Err(IM_ERR_BODY_NOT_FOUND). Mirrors `set_body_type`.
+    fn set_body_type(self, handle, t): Result {
+        var rb: *ImRigidBody3d = self._body(handle);
+        if (rb == 0) { return Err(IM_ERR_BODY_NOT_FOUND); }
+        rb.body_type = t;
+        _im_b3_wake(rb);
+        if (t == IM_BODY_STATIC || t == IM_BODY_KINEMATIC) {
+            rb.linear_velocity = ImVec3_zero();
+            rb.angular_velocity = ImVec3_zero();
+        }
+        self.recompute_mass_properties(handle);
+        return Ok(0);
+    }
+
+    # ── queries ──
+
+    # The nearest hit within max_dist of the ray, over every collider (none filtered): 1 with *out, or 0. Mirrors
+    # `raycast` (src/b3_raycast.cyr's `_im_b3_raycast`).
+    fn raycast(self, origin: ImVec3, direction: ImVec3, max_dist: f64, out: *ImRayHit): i64 {
+        if (self.colliders == 0 || self.bodies == 0) { return 0; }
+        return _im_b3_raycast(self._bodies(), self._colliders(), origin, direction, max_dist, 0, 0, out);
+    }
+
+    # As `raycast`, over the colliders whose layer shares a bit with mask. Mirrors `raycast_filtered`.
+    fn raycast_filtered(self, origin: ImVec3, direction: ImVec3, max_dist: f64, mask, out: *ImRayHit): i64 {
+        if (self.colliders == 0 || self.bodies == 0) { return 0; }
+        return _im_b3_raycast(self._bodies(), self._colliders(), origin, direction, max_dist, 1, mask, out);
+    }
+
+    # Releases everything the state owns: the colliders' shapes, the arenas, the lists, the tracker and the scratch.
+    fn free(self) {
+        if (self.colliders != 0) {
+            var ca: *ImArena = self._colliders();
+            for (var s = 0; s < ca.slot_count(); s = s + 1) {
+                var h = ca.slot_handle(s);
+                if (h != 0 - 1) { _im_b3_as_coll(ca.get(h)).free(); }
+            }
+            ca.free();
+        }
+        if (self.bodies != 0) { self._bodies().free(); }
+        if (self.joints != 0) { self._joints().free(); }
+        for (var i = 0; i < self.list_slots; i = i + 1) {
+            var l: *ImWordList = _im_b3_as_list(self.body_colliders + i * 24);
+            l.free();
+        }
+        if (self.body_colliders != 0) { fl_free(self.body_colliders); }
+        self.colliders = 0;
+        self.bodies = 0;
+        self.joints = 0;
+        self.body_colliders = 0;
+        self.list_slots = 0;
+        self.contact_tracker.free();
+        self.gjk.free();
+        return 0;
+    }
 }
 
 # --- particle.cyr ---
