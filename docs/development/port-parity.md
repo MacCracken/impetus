@@ -1183,6 +1183,34 @@ fails when either drifts from `cyrius.cyml`.
   where `tests/snapshot.tcyr` (pin included) also passes. Surface parity is 662 across 30 modules with nothing pending:
   `serialize_world` and `deserialize_world` are in.
 
+## 27. M6c: the JSON form (2026-11-10, ADR 0013)
+
+- **The document.** One object: format, version and profile first, then the struct's fields in order, with the 2D
+  profile's `manifolds` after the arenas. Bodies are `{"body":{…},"colliders":[…]}`, joints `{"handle","joint":{…}}`,
+  and the other records are their fields. The shared types nest through their serde-compatible codecs (ADR 0010).
+  The particle, emitter and event readers were split so they can nest, each into a value-level `_im_jr_*` reader and
+  its wrapper. The json corpus checks that the split changes nothing: its 1,092 rows give 1,086 ok and the same 6 pending
+  (S3, S4) as before.
+- **Floats.** Values are serde_json's shortest round-trip digits, so every finite value comes back bit for bit. JSON
+  has no non-finite number, so `to_json` counts what the float printer had to write as `null` and refuses with
+  `IM_ERR_SERIALIZE`; the binary form holds such a value. A world with an emitter at a NaN rate is the test.
+- **Reading.** The text must be one object with this format, version and profile. Every field is required, of its
+  type, with enums by name and flags as booleans. Then `restore` runs §25's checks: a well-formed document of an
+  invalid world (a body handle at a slot the arena doesn't hold) is refused there, with the world unchanged.
+- **Tests** (`tests/snapshot.tcyr`, 49 → 58 assertions):
+  - Rust's `snapshot_serde_json`, on the 2.0 snapshot;
+  - world → JSON → world in five scenes, giving the same state (compared through the canonical bytes) and the same
+    text again;
+  - step-equivalence through JSON: restored at frame 25, then 90 frames in step, events included;
+  - the document's lead keys, and an edit to a body's position that restores with the edit;
+  - six reader refusals (not an object, wrong format, version, profile, a missing key, a wrong type) and one by
+    `restore`;
+  - a NaN refused by `to_json` while the bytes hold it.
+
+  Writing one body field's value under another key fails the round trip.
+- **Result:** 2D **98,874 ok, 0 failed, 6 pending**; 3D **29,404 ok**; the same on x86_64 ELF, x86_64 PE and aarch64,
+  where `tests/snapshot.tcyr` also passes. Surface parity is 662 across 30 modules.
+
 ## How to reproduce
 
 ```sh

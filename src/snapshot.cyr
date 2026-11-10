@@ -909,3 +909,219 @@ fn _im_snap_get_field(rd: *ImSnapReader, f: *ImForceField): i64 {
     memcpy(f, &g, sizeof(ImForceField));
     return 1;
 }
+
+# ── the JSON form (ADR 0013) ────────────────────────────────────────────────────────
+# serde's form for the snapshot: each record an object keyed by its field names, enums by variant name, an absent
+# optional (and a -1 slot index) as null, the shared types through their serde-compatible codecs (src/json.cyr, ADR
+# 0010). Floats are serde_json's shortest form; a non-finite one has no JSON form, so writing one fails. The field
+# readers below take a struct node `o` in `form` and set *bad to 1 when the field is absent or malformed.
+
+# An f64 field.
+#must_use
+fn _im_sr_f(o, form, i, name, bad): f64 {
+    var w[8];
+    var zero: f64 = 0.0;
+    if (_im_jr_f64(_im_jr_at(o, form, i, name), &w) == 0) {
+        store64(bad, 1);
+        return zero;
+    }
+    var x: f64 = load64(&w);
+    return x;
+}
+
+# An integer field in [lo, hi].
+#must_use
+fn _im_sr_int(o, form, i, name, lo, hi, bad): i64 {
+    var w[8];
+    if (_im_jr_int(_im_jr_at(o, form, i, name), lo, hi, &w) == 0) {
+        store64(bad, 1);
+        return 0;
+    }
+    return load64(&w);
+}
+
+# A handle (u64) field.
+#must_use
+fn _im_sr_u64(o, form, i, name, bad): i64 { return _im_sr_int(o, form, i, name, 0, 0x7FFFFFFFFFFFFFFF, bad); }
+
+# A boolean field, as 0 or 1.
+#must_use
+fn _im_sr_bool(o, form, i, name, bad): i64 {
+    var w[8];
+    if (_im_jr_bool(_im_jr_at(o, form, i, name), &w) == 0) {
+        store64(bad, 1);
+        return 0;
+    }
+    return load64(&w);
+}
+
+# An [x, y] field.
+#must_use
+fn _im_sr_v2(o, form, i, name, bad): ImVec2 {
+    var v: ImVec2 = ImVec2_new(0.0, 0.0);
+    if (_im_jr_vec2(_im_jr_at(o, form, i, name), &v) == 0) { store64(bad, 1); }
+    return v;
+}
+
+# An [x, y, z] field.
+#must_use
+fn _im_sr_v3(o, form, i, name, bad): ImVec3 {
+    var v: ImVec3 = ImVec3_zero();
+    if (_im_jr_vec3(_im_jr_at(o, form, i, name), &v) == 0) { store64(bad, 1); }
+    return v;
+}
+
+# An optional f64 field (null or absent: none) into *has and the returned value (0.0 for none).
+#must_use
+fn _im_sr_opt_f(o, form, i, name, has, bad): f64 {
+    var v = _im_jr_at(o, form, i, name);
+    var zero: f64 = 0.0;
+    store64(has, 0);
+    if (v == 0 || _im_jr_is_null(v) == 1) { return zero; }
+    store64(has, 1);
+    return _im_sr_f(o, form, i, name, bad);
+}
+
+# A slot index or -1: null, or a non-negative integer.
+#must_use
+fn _im_sr_index(o, form, i, name, bad): i64 {
+    var v = _im_jr_at(o, form, i, name);
+    if (v != 0 && _im_jr_is_null(v) == 1) { return 0 - 1; }
+    return _im_sr_int(o, form, i, name, 0, 0x7FFFFFFFFFFFFFFF, bad);
+}
+
+# The length of array node v, or -1 when v is not an array.
+#must_use
+fn _im_sr_len(v): i64 {
+    if (v == 0 || bayan_json_v_tag(v) != JTAG_ARR) { return 0 - 1; }
+    return bayan_json_v_arr_len(v);
+}
+
+# Appends the slot index x, or null for -1.
+fn _im_sj_index(sb, x) {
+    if (x < 0) { str_builder_add_cstr(sb, "null"); } else { str_builder_add_int(sb, x); }
+    return 0;
+}
+
+# Appends an arena snapshot: {"slots":[{"occupied","generation","next_free"}…],"free_head","free_list_stale"}.
+fn _im_sj_arena(sb, a: *ImArenaSnapshot) {
+    str_builder_add_cstr(sb, "{\"slots\":[");
+    for (var i = 0; i < a.slots.len; i = i + 1) {
+        var s: *ImSlotSnapshot = a.slot(i);
+        if (i > 0) { str_builder_putc(sb, 44); }
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "occupied", 1);
+        _im_jw_bool(sb, s.occupied);
+        _im_jw_key(sb, "generation", 0);
+        str_builder_add_int(sb, s.generation);
+        _im_jw_key(sb, "next_free", 0);
+        _im_sj_index(sb, s.next_free);
+        str_builder_putc(sb, 125);
+    }
+    str_builder_putc(sb, 93);
+    _im_jw_key(sb, "free_head", 0);
+    _im_sj_index(sb, a.free_head);
+    _im_jw_key(sb, "free_list_stale", 0);
+    _im_jw_bool(sb, a.free_list_stale);
+    str_builder_putc(sb, 125);
+    return 0;
+}
+
+# Reads an arena snapshot node into the empty *a: 1, or 0.
+fn _im_sr_arena(o, a: *ImArenaSnapshot): i64 {
+    var f = _im_jr_form(o, 3);
+    if (f == 0) { return 0; }
+    var bad[8];
+    store64(&bad, 0);
+    var sv = _im_jr_at(o, f, 0, "slots");
+    var n = _im_sr_len(sv);
+    if (n < 0 || a.slots.reserve(n) == 0) { return 0; }
+    for (var i = 0; i < n; i = i + 1) {
+        var so = bayan_json_v_arr_get(sv, i);
+        var sf = _im_jr_form(so, 3);
+        if (sf == 0) { return 0; }
+        var s: *ImSlotSnapshot = _im_as_slot(a.slots.at(i));
+        s.occupied = _im_sr_bool(so, sf, 0, "occupied", &bad);
+        s.generation = _im_sr_int(so, sf, 1, "generation", 0, 0xFFFFFFFF, &bad);
+        s.next_free = _im_sr_index(so, sf, 2, "next_free", &bad);
+        a.slots.len = i + 1;
+    }
+    a.free_head = _im_sr_index(o, f, 1, "free_head", &bad);
+    a.free_list_stale = _im_sr_bool(o, f, 2, "free_list_stale", &bad);
+    if (load64(&bad) == 1) { return 0; }
+    return 1;
+}
+
+# Appends a pair list: [[a,b],…].
+fn _im_sj_pairs(sb, p: *ImPairList) {
+    str_builder_putc(sb, 91);
+    for (var i = 0; i < p.len; i = i + 1) {
+        if (i > 0) { str_builder_putc(sb, 44); }
+        str_builder_putc(sb, 91);
+        _im_jw_u64(sb, p.first(i));
+        str_builder_putc(sb, 44);
+        _im_jw_u64(sb, p.second(i));
+        str_builder_putc(sb, 93);
+    }
+    str_builder_putc(sb, 93);
+    return 0;
+}
+
+# Reads a pair-list node into the empty *p: 1, or 0.
+fn _im_sr_pairs(v, p: *ImPairList): i64 {
+    var n = _im_sr_len(v);
+    if (n < 0 || p.reserve(n) == 0) { return 0; }
+    var w[16];
+    for (var i = 0; i < n; i = i + 1) {
+        var e = bayan_json_v_arr_get(v, i);
+        if (_im_sr_len(e) != 2) { return 0; }
+        if (_im_jr_u64(bayan_json_v_arr_get(e, 0), &w) == 0 || _im_jr_u64(bayan_json_v_arr_get(e, 1), &w + 8) == 0) {
+            return 0;
+        }
+        p.push(load64(&w), load64(&w + 8));
+    }
+    return 1;
+}
+
+# Appends a tracker snapshot: {"prev","current","seen","recorded","events"}.
+fn _im_sj_tracker(sb, t: *ImTrackerSnapshot) {
+    str_builder_putc(sb, 123);
+    _im_jw_key(sb, "prev", 1);
+    _im_sj_pairs(sb, t.prev);
+    _im_jw_key(sb, "current", 0);
+    _im_sj_pairs(sb, t.current);
+    _im_jw_key(sb, "seen", 0);
+    _im_sj_pairs(sb, t.seen);
+    _im_jw_key(sb, "recorded", 0);
+    _im_jw_bool(sb, t.recorded);
+    _im_jw_key(sb, "events", 0);
+    str_builder_putc(sb, 91);
+    for (var i = 0; i < t.events.len; i = i + 1) {
+        if (i > 0) { str_builder_putc(sb, 44); }
+        var e: *ImCollisionEvent = _im_as_event(t.events.at(i));
+        e.to_json(sb);
+    }
+    str_builder_putc(sb, 93);
+    str_builder_putc(sb, 125);
+    return 0;
+}
+
+# Reads a tracker snapshot node into the empty *t: 1, or 0.
+fn _im_sr_tracker(o, t: *ImTrackerSnapshot): i64 {
+    var f = _im_jr_form(o, 5);
+    if (f == 0) { return 0; }
+    if (_im_sr_pairs(_im_jr_at(o, f, 0, "prev"), t.prev) == 0) { return 0; }
+    if (_im_sr_pairs(_im_jr_at(o, f, 1, "current"), t.current) == 0) { return 0; }
+    if (_im_sr_pairs(_im_jr_at(o, f, 2, "seen"), t.seen) == 0) { return 0; }
+    var bad[8];
+    store64(&bad, 0);
+    t.recorded = _im_sr_bool(o, f, 3, "recorded", &bad);
+    var ev = _im_jr_at(o, f, 4, "events");
+    var n = _im_sr_len(ev);
+    if (n < 0 || load64(&bad) == 1 || t.events.reserve(n) == 0) { return 0; }
+    for (var i = 0; i < n; i = i + 1) {
+        if (_im_jr_event(bayan_json_v_arr_get(ev, i), _im_as_event(t.events.at(i))) == 0) { return 0; }
+        t.events.len = i + 1;
+    }
+    return 1;
+}

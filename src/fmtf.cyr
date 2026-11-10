@@ -358,11 +358,16 @@ fn im_fmt_f64_display(sb, x: f64) {
     return 0;
 }
 
+# The number of non-finite values im_fmt_f64_json has written as `null`, as serde_json does. A caller that must not
+# lose one (the snapshot's JSON form, ADR 0013) zeroes it, writes, and checks it.
+var _im_json_nonfinite = 0;
+
 # Appends x as serde_json 1.0.154 writes an f64 (zmij's format). Mirrors `serde_json::to_string(&x)`.
 fn im_fmt_f64_json(sb, x: f64) {
     var bits = _im_bits(x);
     var mag = bits & 0x7FFFFFFFFFFFFFFF;
     if (mag >= 0x7FF0000000000000) {
+        _im_json_nonfinite = _im_json_nonfinite + 1;
         str_builder_add_cstr(sb, "null");
         return 0;
     }

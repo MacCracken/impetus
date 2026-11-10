@@ -45,10 +45,17 @@ struct ImWorldSnapshot {
 # The binary form's profile word for this profile (ADR 0013).
 const _IM_SNAP_PROFILE = 2;
 
+# The JSON form's profile name for this profile (ADR 0013).
+#must_use
+fn _im_snap_profile_name(): i64 { return "2d"; }
+
 #must_use
 fn _im_as_body_snap(p): *ImBodySnapshot { return p; }
 #must_use
 fn _im_as_joint_snap(p): *ImJointSnapshot { return p; }
+
+#must_use
+fn _im_b2_as_point(p): *ImManifoldPoint { return p; }
 
 # The collider list of the ImBodySnapshot record at r (Cyrius takes no field addresses: the word after the body).
 #must_use
@@ -538,6 +545,382 @@ impl ImWorldSnapshot {
             if (rd.bad == 1) { return 0; }
         }
         return _im_snap_get_tracker(rd, self.tracker);
+    }
+
+    # ── the JSON form (ADR 0013): the backend's records ──
+    # A body is {"body":{its record's fields},"colliders":[handles]}; a collider its record's fields (shape and material
+    # through their serde codecs); a joint {"handle","joint":{its record's fields}} (joint type and motor likewise); a
+    # manifold its fields, its points as objects.
+
+    # Appends the bodies array.
+    fn _json_bodies(self, sb) {
+        str_builder_putc(sb, 91);
+        for (var i = 0; i < self.bodies.len; i = i + 1) {
+            if (i > 0) { str_builder_putc(sb, 44); }
+            var r = self.bodies.at(i);
+            var b: *ImRigidBody2d = _im_b2_as_body(r);
+            var rot: f64 = b.rotation;
+            var av: f64 = b.angular_velocity;
+            var ld: f64 = b.linear_damping;
+            var ad: f64 = b.angular_damping;
+            var gs: f64 = b.gravity_scale;
+            var tq: f64 = b.torque_accumulator;
+            var ms: f64 = b.mass;
+            var im: f64 = b.inv_mass;
+            var it: f64 = b.inertia;
+            var ii: f64 = b.inv_inertia;
+            var pa: f64 = b.pseudo_angular_velocity;
+            var pr: f64 = b.prev_rotation;
+            var st: f64 = b.sleep_timer;
+            str_builder_add_cstr(sb, "{\"body\":{");
+            _im_jw_key(sb, "handle", 1);
+            _im_jw_u64(sb, b.handle);
+            _im_jw_key(sb, "body_type", 0);
+            _im_jw_name(sb, body_type_name(b.body_type));
+            _im_jw_key(sb, "position", 0);
+            _im_jw_vec2(sb, b.position);
+            _im_jw_key(sb, "rotation", 0);
+            im_fmt_f64_json(sb, rot);
+            _im_jw_key(sb, "linear_velocity", 0);
+            _im_jw_vec2(sb, b.linear_velocity);
+            _im_jw_key(sb, "angular_velocity", 0);
+            im_fmt_f64_json(sb, av);
+            _im_jw_key(sb, "linear_damping", 0);
+            im_fmt_f64_json(sb, ld);
+            _im_jw_key(sb, "angular_damping", 0);
+            im_fmt_f64_json(sb, ad);
+            _im_jw_key(sb, "fixed_rotation", 0);
+            _im_jw_bool(sb, b.fixed_rotation);
+            _im_jw_key(sb, "gravity_scale", 0);
+            im_fmt_f64_json(sb, gs);
+            _im_jw_key(sb, "force_accumulator", 0);
+            _im_jw_vec2(sb, b.force_accumulator);
+            _im_jw_key(sb, "torque_accumulator", 0);
+            im_fmt_f64_json(sb, tq);
+            _im_jw_key(sb, "mass", 0);
+            im_fmt_f64_json(sb, ms);
+            _im_jw_key(sb, "inv_mass", 0);
+            im_fmt_f64_json(sb, im);
+            _im_jw_key(sb, "inertia", 0);
+            im_fmt_f64_json(sb, it);
+            _im_jw_key(sb, "inv_inertia", 0);
+            im_fmt_f64_json(sb, ii);
+            _im_jw_key(sb, "pseudo_velocity", 0);
+            _im_jw_vec2(sb, b.pseudo_velocity);
+            _im_jw_key(sb, "pseudo_angular_velocity", 0);
+            im_fmt_f64_json(sb, pa);
+            _im_jw_key(sb, "prev_position", 0);
+            _im_jw_vec2(sb, b.prev_position);
+            _im_jw_key(sb, "prev_rotation", 0);
+            im_fmt_f64_json(sb, pr);
+            _im_jw_key(sb, "is_sleeping", 0);
+            _im_jw_bool(sb, b.is_sleeping);
+            _im_jw_key(sb, "sleep_timer", 0);
+            im_fmt_f64_json(sb, st);
+            _im_jw_key(sb, "island_id", 0);
+            str_builder_add_int(sb, b.island_id);
+            str_builder_add_cstr(sb, "},\"colliders\":[");
+            var l: *ImWordList = _im_b2_snap_list(r);
+            for (var q = 0; q < l.len; q = q + 1) {
+                if (q > 0) { str_builder_putc(sb, 44); }
+                _im_jw_u64(sb, l.at(q));
+            }
+            str_builder_add_cstr(sb, "]}");
+        }
+        str_builder_putc(sb, 93);
+        return 0;
+    }
+
+    # Reads the bodies array into this empty snapshot: 1, or 0.
+    fn _read_bodies(self, v): i64 {
+        var n = _im_sr_len(v);
+        if (n < 0 || self.bodies.reserve(n) == 0) { return 0; }
+        var empty: ImWordList = ImWordList_new();
+        var bad[8];
+        store64(&bad, 0);
+        var w[8];
+        for (var i = 0; i < n; i = i + 1) {
+            var r = self.bodies.at(i);
+            var dl: *ImWordList = _im_b2_snap_list(r);
+            memcpy(dl, &empty, sizeof(ImWordList));
+            self.bodies.len = i + 1;
+            var o = bayan_json_v_arr_get(v, i);
+            var f = _im_jr_form(o, 2);
+            if (f == 0) { return 0; }
+            var bo = _im_jr_at(o, f, 0, "body");
+            var g = _im_jr_form(bo, 23);
+            if (g == 0) { return 0; }
+            var b: *ImRigidBody2d = _im_b2_as_body(r);
+            b.handle = _im_sr_u64(bo, g, 0, "handle", &bad);
+            if (_im_jr_body_type(_im_jr_at(bo, g, 1, "body_type"), &w) == 0) { return 0; }
+            b.body_type = load64(&w);
+            b.position = _im_sr_v2(bo, g, 2, "position", &bad);
+            b.rotation = _im_sr_f(bo, g, 3, "rotation", &bad);
+            b.linear_velocity = _im_sr_v2(bo, g, 4, "linear_velocity", &bad);
+            b.angular_velocity = _im_sr_f(bo, g, 5, "angular_velocity", &bad);
+            b.linear_damping = _im_sr_f(bo, g, 6, "linear_damping", &bad);
+            b.angular_damping = _im_sr_f(bo, g, 7, "angular_damping", &bad);
+            b.fixed_rotation = _im_sr_bool(bo, g, 8, "fixed_rotation", &bad);
+            b.gravity_scale = _im_sr_f(bo, g, 9, "gravity_scale", &bad);
+            b.force_accumulator = _im_sr_v2(bo, g, 10, "force_accumulator", &bad);
+            b.torque_accumulator = _im_sr_f(bo, g, 11, "torque_accumulator", &bad);
+            b.mass = _im_sr_f(bo, g, 12, "mass", &bad);
+            b.inv_mass = _im_sr_f(bo, g, 13, "inv_mass", &bad);
+            b.inertia = _im_sr_f(bo, g, 14, "inertia", &bad);
+            b.inv_inertia = _im_sr_f(bo, g, 15, "inv_inertia", &bad);
+            b.pseudo_velocity = _im_sr_v2(bo, g, 16, "pseudo_velocity", &bad);
+            b.pseudo_angular_velocity = _im_sr_f(bo, g, 17, "pseudo_angular_velocity", &bad);
+            b.prev_position = _im_sr_v2(bo, g, 18, "prev_position", &bad);
+            b.prev_rotation = _im_sr_f(bo, g, 19, "prev_rotation", &bad);
+            b.is_sleeping = _im_sr_bool(bo, g, 20, "is_sleeping", &bad);
+            b.sleep_timer = _im_sr_f(bo, g, 21, "sleep_timer", &bad);
+            b.island_id = _im_sr_int(bo, g, 22, "island_id", 0, 0x7FFFFFFFFFFFFFFF, &bad);
+            var lv = _im_jr_at(o, f, 1, "colliders");
+            var nl = _im_sr_len(lv);
+            if (nl < 0 || dl.reserve(nl) == 0 || load64(&bad) == 1) { return 0; }
+            for (var q = 0; q < nl; q = q + 1) {
+                if (_im_jr_u64(bayan_json_v_arr_get(lv, q), &w) == 0) { return 0; }
+                dl.push(load64(&w));
+            }
+        }
+        return 1;
+    }
+
+    # Appends the colliders array.
+    fn _json_colliders(self, sb) {
+        str_builder_putc(sb, 91);
+        for (var c = 0; c < self.colliders.len; c = c + 1) {
+            if (c > 0) { str_builder_putc(sb, 44); }
+            var cp: *ImCollider2d = _im_b2_as_coll(self.colliders.at(c));
+            var cm: f64 = cp.mass;
+            str_builder_putc(sb, 123);
+            _im_jw_key(sb, "handle", 1);
+            _im_jw_u64(sb, cp.handle);
+            _im_jw_key(sb, "body", 0);
+            _im_jw_u64(sb, cp.body);
+            _im_jw_key(sb, "shape", 0);
+            cp.shape.to_json(sb);
+            _im_jw_key(sb, "offset", 0);
+            _im_jw_vec2(sb, cp.offset);
+            _im_jw_key(sb, "material", 0);
+            cp.material.to_json(sb);
+            _im_jw_key(sb, "is_sensor", 0);
+            _im_jw_bool(sb, cp.is_sensor);
+            _im_jw_key(sb, "mass", 0);
+            _im_jw_opt_f64(sb, cp.has_mass, cm);
+            _im_jw_key(sb, "collision_layer", 0);
+            str_builder_add_int(sb, cp.collision_layer);
+            _im_jw_key(sb, "collision_mask", 0);
+            str_builder_add_int(sb, cp.collision_mask);
+            str_builder_putc(sb, 125);
+        }
+        str_builder_putc(sb, 93);
+        return 0;
+    }
+
+    # Reads the colliders array into this empty snapshot: 1, or 0.
+    fn _read_colliders(self, v): i64 {
+        var n = _im_sr_len(v);
+        if (n < 0 || self.colliders.reserve(n) == 0) { return 0; }
+        var bad[8];
+        store64(&bad, 0);
+        var has[8];
+        var sh: ImColliderShape;
+        for (var c = 0; c < n; c = c + 1) {
+            var o = bayan_json_v_arr_get(v, c);
+            var f = _im_jr_form(o, 9);
+            if (f == 0) { return 0; }
+            var cp: *ImCollider2d = _im_b2_as_coll(self.colliders.at(c));
+            if (_im_jr_shape(_im_jr_at(o, f, 2, "shape"), &sh) == 0) { return 0; }
+            cp.shape = sh;
+            self.colliders.len = c + 1;
+            cp.handle = _im_sr_u64(o, f, 0, "handle", &bad);
+            cp.body = _im_sr_u64(o, f, 1, "body", &bad);
+            cp.offset = _im_sr_v2(o, f, 3, "offset", &bad);
+            if (_im_jr_material(_im_jr_at(o, f, 4, "material"), cp.material) == 0) { return 0; }
+            cp.is_sensor = _im_sr_bool(o, f, 5, "is_sensor", &bad);
+            cp.mass = _im_sr_opt_f(o, f, 6, "mass", &has, &bad);
+            cp.has_mass = load64(&has);
+            cp.collision_layer = _im_sr_int(o, f, 7, "collision_layer", 0, 4294967295, &bad);
+            cp.collision_mask = _im_sr_int(o, f, 8, "collision_mask", 0, 4294967295, &bad);
+            if (load64(&bad) == 1) { return 0; }
+        }
+        return 1;
+    }
+
+    # Appends the joints array.
+    fn _json_joints(self, sb) {
+        str_builder_putc(sb, 91);
+        for (var j = 0; j < self.joints.len; j = j + 1) {
+            if (j > 0) { str_builder_putc(sb, 44); }
+            var js: *ImJointSnapshot = _im_as_joint_snap(self.joints.at(j));
+            var dp: f64 = js.joint.damping;
+            var bf: f64 = js.joint.break_force;
+            var ra: f64 = js.joint.reference_angle;
+            str_builder_putc(sb, 123);
+            _im_jw_key(sb, "handle", 1);
+            _im_jw_u64(sb, js.handle);
+            _im_jw_key(sb, "joint", 0);
+            str_builder_putc(sb, 123);
+            _im_jw_key(sb, "body_a", 1);
+            _im_jw_u64(sb, js.joint.body_a);
+            _im_jw_key(sb, "body_b", 0);
+            _im_jw_u64(sb, js.joint.body_b);
+            _im_jw_key(sb, "joint_type", 0);
+            js.joint.joint_type.to_json(sb);
+            _im_jw_key(sb, "local_anchor_a", 0);
+            _im_jw_vec2(sb, js.joint.local_anchor_a);
+            _im_jw_key(sb, "local_anchor_b", 0);
+            _im_jw_vec2(sb, js.joint.local_anchor_b);
+            _im_jw_key(sb, "motor", 0);
+            if (js.joint.has_motor == 1) { js.joint.motor.to_json(sb); } else { str_builder_add_cstr(sb, "null"); }
+            _im_jw_key(sb, "damping", 0);
+            im_fmt_f64_json(sb, dp);
+            _im_jw_key(sb, "break_force", 0);
+            _im_jw_opt_f64(sb, js.joint.has_break_force, bf);
+            _im_jw_key(sb, "reference_angle", 0);
+            im_fmt_f64_json(sb, ra);
+            str_builder_add_cstr(sb, "}}");
+        }
+        str_builder_putc(sb, 93);
+        return 0;
+    }
+
+    # Reads the joints array into this empty snapshot: 1, or 0.
+    fn _read_joints(self, v): i64 {
+        var n = _im_sr_len(v);
+        if (n < 0 || self.joints.reserve(n) == 0) { return 0; }
+        var bad[8];
+        store64(&bad, 0);
+        var has[8];
+        var jt: ImJointType;
+        var mo: ImJointMotor = ImJointMotor_new(0.0, 0.0);
+        for (var j = 0; j < n; j = j + 1) {
+            var o = bayan_json_v_arr_get(v, j);
+            var f = _im_jr_form(o, 2);
+            if (f == 0) { return 0; }
+            var jo = _im_jr_at(o, f, 1, "joint");
+            var g = _im_jr_form(jo, 9);
+            if (g == 0) { return 0; }
+            var js: *ImJointSnapshot = _im_as_joint_snap(self.joints.at(j));
+            self.joints.len = j + 1;
+            js.handle = _im_sr_u64(o, f, 0, "handle", &bad);
+            js.joint.body_a = _im_sr_u64(jo, g, 0, "body_a", &bad);
+            js.joint.body_b = _im_sr_u64(jo, g, 1, "body_b", &bad);
+            if (_im_jr_joint_type(_im_jr_at(jo, g, 2, "joint_type"), &jt) == 0) { return 0; }
+            js.joint.joint_type = jt;
+            js.joint.local_anchor_a = _im_sr_v2(jo, g, 3, "local_anchor_a", &bad);
+            js.joint.local_anchor_b = _im_sr_v2(jo, g, 4, "local_anchor_b", &bad);
+            var mv = _im_jr_at(jo, g, 5, "motor");
+            js.joint.has_motor = 0;
+            var none: ImJointMotor = ImJointMotor_new(0.0, 0.0);
+            js.joint.motor = none;
+            if (mv != 0 && _im_jr_is_null(mv) == 0) {
+                if (_im_jr_motor(mv, &mo) == 0) { return 0; }
+                js.joint.has_motor = 1;
+                js.joint.motor = mo;
+            }
+            js.joint.damping = _im_sr_f(jo, g, 6, "damping", &bad);
+            js.joint.break_force = _im_sr_opt_f(jo, g, 7, "break_force", &has, &bad);
+            js.joint.has_break_force = load64(&has);
+            js.joint.reference_angle = _im_sr_f(jo, g, 8, "reference_angle", &bad);
+            if (load64(&bad) == 1) { return 0; }
+        }
+        return 1;
+    }
+
+    # Appends the profile's keys after the arenas: `,"manifolds":[…]`.
+    fn _json_backend_extra(self, sb) {
+        _im_jw_key(sb, "manifolds", 0);
+        str_builder_putc(sb, 91);
+        for (var m = 0; m < self.manifolds.len; m = m + 1) {
+            if (m > 0) { str_builder_putc(sb, 44); }
+            var mn: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(m));
+            var ri: f64 = mn.rolling_impulse;
+            str_builder_putc(sb, 123);
+            _im_jw_key(sb, "collider_a", 1);
+            _im_jw_u64(sb, mn.collider_a);
+            _im_jw_key(sb, "collider_b", 0);
+            _im_jw_u64(sb, mn.collider_b);
+            _im_jw_key(sb, "body_a", 0);
+            _im_jw_u64(sb, mn.body_a);
+            _im_jw_key(sb, "body_b", 0);
+            _im_jw_u64(sb, mn.body_b);
+            _im_jw_key(sb, "normal", 0);
+            _im_jw_vec2(sb, mn.normal);
+            _im_jw_key(sb, "points", 0);
+            str_builder_putc(sb, 91);
+            for (var q = 0; q < mn.point_count; q = q + 1) {
+                if (q > 0) { str_builder_putc(sb, 44); }
+                var pt: *ImManifoldPoint = _im_b2_as_point(mn.points + q * sizeof(ImManifoldPoint));
+                var ni: f64 = pt.normal_impulse;
+                var ti: f64 = pt.tangent_impulse;
+                var de: f64 = pt.depth;
+                str_builder_putc(sb, 123);
+                _im_jw_key(sb, "local_a", 1);
+                _im_jw_vec2(sb, pt.local_a);
+                _im_jw_key(sb, "local_b", 0);
+                _im_jw_vec2(sb, pt.local_b);
+                _im_jw_key(sb, "normal_impulse", 0);
+                im_fmt_f64_json(sb, ni);
+                _im_jw_key(sb, "tangent_impulse", 0);
+                im_fmt_f64_json(sb, ti);
+                _im_jw_key(sb, "depth", 0);
+                im_fmt_f64_json(sb, de);
+                str_builder_putc(sb, 125);
+            }
+            str_builder_putc(sb, 93);
+            _im_jw_key(sb, "rolling_impulse", 0);
+            im_fmt_f64_json(sb, ri);
+            str_builder_putc(sb, 125);
+        }
+        str_builder_putc(sb, 93);
+        return 0;
+    }
+
+    # Reads the profile's keys after the arenas (the manifolds) from the document node o: 1, or 0.
+    fn _read_backend_extra(self, o): i64 {
+        var v = bayan_json_v_obj_get_by_cstr(o, "manifolds");
+        var n = _im_sr_len(v);
+        if (n < 0 || self.manifolds.reserve(n) == 0) { return 0; }
+        var bad[8];
+        store64(&bad, 0);
+        for (var m = 0; m < n; m = m + 1) {
+            var mo = bayan_json_v_arr_get(v, m);
+            var f = _im_jr_form(mo, 7);
+            if (f == 0) { return 0; }
+            var mn: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(m));
+            mn.points = 0;
+            mn.point_count = 0;
+            self.manifolds.len = m + 1;
+            mn.collider_a = _im_sr_u64(mo, f, 0, "collider_a", &bad);
+            mn.collider_b = _im_sr_u64(mo, f, 1, "collider_b", &bad);
+            mn.body_a = _im_sr_u64(mo, f, 2, "body_a", &bad);
+            mn.body_b = _im_sr_u64(mo, f, 3, "body_b", &bad);
+            mn.normal = _im_sr_v2(mo, f, 4, "normal", &bad);
+            var pv = _im_jr_at(mo, f, 5, "points");
+            var np = _im_sr_len(pv);
+            if (np < 0) { return 0; }
+            if (np > 0) {
+                mn.points = fl_alloc(np * sizeof(ImManifoldPoint));
+                if (mn.points == 0) { return 0; }
+                mn.point_count = np;
+            }
+            for (var q = 0; q < np; q = q + 1) {
+                var po = bayan_json_v_arr_get(pv, q);
+                var g = _im_jr_form(po, 5);
+                if (g == 0) { return 0; }
+                var pt: *ImManifoldPoint = _im_b2_as_point(mn.points + q * sizeof(ImManifoldPoint));
+                pt.local_a = _im_sr_v2(po, g, 0, "local_a", &bad);
+                pt.local_b = _im_sr_v2(po, g, 1, "local_b", &bad);
+                pt.normal_impulse = _im_sr_f(po, g, 2, "normal_impulse", &bad);
+                pt.tangent_impulse = _im_sr_f(po, g, 3, "tangent_impulse", &bad);
+                pt.depth = _im_sr_f(po, g, 4, "depth", &bad);
+            }
+            mn.rolling_impulse = _im_sr_f(mo, f, 6, "rolling_impulse", &bad);
+            if (load64(&bad) == 1) { return 0; }
+        }
+        return 1;
     }
 
     # Releases the backend half: the collider lists, shapes, manifold points, arenas and tracker.

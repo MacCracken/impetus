@@ -51,9 +51,15 @@ steps to the same bits and hands out the same handles.
   field) is its kind then that variant's own fields. So the bytes depend only on the state, never on a record's
   unused fields. The magic is "IMPSNAP\0". A wrong magic, version, profile, length or checksum is refused before any
   field is read, and every count is checked against the words left before anything is allocated.
-- **JSON.** serde's form for the struct, each record's field names as keys, enums by variant name, an absent optional
-  as `null` (ADR 0010's conventions), with the format and profile as the first keys. It has no checksum, since it is
-  meant to be read and edited; it gets the same validation.
+- **JSON.** One object: `"format":"impetus-snapshot"`, `"version":1` and `"profile"` (`"2d"` or `"3d"`) first, then
+  the struct's fields in order. Each record is an object keyed by its field names, enums are variant names, and an
+  absent optional (and a -1 slot index) is `null`. The shared types (config, shape, material, joint type, motor,
+  particle, emitter, force field, event) go through their serde-compatible codecs (ADR 0010). It has no checksum,
+  since it is meant to be read and edited, and it gets the same validation. Two limits come from JSON itself:
+  - a non-finite float has no JSON form (serde_json writes `null` and can't read it back), so `to_json` refuses the
+    snapshot with `IM_ERR_SERIALIZE`; the binary form holds it;
+  - a handle above 2^63 (a slot reused more than 2^31 times) can't be read back until bayan reads unsigned 64-bit
+    integers (S3).
 - **Validation** (`validate_snapshot`, a superset of Rust's):
   - the config passes `validate`;
   - an arena has at most `IM_MAX_SNAPSHOT_INDEX + 1` slots, each slot's words are in range, and its free list visits

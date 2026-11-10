@@ -5,7 +5,10 @@
 # binary form: the five 2D tests of rust-old/src/serialize.rs that go through bytes (its JSON one waits for part 3),
 # `restore_preserves_handle_allocation` and `restore_replaces_force_fields` through bytes (both `#[ignore]`d in Rust),
 # and Cyrius-only tests of byte round trips, the header's refusals, every truncation, every one-word change, seeded
-# corruption behind a recomputed checksum (fuzz_serialize's contract) and the bytes' target independence.
+# corruption behind a recomputed checksum (fuzz_serialize's contract) and the bytes' target independence. Part 3, the
+# JSON form: serialize.rs's `snapshot_serde_json`, and Cyrius-only tests of JSON round trips (the same state and the
+# same text), step-equivalence through JSON, the document's lead keys, an edit restored, refusals by the reader and
+# by `restore`, and a NaN refused by to_json while the bytes hold it.
 
 include "tests/lib_2d.cyr"
 
@@ -335,6 +338,68 @@ fn scene_bytes(k, n, out: *ImWordList) {
 # A ball of radius r (Rust's `ColliderDesc`, material m) on a body of type t at (x, y): its handle.
 fn rust_ball(w: *ImPhysicsWorld, t, x: f64, y: f64, r: f64, m: ImPhysicsMaterial): i64 {
     return body(w, t, x, y, 0.0, ImColliderShape_ball(r), m);
+}
+
+# ── the JSON form ───────────────────────────────────────────────────────────────────
+
+# The Str of a builder's text.
+fn sb_text(sb): i64 { return str_builder_build(sb); }
+
+# The JSON form of world w's snapshot as a Str (0 when to_json refuses).
+fn world_json(w: *ImPhysicsWorld): i64 {
+    var s: ImWorldSnapshot = ImWorldSnapshot_new();
+    w.snapshot(&s);
+    var sb = str_builder_new();
+    var t, v = s.to_json(sb);
+    s.free();
+    if (is_ok(t) == 0) { return 0; }
+    return sb_text(sb);
+}
+
+# The bytes of world w (the canonical form) into *out.
+fn world_bytes(w: *ImPhysicsWorld, out: *ImWordList) {
+    serialize_world(w, out);
+    return 0;
+}
+
+# 1 when worlds a and b serialize to the same bytes.
+fn same_bytes_world(a: *ImPhysicsWorld, b: *ImPhysicsWorld): i64 {
+    var x: ImWordList = ImWordList_new();
+    var y: ImWordList = ImWordList_new();
+    world_bytes(a, &x);
+    world_bytes(b, &y);
+    var r = 0;
+    if (x.len == y.len && memeq(x.data, y.data, x.len * 8) == 1) { r = 1; }
+    x.free();
+    y.free();
+    return r;
+}
+
+# Restores world w from the JSON text j (a Str): the result's tag (1 for Ok) or 0 when from_json refuses.
+fn restore_json(w: *ImPhysicsWorld, j): i64 {
+    var s: ImWorldSnapshot = ImWorldSnapshot_new();
+    var t, v = ImWorldSnapshot_from_json(str_data(j), str_len(j), &s);
+    if (is_ok(t) == 0) { return 0 - 1; }
+    var tr, vr = w.restore(&s);
+    s.free();
+    return is_ok(tr);
+}
+
+# The Str j with its first occurrence of the C string `old` replaced by `new` (j itself when absent).
+fn edit(j, old, new): i64 {
+    var d = str_data(j);
+    var n = str_len(j);
+    var lo = strlen(old);
+    for (var i = 0; i + lo <= n; i = i + 1) {
+        if (memeq(d + i, old, lo) == 1) {
+            var sb = str_builder_new();
+            for (var a = 0; a < i; a = a + 1) { str_builder_putc(sb, load8(d + a)); }
+            str_builder_add_cstr(sb, new);
+            for (var b = i + lo; b < n; b = b + 1) { str_builder_putc(sb, load8(d + b)); }
+            return str_builder_build(sb);
+        }
+    }
+    return j;
 }
 
 # Runs the snapshot tests.
@@ -760,6 +825,109 @@ fn main() {
     assert_eq(pin_sum, PIN_SUM, "scene 2 after 33 frames: the pinned checksum of all its words");
     pin.free();
     xb.free();
+
+    # ── serialize.rs: the JSON form ──
+    test_group("snapshot_serde_json");
+    var jw0: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    var js0: ImWorldSnapshot = ImWorldSnapshot_new();
+    jw0.snapshot(&js0);
+    var jsb0 = str_builder_new();
+    var tj0, vj0 = js0.to_json(jsb0);
+    var jt0 = sb_text(jsb0);
+    var jback: ImWorldSnapshot = ImWorldSnapshot_new();
+    var tj1, vj1 = ImWorldSnapshot_from_json(str_data(jt0), str_len(jt0), &jback);
+    assert_eq(is_ok(tj0) == 1 && is_ok(tj1) == 1 && jback.next_particle_id == 0, 1, "an empty world's snapshot back");
+    js0.free();
+    jback.free();
+    jw0.free();
+
+    # ── Cyrius-only: the JSON form ──
+    test_group("json_round_trips");
+    var jr = 1;
+    for (var jk = 0; jk < 5; jk = jk + 1) {
+        var jwa: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+        scene(&jwa, jk);
+        for (var jf = 0; jf < 37; jf = jf + 1) { jwa.step(); }
+        var ja = world_json(&jwa);
+        var jwb: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+        if (ja == 0 || restore_json(&jwb, ja) != 1) { jr = 0; }
+        if (same_bytes_world(&jwa, &jwb) == 0) { jr = 0; }
+        var jb = world_json(&jwb);
+        if (jb == 0 || str_len(ja) != str_len(jb) || memeq(str_data(ja), str_data(jb), str_len(ja)) == 0) { jr = 0; }
+        jwa.free();
+        jwb.free();
+    }
+    assert_eq(jr, 1, "world → JSON → world: the same state, and the same text again, in every scene");
+
+    test_group("json_step_equivalence");
+    var jsa: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    scene(&jsa, 2);
+    for (var j25 = 0; j25 < 25; j25 = j25 + 1) { jsa.step(); }
+    var jtext = world_json(&jsa);
+    var jsb2: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    scene(&jsb2, 3);
+    var jok = restore_json(&jsb2, jtext);
+    var jsame = 1;
+    for (var j90 = 0; j90 < 90; j90 = j90 + 1) {
+        jsa.step();
+        jsb2.step();
+        var jea, jna = jsa.collision_events();
+        var jeb, jnb = jsb2.collision_events();
+        if (jna != jnb || same_bytes(jea, jeb, jna * sizeof(ImCollisionEvent)) == 0) { jsame = 0; }
+    }
+    assert_eq(jok == 1 && jsame == 1 && same_bytes_world(&jsa, &jsb2) == 1, 1,
+      "restored from JSON at frame 25, 90 frames in step, bit for bit");
+    jsa.free();
+    jsb2.free();
+
+    test_group("json_document");
+    var jd: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    scene(&jd, 0);
+    var jdt = world_json(&jd);
+    var lead = "{\"format\":\"impetus-snapshot\",\"version\":1,\"profile\":\"2d\",\"config\":{";
+    assert_eq(str_len(jdt) > strlen(lead) && memeq(str_data(jdt), lead, strlen(lead)) == 1, 1,
+      "format, version and profile lead, then the config");
+    # An edit: the ball's position in the text, then restored.
+    var moved = edit(jdt, "\"position\":[3.0,15.0]", "\"position\":[3.0,12.5]");
+    var jm: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    var jmr = restore_json(&jm, moved);
+    var jms: ImBodyState;
+    jm.get_body_state(_im_arena_handle(1, 0), &jms);
+    var jmy: f64 = jms.position.y;
+    assert_eq(str_len(moved) != str_len(jdt) || memeq(str_data(moved), str_data(jdt), str_len(jdt)) == 0, 1,
+      "(the edit applied)");
+    assert_eq(jmr == 1 && jmy == 12.5, 1, "an edited document restores with the edit");
+    jm.free();
+
+    test_group("json_refusals");
+    var jx: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    var jr_text = restore_json(&jx, edit(jdt, "{", "["));
+    var jr_fmt = restore_json(&jx, edit(jdt, "impetus-snapshot", "impetus-snapshoT"));
+    var jr_ver = restore_json(&jx, edit(jdt, "\"version\":1", "\"version\":2"));
+    var jr_prof = restore_json(&jx, edit(jdt, "\"profile\":\"2d\"", "\"profile\":\"3d\""));
+    var jr_key = restore_json(&jx, edit(jdt, "\"tracker\"", "\"tracked\""));
+    var jr_type = restore_json(&jx, edit(jdt, "\"is_sleeping\":false", "\"is_sleeping\":0"));
+    var jall = jr_text + jr_fmt + jr_ver + jr_prof + jr_key + jr_type;
+    assert_eq(jall, 0 - 6, "not an object; a wrong format, version, profile, key or type: refused by the reader");
+    var jr_handle = restore_json(&jx, edit(jdt, "{\"body\":{\"handle\":1,", "{\"body\":{\"handle\":9,"));
+    assert_eq(jr_handle == 0 && jx.body_count() == 0, 1, "a well-formed document of an invalid world: refused");
+    jx.free();
+    jd.free();
+    var jn: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    var nan_rate: f64 = 0.0;
+    nan_rate = nan_rate / nan_rate;
+    jn.add_emitter(ImParticleEmitter_new(ImVec3_zero(), ImVec3_zero(), nan_rate));
+    var jns: ImWorldSnapshot = ImWorldSnapshot_new();
+    jn.snapshot(&jns);
+    var jnsb = str_builder_new();
+    var tjn, vjn = jns.to_json(jnsb);
+    var jnb: ImWordList = ImWordList_new();
+    var tjb, vjb = jns.to_bytes(&jnb);
+    assert_eq(is_ok(tjn) == 0 && vjn == IM_ERR_SERIALIZE && is_ok(tjb) == 1, 1,
+      "a NaN has no JSON form (IM_ERR_SERIALIZE); the bytes hold it");
+    jnb.free();
+    jns.free();
+    jn.free();
 
     test_group("flat_heap_snapshots");
     # Snapshot and restore, round and round: after warm-up the heap stays put.

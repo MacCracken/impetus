@@ -222,3 +222,129 @@ fn deserialize_world(w: *ImPhysicsWorld, buf, len): Result {
     return Ok(0);
 }
 
+# ── the JSON form (ADR 0013) ────────────────────────────────────────────────────────
+# One object: "format" ("impetus-snapshot"), "version" (1) and "profile" ("2d" or "3d") first, then the struct's fields
+# in order (config, next_particle_id, next_emitter_id, bodies, colliders, joints, particles, emitters, force_fields,
+# body_arena, collider_arena, joint_arena, the profile's own keys, tracker). No checksum: the form is meant to be read
+# and edited, and `restore` checks it as it checks any snapshot.
+
+impl ImWorldSnapshot {
+    # Appends the snapshot as JSON to the str builder sb: Ok(0), or Err(IM_ERR_SERIALIZE) when a value is not finite
+    # (JSON has no form for it, and serde_json would write null; the binary form holds it). sb then holds a document
+    # that must not be read back. ADR 0013.
+    fn to_json(self, sb): Result {
+        _im_json_nonfinite = 0;
+        str_builder_add_cstr(sb, "{\"format\":\"impetus-snapshot\",\"version\":1,\"profile\":");
+        _im_jw_name(sb, _im_snap_profile_name());
+        _im_jw_key(sb, "config", 0);
+        self.config.to_json(sb);
+        _im_jw_key(sb, "next_particle_id", 0);
+        _im_jw_u64(sb, self.next_particle_id);
+        _im_jw_key(sb, "next_emitter_id", 0);
+        _im_jw_u64(sb, self.next_emitter_id);
+        _im_jw_key(sb, "bodies", 0);
+        self._json_bodies(sb);
+        _im_jw_key(sb, "colliders", 0);
+        self._json_colliders(sb);
+        _im_jw_key(sb, "joints", 0);
+        self._json_joints(sb);
+        _im_jw_key(sb, "particles", 0);
+        str_builder_putc(sb, 91);
+        for (var i = 0; i < self.particles.len; i = i + 1) {
+            if (i > 0) { str_builder_putc(sb, 44); }
+            var p: *ImParticle = _im_as_particle(self.particles.at(i));
+            p.to_json(sb);
+        }
+        str_builder_putc(sb, 93);
+        _im_jw_key(sb, "emitters", 0);
+        str_builder_putc(sb, 91);
+        for (var e = 0; e < self.emitters.len; e = e + 1) {
+            if (e > 0) { str_builder_putc(sb, 44); }
+            var em: *ImParticleEmitter = _im_as_emitter(self.emitters.at(e));
+            em.to_json(sb);
+        }
+        str_builder_putc(sb, 93);
+        _im_jw_key(sb, "force_fields", 0);
+        str_builder_putc(sb, 91);
+        for (var f = 0; f < self.force_fields.len; f = f + 1) {
+            if (f > 0) { str_builder_putc(sb, 44); }
+            var ff: *ImForceField = _im_as_force_field(self.force_fields.at(f));
+            ff.to_json(sb);
+        }
+        str_builder_putc(sb, 93);
+        _im_jw_key(sb, "body_arena", 0);
+        _im_sj_arena(sb, self.body_arena);
+        _im_jw_key(sb, "collider_arena", 0);
+        _im_sj_arena(sb, self.collider_arena);
+        _im_jw_key(sb, "joint_arena", 0);
+        _im_sj_arena(sb, self.joint_arena);
+        self._json_backend_extra(sb);
+        _im_jw_key(sb, "tracker", 0);
+        _im_sj_tracker(sb, self.tracker);
+        str_builder_putc(sb, 125);
+        if (_im_json_nonfinite > 0) { return Err(IM_ERR_SERIALIZE); }
+        return Ok(0);
+    }
+
+    # Reads the document node o into this empty snapshot: 1, or 0.
+    fn _read_json(self, o): i64 {
+        var bad[8];
+        store64(&bad, 0);
+        var w[8];
+        var fv = bayan_json_v_obj_get_by_cstr(o, "format");
+        var pv = bayan_json_v_obj_get_by_cstr(o, "profile");
+        if (fv == 0 || bayan_json_v_tag(fv) != JTAG_STR || pv == 0 || bayan_json_v_tag(pv) != JTAG_STR) { return 0; }
+        if (str_eq_cstr(bayan_json_v_str(fv), "impetus-snapshot") != 1) { return 0; }
+        if (str_eq_cstr(bayan_json_v_str(pv), _im_snap_profile_name()) != 1) { return 0; }
+        if (_im_jr_int(bayan_json_v_obj_get_by_cstr(o, "version"), 1, 1, &w) == 0) { return 0; }
+        if (_im_jr_config(bayan_json_v_obj_get_by_cstr(o, "config"), self.config) == 0) { return 0; }
+        self.next_particle_id = _im_sr_u64(o, 1, 0, "next_particle_id", &bad);
+        self.next_emitter_id = _im_sr_u64(o, 1, 0, "next_emitter_id", &bad);
+        if (load64(&bad) == 1) { return 0; }
+        if (self._read_bodies(bayan_json_v_obj_get_by_cstr(o, "bodies")) == 0) { return 0; }
+        if (self._read_colliders(bayan_json_v_obj_get_by_cstr(o, "colliders")) == 0) { return 0; }
+        if (self._read_joints(bayan_json_v_obj_get_by_cstr(o, "joints")) == 0) { return 0; }
+        var plv = bayan_json_v_obj_get_by_cstr(o, "particles");
+        var np = _im_sr_len(plv);
+        if (np < 0 || self.particles.reserve(np) == 0) { return 0; }
+        for (var i = 0; i < np; i = i + 1) {
+            if (_im_jr_particle(bayan_json_v_arr_get(plv, i), _im_as_particle(self.particles.at(i))) == 0) { return 0; }
+            self.particles.len = i + 1;
+        }
+        var elv = bayan_json_v_obj_get_by_cstr(o, "emitters");
+        var ne = _im_sr_len(elv);
+        if (ne < 0 || self.emitters.reserve(ne) == 0) { return 0; }
+        for (var e = 0; e < ne; e = e + 1) {
+            if (_im_jr_emitter(bayan_json_v_arr_get(elv, e), _im_as_emitter(self.emitters.at(e))) == 0) { return 0; }
+            self.emitters.len = e + 1;
+        }
+        var flv = bayan_json_v_obj_get_by_cstr(o, "force_fields");
+        var nf = _im_sr_len(flv);
+        if (nf < 0 || self.force_fields.reserve(nf) == 0) { return 0; }
+        for (var f = 0; f < nf; f = f + 1) {
+            var fp: *ImForceField = _im_as_force_field(self.force_fields.at(f));
+            if (_im_jr_force_field(bayan_json_v_arr_get(flv, f), fp) == 0) { return 0; }
+            self.force_fields.len = f + 1;
+        }
+        if (_im_sr_arena(bayan_json_v_obj_get_by_cstr(o, "body_arena"), self.body_arena) == 0) { return 0; }
+        if (_im_sr_arena(bayan_json_v_obj_get_by_cstr(o, "collider_arena"), self.collider_arena) == 0) { return 0; }
+        if (_im_sr_arena(bayan_json_v_obj_get_by_cstr(o, "joint_arena"), self.joint_arena) == 0) { return 0; }
+        if (self._read_backend_extra(o) == 0) { return 0; }
+        return _im_sr_tracker(bayan_json_v_obj_get_by_cstr(o, "tracker"), self.tracker);
+    }
+}
+
+# Reads a snapshot's JSON form at buf (len bytes) into *out (overwritten; free it after): Ok(0), or
+# Err(IM_ERR_DESERIALIZE) when the text is not one JSON object, its format, version or profile is not this one's, or a
+# field is missing or malformed. A snapshot read here is checked in full by `restore`. ADR 0013.
+fn ImWorldSnapshot_from_json(buf, len, out: *ImWorldSnapshot): Result {
+    var o = _im_jr_parse(buf, len);
+    if (o == 0 || bayan_json_v_tag(o) != JTAG_OBJ) { return Err(IM_ERR_DESERIALIZE); }
+    var s: ImWorldSnapshot = ImWorldSnapshot_new();
+    if (s._read_json(o) == 0) {
+        s.free();
+        return Err(IM_ERR_DESERIALIZE);
+    }
+    memcpy(out, &s, sizeof(ImWorldSnapshot));
+    return Ok(0);
+}

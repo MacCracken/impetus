@@ -1300,19 +1300,23 @@ impl ImCollisionEvent {
 # `serde_json::from_str::<CollisionEvent>`.
 #must_use
 fn ImCollisionEvent_from_json(buf, len, out: *ImCollisionEvent): Result {
-    var o = _im_jr_parse(buf, len);
+    return _im_jr_result(_im_jr_event(_im_jr_parse(buf, len), out));
+}
+
+# A `CollisionEvent` node into *out: 1, or 0. The reader of ImCollisionEvent_from_json, for nesting.
+fn _im_jr_event(o, out: *ImCollisionEvent): i64 {
     var kw[8];
     var pw[8];
-    if (_im_jr_tagged(o, &event_kind_name, 3, &kw, &pw) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_tagged(o, &event_kind_name, 3, &kw, &pw) == 0) { return 0; }
     var p = load64(&pw);
     var f = _im_jr_form(p, 2);
-    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (f == 0) { return 0; }
     var w[16];
-    if (_im_jr_u64(_im_jr_at(p, f, 0, "collider_a"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
-    if (_im_jr_u64(_im_jr_at(p, f, 1, "collider_b"), &w + 8) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_u64(_im_jr_at(p, f, 0, "collider_a"), &w) == 0) { return 0; }
+    if (_im_jr_u64(_im_jr_at(p, f, 1, "collider_b"), &w + 8) == 0) { return 0; }
     var e: ImCollisionEvent = ImCollisionEvent_new(load64(&kw), load64(&w), load64(&w + 8));
     memcpy(out, &e, sizeof(ImCollisionEvent));
-    return Ok(0);
+    return 1;
 }
 
 impl ImContactPoint {
@@ -1822,15 +1826,19 @@ impl ImParticle {
 # `serde_json::from_str::<Particle>`.
 #must_use
 fn ImParticle_from_json(buf, len, out: *ImParticle): Result {
-    var o = _im_jr_parse(buf, len);
+    return _im_jr_result(_im_jr_particle(_im_jr_parse(buf, len), out));
+}
+
+# A `Particle` node into *out: 1, or 0. The reader of ImParticle_from_json, for nesting.
+fn _im_jr_particle(o, out: *ImParticle): i64 {
     var f = _im_jr_form(o, 10);
-    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (f == 0) { return 0; }
     var hw[8];
-    if (_im_jr_u64(_im_jr_at(o, f, 0, "handle"), &hw) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_u64(_im_jr_at(o, f, 0, "handle"), &hw) == 0) { return 0; }
     var pos: ImVec3 = ImVec3_zero();
     var vel: ImVec3 = ImVec3_zero();
-    if (_im_jr_vec3(_im_jr_at(o, f, 1, "position"), &pos) == 0) { return Err(IM_ERR_DESERIALIZE); }
-    if (_im_jr_vec3(_im_jr_at(o, f, 2, "velocity"), &vel) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_vec3(_im_jr_at(o, f, 1, "position"), &pos) == 0) { return 0; }
+    if (_im_jr_vec3(_im_jr_at(o, f, 2, "velocity"), &vel) == 0) { return 0; }
     var w[48];
     var names[48];
     store64(&names, "lifetime");
@@ -1841,7 +1849,7 @@ fn ImParticle_from_json(buf, len, out: *ImParticle): Result {
     store64(&names + 40, "damping");
     for (var i = 0; i < 6; i = i + 1) {
         if (_im_jr_f64(_im_jr_at(o, f, i + 3, load64(&names + i * 8)), &w + i * 8) == 0) {
-            return Err(IM_ERR_DESERIALIZE);
+            return 0;
         }
     }
     var life: f64 = load64(&w);
@@ -1860,13 +1868,13 @@ fn ImParticle_from_json(buf, len, out: *ImParticle): Result {
     p.damping = dm;
     var sub: ImSubEmitter = ImSubEmitter_new(0, 0.0, 0.0, 0.0, 0.0, 0.0);
     var r = _im_jr_opt_def(_im_jr_at(o, f, 9, "on_death_emit"), &_im_jr_sub_emitter, &sub);
-    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (r == 0) { return 0; }
     if (r == 1) {
         p.has_on_death_emit = 1;
         p.on_death_emit = sub;
     }
     memcpy(out, &p, sizeof(ImParticle));
-    return Ok(0);
+    return 1;
 }
 
 impl ImParticleEmitter {
@@ -1914,17 +1922,21 @@ impl ImParticleEmitter {
 # `serde_json::from_str::<ParticleEmitter>`.
 #must_use
 fn ImParticleEmitter_from_json(buf, len, out: *ImParticleEmitter): Result {
-    var o = _im_jr_parse(buf, len);
+    return _im_jr_result(_im_jr_emitter(_im_jr_parse(buf, len), out));
+}
+
+# A `ParticleEmitter` node into *out: 1, or 0. The reader of ImParticleEmitter_from_json, for nesting.
+fn _im_jr_emitter(o, out: *ImParticleEmitter): i64 {
     var f = _im_jr_form(o, 12);
-    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (f == 0) { return 0; }
     var hw[8];
-    if (_im_jr_u64(_im_jr_at(o, f, 0, "handle"), &hw) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_u64(_im_jr_at(o, f, 0, "handle"), &hw) == 0) { return 0; }
     var pos: ImVec3 = ImVec3_zero();
     var vel: ImVec3 = ImVec3_zero();
     var spr: ImVec3 = ImVec3_zero();
-    if (_im_jr_vec3(_im_jr_at(o, f, 1, "position"), &pos) == 0) { return Err(IM_ERR_DESERIALIZE); }
-    if (_im_jr_vec3(_im_jr_at(o, f, 2, "velocity"), &vel) == 0) { return Err(IM_ERR_DESERIALIZE); }
-    if (_im_jr_vec3(_im_jr_at(o, f, 3, "velocity_spread"), &spr) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_vec3(_im_jr_at(o, f, 1, "position"), &pos) == 0) { return 0; }
+    if (_im_jr_vec3(_im_jr_at(o, f, 2, "velocity"), &vel) == 0) { return 0; }
+    if (_im_jr_vec3(_im_jr_at(o, f, 3, "velocity_spread"), &spr) == 0) { return 0; }
     var w[48];
     var names[48];
     store64(&names, "rate");
@@ -1935,13 +1947,13 @@ fn ImParticleEmitter_from_json(buf, len, out: *ImParticleEmitter): Result {
     store64(&names + 40, "particle_damping");
     for (var i = 0; i < 6; i = i + 1) {
         if (_im_jr_f64(_im_jr_at(o, f, i + 4, load64(&names + i * 8)), &w + i * 8) == 0) {
-            return Err(IM_ERR_DESERIALIZE);
+            return 0;
         }
     }
     var aw[8];
-    if (_im_jr_bool(_im_jr_at(o, f, 10, "active"), &aw) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_bool(_im_jr_at(o, f, 10, "active"), &aw) == 0) { return 0; }
     var cw[8];
-    if (_im_jr_f64(_im_jr_at(o, f, 11, "accumulator"), &cw) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_f64(_im_jr_at(o, f, 11, "accumulator"), &cw) == 0) { return 0; }
     var rate: f64 = load64(&w);
     var e: ImParticleEmitter = ImParticleEmitter_new(pos, vel, rate);
     e.handle = load64(&hw);
@@ -1960,5 +1972,5 @@ fn ImParticleEmitter_from_json(buf, len, out: *ImParticleEmitter): Result {
     e.active = load64(&aw);
     e.accumulator = ac;
     memcpy(out, &e, sizeof(ImParticleEmitter));
-    return Ok(0);
+    return 1;
 }

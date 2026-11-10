@@ -574,6 +574,23 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     - a pinned checksum, which the PE and aarch64 runs confirm.
   - Surface parity is 662 across 30 modules with nothing pending.
 
+- **Cyrius port, M6 part 3: the JSON form** ([ADR 0013](docs/adr/0013-complete-snapshots.md);
+  `docs/development/port-parity.md` §27):
+  - `snap.to_json(sb)` and `ImWorldSnapshot_from_json` write and read one object. Format, version and profile lead,
+    then the struct's fields. Records are objects keyed by their field names, and the shared types nest through
+    their serde-compatible codecs (ADR 0010). It has no checksum, being meant for reading and editing; `restore`
+    checks it as any snapshot.
+  - Finite values come back bit for bit. JSON has no non-finite number, so `to_json` refuses one with
+    `IM_ERR_SERIALIZE`; the binary form holds it. The float printer now counts the values it writes as `null`.
+  - The particle, emitter and event readers in `src/json.cyr` were split so they can nest (`_im_jr_particle`,
+    `_im_jr_emitter`, `_im_jr_event`); the json corpus is unchanged.
+  - `tests/snapshot.tcyr` grows from 49 to 58 assertions:
+    - Rust's `snapshot_serde_json`;
+    - JSON round trips in five scenes (the same state, the same text again);
+    - step-equivalence through JSON, and an edited document restoring with its edit;
+    - six reader refusals and one by `restore`;
+    - a NaN refused by `to_json`.
+
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
   sin_cos from 3.3 µs to 187 ns (the polyfills: 48–64 and 75–83 ns).
@@ -677,6 +694,8 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
 - **Snapshots against Rust** (quiet machine; Rust's bitcode on its 2D build): `snapshot/serialize_empty` 1.35 →
   2.24 µs, `serialize_100_bodies` 14.5 → 282 µs, `roundtrip_100_bodies` 33.6 → 357 µs. The port's snapshot holds the
   whole state (49 words for a ball and its body), and the struct capture is 208 µs of the 282; not profiled yet.
+- **The snapshot's JSON form, first numbers** (Cyrius only): 100 balls written in 2.31 ms and read back and restored
+  in 3.70 ms, about 0.8 µs per shortest-form float (29 a ball); the binary form is 8–10× faster.
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

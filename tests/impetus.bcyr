@@ -7,7 +7,7 @@
 # M1a: forces/force_magnitude, forces/gravity_force, materials/preset_steel, preset_rubber,
 # degrees_to_radians, quantity_new. materials/quantity_display waits for S2 (port plan §8).
 # M6 part 1: the snapshot struct's capture and restore on Rust's snapshot/* scenes (ADR 0013). Part 2: Rust's
-# snapshot/* rows through the binary form.
+# snapshot/* rows through the binary form. Part 3: the JSON form's write and round trip (Cyrius only).
 
 include "tests/lib_2d.cyr"
 
@@ -920,6 +920,50 @@ fn bench_snapshot_bytes() {
     return 0;
 }
 
+# The snapshot's JSON form (M6 part 3, ADR 0013) on Rust's 100-ball scene: a snapshot written as JSON, and that text
+# read and restored into a fresh world. Cyrius only: Rust has no JSON snapshot bench.
+fn bench_snapshot_json() {
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    for (var i = 0; i < 100; i = i + 1) {
+        var d: ImBodyDesc = ImBodyDesc_default();
+        var x: f64 = f64_from(i % 10);
+        var y: f64 = f64_from(i / 10);
+        d.position = ImVec3_new(x, y, 0.0);
+        var h = w.add_body(d);
+        var tc, c = w.add_collider(h, ImColliderDesc_new(ImColliderShape_ball(0.5)));
+    }
+    var s: ImWorldSnapshot = ImWorldSnapshot_new();
+    var t0, v0 = w.snapshot(&s);
+    var b1 = bench_new("snapshot/to_json_100_bodies");
+    bench_batch_start(b1);
+    for (var r = 0; r < 2000; r = r + 1) {
+        var sb = str_builder_new();
+        var t1, v1 = s.to_json(sb);
+        g_sink = t1;
+    }
+    bench_batch_stop(b1, 2000);
+    bench_report(b1);
+    var sbk = str_builder_new();
+    var t2, v2 = s.to_json(sbk);
+    var text = str_builder_build(sbk);
+    var b2 = bench_new("snapshot/json_roundtrip_100_bodies");
+    bench_batch_start(b2);
+    for (var r2 = 0; r2 < 2000; r2 = r2 + 1) {
+        var back: ImWorldSnapshot = ImWorldSnapshot_new();
+        var t3, v3 = ImWorldSnapshot_from_json(str_data(text), str_len(text), &back);
+        var fresh: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+        var t4, v4 = fresh.restore(&back);
+        g_sink = t4;
+        fresh.free();
+        back.free();
+    }
+    bench_batch_stop(b2, 2000);
+    bench_report(b2);
+    s.free();
+    w.free();
+    return 0;
+}
+
 # Runs every bench.
 fn main(): i64 {
     alloc_init();
@@ -955,6 +999,7 @@ fn main(): i64 {
     bench_world();
     bench_snapshot();
     bench_snapshot_bytes();
+    bench_snapshot_json();
     return 0;
 }
 

@@ -581,3 +581,16 @@ serialize -- snapshot/`, medians), which writes bitcode. Cyrius writes ADR 0013'
   unprofiled, and it still is.
 - **Recorded, not acted on**: speed is measured, not gated. Part 5 (benches and the close) is the place to profile
   the capture.
+
+## M6 part 3: the JSON form (2026-11-10)
+
+x86_64 ELF, quiet machine. Cyrius only: Rust has no bench for a snapshot's JSON. The scene is Rust's 100 balls.
+
+| Bench | Body | Cyrius |
+|---|---|---|
+| `snapshot/to_json_100_bodies` | the snapshot written as JSON | 2.31 ms |
+| `snapshot/json_roundtrip_100_bodies` | that text read and restored into a fresh world | 3.70 ms |
+
+A ball writes 29 floats (22 in its body record, 7 in its collider), so about 2,900 in all, each in serde_json's shortest
+form. That is about 0.8 µs a float, near the printer's cost in the M1b serde rows (`serialize_config` 8.9 µs). The binary form is 8× faster to write (282 µs) and 10× faster
+to read back (354 µs).
