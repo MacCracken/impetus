@@ -121,75 +121,93 @@ fn main() {
     var pi: f64 = _IM_PI;
     var r45z: ImQuat = ImQuat_from_rotation_z(pi / 4.0);
 
-    test_group("sphere_sphere");
+    test_group("sphere_sphere_overlap");
     assert_eq(_im_b3_sphere_sphere(zero, 1.0, v(1.5, 0.0, 0.0), 1.0, &h), 1, "overlap");
     var d0: f64 = h.depth;
     assert_eq(near(h.normal.x, 1.0, eps) + near(d0, 0.5, eps), 2, "normal +x, depth 0.5");
+    test_group("sphere_sphere_no_overlap");
     assert_eq(_im_b3_sphere_sphere(zero, 1.0, v(5.0, 0.0, 0.0), 1.0, &h), 0, "no overlap");
 
-    test_group("sphere_obb");
+    test_group("sphere_obb_overlap");
     assert_eq(_im_b3_sphere_obb(v(1.8, 0.0, 0.0), 0.5, zero, ident(), v(1.5, 1.0, 1.0), &h), 1, "overlap");
+    test_group("sphere_obb_miss");
     assert_eq(_im_b3_sphere_obb(v(5.0, 0.0, 0.0), 0.5, zero, ident(), one, &h), 0, "miss");
+    test_group("sphere_obb_rotated");
     assert_eq(_im_b3_sphere_obb(v(1.5, 1.5, 0.0), 0.5, zero, r45z, v(2.0, 0.5, 1.0), &h), 1, "rotated box hit");
 
-    test_group("aabb_3d");
+    test_group("aabb_3d_overlap");
     assert_eq(_im_b3_aabb_aabb_3d(zero, one, v(1.5, 0.0, 0.0), one, &h), 1, "overlap");
     var d1: f64 = h.depth;
     assert_eq(near(h.normal.x, 1.0, eps) + near(d1, 0.5, eps), 2, "normal +x, depth 0.5");
+    test_group("aabb_3d_no_overlap");
     assert_eq(_im_b3_aabb_aabb_3d(zero, one, v(5.0, 0.0, 0.0), one, &h), 0, "no overlap");
 
-    test_group("capsule_sphere_3d");
+    test_group("capsule_sphere_3d_overlap");
     assert_eq(_im_b3_capsule_sphere_3d(zero, ident(), 1.0, 0.5, v(0.8, 0.0, 0.0), 0.5, &h), 1, "overlap");
+    test_group("capsule_sphere_3d_miss");
     assert_eq(_im_b3_capsule_sphere_3d(zero, ident(), 1.0, 0.5, v(5.0, 0.0, 0.0), 0.5, &h), 0, "miss");
 
-    test_group("obb_obb");
+    test_group("obb_obb_aligned_overlap");
     assert_eq(_im_b3_obb_obb_3d(zero, ident(), one, v(1.5, 0.0, 0.0), ident(), one, &h), 1, "aligned overlap");
     var d2: f64 = h.depth;
     assert_eq(near(h.normal.x, 1.0, eps) + near(d2, 0.5, eps), 2, "normal +x, depth 0.5");
+    test_group("obb_obb_no_overlap");
     assert_eq(_im_b3_obb_obb_3d(zero, ident(), one, v(5.0, 0.0, 0.0), ident(), one, &h), 0, "no overlap");
+    test_group("obb_obb_rotated_overlap");
     assert_eq(_im_b3_obb_obb_3d(zero, ident(), one, v(1.5, 0.0, 0.0), r45z, one, &h), 1, "rotated overlap");
+    test_group("obb_obb_rotated_separated");
     var half: ImVec3 = ImVec3_splat(0.5);
     assert_eq(_im_b3_obb_obb_3d(zero, ident(), half, v(3.0, 0.0, 0.0), r45z, half, &h), 0, "rotated separated");
 
-    test_group("capsule_capsule");
+    test_group("capsule_capsule_overlap");
     assert_eq(_im_b3_capsule_capsule_3d(zero, ident(), 1.0, 0.5, v(0.8, 0.0, 0.0), ident(), 1.0, 0.5, &h), 1,
       "overlap");
+    test_group("capsule_capsule_miss");
     assert_eq(_im_b3_capsule_capsule_3d(zero, ident(), 1.0, 0.5, v(5.0, 0.0, 0.0), ident(), 1.0, 0.5, &h), 0, "miss");
+    test_group("capsule_capsule_crossed");
     var rx: ImQuat = ImQuat_from_rotation_x(pi / 2.0);
     assert_eq(_im_b3_capsule_capsule_3d(zero, ident(), 2.0, 0.3, zero, rx, 2.0, 0.3, &h), 1, "crossed");
 
-    test_group("capsule_box");
+    test_group("capsule_box_overlap");
     assert_eq(_im_b3_capsule_box_3d(zero, ident(), 1.0, 0.5, v(1.0, 0.0, 0.0), ident(), one, &h), 1, "overlap");
+    test_group("capsule_box_miss");
     assert_eq(_im_b3_capsule_box_3d(zero, ident(), 1.0, 0.5, v(5.0, 0.0, 0.0), ident(), one, &h), 0, "miss");
 
-    test_group("segment_sphere_and_box");
+    test_group("segment_sphere_overlap");
     var sa: ImVec3 = v(-2.0, 0.0, 0.0);
     var sb: ImVec3 = v(2.0, 0.0, 0.0);
     assert_eq(_im_b3_segment_sphere_3d(zero, ident(), sa, sb, v(0.0, 0.3, 0.0), 0.5, &h), 1, "sphere overlap");
+    test_group("segment_sphere_miss");
     assert_eq(_im_b3_segment_sphere_3d(zero, ident(), sa, sb, v(0.0, 5.0, 0.0), 0.5, &h), 0, "sphere miss");
+    test_group("segment_box_overlap");
     var ha: ImVec3 = v(-0.5, 0.0, 0.0);
     var hb: ImVec3 = v(0.5, 0.0, 0.0);
     assert_eq(_im_b3_segment_box_3d(zero, ident(), ha, hb, zero, ident(), one, &h), 1, "box overlap");
+    test_group("segment_box_miss");
     assert_eq(_im_b3_segment_box_3d(zero, ident(), ha, hb, v(5.0, 5.0, 5.0), ident(), one, &h), 0, "box miss");
 
-    test_group("convex_hull_sphere");
+    test_group("convex_hull_sphere_overlap");
     var tri: ImColliderShape = tri_hull();
     assert_eq(_im_b3_convex_hull_sphere_3d(&tri, zero, ident(), v(0.0, 1.2, 0.0), 0.5, &sc, &h), 1, "overlap");
+    test_group("convex_hull_sphere_miss");
     assert_eq(_im_b3_convex_hull_sphere_3d(&tri, zero, ident(), v(0.0, 5.0, 0.0), 0.5, &sc, &h), 0, "miss");
     tri.free();
 
-    test_group("closest_points_segments");
+    test_group("closest_points_parallel_segments");
     var p: ImVec3 = zero;
     var q: ImVec3 = zero;
     _im_b3_closest_points_segments_3d(zero, v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), v(1.0, 1.0, 0.0), &p, &q);
     var py: f64 = f64_abs(p.y);
     assert_eq(py < eps && near(q.y, 1.0, eps) == 1, 1, "parallel");
+    test_group("closest_points_crossing_segments");
     _im_b3_closest_points_segments_3d(v(-1.0, 0.0, 0.0), v(1.0, 0.0, 0.0), v(0.0, -1.0, 1.0), v(0.0, 1.0, 1.0), &p,
       &q);
     assert_eq(vnear(p, zero, eps) + vnear(q, v(0.0, 0.0, 1.0), eps), 2, "crossing");
+    test_group("closest_points_parallel_offset_segments");
     _im_b3_closest_points_segments_3d(zero, v(10.0, 0.0, 0.0), v(5.0, 1.0, 0.0), v(15.0, 1.0, 0.0), &p, &q);
     var gap: f64 = ImVec3_length(p - q);
     assert_eq(near(gap, 1.0, 0.000000001), 1, "parallel offset: distance 1");
+    test_group("closest_points_segments_match_brute_force");
     var worse = 0;
     for (var i = 0; i < 300; i = i + 1) {
         var a: ImVec3 = v(rnd(), rnd(), rnd());
@@ -278,9 +296,10 @@ fn main() {
       + near(qz, 2.0, tight), 4, "normal, depth, under the box");
     assert_eq(qy > 0.44 && qy < 0.51, 1, "in the slab");
 
-    test_group("obb_edge_axes");
+    test_group("obb_sat_uses_edge_axes");
     var ry45: ImQuat = ImQuat_from_rotation_y(pi / 4.0);
     assert_eq(_im_b3_obb_obb_3d(zero, ry45, half, v(1.5, 0.0, 0.0), r45z, half, &h), 0, "edge-edge separated");
+    test_group("obb_edge_edge_contact");
     var sep: f64 = sq2 - 0.1;
     assert_eq(_im_b3_obb_obb_3d(zero, ry45, half, v(sep, 0.0, 0.0), r45z, half, &h), 1, "edge-edge overlap");
     var d11: f64 = h.depth;

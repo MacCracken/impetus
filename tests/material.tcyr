@@ -86,10 +86,13 @@ fn main() {
     var mo: f64 = m.rolling_friction;
     assert(mo == 0.0, "no rolling friction");
 
-    test_group("combine_rules");
+    test_group("combine_rule_average");
     assert(close(combine_rule_combine(IM_COMBINE_AVERAGE, 0.4, 0.6), 0.5) == 1, "average");
+    test_group("combine_rule_min");
     assert(close(combine_rule_combine(IM_COMBINE_MIN, 0.3, 0.7), 0.3) == 1, "min");
+    test_group("combine_rule_max");
     assert(close(combine_rule_combine(IM_COMBINE_MAX, 0.3, 0.7), 0.7) == 1, "max");
+    test_group("combine_rule_multiply");
     assert(close(combine_rule_combine(IM_COMBINE_MULTIPLY, 0.5, 0.4), 0.2) == 1, "multiply");
 
     test_group("combine_rule_ordering");
@@ -124,6 +127,25 @@ fn main() {
     assert(orr == 0.0, "rolling friction defaults to 0");
     assert_eq(od.friction_combine, IM_COMBINE_AVERAGE, "friction combine defaults to Average");
     assert_eq(od.restitution_combine, IM_COMBINE_MIN, "restitution combine defaults to Min");
+
+    # backend_2d/tests.rs's two static-friction serde tests.
+    test_group("static_friction_serde_roundtrip");
+    var sf: ImPhysicsMaterial = ImPhysicsMaterial_default();
+    sf.friction = 0.5;
+    sf.has_static_friction = 1;
+    sf.static_friction = 0.8;
+    var sfb: ImPhysicsMaterial = ImPhysicsMaterial_default();
+    assert(json_roundtrip(sf, &sfb) == 1, "reads back");
+    var sfv: f64 = sfb.static_friction;
+    assert(sfb.has_static_friction == 1 && sfv == 0.8, "Some(0.8)");
+
+    test_group("static_friction_serde_default_none");
+    # The target starts with an override, so the reader has to clear it.
+    var sn: ImPhysicsMaterial = ImPhysicsMaterial_ice();
+    sn.has_static_friction = 1;
+    sn.static_friction = 0.3;
+    var snt, snv = ImPhysicsMaterial_from_json(old, strlen(old), &sn);
+    assert(is_err_result(snt) == 0 && sn.has_static_friction == 0, "an old document reads as None");
 
     # Cyrius-only: the static friction override and its fallback.
     test_group("effective_static_friction");

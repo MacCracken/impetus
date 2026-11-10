@@ -454,5 +454,38 @@ fn world_cases() {
     assert_eq(w.particle_count() > 80, 1, "particles live");
     w.free();
 
+    # ── lib.rs ──
+    test_group("create_default_world");
+    var rq_dw: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    assert_eq(rq_dw.body_count(), 0, "no bodies");
+    rq_dw.free();
+
+    # rust-old/README.md's Quick Start, a doc test (lib.rs takes the README as the crate's docs). Rust checks only that
+    # it runs; here every call succeeds and the pushed ball moves right as it falls.
+    test_group("doc_readme_quick_start");
+    var rq_w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    var rq_bd: ImBodyDesc = ImBodyDesc_default();
+    rq_bd.body_type = IM_BODY_DYNAMIC;
+    rq_bd.position = ImVec3_new(0.0, 10.0, 0.0);
+    var rq_ball = rq_w.add_body(rq_bd);
+    var rq_bc: ImColliderDesc = ImColliderDesc_new(ImColliderShape_ball(0.5));
+    rq_bc.material = ImPhysicsMaterial_rubber();
+    var rq_t1, rq_v1 = rq_w.add_collider(rq_ball, rq_bc);
+    var rq_fd: ImBodyDesc = ImBodyDesc_default();
+    rq_fd.body_type = IM_BODY_STATIC;
+    var rq_floor = rq_w.add_body(rq_fd);
+    var rq_fc: ImColliderDesc = ImColliderDesc_new(ImColliderShape_box(50.0, 0.5, 50.0));
+    rq_fc.material = ImPhysicsMaterial_wood();
+    var rq_t2, rq_v2 = rq_w.add_collider(rq_floor, rq_fc);
+    rq_w.apply_force(rq_ball, ImForce_new(5.0, 0.0, 0.0));
+    rq_w.step();
+    var rq_st: ImBodyState;
+    var rq_t3, rq_v3 = rq_w.get_body_state(rq_ball, &rq_st);
+    var rq_vx: f64 = rq_st.linear_velocity.x;
+    var rq_vy: f64 = rq_st.linear_velocity.y;
+    assert_eq(is_ok(rq_t1) + is_ok(rq_t2) + is_ok(rq_t3), 3, "the colliders added, the state read");
+    assert_eq(rq_w.body_count() == 2 && rq_vx > 0.0 && rq_vy < 0.0, 1, "two bodies; the ball moves right and down");
+    rq_w.free();
+
     return 0;
 }

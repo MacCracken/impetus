@@ -255,6 +255,15 @@ fn main() {
     p = s.position();
     assert(p == 1.0, "k = c = 0: free motion, 0 + 2·0.5");
 
+    # rust-old/README.md's Spring Animation, a doc test (lib.rs takes the README as the crate's docs).
+    test_group("doc_readme_spring_animation");
+    var ui: ImSpring2d = ImSpring2d_critically_damped(ImVec2_new(0.0, 0.0), ImVec2_new(500.0, 300.0), 400.0);
+    ui.step(1.0 / 60.0);
+    var uip: ImVec2 = ui.position();
+    var uix: f64 = uip.x;
+    var uiy: f64 = uip.y;
+    assert(uix > 0.0 && uix < 500.0 && uiy > 0.0 && uiy < 300.0, "a frame moves it toward the target");
+
     return assert_summary();
 }
 

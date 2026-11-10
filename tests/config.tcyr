@@ -119,6 +119,30 @@ fn main() {
     assert(zy == 0.0, "gravity zero");
     assert(accepts(z) == 1, "zero gravity is valid");
 
+    # backend_2d/tests.rs's three sub-step tests.
+    test_group("sub_steps_config_default");
+    var ssd: ImWorldConfig = ImWorldConfig_default();
+    assert_eq(ssd.sub_steps, 1, "1 sub-step");
+
+    test_group("sub_steps_config_serde");
+    var ss: ImWorldConfig = ImWorldConfig_default();
+    ss.sub_steps = 4;
+    var ssb: ImWorldConfig = ImWorldConfig_default();
+    assert(json_roundtrip(ss, &ssb) == 1, "reads back");
+    assert_eq(ssb.sub_steps, 4, "4 sub-steps");
+
+    test_group("sub_steps_config_serde_default");
+    # Rust's document from before sub_steps, read into a config that starts at 8 sub-steps.
+    var osb = str_builder_new();
+    str_builder_add_cstr(osb, "{\"timestep\":0.016666666666666666,\"gravity\":[0.0,-9.81,0.0],");
+    str_builder_add_cstr(osb, "\"velocity_iterations\":4,\"position_iterations\":1,\"deterministic\":true,\"step\":0}");
+    var os = str_builder_build(osb);
+    var oc: ImWorldConfig = ImWorldConfig_default();
+    oc.sub_steps = 8;
+    var oct, ocv = ImWorldConfig_from_json(str_data(os), str_len(os), &oc);
+    assert(is_err_result(oct) == 0, "an old document reads");
+    assert_eq(oc.sub_steps, 1, "sub_steps defaults to 1");
+
     # ADR 0008 #6 (Cyrius-only): XPBD is refused; a value that is no variant too.
     test_group("adr_0008_xpbd_refused");
     var x: ImWorldConfig = ImWorldConfig_default();

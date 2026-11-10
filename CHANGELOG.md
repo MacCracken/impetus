@@ -626,6 +626,22 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     addresses into the snapshot and again into the restored world, each copy outliving the other. `snapshot.tcyr`
     has 62 assertions and `b3_snapshot.tcyr` 63 (the shared cases 34). Skipping every clone fails the group.
 
+- **Cyrius port, M7 part 1: the Rust-test ledger** (`docs/development/port-parity.md` §30):
+  - `scripts/rust_test_ledger.py` (after tanmatra's) writes `docs/development/rust-test-ledger.md`. Its `--check`
+    fails on a stale ledger or a Rust test that is neither ported nor recorded with a reason. A test counts as
+    ported when one of the Cyrius files mapped to its Rust file has a `test_group` of the same name.
+  - The ledger covers 432 tests: rust-old's 430 `#[test]`s and the README's two examples, which are doc tests because
+    `lib.rs` takes the README as the crate's docs. 388 are ported. 17 are n/a: 8 XPBD tests (ADR 0008 #6) and the 9
+    tests of the oracle hooks. 27 are deferred: the bridges (port plan §3.2).
+  - Groups that held several Rust tests are split, one per test: 30 3D narrowphase tests in `tests/b3_narrowphase.tcyr`
+    and the 4 combine rules in `tests/material.tcyr`. The assertions are unchanged.
+  - Newly ported:
+    - `backend_2d/tests.rs`'s two static-friction serde tests (`tests/material.tcyr`) and its three sub-step tests
+      (`tests/config.tcyr`). An old document reads into a target that starts with other values, so the reader must
+      reset them;
+    - `lib.rs`'s `create_default_world`, and the README's Quick Start, in the shared world cases (both profiles);
+    - the README's spring example (`tests/spring.tcyr`).
+
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
   sin_cos from 3.3 µs to 187 ns (the polyfills: 48–64 and 75–83 ns).

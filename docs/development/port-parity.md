@@ -1289,6 +1289,32 @@ fails when either drifts from `cyrius.cyml`.
   and aarch64, where both snapshot test files pass with their pins. `snapshot.tcyr` has 62 assertions,
   `b3_snapshot.tcyr` 63, and the shared cases 34. Surface parity is 662 across 30 modules. M6 is closed.
 
+## 30. M7a: the Rust-test ledger (2026-11-10)
+
+- **The ledger.** `scripts/rust_test_ledger.py`, after tanmatra's, maps each Rust file with tests to the Cyrius test
+  files that port them. A Rust test is ported when one of those files has a `test_group` of its name. A test with no
+  port needs a recorded reason, and a reason for a test that is ported, or no longer exists, is an error. The script
+  writes `docs/development/rust-test-ledger.md`, and `--check` fails on a stale ledger or an unaccounted test. The
+  mapping is per file because names repeat: the 2D and 3D narrowphase both have a `capsule_capsule_overlap`, which
+  a global match would have counted for 3D when only the 2D test was a group of its own.
+- **Doc tests.** `src/lib.rs` takes `README.md` as the crate's docs, so its two runnable examples, the Quick Start and
+  the spring, are doc tests. The script counts the runnable fences in the README and the doc comments (`ignore` and
+  `text` fences are not run) and requires one ported group for each.
+- **Result:** 432 Rust tests. 388 are ported. 17 are n/a: 8 XPBD tests (ADR 0008 #6) and the 9 tests of the oracle
+  hooks (§4 step 0), which test the frozen crate's dump, not impetus 1.4.0. 27 are deferred: the bridges (port plan
+  §3.2). Rust's two `#[ignore]`d tests run live in `tests/snapshot_cases.cyr`. The shared world, snapshot and
+  regression cases run on both profiles.
+- **What it took.**
+  - Splitting groups that held several Rust tests: 30 3D narrowphase tests and the 4 combine rules, assertions
+    unchanged.
+  - Porting 8 tests:
+    - the 2D module's static-friction serde pair and sub-step trio. An old document is read into a target that
+      starts with other values, which confirms the readers reset what the document leaves out;
+    - `create_default_world`;
+    - the README's two examples. Rust checks only that they run; the ports assert that the calls succeed and that
+      the ball or spring moves.
+- **Unchanged:** the golden corpus (no new rows) and surface parity (662).
+
 ## How to reproduce
 
 ```sh
@@ -1300,6 +1326,7 @@ cyrius test --win tests/parity_2d.tcyr            # x86_64 PE, needs wine
 cyrius test --aarch64 tests/parity_2d.tcyr        # aarch64, needs qemu-aarch64
 cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml --no-default-features --features b3 -- --check
 cyrius test tests/parity_3d.tcyr                  # the b3_* modules; also --win and --aarch64
+python3 -I scripts/rust_test_ledger.py . --check  # §30: every Rust test ported or recorded
 cyrius run scripts/probes/p1_memory.cyr           # §4.1
 cyrius bench scripts/probes/p2_vectors.bcyr       # §4.2
 ```
