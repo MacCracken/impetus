@@ -1,0 +1,376 @@
+# b3_joints.tcyr — the ported Rust tests of rust-old/src/backend_3d/joints.rs and of the 3D step when nothing touches
+# (M5 part 2): every stepping test of backend_3d/tests.rs whose colliders can't meet (one collider, or mask 0). They
+# step through tests/step3.cyr's contact-free sub-step, which equals Rust's `step_frame` only while the broadphase pairs
+# nothing; its guard (`_t3_touch`) proves that on every frame. Plus Cyrius-only groups: the Prismatic no-op, breaking by
+# explicit force, a Fixed joint on the point block alone, the error-reduction parameter, and a flat heap.
+
+include "tests/lib_3d.cyr"
+include "tests/step3.cyr"
+
+var eps: f64 = 0.000001;
+
+fn near(got: f64, want: f64, tol: f64): i64 {
+    var d: f64 = f64_abs(got - want);
+    if (d < tol) { return 1; }
+    return 0;
+}
+
+fn v(x: f64, y: f64, z: f64): ImVec3 { return ImVec3_new(x, y, z); }
+
+# 1 when every entry of m is zero (Rust's `== DMat3::ZERO`).
+fn mat_is_zero(m: ImMat3): i64 {
+    if (m.x.x == 0.0 && m.x.y == 0.0 && m.x.z == 0.0 && m.y.x == 0.0 && m.y.y == 0.0 && m.y.z == 0.0) {
+        if (m.z.x == 0.0 && m.z.y == 0.0 && m.z.z == 0.0) { return 1; }
+    }
+    return 0;
+}
+
+fn dist_to(p: ImVec3, q: ImVec3): f64 {
+    var l: f64 = ImVec3_length(p - q);
+    return l;
+}
+
+# A body of type t at pos, rotated rot about z.
+fn body(st: *ImPhysicsState3d, t, pos: ImVec3, rot: f64): i64 {
+    var d: ImBodyDesc = ImBodyDesc_default();
+    d.body_type = t;
+    d.position = pos;
+    d.rotation = rot;
+    return st.add_body(d);
+}
+
+# A collider of `shape` on body h, with an explicit mass when has_m is 1 and the given layer and mask.
+fn collider(st: *ImPhysicsState3d, h, shape: ImColliderShape, has_m, m: f64, layer, mask): i64 {
+    var d: ImColliderDesc = ImColliderDesc_new(shape);
+    d.has_mass = has_m;
+    d.mass = m;
+    d.collision_layer = layer;
+    d.collision_mask = mask;
+    var t, c = st.add_collider(h, d);
+    d.shape.free();
+    return c;
+}
+
+# The Rust tests' `joint_desc` (anchors at the origins, no motor, damping or break force), added: its handle.
+fn joint(st: *ImPhysicsState3d, a, b, jt: ImJointType, la: ImVec2, lb: ImVec2, damping: f64, has_bf, bf: f64): i64 {
+    var d: ImJointDesc = ImJointDesc_new(a, b, jt, la, lb);
+    d.damping = damping;
+    d.has_break_force = has_bf;
+    d.break_force = bf;
+    var t, j = st.add_joint(d);
+    return j;
+}
+
+# The Rust tests' `anchored_ball`: a static anchor at (0, 10, 0) with no collider and a dynamic ball of radius 0.25.
+fn anchored_ball(st: *ImPhysicsState3d, pos: ImVec3): i64 {
+    var a = body(st, IM_BODY_STATIC, v(0.0, 10.0, 0.0), 0.0);
+    var b = body(st, IM_BODY_DYNAMIC, pos, 0.0);
+    collider(st, b, ImColliderShape_ball(0.25), 0, 0.0, 0xFFFFFFFF, 0xFFFFFFFF);
+    return (a, b);
+}
+
+# The Rust tests' `one_step_velocity`: a 1 kg ball at (1, 0, 0) moving at (0, 2, 0), one 0.01 s step with no
+# gravity and `iters` velocity iterations, with joint type jt (from the static body, or on the ball itself for a
+# Mouse) and per-joint damping: the ball's velocity.
+fn one_step_velocity(jt: ImJointType, damping: f64, iters): ImVec3 {
+    var st: ImPhysicsState3d = ImPhysicsState3d_new();
+    var a = body(&st, IM_BODY_STATIC, ImVec3_zero(), 0.0);
+    var bd: ImBodyDesc = ImBodyDesc_default();
+    bd.position = v(1.0, 0.0, 0.0);
+    bd.linear_velocity = v(0.0, 2.0, 0.0);
+    var b = st.add_body(bd);
+    collider(&st, b, ImColliderShape_ball(0.1), 1, 1.0, 0xFFFFFFFF, 0xFFFFFFFF);
+    var ja = a;
+    if (jt.kind == IM_JOINT_MOUSE) { ja = b; }
+    var z2: ImVec2 = ImVec2_new(0.0, 0.0);
+    joint(&st, ja, b, jt, z2, z2, damping, 0, 0.0);
+    _t3_substep(&st, ImVec3_zero(), 0.01, iters, 1, 0.01, 0.2, 100.0, 30.0, 1.0);
+    st.finish_step();
+    var w: ImVec3 = st._body(b).linear_velocity;
+    st.free();
+    return w;
+}
+
+fn main() {
+    alloc_init();
+    var g: ImVec3 = v(0.0, -9.81, 0.0);
+    var zero: ImVec3 = ImVec3_zero();
+    var z2: ImVec2 = ImVec2_new(0.0, 0.0);
+    var anchor: ImVec3 = v(0.0, 10.0, 0.0);
+
+    test_group("gravity_moves_body_3d");
+    var s1: ImPhysicsState3d = ImPhysicsState3d_new();
+    var h1 = body(&s1, IM_BODY_DYNAMIC, v(0.0, 10.0, 0.0), 0.0);
+    collider(&s1, h1, ImColliderShape_ball(0.5), 0, 0.0, 0xFFFFFFFF, 0xFFFFFFFF);
+    for (var f1 = 0; f1 < 60; f1 = f1 + 1) { _t3_frame(&s1, g); }
+    var y1: f64 = s1._body(h1).position.y;
+    assert_eq(y1 < 10.0, 1, "the body falls");
+    s1.free();
+
+    test_group("fixed_joint_3d");
+    var s2: ImPhysicsState3d = ImPhysicsState3d_new();
+    var a2 = body(&s2, IM_BODY_STATIC, v(0.0, 5.0, 0.0), 0.0);
+    var b2 = body(&s2, IM_BODY_DYNAMIC, v(0.0, 3.0, 0.0), 0.0);
+    collider(&s2, b2, ImColliderShape_ball(0.5), 0, 0.0, 0xFFFFFFFF, 0xFFFFFFFF);
+    joint(&s2, a2, b2, ImJointType_fixed(), ImVec2_new(0.0, -2.0), z2, 0.0, 0, 0.0);
+    for (var f2 = 0; f2 < 600; f2 = f2 + 1) { _t3_frame(&s2, g); }
+    var rb2: *ImRigidBody3d = s2._body(b2);
+    var d2: f64 = dist_to(rb2.position, v(0.0, 3.0, 0.0));
+    var sp2: f64 = ImVec3_length(rb2.linear_velocity);
+    assert_eq(near(d2, 0.0, 0.01) + near(sp2, 0.0, 0.1), 2, "held in place under gravity");
+    s2.free();
+
+    test_group("static_body_switched_to_dynamic_gains_mass");
+    var s3: ImPhysicsState3d = ImPhysicsState3d_new();
+    var h3 = body(&s3, IM_BODY_STATIC, v(0.0, 10.0, 0.0), 0.0);
+    collider(&s3, h3, ImColliderShape_ball(0.5), 0, 0.0, 0xFFFFFFFF, 0xFFFFFFFF);
+    var im3a: f64 = s3._body(h3).inv_mass;
+    assert_eq(im3a == 0.0, 1, "static: no mass");
+    var t3a, u3a = s3.set_body_type(h3, IM_BODY_DYNAMIC);
+    var rb3: *ImRigidBody3d = s3._body(h3);
+    var expected: f64 = (4.0 / 3.0) * _IM_PI * 0.125;
+    var m3: f64 = rb3.mass;
+    var im3: f64 = rb3.inv_mass;
+    var ii3: f64 = rb3.inv_inertia.x.x;
+    assert_eq(near(m3, expected, eps) + near(im3, 1.0 / expected, eps), 2, "dynamic: the ball's mass");
+    assert_eq(ii3 > 0.0, 1, "and its inertia");
+    for (var f3 = 0; f3 < 30; f3 = f3 + 1) { _t3_frame(&s3, g); }
+    var y3: f64 = s3._body(h3).position.y;
+    assert_eq(y3 < 9.5, 1, "it falls");
+    var t3b, u3b = s3.set_body_type(h3, IM_BODY_KINEMATIC);
+    var m3k: f64 = rb3.mass;
+    var im3k: f64 = rb3.inv_mass;
+    assert_eq(m3k == 0.0 && im3k == 0.0 && mat_is_zero(rb3.inv_inertia) == 1, 1, "kinematic: no mass or inertia");
+    s3.free();
+
+    test_group("sleeping_body_does_not_drift");
+    var s4: ImPhysicsState3d = ImPhysicsState3d_new();
+    var bd4: ImBodyDesc = ImBodyDesc_default();
+    bd4.linear_velocity = v(0.005, 0.0, 0.0);
+    var h4 = s4.add_body(bd4);
+    collider(&s4, h4, ImColliderShape_ball(0.5), 0, 0.0, 0xFFFFFFFF, 0xFFFFFFFF);
+    for (var f4 = 0; f4 < 120; f4 = f4 + 1) { _t3_frame(&s4, zero); }
+    var rb4: *ImRigidBody3d = s4._body(h4);
+    var v4: f64 = ImVec3_length(rb4.linear_velocity);
+    assert_eq(rb4.is_sleeping == 1 && v4 == 0.0, 1, "asleep, stopped");
+    var p4: ImVec3 = rb4.position;
+    for (var f4b = 0; f4b < 120; f4b = f4b + 1) { _t3_frame(&s4, zero); }
+    var q4: ImVec3 = s4._body(h4).position;
+    assert_eq(q4.x == p4.x && q4.y == p4.y && q4.z == p4.z, 1, "it doesn't drift");
+    s4.free();
+
+    test_group("distance_joint_holds_hanging_ball");
+    var s5: ImPhysicsState3d = ImPhysicsState3d_new();
+    var a5, b5 = anchored_ball(&s5, v(0.0, 8.0, 0.0));
+    var dj: ImJointType = ImJointType_distance(2.0);
+    joint(&s5, a5, b5, dj, z2, z2, 0.0, 0, 0.0);
+    for (var f5 = 0; f5 < 600; f5 = f5 + 1) { _t3_frame(&s5, g); }
+    var rb5: *ImRigidBody3d = s5._body(b5);
+    var sp5: f64 = ImVec3_length(rb5.linear_velocity);
+    var d5: f64 = dist_to(rb5.position, anchor);
+    assert_eq(sp5 < 1.0, 1, "settled");
+    assert_eq(near(d5, 2.0, 0.01), 1, "at the joint's length");
+    s5.free();
+
+    test_group("distance_joint_pendulum_keeps_length_and_energy");
+    var s6: ImPhysicsState3d = ImPhysicsState3d_new();
+    var a6, b6 = anchored_ball(&s6, v(2.0, 10.0, 0.0));
+    joint(&s6, a6, b6, dj, z2, z2, 0.0, 0, 0.0);
+    var vmax: f64 = f64_sqrt(2.0 * 9.81 * 2.0);
+    var len_ok = 1;
+    var speed_ok = 1;
+    for (var f6 = 0; f6 < 600; f6 = f6 + 1) {
+        _t3_frame(&s6, g);
+        var rb6: *ImRigidBody3d = s6._body(b6);
+        var d6: f64 = dist_to(rb6.position, anchor);
+        var sp6: f64 = ImVec3_length(rb6.linear_velocity);
+        if (near(d6, 2.0, 0.01) == 0) { len_ok = 0; }
+        if (!(sp6 < vmax * 1.01)) { speed_ok = 0; }
+    }
+    assert_eq(len_ok, 1, "length within 0.01 every frame");
+    assert_eq(speed_ok, 1, "no energy gained");
+    s6.free();
+
+    test_group("rope_joint_holds_max_length");
+    var s7: ImPhysicsState3d = ImPhysicsState3d_new();
+    var a7, b7 = anchored_ball(&s7, v(1.0, 8.5, 0.0));
+    var rope: ImJointType = ImJointType_rope(2.0);
+    joint(&s7, a7, b7, rope, z2, z2, 0.0, 0, 0.0);
+    var rope_ok = 1;
+    for (var f7 = 0; f7 < 600; f7 = f7 + 1) {
+        _t3_frame(&s7, g);
+        var d7: f64 = dist_to(s7._body(b7).position, anchor);
+        if (!(d7 < 2.02)) { rope_ok = 0; }
+    }
+    var sp7: f64 = ImVec3_length(s7._body(b7).linear_velocity);
+    assert_eq(rope_ok, 1, "never past 2.02");
+    assert_eq(sp7 < 7.0, 1, "bounded speed");
+    s7.free();
+    var s7b: ImPhysicsState3d = ImPhysicsState3d_new();
+    var a7b, b7b = anchored_ball(&s7b, v(0.0, 9.0, 0.0));
+    joint(&s7b, a7b, b7b, rope, z2, z2, 0.0, 0, 0.0);
+    _t3_frame(&s7b, g);
+    var vy7: f64 = s7b._body(b7b).linear_velocity.y;
+    assert_eq(near(vy7, -9.81 / 60.0, 0.000000001), 1, "slack: free fall");
+    s7b.free();
+
+    test_group("fixed_joint_locks_relative_rotation");
+    var s8: ImPhysicsState3d = ImPhysicsState3d_new();
+    var a8 = body(&s8, IM_BODY_STATIC, zero, 0.0);
+    var b8 = body(&s8, IM_BODY_DYNAMIC, v(2.0, 0.0, 0.0), 0.0);
+    collider(&s8, b8, ImColliderShape_box(0.5, 0.1, 0.1), 0, 0.0, 0, 0);
+    joint(&s8, a8, b8, ImJointType_fixed(), z2, ImVec2_new(-2.0, 0.0), 0.0, 0, 0.0);
+    for (var f8 = 0; f8 < 300; f8 = f8 + 1) { _t3_frame(&s8, g); }
+    var rb8: *ImRigidBody3d = s8._body(b8);
+    var d8: f64 = dist_to(rb8.position, v(2.0, 0.0, 0.0));
+    var xr: ImVec3 = ImQuat_mul_vec3(rb8.rotation, v(1.0, 0.0, 0.0));
+    var xx: f64 = xr.x;
+    assert_eq(d8 < 0.05, 1, "the cantilever holds its place");
+    assert_eq(xx > 0.999, 1, "and its rotation");
+    s8.free();
+
+    test_group("wheel_joint_constrains_both_perpendicular_axes");
+    var s9: ImPhysicsState3d = ImPhysicsState3d_new();
+    var a9, b9 = anchored_ball(&s9, v(0.3, 9.0, 0.2));
+    joint(&s9, a9, b9, ImJointType_wheel(ImVec2_new(0.0, 1.0), 50.0, 2.0), z2, z2, 0.0, 0, 0.0);
+    for (var f9 = 0; f9 < 600; f9 = f9 + 1) { _t3_frame(&s9, g); }
+    var rb9: *ImRigidBody3d = s9._body(b9);
+    var px9: f64 = f64_abs(rb9.position.x);
+    var pz9: f64 = f64_abs(rb9.position.z);
+    var sp9: f64 = ImVec3_length(rb9.linear_velocity);
+    assert_eq(px9 < 0.01 && pz9 < 0.01, 1, "on the axis");
+    assert_eq(sp9 < 0.1, 1, "settled on its suspension");
+    s9.free();
+
+    test_group("explicit_joint_forces_independent_of_iterations");
+    var spring: ImJointType = ImJointType_spring(0.0, 10.0, 0.0);
+    var mouse: ImJointType = ImJointType_mouse(v(2.0, 0.0, 0.0), 10.0, 0.0, 100.0);
+    var rev: ImJointType = ImJointType_revolute(z2, 0, 0.0, 0.0);
+    var cases_ok = 0;
+    for (var k = 0; k < 3; k = k + 1) {
+        var jt: ImJointType = spring;
+        var jd: f64 = 0.0;
+        var want: ImVec3 = v(-0.1, 2.0, 0.0);
+        if (k == 1) {
+            jt = mouse;
+            want = v(0.1, 2.0, 0.0);
+        } elif (k == 2) {
+            jt = rev;
+            jd = 5.0;
+            want = v(0.0, 2.0 - 5.0 * 2.0 * 0.01, 0.0);
+        }
+        var v1: ImVec3 = one_step_velocity(jt, jd, 1);
+        var v8: ImVec3 = one_step_velocity(jt, jd, 8);
+        var e1: f64 = dist_to(v1, want);
+        var e8: f64 = dist_to(v8, v1);
+        if (e1 < 0.000000001 && e8 < 0.000000000001) { cases_ok = cases_ok + 1; }
+    }
+    assert_eq(cases_ok, 3, "spring, mouse and revolute damping: the same Δv at 1 and 8 iterations");
+
+    test_group("joint_breaks_on_reaction_force");
+    var broke = 0;
+    for (var q = 0; q < 2; q = q + 1) {
+        var bf: f64 = 0.1;
+        if (q == 1) { bf = 1.0; }
+        var s10: ImPhysicsState3d = ImPhysicsState3d_new();
+        var a10, b10 = anchored_ball(&s10, v(0.0, 8.0, 0.0));
+        joint(&s10, a10, b10, dj, z2, z2, 0.0, 1, bf);
+        for (var f10 = 0; f10 < 5; f10 = f10 + 1) { _t3_frame(&s10, g); }
+        if (s10._joints().len() == 0) { broke = broke + (q + 1); }
+        s10.free();
+    }
+    assert_eq(broke, 1, "0.1 N breaks, 1 N holds");
+
+    test_group("prismatic_is_a_no_op");
+    # Cyrius-only: Rust 1.4.0's 3D Prismatic joint has no rows or force; without damping it leaves the ball alone.
+    var pri: ImJointType = ImJointType_prismatic(ImVec2_new(1.0, 0.0), 1, -1.0, 1.0);
+    var vp: ImVec3 = one_step_velocity(pri, 0.0, 4);
+    assert_eq(vp.x == 0.0 && vp.y == 2.0 && vp.z == 0.0, 1, "velocity unchanged");
+
+    test_group("breaks_on_explicit_force");
+    # Cyrius-only: a Spring has no rows, so break_joints compares its explicit force: 10 N/m stretched 1 m is 10 N.
+    var held = 0;
+    for (var q2 = 0; q2 < 2; q2 = q2 + 1) {
+        var bf2: f64 = 9.0;
+        if (q2 == 1) { bf2 = 11.0; }
+        var s11: ImPhysicsState3d = ImPhysicsState3d_new();
+        var a11, b11 = anchored_ball(&s11, v(0.0, 9.0, 0.0));
+        joint(&s11, a11, b11, ImJointType_spring(0.0, 10.0, 0.0), z2, z2, 0.0, 1, bf2);
+        _t3_frame(&s11, zero);
+        held = held + s11._joints().len() * (q2 + 1);
+        s11.free();
+    }
+    assert_eq(held, 2, "9 N breaks, 11 N holds");
+
+    test_group("fixed_joint_point_block_only");
+    # Cyrius-only: with rotation fixed, K_ll = I_a⁻¹ + I_b⁻¹ = 0 can't be inverted, so the joint keeps the point block
+    # alone and still holds the anchor.
+    var s12: ImPhysicsState3d = ImPhysicsState3d_new();
+    var a12 = body(&s12, IM_BODY_STATIC, zero, 0.0);
+    var bd12: ImBodyDesc = ImBodyDesc_default();
+    bd12.position = v(1.0, 0.0, 0.0);
+    bd12.fixed_rotation = 1;
+    var b12 = s12.add_body(bd12);
+    collider(&s12, b12, ImColliderShape_ball(0.2), 0, 0.0, 0xFFFFFFFF, 0xFFFFFFFF);
+    joint(&s12, a12, b12, ImJointType_fixed(), ImVec2_new(1.0, 0.0), z2, 0.0, 0, 0.0);
+    _t3_frame(&s12, g);
+    var c12: *ImJointConstraint = s12._jc_at(0);
+    assert_eq(s12.jc_len == 1 && c12.kind == _IM_B3_ROWS_FIXED && c12.has_angular == 0, 1, "the point block alone");
+    for (var f12 = 0; f12 < 300; f12 = f12 + 1) { _t3_frame(&s12, g); }
+    var d12: f64 = dist_to(s12._body(b12).position, v(1.0, 0.0, 0.0));
+    assert_eq(d12 < 0.01, 1, "holds the anchor");
+    s12.free();
+
+    test_group("error_reduction");
+    # Cyrius-only: the soft constraint's erp = dt·k / (2ζω + dt·k), the Baumgarte fraction without it, clamped.
+    var dt: f64 = 1.0 / 60.0;
+    var nan: f64 = _im_cr_from_word(0x7ff8000000000000);
+    var omega: f64 = 2.0 * _IM_PI * 30.0;
+    var kk: f64 = omega * omega;
+    var soft: f64 = dt * kk / (2.0 * omega + dt * kk);
+    var e_soft: f64 = _im_b3_error_reduction(30.0, 1.0, 0.2, dt);
+    var e_baum: f64 = _im_b3_error_reduction(0.0, 1.0, 0.2, dt);
+    var e_dt0: f64 = _im_b3_error_reduction(30.0, 1.0, 0.2, 0.0);
+    var e_lo: f64 = _im_b3_error_reduction(0.0, 1.0, -3.0, dt);
+    var e_hi: f64 = _im_b3_error_reduction(0.0, 1.0, 7.0, dt);
+    var e_nan: f64 = _im_b3_error_reduction(0.0, 1.0, nan, dt);
+    assert_eq(e_soft == soft && e_baum == 0.2 && e_dt0 == 0.2, 1, "soft spring; Baumgarte without it or at dt 0");
+    assert_eq(e_lo == 0.0 && e_hi == 1.0 && e_nan == 0.0, 1, "clamped to [0, 1], NaN to 0");
+
+    test_group("flat_heap_joints");
+    # Cyrius-only: after the first frame, stepping joints reuses the constraint scratch: no growth.
+    var s13: ImPhysicsState3d = ImPhysicsState3d_new();
+    var a13 = body(&s13, IM_BODY_STATIC, v(0.0, 10.0, 0.0), 0.0);
+    var prev = a13;
+    for (var n13 = 0; n13 < 6; n13 = n13 + 1) {
+        var y13: f64 = 9.0 - f64_from(n13);
+        var h13 = body(&s13, IM_BODY_DYNAMIC, v(0.0, y13, 0.0), 0.0);
+        collider(&s13, h13, ImColliderShape_ball(0.2), 0, 0.0, 1, 0);
+        var kind13 = n13 % 4;
+        var jt13: ImJointType = ImJointType_distance(1.0);
+        if (kind13 == 1) { jt13 = ImJointType_fixed(); }
+        if (kind13 == 2) { jt13 = ImJointType_wheel(ImVec2_new(0.0, 1.0), 40.0, 1.0); }
+        if (kind13 == 3) { jt13 = ImJointType_rope(1.2); }
+        joint(&s13, prev, h13, jt13, z2, z2, 0.5, 0, 0.0);
+        prev = h13;
+    }
+    _t3_frame(&s13, g);
+    var heap0 = alloc_used();
+    var arena0 = _fl_arena;
+    var pos0 = _fl_arena_pos;
+    for (var f13 = 0; f13 < 200; f13 = f13 + 1) { _t3_frame(&s13, g); }
+    assert_eq(s13._joints().len(), 6, "every joint still there");
+    assert_eq(alloc_used() == heap0 && _fl_arena == arena0 && _fl_arena_pos == pos0, 1, "no growth");
+    s13.free();
+
+    test_group("no_pair_could_touch");
+    # Cyrius-only: every frame above ran with no collider pair the broadphase could make, so the contact-free sub-step
+    # was Rust's whole step.
+    assert_eq(_t3_touch, 0, "no frame could have paired two colliders");
+
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

@@ -1,0 +1,122 @@
+# b3_solver.cyr — the 3D backend's step (port of rust-old/src/backend_3d/solver.rs).
+#
+# Rust's `step` is one sub-step of the sequential-impulse solver: (1) integrate velocities and refresh each body's
+# world inverse inertia, (1b) the joints' explicit forces and rows (src/b3_joints.cyr), (2–3) the broadphase and the
+# narrowphase, (4) wake on contact, (5) the shock-propagation order, (6) the contact and joint velocity solves
+# interleaved, then breaking joints, (7) the split-impulse position solve, (8) integrate positions, (9) sleep, and
+# (10) the touching pairs recorded. `finish_step` ends the outer step.
+#
+# M5 part 2 ports the stages that run when nothing touches: 1, 6–9 without contacts, `finish_step`, `solver_mass`
+# (src/b3_joints.cyr) and `error_reduction`. The contact stages and `step` come with part 3. Every expression keeps
+# Rust's operation order on src/math3.cyr's glam transcriptions (ADR 0012).
+
+# The error-reduction parameter of the position solve: from the soft-constraint spring (frequency Hz, damping_ratio)
+# as dt·k / (d + dt·k), k = ω², d = 2ζω, ω = 2π·frequency, when frequency > 0 and dt > 0; else the Baumgarte fraction
+# `correction`. Clamped to [0, 1], and 0 when not finite. Mirrors `error_reduction`.
+#must_use
+fn _im_b3_error_reduction(frequency: f64, damping_ratio: f64, correction: f64, dt: f64): f64 {
+    var erp: f64 = correction;
+    if (frequency > 0.0 && dt > 0.0) {
+        var omega: f64 = 2.0 * _IM_PI * frequency;
+        var d: f64 = 2.0 * damping_ratio * omega;
+        var k: f64 = omega * omega;
+        erp = dt * k / (d + dt * k);
+    }
+    if (_im_is_finite(erp) == 1) {
+        var r: f64 = _im_clamp(erp, 0.0, 1.0);
+        return r;
+    }
+    return 0.0;
+}
+
+impl ImPhysicsState3d {
+    # Step 1: every body's velocity integrated (gravity, forces, the gyroscopic step, torques, damping, the speed
+    # cap), then its world inverse inertia refreshed, in slot order.
+    fn _integrate_velocities(self, gravity: ImVec3, dt: f64, max_velocity: f64) {
+        var ba: *ImArena = self._bodies();
+        for (var s = 0; s < ba.slot_count(); s = s + 1) {
+            var h = ba.slot_handle(s);
+            if (h != 0 - 1) {
+                var rb: *ImRigidBody3d = self._body(h);
+                rb.integrate_velocities(gravity, dt, max_velocity);
+                rb.update_inertia_world();
+            }
+        }
+        return 0;
+    }
+
+    # Zeroes every body's split-impulse pseudo-velocities, the start of step 7.
+    fn _clear_pseudo(self) {
+        var ba: *ImArena = self._bodies();
+        var z: ImVec3 = ImVec3_zero();
+        for (var s = 0; s < ba.slot_count(); s = s + 1) {
+            var h = ba.slot_handle(s);
+            if (h != 0 - 1) {
+                var rb: *ImRigidBody3d = self._body(h);
+                rb.pseudo_velocity = z;
+                rb.pseudo_angular_velocity = z;
+            }
+        }
+        return 0;
+    }
+
+    # Step 8: every body's position integrated, in slot order.
+    fn _integrate_positions(self, dt: f64) {
+        var ba: *ImArena = self._bodies();
+        for (var s = 0; s < ba.slot_count(); s = s + 1) {
+            var h = ba.slot_handle(s);
+            if (h != 0 - 1) {
+                var rb: *ImRigidBody3d = self._body(h);
+                rb.integrate_positions(dt);
+            }
+        }
+        return 0;
+    }
+
+    # Step 9, body by body (the 3D backend has no islands): a dynamic body with mass whose linear and angular speeds
+    # are both below SLEEP_VELOCITY_THRESHOLD_3D advances its sleep timer, and once that reaches
+    # SLEEP_TIME_THRESHOLD_3D it sleeps, its velocities dropped; any other resets the timer and wakes.
+    fn _sleep_check(self, dt: f64) {
+        var ba: *ImArena = self._bodies();
+        var z: ImVec3 = ImVec3_zero();
+        for (var s = 0; s < ba.slot_count(); s = s + 1) {
+            var h = ba.slot_handle(s);
+            if (h != 0 - 1) {
+                var rb: *ImRigidBody3d = self._body(h);
+                var im: f64 = rb.inv_mass;
+                if (rb.is_dynamic() == 1 && im != 0.0) {
+                    var lin: f64 = ImVec3_length(rb.linear_velocity);
+                    var ang: f64 = ImVec3_length(rb.angular_velocity);
+                    if (lin < _IM_B3_SLEEP_VELOCITY_THRESHOLD_3D && ang < _IM_B3_SLEEP_VELOCITY_THRESHOLD_3D) {
+                        var t: f64 = rb.sleep_timer;
+                        var nt: f64 = t + dt;
+                        rb.sleep_timer = nt;
+                        if (nt >= _IM_B3_SLEEP_TIME_THRESHOLD_3D) {
+                            rb.is_sleeping = 1;
+                            rb.linear_velocity = z;
+                            rb.angular_velocity = z;
+                        }
+                    } else {
+                        rb.sleep_timer = 0.0;
+                        rb.is_sleeping = 0;
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+
+    # The end of an outer step: clears every body's accumulated force and torque (they act across all sub-steps) and
+    # closes the frame's contact events: their count (ImContactTracker::event reads them). Mirrors `finish_step`.
+    fn finish_step(self): i64 {
+        var ba: *ImArena = self._bodies();
+        for (var s = 0; s < ba.slot_count(); s = s + 1) {
+            var h = ba.slot_handle(s);
+            if (h != 0 - 1) {
+                var rb: *ImRigidBody3d = self._body(h);
+                rb.clear_forces();
+            }
+        }
+        return self.contact_tracker.finish();
+    }
+}

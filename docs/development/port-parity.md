@@ -869,6 +869,64 @@ fails when either drifts from `cyrius.cyml`.
   `f64::atan2`'s, now the correctly rounded one, is `0x6b403ab79185f15f` on all three. On aarch64 only the native
   shadows differ. Surface parity is 627 across 27 modules, with the M6 snapshot functions the only ones pending.
 
+## 21. M5b: the 3D joints and the step when nothing touches (2026-11-09)
+
+- **The modules:**
+  - `src/b3_joints.cyr`, all of `backend_3d/joints.rs`:
+    - `ImJointConstraint`, Rust's `JointConstraint` with `JointRows` and `FixedAngular` inline;
+    - the Fixed joint's coupled 6×6 block through the Schur complement, falling back to the point block alone when
+      K_ll or the complement can't be inverted;
+    - the Distance and Rope rows, the Wheel's two perpendicular rows, and the split-impulse position passes;
+    - the explicit forces once per sub-step: Spring, the Wheel's suspension, Mouse and the per-joint damping.
+      Revolute and Prismatic are no-ops in Rust 1.4.0's 3D backend apart from that damping;
+    - `break_joints`, on the rows' impulse over dt or the explicit force, whichever is larger.
+
+    The constraints live in the state's scratch (`jc`), reused from step to step. Rust's paths for a joint whose
+    body is missing (no rows; removed when its explicit force exceeds its break force) are ported, but the port
+    can't reach them: `add_joint` and `add_joint_at` refuse a missing body (ADR 0008 #1), and `remove_body` takes
+    the body's joints with it.
+  - `src/b3_solver.cyr`, the stages of `step` that run when nothing touches: velocity integration with each body's
+    world inverse inertia refreshed, the pseudo-velocities cleared, position integration, the per-body sleep check
+    (the 3D backend has no islands), `finish_step` and `error_reduction`. The broadphase, narrowphase, wake, shock
+    propagation, contact solve and `step` itself come with part 3.
+- **The contact-free sub-step.** As in M3b (§14), the harness composes Rust's `step` from the library's stages, its
+  contact stages empty (`tests/step3.cyr`). That is Rust's step only while the broadphase pairs nothing, so the
+  composition also runs the broadphase's own filters on every collider pair (same body, two static bodies, two
+  sensors, the layer test) and checks that no two speculative world AABBs overlap. A pair that could touch fails the
+  row.
+- **`b3_step.tsv`**, 333 rows, every collider at mask 0:
+  - free fall at 1, 4 and 8 sub-steps, damping with a gravity scale, the speed cap;
+  - free spins with gravity off: an asymmetric box tumbling off its principal axes (the gyroscopic step), a ball, a
+    fixed-rotation box, an offset capsule, a fast spin; a torque every frame, and a force at a point every frame;
+  - Distance pendulums at 1 and 4 sub-steps and a damped Distance joint;
+  - Fixed joints: the cantilever, a rotated pair on a rotated static pin, a fixed-rotation body (the point block
+    alone);
+  - a Wheel under a pinned chassis, a Wheel with a zero axis, and one with a diagonal axis;
+  - a Spring (and one at zero length), a Rope from slack to taut, and Mouse joints capped, uncapped and with a NaN cap;
+  - Revolute and Prismatic with damping and a motor, and a joint between two static bodies;
+  - breaking: a Distance joint by its impulse, a Spring and a Mouse by their force, a Wheel by its two impulses'
+    hypot, a Fixed joint and a Rope, beside ones that hold;
+  - a kinematic driver, a push every frame, a 10-link chain of mixed joints, two bodies falling asleep;
+  - the solver settings: Baumgarte, no position iterations, 1 and 8 velocity iterations, a 1/30 s timestep;
+  - 50 seeded scenes: two to six bodies of every collider kind, kinematics, fixed rotations, offsets, spins, every
+    joint type, damping and break forces, random iteration counts and sub-steps.
+
+  Class C, since a Wheel's break test is a `hypot`. **All 333 at 0 ulp** (91,829 floats) on the first run. These are
+  the first golden rows for `integrate_velocities` (the gyroscopic step included) and `integrate_positions`. Perturbing
+  the rotation error's factor of 2 by 1e-7 fails 32 rows, so the rows pin the angular lock.
+- **The transcription.** `validate.py` transcribes the sub-step from rust-old: integration and the gyroscopic step,
+  every joint path, sleep, and the tracker. It reproduces all 333 rows bit for bit, and asserts every collider's mask
+  is 0. MPFR's hypot changes none of them, so there is no `b3_step.cr.tsv`.
+- **Rust tests.** `tests/b3_joints.tcyr` ports the 11 stepping tests of `backend_3d/tests.rs` whose colliders can't
+  meet: gravity, `fixed_joint_3d`, the type switch with its mass, the sleeping body that doesn't drift, the hanging
+  ball and the pendulum, the rope, the cantilever's angular lock, the wheel, explicit forces independent of
+  iterations, and breaking on reaction force. Each steps through the composition, and its guard confirms that no frame
+  could have paired two colliders. Cyrius-only groups cover the Prismatic no-op, breaking by explicit force, the
+  point block alone, `error_reduction` and a flat heap. `impulse_changes_velocity_3d`, which needs no step, joined
+  `tests/b3_state.tcyr`.
+- **Result:** 3D **28,762 ok, 0 failed, 10 accepted (ADR 11: 7)** over 6 modules; 2D unchanged at **98,873 ok**.
+  The same on x86_64 ELF, x86_64 PE and aarch64: every b3_step row at 0 ulp on each, so the bits are equal. Surface parity is 632 across 28 modules; `backend_3d/solver` stays pending until part 3.
+
 ## How to reproduce
 
 ```sh

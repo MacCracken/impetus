@@ -65,6 +65,7 @@ harness reads the same files. This README records what is specific to impetus.
 | `b3_ray` | b3 | M4 | 4,138 (+ 2 corrected) | `src/m_b3_ray.rs` | — |
 | `b3_body` | b3 | M4 | 234 | `src/m_b3_body.rs` | — |
 | `b3_state` | b3 | M5 | 411 (+ 5 corrected) | `src/m_b3_state.rs` | — |
+| `b3_step` | b3 | M5 | 333 | `src/m_b3_step.rs` | — |
 | (private constants) | b2 | M2 | — | — | `src/constants_private.cyr` (`src/t_private.rs`: every library `const` of `aabb_tree.rs`, `spatial_hash.rs`, `backend_2d/joints.rs`, `backend_2d/solver.rs`, `backend_2d/types.rs`, `backend_3d/narrowphase.rs`, `backend_3d/types.rs` and `world.rs`, emitted or excused (a
 function's local `const` counts, as `obb_obb_3d`'s `REL_TOL`); a `[f64; N]` array, which may span lines, becomes N globals `_0` … `_{N-1}`) |
 
@@ -142,6 +143,12 @@ impetus specifics:
   its `step` the frame index) and the backend dump at frame k, taken after that frame's forces; outputs are the dump at
   k + 1 and the frame's events. M3b's scenes give every collider collision mask 0, so nothing pairs and the contact
   stages are empty. `b2_contact.tsv` (M3c) has the same format, with scenes whose colliders touch.
+- 3D single-step rows (`b3_step.tsv`, class S at class C, the 3D build only) have `b2_step.tsv`'s format with the
+  3D dump: the config, then the dump at frame k after that frame's forces; out, the dump at k + 1 and the events. M5
+  part 2's scenes give every collider mask 0, so the contact stages are empty: integration with the gyroscopic step
+  (spins from off-centre impulses, torques and forces at points), the speed cap, every 3D joint path (Fixed with and
+  without the angular lock, Distance, Rope, Wheel, Spring, Mouse, the Revolute and Prismatic no-ops with damping),
+  breaking, kinematic drivers, sleep, the solver settings, and 50 seeded scenes.
 - World steps (`world_step.tsv`, class S at class C, the 2D build only): the config, then the world's own state
   (`dump2d::world`: the particle and emitter counters, the particles, the emitters with their spawn accumulator, read
   through `serde_json` since the field is crate-private, and the force fields), then the backend dump; outputs are the
@@ -230,6 +237,9 @@ Standard-library Python, run with `-I`. It never calls the oracle:
   the same on MPFR's writes `b3_ray.cr.tsv`;
 - every `b3_body` body is recomputed: `from_desc`, each collider's mass, inertia and centroid, the parallel-axis sum
   of `recompute_mass_properties`, the inverses and R·I⁻¹·Rᵀ;
+- every `b3_step` row is recomputed by a transcription of the 3D sub-step when nothing touches (integration and the
+  gyroscopic step, the joints' forces, rows, velocity and position passes and breaking, sleep, the tracker), bit for
+  bit; it asserts every collider's mask is 0, and on MPFR's hypot writes `b3_step.cr.tsv` (none so far);
 - every `b3_state` script is replayed on a Python model of the 3D state (the arenas, the mass recompute, the joints'
   reference rotation, forces and impulses through R·I⁻¹·Rᵀ, the state's rotation through glibc's atan2), rebuilding
   every result and dump token; the same on MPFR's writes `b3_state.cr.tsv`;

@@ -1,8 +1,8 @@
 # b3_state.tcyr — the ported Rust tests of rust-old/src/backend_3d/state.rs (M5 part 1): the state-level tests of
 # backend_3d/tests.rs that need no step (body counts, teleports, type changes, the mass recompute over colliders,
-# the parallel-axis theorem with a removal, the world-space impulse), plus Cyrius-only tests of the ADR 0008 #1
-# refusals, removals, joints' reference rotation and a flat heap. The tests that step the state arrive with the
-# solver (M5 part 2).
+# the parallel-axis theorem with a removal, the linear and the world-space angular impulse), plus Cyrius-only tests of
+# the ADR 0008 #1 refusals, removals, joints' reference rotation and a flat heap. The tests that step the state are in
+# tests/b3_joints.tcyr (M5 part 2) and, with contacts, part 3.
 
 include "tests/lib_3d.cyr"
 
@@ -162,6 +162,17 @@ fn main() {
     assert_eq(near(w9.y, -1.0 / i_long, tight), 1, "−1/I_long about y");
     assert_eq(near(w9.x, 0.0, tight) + near(w9.z, 0.0, tight), 2, "nothing about x or z");
     s9.free();
+
+    test_group("impulse_changes_velocity_3d");
+    var s9b: ImPhysicsState3d = ImPhysicsState3d_new();
+    var h9b = s9b.add_body(ImBodyDesc_default());
+    var d9b: ImColliderDesc = ball_desc(0.5, zero, 0, 0.0);
+    var r9bt, r9bv = s9b.add_collider(h9b, d9b);
+    d9b.shape.free();
+    s9b.apply_impulse(h9b, ImImpulse_new(10.0, 0.0, 0.0));
+    var vx9b: f64 = s9b._body(h9b).linear_velocity.x;
+    assert_eq(vx9b > 0.0, 1, "moves along +x");
+    s9b.free();
 
     test_group("orphans_refused");
     # ADR 0008 #1: a collider or joint for a body that isn't live is refused (Rust stores an orphan).

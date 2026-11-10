@@ -435,6 +435,30 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - Surface parity is 627/627 across 27 modules; only the M6 snapshot functions are pending.
   - **3D: 28,429 ok, 0 failed, 10 accepted (ADR 11: 7)**; 2D **98,873 ok, 0 failed, 7 pending, 166 accepted (ADR 11:
     71)**, one atan2 row having moved to the corrected oracle. Identical digests on x86_64 ELF, x86_64 PE and aarch64.
+- **Cyrius port, M5 part 2: the 3D joints and the step when nothing touches** (`docs/development/port-parity.md` §21):
+  - `src/b3_joints.cyr` ports all of `backend_3d/joints.rs`:
+    - the Fixed joint's coupled 6×6 block through the Schur complement, or the point block alone;
+    - the Distance, Rope and Wheel rows with their split-impulse position passes;
+    - the explicit forces once per sub-step (Spring, the Wheel's suspension, Mouse, the per-joint damping; Revolute
+      and Prismatic are no-ops in Rust 1.4.0's 3D backend apart from that damping);
+    - `break_joints`.
+
+    The constraints live in a scratch the state reuses from step to step.
+  - `src/b3_solver.cyr` has the stages of the step that run when nothing touches: integration (the first golden test
+    of M4's gyroscopic step), the per-body sleep check, `finish_step` and `error_reduction`. The contact stages and
+    `step` come with part 3.
+  - The golden `b3_step.tsv` holds 333 single steps with every collider at mask 0. It covers spins, torques, the speed
+    cap, every 3D joint path, breaking, kinematics, sleep, the solver settings and 50 seeded scenes. The harness
+    composes the contact-free sub-step from the library's stages (`tests/step3.cyr`) and checks with the broadphase's
+    own filters that no pair could touch. **All 333 at 0 ulp** on the first run. `validate.py` transcribes the sub-step
+    and reproduces every row; there is no correction file.
+  - 31 assertions in `tests/b3_joints.tcyr`: the 11 stepping Rust tests whose colliders can't meet, plus Cyrius-only
+    groups for the Prismatic no-op, breaking by explicit force, the point block alone, `error_reduction` and a flat
+    heap. `impulse_changes_velocity_3d` joins `tests/b3_state.tcyr`.
+  - The config and dump loaders moved from `parity_2d.tcyr` to the shared `tests/parity_types.cyr`.
+  - Surface parity is 632/632 across 28 modules.
+  - **3D: 28,762 ok, 0 failed, 10 accepted (ADR 11: 7)**; 2D unchanged at **98,873 ok**. The same on x86_64 ELF,
+    x86_64 PE and aarch64.
 
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
@@ -509,6 +533,9 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - `forces/apply_force` 7.48 → 57 ns, `apply_impulse` 2.34 → 40 ns.
 
   A 3D body record is 496 B against 2D's 224 B, and the arenas copy records with the byte-loop `memcpy` (S5).
+- **The 3D joints and the contact-free step, first numbers** (Cyrius only; Rust times its 3D step whole, broadphase
+  included, so the comparison comes with part 3's `step`): a tumbling box's gyroscopic velocity step 1.21 µs; one
+  sub-step's joint work on a 20-link chain 59.9 µs (3 µs a joint); that chain's whole contact-free frame 97.4 µs.
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

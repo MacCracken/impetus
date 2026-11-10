@@ -603,3 +603,69 @@ fn _par_got_unit(t, v) {
     if (is_ok(t) == 1) { _par_got_i(0); } else { _par_got_err(v); }
     return 0;
 }
+
+# ── configs and dumps (the b2 and b3 step rows) ──────────────────────────────────────
+
+# The world config at token k: flat::config's 16 tokens.
+fn _par_in_config(k): ImWorldConfig {
+    var c: ImWorldConfig = ImWorldConfig_default();
+    var ts: f64 = _par_in(k);
+    var gx: f64 = _par_in(k + 1);
+    var gy: f64 = _par_in(k + 2);
+    var gz: f64 = _par_in(k + 3);
+    var slop: f64 = _par_in(k + 8);
+    var corr: f64 = _par_in(k + 9);
+    var mv: f64 = _par_in(k + 10);
+    var fq: f64 = _par_in(k + 12);
+    var dr: f64 = _par_in(k + 13);
+    c.timestep = ts;
+    c.gravity = ImVec3_new(gx, gy, gz);
+    c.velocity_iterations = _par_in(k + 4);
+    c.position_iterations = _par_in(k + 5);
+    c.deterministic = _par_in(k + 6);
+    c.step = _par_in(k + 7);
+    c.position_slop = slop;
+    c.position_correction = corr;
+    c.max_velocity = mv;
+    c.sub_steps = _par_in(k + 11);
+    c.constraint_frequency = fq;
+    c.constraint_damping_ratio = dr;
+    c.broadphase = _par_in_enum(k + 14, "BroadphaseKind.", &broadphase_kind_name, 2);
+    c.solver = _par_in_enum(k + 15, "SolverKind.", &solver_kind_name, 2);
+    return c;
+}
+
+# An arena's dumped slots at token k into ar: the token after them.
+fn _par_load_arena(ar: *ImArena, k): i64 {
+    var n = _par_in(k);
+    if (ar._reserve(n) == 0) { return 0 - 1; }
+    ar.count = n;
+    ar.len = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var m = ar._meta(i);
+        var occ = _par_in(k + 1 + i * 3);
+        store64(m, occ);
+        store64(m + 8, _par_in(k + 2 + i * 3));
+        var nx = 0 - 1;
+        if (_par_in_is_none(k + 3 + i * 3) == 0) { nx = _par_in(k + 3 + i * 3); }
+        store64(m + 16, nx);
+        if (occ == 1) { ar.len = ar.len + 1; }
+    }
+    var j = k + 1 + n * 3;
+    ar.free_head = 0 - 1;
+    if (_par_in_is_none(j) == 0) { ar.free_head = _par_in(j); }
+    ar.free_list_stale = _par_in(j + 1);
+    return j + 2;
+}
+
+# The record slot of handle h in arena ar.
+fn _par_slot(ar: *ImArena, h): i64 {
+    return ar.values + _im_handle_index(h) * ar.elem_size;
+}
+
+# A dumped pair list at token k pushed onto pl: the token after it.
+fn _par_load_pairs(pl: *ImPairList, k): i64 {
+    var n = _par_in(k);
+    for (var i = 0; i < n; i = i + 1) { pl.push(_par_in(k + 1 + i * 2), _par_in(k + 2 + i * 2)); }
+    return k + 1 + n * 2;
+}

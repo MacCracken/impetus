@@ -418,3 +418,27 @@ loops on `ImPhysicsState3d`; as in Rust, `add_body` and `add_joint` grow one wor
   phase 1 decides 99.9 % of calls; where that time goes is not profiled yet.
 
 These are first numbers, measured and not gated. S5 (a word-at-a-time `memcpy`) would cut most of the state's gap.
+
+## M5 part 2: the 3D joints and the step when nothing touches (2026-11-09)
+
+x86_64 ELF, `tests/impetus_3d.bcyr`, Cyrius only. Rust times its 3D step only whole, through `world/step_*`, and
+that includes the broadphase, which this part doesn't have; the Rust comparison comes with part 3's `step`. The
+frame is `tests/step3.cyr`'s contact-free composition with its test guard off.
+
+| Bench | Body | Cyrius |
+|---|---|---|
+| `b3/integrate_velocities_tumble` | an asymmetric box spinning off its principal axes: the gyroscopic Newton step, its 3×3 inverse and the energy rescale | 1.21 µs |
+| `b3/joints_chain20` | one sub-step's joint work on a 20-link chain (Fixed, Distance, Rope and Spring joints in turn): forces and rows, 4 velocity passes, breaking, 1 position pass | 59.9 µs |
+| `b3/frame_chain20 (no contacts)` | the same chain's whole frame: integration, the joints, positions, sleep, `finish_step` | 97.4 µs |
+
+**Reading it.** Measured once the machine was quiet. M4's `b3/integrate_velocities` read 1.07 µs in the same run,
+against its recorded 1.10 µs, and a second run agreed within 2 %.
+- **The frame adds up.** 21 bodies at about 1.6 µs each for the two integrations (M4's rows, 1.07 µs and 502 ns) is
+  33 µs. With the joint work's 60 µs, that is 93 µs of the frame's 97 µs.
+- **The joint work is 3 µs a joint a sub-step.** 2D's revolute chain takes 1.1 µs a joint (22.5 µs for 20, M3 part 2),
+  without the breaking and position passes this row includes. Not profiled yet. A Fixed joint builds its blocks from by-value 3×3 products and two inverses. Each joint's
+  constraint record carries two inverse-inertia matrices that every `axial_mass` call copies on entry
+  (`port-parity.md` §4.2).
+- **The gyroscopic step costs 1.21 µs** for a tumbling box, against 1.07 µs for M4's simpler spin.
+
+First numbers, measured and not gated.

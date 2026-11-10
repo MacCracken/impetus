@@ -6,9 +6,13 @@
 # M4 part 1: glam's value math (src/math3.cyr) beside hisab's allocating calls for the same operation (ADR 0012's
 # trade), the gyroscopic step, body integration, the mass recompute and a world AABB. M4 part 2: the narrowphase.
 # M4 part 3: the raycast. M5 part 1: the 3D state, Rust's bodies/* and forces/apply_* loops (Rust's own numbers from the
-# 3D build), and get_body_state, which reads the rotation back through the correctly rounded atan2.
+# 3D build), and get_body_state, which reads the rotation back through the correctly rounded atan2. M5 part 2: the
+# gyroscopic velocity step, a 20-link chain's joint work for one sub-step, and its whole contact-free frame
+# (tests/step3.cyr's composition, unguarded; Rust times its 3D step only whole, broadphase included, so the comparison
+# waits for part 3's `step`).
 
 include "tests/lib_3d.cyr"
+include "tests/step3.cyr"
 
 var N = 1000000;
 var g_sink = 0;
@@ -341,6 +345,90 @@ fn bench_states3() {
     return 0;
 }
 
+# A static anchor and a 20-link chain of 1 m boxes, the joints cycling Fixed, Distance, Rope and Spring, every collider
+# mask 0: the state, after `warm` frames.
+fn chain20(st: *ImPhysicsState3d, warm) {
+    var g: ImVec3 = ImVec3_new(0.0, -9.81, 0.0);
+    var prev = st.add_body(ImBodyDesc_default());
+    st._body(prev).body_type = IM_BODY_STATIC;
+    var z2: ImVec2 = ImVec2_new(0.0, 0.0);
+    for (var i = 0; i < 20; i = i + 1) {
+        var d: ImBodyDesc = ImBodyDesc_default();
+        var x: f64 = 0.5 + f64_from(i);
+        d.position = ImVec3_new(x, 0.0, 0.0);
+        var h = st.add_body(d);
+        var cd: ImColliderDesc = ImColliderDesc_new(ImColliderShape_box(0.5, 0.1, 0.1));
+        cd.collision_layer = 1;
+        cd.collision_mask = 0;
+        var tc, c = st.add_collider(h, cd);
+        cd.shape.free();
+        var jt: ImJointType = ImJointType_fixed();
+        var k = i % 4;
+        if (k == 1) { jt = ImJointType_distance(1.0); }
+        if (k == 2) { jt = ImJointType_rope(1.05); }
+        if (k == 3) { jt = ImJointType_spring(1.0, 200.0, 4.0); }
+        var la: ImVec2 = ImVec2_new(0.5, 0.0);
+        if (i == 0) { la = z2; }
+        var tj, j = st.add_joint(ImJointDesc_new(prev, h, jt, la, ImVec2_new(-0.5, 0.0)));
+        prev = h;
+    }
+    for (var f = 0; f < warm; f = f + 1) { _t3_frame(st, g); }
+    return 0;
+}
+
+fn bench_step3() {
+    _t3_guard = 0;
+    var g: ImVec3 = ImVec3_new(0.0, -9.81, 0.0);
+    var dt: f64 = 1.0 / 60.0;
+    # The gyroscopic step: an asymmetric box tumbling about an axis off its principal axes.
+    var st: ImPhysicsState3d = ImPhysicsState3d_new();
+    var h = st.add_body(ImBodyDesc_default());
+    var cd: ImColliderDesc = ImColliderDesc_new(ImColliderShape_box(1.0, 0.5, 0.25));
+    var tc, c = st.add_collider(h, cd);
+    cd.shape.free();
+    var rb: *ImRigidBody3d = st._body(h);
+    var w0: ImVec3 = ImVec3_new(3.0, 1.0, 2.0);
+    var zero: ImVec3 = ImVec3_zero();
+    var n = 100000;
+    var b1 = bench_new("b3/integrate_velocities_tumble");
+    bench_batch_start(b1);
+    for (var i = 0; i < n; i = i + 1) {
+        rb.angular_velocity = w0;
+        rb.integrate_velocities(zero, dt, 100.0);
+    }
+    bench_batch_stop(b1, n);
+    bench_report(b1);
+    st.free();
+    # One sub-step's joint work on the 20-link chain: prepare (forces and rows), 4 velocity passes, breaking, 1
+    # position pass.
+    var sc: ImPhysicsState3d = ImPhysicsState3d_new();
+    chain20(&sc, 60);
+    var erp: f64 = _im_b3_error_reduction(30.0, 1.0, 0.2, dt);
+    var m = 10000;
+    var b2 = bench_new("b3/joints_chain20");
+    bench_batch_start(b2);
+    for (var j = 0; j < m; j = j + 1) {
+        sc.prepare_joints(dt);
+        for (var v = 0; v < 4; v = v + 1) { sc.solve_joint_velocities(dt); }
+        sc.break_joints(dt);
+        sc.solve_joint_positions(erp, dt);
+    }
+    bench_batch_stop(b2, m);
+    bench_report(b2);
+    sc.free();
+    # The chain's whole contact-free frame: integration, joints, positions, sleep, finish_step.
+    var sf: ImPhysicsState3d = ImPhysicsState3d_new();
+    chain20(&sf, 60);
+    var b3 = bench_new("b3/frame_chain20 (no contacts)");
+    bench_batch_start(b3);
+    for (var f = 0; f < m; f = f + 1) { _t3_frame(&sf, g); }
+    bench_batch_stop(b3, m);
+    bench_report(b3);
+    sf.free();
+    _t3_guard = 1;
+    return 0;
+}
+
 fn main() {
     alloc_init();
     bench_math3();
@@ -349,6 +437,7 @@ fn main() {
     bench_narrowphase();
     bench_raycast();
     bench_states3();
+    bench_step3();
     return 0;
 }
 

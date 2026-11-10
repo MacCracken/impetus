@@ -700,6 +700,12 @@ def corrections(module, rows):
                 seen = list(dict.fromkeys(log))
                 out.append((fn, " ".join(ins), " ".join(toks), "oracle (dump); " + "; ".join(seen)))
             continue
+        elif module == "b3_step":
+            toks = _Step3d(_logged_hypot(log)).step(ins)
+            if not _same_tokens(outs, toks):
+                seen = list(dict.fromkeys(log))
+                out.append((fn, " ".join(ins), " ".join(toks), "oracle (dump); " + "; ".join(seen)))
+            continue
         elif module == "b3_ray":
             toks = _b3_ray_tokens(ins, prim["sin"], prim["cos"])
             if not _same_tokens(outs, toks):
@@ -5008,6 +5014,543 @@ def check_b3_state(rows):
     return len(rows)
 
 
+# ── the 3D step when nothing touches (backend_3d/solver.rs, joints.rs, types.rs; M5 part 2) ──
+
+B3_SLEEP_V = 0.01
+B3_SLEEP_T = 0.5
+_ZV = (0.0, 0.0, 0.0)
+
+
+def _m_sub(a, b):
+    return tuple(_v_sub(a[c], b[c]) for c in range(3))
+
+
+def _m_neg(a):
+    return tuple(_v_neg(a[c]) for c in range(3))
+
+
+def _m_scale(a, s):
+    return tuple(_v_scale(a[c], s) for c in range(3))
+
+
+def _m_diag(d):
+    return ((d[0], 0.0, 0.0), (0.0, d[1], 0.0), (0.0, 0.0, d[2]))
+
+
+def _m_det(m):
+    """glam's DMat3::determinant: z · (x × y)."""
+    return _v_dot(m[2], _v_cross(m[0], m[1]))
+
+
+def _b3_skew(v):
+    """types.rs `skew`: the columns (0, z, −y), (−z, 0, x), (y, −x, 0)."""
+    return ((0.0, v[2], -v[1]), (-v[2], 0.0, v[0]), (v[1], -v[0], 0.0))
+
+
+def _v_finite(v):
+    return all(math.isfinite(x) for x in v)
+
+
+def _b3_gyro(inertia, w, dt):
+    """types.rs `gyroscopic_step`: one Newton step of the implicit update, rescaled onto the pre-step energy."""
+    iw = _m_mul_vec3(inertia, w)
+    f = _v_scale(_v_cross(w, iw), dt)
+    jac = _m_add(inertia, _m_scale(_m_sub(_m_mul(_b3_skew(w), inertia), _b3_skew(iw)), dt))
+    det = _m_det(jac)
+    if not (math.isfinite(det) and abs(det) > B3_EPSILON_SQ):
+        return w
+    w2 = _v_sub(w, _m_mul_vec3(_m_inverse(jac), f))
+    e1 = _v_dot(w, iw)
+    e2 = _v_dot(w2, _m_mul_vec3(inertia, w2))
+    if not (_v_finite(w2) and math.isfinite(e2)):
+        return w
+    if e2 > B3_EPSILON_SQ and e1 >= 0.0:
+        return _v_scale(w2, rust_sqrt(_np_div(e1, e2)))
+    return w2
+
+
+def _b3_dyn(b):
+    return b["type"] == "e:BodyType.Dynamic"
+
+
+def _b3_integrate_velocities(b, g, dt, max_v):
+    """RigidBody3d::integrate_velocities."""
+    if not _b3_dyn(b) or b["inv_mass"] == 0.0 or b["sleeping"]:
+        return
+    b["vel"] = _v_add(b["vel"], _v_scale(g, b["gs"] * dt))
+    b["vel"] = _v_add(b["vel"], _v_scale(b["force"], b["inv_mass"] * dt))
+    if not b["fixed"]:
+        q_inv = _q_inv(b["rot"])
+        w_body = _b3_gyro(b["inertia"], _q_mul_vec3(q_inv, b["w"]), dt)
+        tau = _q_mul_vec3(q_inv, b["torque"])
+        b["w"] = _q_mul_vec3(b["rot"], _v_add(w_body, _v_scale(_m_mul_vec3(b["inv_inertia"], tau), dt)))
+    b["vel"] = _v_scale(b["vel"], _np_div(1.0, 1.0 + dt * b["ld"]))
+    b["w"] = _v_scale(b["w"], _np_div(1.0, 1.0 + dt * b["ad"]))
+    speed_sq = _v_dot(b["vel"], b["vel"])
+    if speed_sq > max_v * max_v:
+        b["vel"] = _v_scale(b["vel"], _np_div(max_v, rust_sqrt(speed_sq)))
+
+
+def _b3_integrate_positions(b, dt):
+    """RigidBody3d::integrate_positions."""
+    if b["type"] == "e:BodyType.Static" or b["sleeping"]:
+        return
+    if _b3_dyn(b) and b["inv_mass"] == 0.0:
+        return
+    b["pos"] = _v_add(b["pos"], _v_scale(_v_add(b["vel"], b["pv"]), dt))
+    if not b["fixed"]:
+        w = _v_add(b["w"], b["pw"])
+        h = dt * 0.5
+        r = b["rot"]
+        dq = _q_mul((w[0] * h, w[1] * h, w[2] * h, 0.0), r)
+        b["rot"] = _q_normalize((r[0] + dq[0], r[1] + dq[1], r[2] + dq[2], r[3] + dq[3]))
+    b["pv"], b["pw"] = _ZV, _ZV
+    b["world"] = _b3_inv_world(b)
+
+
+def _b3_error_reduction(freq, ratio, corr, dt):
+    """solver.rs `error_reduction`."""
+    if freq > 0.0 and dt > 0.0:
+        omega = 2.0 * math.pi * freq
+        d = 2.0 * ratio * omega
+        k = omega * omega
+        erp = _np_div(dt * k, d + dt * k)
+    else:
+        erp = corr
+    return rust_clamp(erp, 0.0, 1.0) if math.isfinite(erp) else 0.0
+
+
+def _b3_dump_parse(t, k):
+    """A 3D backend dump at token k (dump3d.rs): (state dict, token after it)."""
+    st = {}
+    st["bodies"], k = _dump_arena(t, k)
+    nb = int(t[k][2:])
+    k += 1
+    F = lambda j, n: tuple(tok_f(x) for x in t[j:j + n])
+    for _ in range(nb):
+        b = {"handle": _st_word(t[k]), "type": t[k + 1], "pos": F(k + 2, 3), "rot": F(k + 5, 4), "vel": F(k + 9, 3),
+             "w": F(k + 12, 3), "ld": tok_f(t[k + 15]), "ad": tok_f(t[k + 16]), "fixed": tok_i(t[k + 17]) == 1,
+             "gs": tok_f(t[k + 18]), "force": F(k + 19, 3), "torque": F(k + 22, 3), "mass": tok_f(t[k + 25]),
+             "inv_mass": tok_f(t[k + 26]), "inertia": (F(k + 27, 3), F(k + 30, 3), F(k + 33, 3)),
+             "inv_inertia": (F(k + 36, 3), F(k + 39, 3), F(k + 42, 3)),
+             "world": (F(k + 45, 3), F(k + 48, 3), F(k + 51, 3)), "pv": F(k + 54, 3), "pw": F(k + 57, 3),
+             "sleeping": tok_i(t[k + 60]) == 1, "sleep_timer": tok_f(t[k + 61])}
+        st["bodies"].slots[b["handle"] & 0xFFFFFFFF][3] = b
+        k += 62
+    c0 = k
+    _, k = _dump_arena(t, k)
+    nc = int(t[k][2:])
+    k += 1
+    st["masks"] = []
+    for _ in range(nc):
+        _, k2 = _b3_shape(t, k + 2)
+        st["masks"].append(tok_i(t[k2 + 13]))
+        k = k2 + 14
+    st["coll_tokens"] = t[c0:k]
+    st["joints"], k = _dump_arena(t, k)
+    nj = int(t[k][2:])
+    k += 1
+    for _ in range(nj):
+        h = _st_word(t[k])
+        ke = _st_joint_type_end(t, k + 3)
+        j = {"handle": h, "a": _st_word(t[k + 1]), "b": _st_word(t[k + 2]), "jt": t[k + 3:ke], "la": F(ke, 3),
+             "lb": F(ke + 3, 3), "ref": F(ke + 6, 4)}
+        k = ke + 10
+        if t[k] == "n:":
+            j["motor"], k = t[k:k + 1], k + 1
+        else:
+            j["motor"], k = t[k:k + 2], k + 2
+        j["damping"] = tok_f(t[k])
+        j["brk"] = None if t[k + 1] == "n:" else tok_f(t[k + 1])
+        j["tail"] = t[k:k + 2]
+        k += 2
+        st["joints"].slots[h & 0xFFFFFFFF][3] = j
+    s0 = k
+    nbc = int(t[k][2:])
+    k += 1
+    for _ in range(nbc):
+        k += 2 + int(t[k + 1][2:])
+    st["body_colliders"] = t[s0:k]
+    tr = {}
+    for part in ("prev", "current", "seen"):
+        n = int(t[k][2:])
+        tr[part] = [(_st_word(t[k + 1 + 2 * i]), _st_word(t[k + 2 + 2 * i])) for i in range(n)]
+        k += 1 + 2 * n
+    tr["recorded"] = tok_i(t[k]) == 1
+    st["tracker"] = tr
+    st["manifolds"] = []  # the 3D backend keeps none; _Step2d.record reads the touching pairs from them
+    return st, k + 1
+
+
+def _b3_dump_emit(st):
+    F = lambda *vals: [_st_f(x) for x in vals]
+    M = lambda m: F(*m[0], *m[1], *m[2])
+    out = st["bodies"].tokens() + [f"v:{len(st['bodies'].values())}"]
+    for h, b in st["bodies"].values():
+        out += [_st_h(h), b["type"]] + F(*b["pos"], *b["rot"], *b["vel"], *b["w"], b["ld"], b["ad"])
+        out += [f"i:{int(b['fixed'])}"] + F(b["gs"], *b["force"], *b["torque"], b["mass"], b["inv_mass"])
+        out += M(b["inertia"]) + M(b["inv_inertia"]) + M(b["world"]) + F(*b["pv"], *b["pw"])
+        out += [f"i:{int(b['sleeping'])}"] + F(b["sleep_timer"])
+    out += st["coll_tokens"]
+    out += st["joints"].tokens() + [f"v:{len(st['joints'].values())}"]
+    for h, j in st["joints"].values():
+        out += [_st_h(h), _st_h(j["a"]), _st_h(j["b"])] + j["jt"] + F(*j["la"], *j["lb"], *j["ref"])
+        out += j["motor"] + j["tail"]
+    out += st["body_colliders"]
+    tr = st["tracker"]
+    for part in ("prev", "current", "seen"):
+        out += [f"v:{len(tr[part])}"]
+        for a, b in tr[part]:
+            out += [_st_h(a), _st_h(b)]
+    out += [f"i:{int(tr['recorded'])}"]
+    return out
+
+
+class _Step3d:
+    """The 3D backend's sub-step when nothing touches, transcribed from rust-old (types.rs, joints.rs, solver.rs) in
+    glam's operation order; hypot (a Wheel's break test) is the given one."""
+
+    def __init__(self, hypot):
+        self.hypot = hypot
+
+    # ── joints.rs ──
+
+    @staticmethod
+    def solver_mass(b):
+        return (b["inv_mass"], b["world"]) if _b3_dyn(b) else (0.0, _ZERO3)
+
+    @staticmethod
+    def axial_mass(d, c):
+        ka, kb = _v_cross(c["ra"], d), _v_cross(c["rb"], d)
+        k = c["ma"] + c["mb"] + _v_dot(ka, _m_mul_vec3(c["ia"], ka)) + _v_dot(kb, _m_mul_vec3(c["ib"], kb))
+        return _np_div(1.0, k) if k > B3_EPSILON else 0.0
+
+    @staticmethod
+    def invert_mass(k):
+        det = _m_det(k)
+        return _m_inverse(k) if math.isfinite(det) and det > B3_EPSILON else None
+
+    @staticmethod
+    def rotation_error(q):
+        if q[3] < 0.0:
+            q = (-q[0], -q[1], -q[2], -q[3])
+        return (q[0] * 2.0, q[1] * 2.0, q[2] * 2.0)
+
+    def joint_bodies(self, st, j):
+        ba, bb = st["bodies"].get(j["a"]), st["bodies"].get(j["b"])
+        if ba is None or bb is None:
+            return None
+        (ma, ia), (mb, ib) = self.solver_mass(ba), self.solver_mass(bb)
+        ra, rb = _q_mul_vec3(ba["rot"], j["la"]), _q_mul_vec3(bb["rot"], j["lb"])
+        diff = _v_sub(_v_add(bb["pos"], rb), _v_add(ba["pos"], ra))
+        return {"a": j["a"], "b": j["b"], "ma": ma, "mb": mb, "ia": ia, "ib": ib, "ra": ra, "rb": rb, "diff": diff,
+                "rows": None, "ef": 0.0, "brk": None, "broken": False, "handle": 0}
+
+    def joint_rows(self, st, j, h):
+        c = self.joint_bodies(st, j)
+        if c is None:
+            return None
+        c["handle"], c["brk"] = h, j["brk"]
+        if c["ma"] == 0.0 and c["mb"] == 0.0:
+            return c
+        kind, jt = j["jt"][0].split(".", 1)[1], j["jt"]
+        diff = c["diff"]
+        if kind == "Fixed":
+            sa, sb = _b3_skew(c["ra"]), _b3_skew(c["rb"])
+            ia, ib = c["ia"], c["ib"]
+            k_pp = _m_sub(_m_sub(_m_diag((c["ma"] + c["mb"],) * 3), _m_mul(_m_mul(sa, ia), sa)), _m_mul(_m_mul(sb, ib), sb))
+            k_pl = _m_sub(_m_neg(_m_mul(sb, ib)), _m_mul(sa, ia))
+            k_lp = _m_add(_m_mul(ib, sb), _m_mul(ia, sa))
+            block = None
+            k_ll_inv = self.invert_mass(_m_add(ia, ib))
+            if k_ll_inv is not None:
+                pm = self.invert_mass(_m_sub(k_pp, _m_mul(_m_mul(k_pl, k_ll_inv), k_lp)))
+                if pm is not None:
+                    block = (pm, (k_pl, k_lp, k_ll_inv))
+            if block is None:
+                pm = self.invert_mass(k_pp)
+                if pm is not None:
+                    block = (pm, None)
+            if block is not None:
+                ba, bb = st["bodies"].get(j["a"]), st["bodies"].get(j["b"])
+                locked = _q_mul(ba["rot"], j["ref"])
+                c["rows"] = {"kind": "Fixed", "pm": block[0], "ang": block[1], "pe": diff,
+                             "ae": self.rotation_error(_q_mul(bb["rot"], _q_inv(locked))), "imp": _ZV}
+        elif kind in ("Distance", "Rope"):
+            length = tok_f(jt[1])
+            dist = _v_length(diff)
+            if not (dist < B3_EPSILON or not math.isfinite(length)):
+                axis = _v_div(diff, dist)
+                c["rows"] = {"kind": "Axial", "axis": axis, "mass": self.axial_mass(axis, c), "err": dist - length,
+                             "rope": kind == "Rope", "imp": 0.0, "pimp": 0.0}
+        elif kind == "Wheel":
+            ax = (tok_f(jt[1]), tok_f(jt[2]), 0.0)
+            ln = _v_length(ax)
+            if not (ln < B3_EPSILON or not math.isfinite(ln)):
+                ax = _v_div(ax, ln)
+                p1 = (-ax[1], ax[0], 0.0)
+                p2 = _v_cross(ax, p1)
+                c["rows"] = {"kind": "Perp", "axes": (p1, p2), "m": (self.axial_mass(p1, c), self.axial_mass(p2, c)),
+                             "e": (_v_dot(diff, p1), _v_dot(diff, p2)), "imp": [0.0, 0.0]}
+        return c
+
+    @staticmethod
+    def rel(st, c, pseudo):
+        def vw(h):
+            b = st["bodies"].get(h)
+            if b is None:
+                return _ZV, _ZV
+            return (b["pv"], b["pw"]) if pseudo else (b["vel"], b["w"])
+        (va, wa), (vb, wb) = vw(c["a"]), vw(c["b"])
+        return _v_sub(_v_sub(_v_add(vb, _v_cross(wb, c["rb"])), va), _v_cross(wa, c["ra"])), _v_sub(wb, wa)
+
+    @staticmethod
+    def apply(st, c, p, l, pseudo):
+        lin, ang = ("pv", "pw") if pseudo else ("vel", "w")
+        for side, m, ii, r, sgn in (("a", c["ma"], c["ia"], c["ra"], -1), ("b", c["mb"], c["ib"], c["rb"], 1)):
+            if m > 0.0:
+                b = st["bodies"].get(c[side])
+                if b is not None:
+                    dv = _v_scale(p, m)
+                    dw = _m_mul_vec3(ii, _v_add(_v_cross(r, p), l))
+                    op = _v_sub if sgn < 0 else _v_add
+                    b[lin], b[ang] = op(b[lin], dv), op(b[ang], dw)
+
+    def fixed_block(self, st, c, bias, pseudo):
+        rw = c["rows"]
+        v_rel, w_rel = self.rel(st, c, pseudo)
+        bp, bl = bias if bias is not None else (_ZV, _ZV)
+        rhs_p = _v_neg(_v_add(v_rel, bp))
+        if rw["ang"] is not None:
+            k_pl, k_lp, k_ll_inv = rw["ang"]
+            rhs_l = _v_neg(_v_add(w_rel, bl))
+            p = _m_mul_vec3(rw["pm"], _v_sub(rhs_p, _m_mul_vec3(k_pl, _m_mul_vec3(k_ll_inv, rhs_l))))
+            l = _m_mul_vec3(k_ll_inv, _v_sub(rhs_l, _m_mul_vec3(k_lp, p)))
+        else:
+            p, l = _m_mul_vec3(rw["pm"], rhs_p), _ZV
+        if _v_finite(p) and _v_finite(l):
+            self.apply(st, c, p, l, pseudo)
+            return p
+        return _ZV
+
+    def solve_velocities(self, st, cs, dt):
+        for c in cs:
+            rw = c["rows"]
+            if c["broken"] or rw is None:
+                continue
+            if rw["kind"] == "Fixed":
+                rw["imp"] = _v_add(rw["imp"], self.fixed_block(st, c, None, False))
+            elif rw["kind"] == "Axial":
+                cdot = _v_dot(self.rel(st, c, False)[0], rw["axis"])
+                if rw["rope"]:
+                    bias = _np_div(rw["err"], dt) if rw["err"] < 0.0 and dt > 0.0 else 0.0
+                    new = rust_min(rw["imp"] - (cdot + bias) * rw["mass"], 0.0)
+                    lam = new - rw["imp"]
+                    rw["imp"] = new
+                else:
+                    lam = -cdot * rw["mass"]
+                    rw["imp"] += lam
+                if lam != 0.0:
+                    self.apply(st, c, _v_scale(rw["axis"], lam), _ZV, False)
+            else:
+                for i in range(2):
+                    lam = -_v_dot(self.rel(st, c, False)[0], rw["axes"][i]) * rw["m"][i]
+                    rw["imp"][i] += lam
+                    self.apply(st, c, _v_scale(rw["axes"][i], lam), _ZV, False)
+
+    def solve_positions(self, st, cs, erp, dt):
+        if dt <= 0.0:
+            return
+        rate = _np_div(erp, dt)
+        for c in cs:
+            rw = c["rows"]
+            if c["broken"] or rw is None:
+                continue
+            if rw["kind"] == "Fixed":
+                self.fixed_block(st, c, (_v_scale(rw["pe"], rate), _v_scale(rw["ae"], rate)), True)
+            elif rw["kind"] == "Axial":
+                if not rw["rope"] or rw["err"] > 0.0:
+                    lam = -(_v_dot(self.rel(st, c, True)[0], rw["axis"]) + rw["err"] * rate) * rw["mass"]
+                    if rw["rope"]:
+                        new = rust_min(rw["pimp"] + lam, 0.0)
+                        lam, rw["pimp"] = new - rw["pimp"], new
+                    if lam != 0.0:
+                        self.apply(st, c, _v_scale(rw["axis"], lam), _ZV, True)
+            else:
+                for i in range(2):
+                    lam = -(_v_dot(self.rel(st, c, True)[0], rw["axes"][i]) + rw["e"][i] * rate) * rw["m"][i]
+                    self.apply(st, c, _v_scale(rw["axes"][i], lam), _ZV, True)
+
+    def break_joints(self, st, cs, dt):
+        for c in cs:
+            if c["brk"] is None:
+                continue
+            rw = c["rows"]
+            if rw is None:
+                imp = 0.0
+            elif rw["kind"] == "Fixed":
+                imp = _v_length(rw["imp"])
+            elif rw["kind"] == "Axial":
+                imp = abs(rw["imp"])
+            else:
+                imp = self.hypot(rw["imp"][0], rw["imp"][1])
+            reaction = _np_div(imp, dt) if dt > 0.0 else 0.0
+            if rust_max(reaction, c["ef"]) > c["brk"]:
+                c["broken"] = True
+                st["joints"].remove(c["handle"])
+
+    def axial_spring(self, st, j, axis, rest, k, damping, dt):
+        c = self.joint_bodies(st, j)
+        if c is None:
+            return 0.0
+        diff = c["diff"]
+        if axis is not None:
+            n, stretch = axis, _v_dot(diff, axis)
+        else:
+            dist = _v_length(diff)
+            if dist < B3_EPSILON:
+                return 0.0
+            n, stretch = _v_div(diff, dist), dist - rest
+        total = k * stretch + damping * _v_dot(self.rel(st, c, False)[0], n)
+        if not math.isfinite(total):
+            return 0.0
+        self.apply(st, c, _v_scale(n, -total * dt), _ZV, False)
+        return abs(total)
+
+    def mouse(self, st, j, target, k, damping, max_force, dt):
+        ba = st["bodies"].get(j["a"])
+        if ba is None:
+            return 0.0
+        im, ii = self.solver_mass(ba)
+        ra = _q_mul_vec3(ba["rot"], j["la"])
+        anchor = _v_add(ba["pos"], ra)
+        v_anchor = _v_add(ba["vel"], _v_cross(ba["w"], ra))
+        force = _v_sub(_v_scale(_v_sub(target, anchor), k), _v_scale(v_anchor, damping))
+        cap = 0.0 if math.isnan(max_force) else rust_max(max_force, 0.0)
+        mag = _v_length(force)
+        if not math.isfinite(mag):
+            return 0.0
+        if mag > cap:
+            force = _v_scale(force, _np_div(cap, mag) if mag > 0.0 else 0.0)
+        imp = _v_scale(force, dt)
+        if im > 0.0:
+            ba["vel"] = _v_add(ba["vel"], _v_scale(imp, im))
+            ba["w"] = _v_add(ba["w"], _m_mul_vec3(ii, _v_cross(ra, imp)))
+        return _v_length(force)
+
+    def damping(self, st, j, dt):
+        c = self.joint_bodies(st, j)
+        if c is None:
+            return
+        v_rel = self.rel(st, c, False)[0]
+        speed = _v_length(v_rel)
+        if speed < B3_EPSILON:
+            return
+        d = _v_div(v_rel, speed)
+        mass = self.axial_mass(d, c)
+        if mass == 0.0:
+            return
+        mag = rust_min(j["damping"] * speed * dt, speed * mass)
+        self.apply(st, c, _v_scale(d, -mag), _ZV, False)
+
+    def joint_force(self, st, j, dt):
+        kind, jt = j["jt"][0].split(".", 1)[1], j["jt"]
+        x = [tok_f(t) for t in jt[1:] if t.startswith("f:")]
+        force = 0.0
+        if kind == "Spring":
+            force = self.axial_spring(st, j, None, x[0], x[1], x[2], dt)
+        elif kind == "Wheel":
+            ax = (x[0], x[1], 0.0)
+            ln = _v_length(ax)
+            if not (ln < B3_EPSILON or not math.isfinite(ln)):
+                force = self.axial_spring(st, j, _v_div(ax, ln), 0.0, x[2], x[3], dt)
+        elif kind == "Mouse":
+            force = self.mouse(st, j, (x[0], x[1], x[2]), x[3], x[4], x[5], dt)
+        if j["damping"] > 0.0 and kind != "Spring":
+            self.damping(st, j, dt)
+        return force
+
+    def prepare_joints(self, st, dt):
+        out = []
+        for h, j in st["joints"].values():
+            ef = self.joint_force(st, j, dt)
+            c = self.joint_rows(st, j, h)
+            if c is not None:
+                c["ef"] = ef
+                out.append(c)
+            elif j["brk"] is not None and ef > j["brk"]:
+                st["joints"].remove(h)
+        return out
+
+    # ── solver.rs ──
+
+    def substep(self, st, cfg, dt):
+        bodies = [b for _, b in st["bodies"].values()]
+        for b in bodies:
+            _b3_integrate_velocities(b, cfg["g"], dt, cfg["maxv"])
+            b["world"] = _b3_inv_world(b)
+        cs = self.prepare_joints(st, dt)
+        for _ in range(cfg["iters"]):
+            self.solve_velocities(st, cs, dt)
+        self.break_joints(st, cs, dt)
+        for b in bodies:
+            b["pv"], b["pw"] = _ZV, _ZV
+        if dt > 0.0:
+            erp = _b3_error_reduction(cfg["freq"], cfg["ratio"], cfg["corr"], dt)
+            for _ in range(cfg["piters"]):
+                self.solve_positions(st, cs, erp, dt)
+        for b in bodies:
+            _b3_integrate_positions(b, dt)
+        for b in bodies:
+            if not _b3_dyn(b) or b["inv_mass"] == 0.0:
+                continue
+            if _v_length(b["vel"]) < B3_SLEEP_V and _v_length(b["w"]) < B3_SLEEP_V:
+                b["sleep_timer"] += dt
+                if b["sleep_timer"] >= B3_SLEEP_T:
+                    b["sleeping"], b["vel"], b["w"] = True, _ZV, _ZV
+            else:
+                b["sleep_timer"], b["sleeping"] = 0.0, False
+        _Step2d.record(st)
+
+    def step(self, ins):
+        """The output tokens of a b3_step row."""
+        cfg = {"dt": tok_f(ins[0]), "g": (tok_f(ins[1]), tok_f(ins[2]), tok_f(ins[3])), "iters": tok_i(ins[4]),
+               "piters": tok_i(ins[5]), "corr": tok_f(ins[9]), "maxv": tok_f(ins[10]), "sub": tok_i(ins[11]),
+               "freq": tok_f(ins[12]), "ratio": tok_f(ins[13])}
+        st, k = _b3_dump_parse(ins, 16)
+        if k != len(ins):
+            fail(f"b3_step: {len(ins) - k} input tokens left over")
+        if any(m != 0 for m in st["masks"]):
+            fail("b3_step: a scene has a collider that can pair (mask != 0)")
+        tr = st["tracker"]
+        if tr["prev"] or tr["current"] or tr["seen"]:
+            fail("b3_step: a row's dump has contacts")
+        sub = max(cfg["sub"], 1)
+        dt = cfg["dt"] / float(sub)
+        for _ in range(sub):
+            self.substep(st, cfg, dt)
+        for _, b in st["bodies"].values():
+            b["force"], b["torque"] = _ZV, _ZV
+        ev = _Step2d.finish(st)
+        return _b3_dump_emit(st) + _events_tokens(ev)
+
+
+def check_b3_step(rows):
+    """Recomputes every 3D single-step row on glibc's hypot."""
+    model = _Step3d(_glibc_hypot)
+    for i, (fn, cls, ins, outs, note) in enumerate(rows):
+        if fn != "b3::step":
+            fail(f"b3_step: unknown function {fn}")
+            continue
+        want = model.step(ins)
+        if not _same_tokens(outs, want):
+            first = next((n for n, (a, b) in enumerate(zip(outs, want)) if not _same_tokens([a], [b])),
+                         min(len(outs), len(want)))
+            fail(f"b3_step: row {i}: the transcription differs at output {first} of {len(outs)}: "
+                 f"{' '.join(outs[first:first + 3])} vs {' '.join(want[first:first + 3])}")
+    return len(rows)
+
+
 def main():
     root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
     check_tables(root)
@@ -5024,7 +5567,7 @@ def main():
         rows = read_module(golden / f"{name}.tsv")
         total += len(rows)
         if name in ("math", "spring", "b2_narrow", "b2_ray", "b2_step", "b2_contact", "world_step", "b3_math",
-                    "b3_body", "b3_ray", "b3_state"):
+                    "b3_body", "b3_ray", "b3_state", "b3_step"):
             check_corrections(root, name, golden / f"{name}.tsv", rows)
         if name == "constants":
             check_constants(root, rows)
@@ -5051,6 +5594,9 @@ def main():
             print(f"b2_narrow: {check_b2_narrow(rows)} rows recomputed (a transcription on Python's libm)")
         elif name == "b3_state":
             print(f"b3_state: {check_b3_state(rows)} scripts replayed on a model of the 3D state")
+        elif name == "b3_step":
+            print(f"b3_step: {check_b3_step(rows)} single steps recomputed (integration, gyroscopic step, joints, "
+                  f"sleep)")
         elif name == "b3_ray":
             print(f"b3_ray: {check_b3_ray(rows)} rays recomputed (raycast_impl on glibc's sin and cos)")
         elif name == "b3_narrow":

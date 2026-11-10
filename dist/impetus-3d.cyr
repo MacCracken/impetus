@@ -9267,7 +9267,8 @@ fn _im_b3_wake(rb: *ImRigidBody3d) {
 }
 
 # `bodies`, `colliders` and `joints` are *ImArena words; `body_colliders` is one ImWordList record (three words) per
-# body slot, `list_slots` of them. Mirrors `PhysicsState3d`.
+# body slot, `list_slots` of them. The rest is scratch reused from step to step: `gjk` the narrowphase's, and `jc`
+# (`jc_len` of `jc_cap` ImJointConstraint records) the joint solver's (src/b3_joints.cyr). Mirrors `PhysicsState3d`.
 struct ImPhysicsState3d {
     bodies;
     colliders;
@@ -9276,6 +9277,9 @@ struct ImPhysicsState3d {
     list_slots;
     contact_tracker: ImContactTracker;
     gjk: ImGjkScratch3d;
+    jc;
+    jc_len;
+    jc_cap;
 }
 
 # An empty state. Its arenas are 0 when there is no memory (every operation then refuses). Mirrors
@@ -9290,6 +9294,9 @@ fn ImPhysicsState3d_new(): ImPhysicsState3d {
     s.list_slots = 0;
     s.contact_tracker = ImContactTracker_new();
     s.gjk = ImGjkScratch3d_new();
+    s.jc = 0;
+    s.jc_len = 0;
+    s.jc_cap = 0;
     return s;
 }
 
@@ -9675,7 +9682,876 @@ impl ImPhysicsState3d {
         self.list_slots = 0;
         self.contact_tracker.free();
         self.gjk.free();
+        if (self.jc != 0) { fl_free(self.jc); }
+        self.jc = 0;
+        self.jc_len = 0;
+        self.jc_cap = 0;
         return 0;
+    }
+}
+
+# --- b3_joints.cyr ---
+
+# b3_joints.cyr — 3D joint constraints (port of rust-old/src/backend_3d/joints.rs).
+#
+# Fixed, Distance, Rope and the Wheel's two perpendicular rows are velocity-level constraints solved with sequential
+# impulses, each row mass-weighted with linear and angular terms; position drift is removed with split-impulse
+# pseudo-velocities. A Fixed joint locks the anchors and the relative rotation it was made with, as one coupled 6×6
+# block solved through the Schur complement. Spring, the Wheel's suspension, Mouse and the per-joint damping are
+# explicit forces, applied once per sub-step. Revolute and Prismatic joints (and motors) are not implemented in 3D in
+# Rust 1.4.0: silent no-ops apart from the per-joint damping. Wheel axes are world directions in the XY plane; local
+# anchors are the 2D anchors at z = 0.
+#
+# `prepare_joints` applies the explicit forces and builds each joint's rows into the state's scratch (`jc`, reused
+# from step to step, so the heap stays flat); `solve_joint_velocities` and `solve_joint_positions` run one pass each;
+# `break_joints` removes the joints whose reaction exceeded their limit. Every expression keeps Rust's operation order
+# on src/math3.cyr's glam transcriptions (ADR 0012), so the joints add only + − × ÷ √ and crmath's hypot (ADR 0011).
+#
+# A struct-returning call whose arguments read a struct-typed field is bound to a local before it is stored into a
+# field (the cyrius 6.7.18 field-store defect, src/b3_types.cyr's header).
+
+# The rows a joint has this sub-step. Mirrors `JointRows`'s variants.
+const _IM_B3_ROWS_NONE = 0;
+const _IM_B3_ROWS_FIXED = 1;
+const _IM_B3_ROWS_AXIAL = 2;
+const _IM_B3_ROWS_PERP = 3;
+
+# ── records ─────────────────────────────────────────────────────────────────────────
+
+# One joint's solver state for a sub-step: its bodies' solver inverses (zero unless dynamic), the world lever arms and
+# its rows. `kind` picks the rows; each kind's fields are meaningful only for it:
+# - Fixed: point_mass (the point block's inverse effective mass: the Schur complement's when the rotation is locked,
+#   has_angular 1 with the coupling blocks k_pl, k_lp and k_ll_inv), point_error (anchor_b − anchor_a), angular_error
+#   (B's small-angle error from its locked rotation) and the accumulated point impulse;
+# - Axial (Distance, or Rope with rope 1): the unit axis A → B, its effective mass, distance − length, and the
+#   accumulated velocity and position impulses;
+# - Perpendicular (Wheel): two axes p1, p2 across the suspension, their masses m1, m2, errors e1, e2 and impulses.
+# Mirrors `JointConstraint` (with `JointRows` and `FixedAngular` inline).
+struct ImJointConstraint {
+    handle;
+    body_a;
+    body_b;
+    inv_mass_a: f64;
+    inv_mass_b: f64;
+    inv_i_a: ImMat3;
+    inv_i_b: ImMat3;
+    ra: ImVec3;
+    rb: ImVec3;
+    kind;
+    point_mass: ImMat3;
+    has_angular;
+    k_pl: ImMat3;
+    k_lp: ImMat3;
+    k_ll_inv: ImMat3;
+    point_error: ImVec3;
+    angular_error: ImVec3;
+    impulse: ImVec3;
+    axis: ImVec3;
+    mass: f64;
+    error: f64;
+    rope;
+    ax_impulse: f64;
+    position_impulse: f64;
+    p1: ImVec3;
+    p2: ImVec3;
+    m1: f64;
+    m2: f64;
+    e1: f64;
+    e2: f64;
+    i1: f64;
+    i2: f64;
+    explicit_force: f64;
+    has_break_force;
+    break_force: f64;
+    broken;
+}
+
+#must_use
+fn _im_b3_as_jc(p): *ImJointConstraint { return p; }
+#must_use
+fn _im_b3_as_v3(p): *ImVec3 { return p; }
+
+# ── helpers ─────────────────────────────────────────────────────────────────────────
+
+# The inverse mass a body gives the solver, with its world inverse inertia into *inv_i: the body's own for a dynamic
+# body, zero for a static or kinematic one. Mirrors `solver_mass` (backend_3d/solver.rs).
+fn _im_b3_solver_mass(b: *ImRigidBody3d, inv_i: *ImMat3): f64 {
+    if (b.is_dynamic() == 1) {
+        var w: ImMat3 = b.inv_inertia_world;
+        inv_i.x = w.x;
+        inv_i.y = w.y;
+        inv_i.z = w.z;
+        var im: f64 = b.inv_mass;
+        return im;
+    }
+    var z: ImVec3 = ImVec3_zero();
+    inv_i.x = z;
+    inv_i.y = z;
+    inv_i.z = z;
+    return 0.0;
+}
+
+# The scalar effective mass 1/K along d for the lever arms ra, rb: K = m_a⁻¹ + m_b⁻¹ + (ra × d)·I_a⁻¹(ra × d) +
+# (rb × d)·I_b⁻¹(rb × d), and 0 when K is not above EPSILON. Mirrors `axial_mass`.
+#must_use
+fn _im_b3_axial_mass(d: ImVec3, ra: ImVec3, rb: ImVec3, inv_mass_a: f64, inv_mass_b: f64, inv_i_a: ImMat3,
+  inv_i_b: ImMat3): f64 {
+    var ka: ImVec3 = ImVec3_cross(ra, d);
+    var kb: ImVec3 = ImVec3_cross(rb, d);
+    var ika: ImVec3 = ImMat3_mul_vec3(inv_i_a, ka);
+    var ikb: ImVec3 = ImMat3_mul_vec3(inv_i_b, kb);
+    var da: f64 = ImVec3_dot(ka, ika);
+    var db: f64 = ImVec3_dot(kb, ikb);
+    var k: f64 = inv_mass_a + inv_mass_b + da + db;
+    if (k > _IM_B3_EPSILON) {
+        var inv: f64 = 1.0 / k;
+        return inv;
+    }
+    return 0.0;
+}
+
+# The inverse of a symmetric 3×3 effective-mass matrix into *out when its determinant is finite and above EPSILON:
+# 1, or 0 (out untouched). Mirrors `invert_mass`.
+fn _im_b3_invert_mass(k: ImMat3, out: *ImMat3): i64 {
+    var det: f64 = ImMat3_determinant(k);
+    if (_im_is_finite(det) == 1 && det > _IM_B3_EPSILON) {
+        var inv: ImMat3 = ImMat3_inverse(k);
+        out.x = inv.x;
+        out.y = inv.y;
+        out.z = inv.z;
+        return 1;
+    }
+    return 0;
+}
+
+# The small-angle error vector of rotation q along the shortest arc: 2·(x, y, z) of q, or of −q when q.w < 0.
+# Mirrors `rotation_error`.
+#must_use
+fn _im_b3_rotation_error(q: ImQuat): ImVec3 {
+    var x: f64 = q.x;
+    var y: f64 = q.y;
+    var z: f64 = q.z;
+    var w: f64 = q.w;
+    if (w < 0.0) {
+        # glam's `-q` is `q * -1.0`, which LLVM folds to a sign flip.
+        x = -x;
+        y = -y;
+        z = -z;
+    }
+    var ex: f64 = x * 2.0;
+    var ey: f64 = y * 2.0;
+    var ez: f64 = z * 2.0;
+    return ImVec3_new(ex, ey, ez);
+}
+
+impl ImPhysicsState3d {
+    # Room in the scratch for n joint constraints: 1, or 0 when there is no memory.
+    fn _jc_scratch(self, n): i64 {
+        if (n > self.jc_cap) {
+            var cap = n;
+            if (cap < 8) { cap = 8; }
+            var p = fl_alloc(cap * sizeof(ImJointConstraint));
+            if (p == 0) { return 0; }
+            if (self.jc != 0) { fl_free(self.jc); }
+            self.jc = p;
+            self.jc_cap = cap;
+        }
+        return 1;
+    }
+
+    # The i-th prepared joint constraint.
+    #must_use
+    fn _jc_at(self, i): *ImJointConstraint {
+        return _im_b3_as_jc(self.jc + i * sizeof(ImJointConstraint));
+    }
+
+    # Joint j's bodies into c (handle 0, no rows, no break force, not broken), with the anchor separation
+    # (bb.position + rb) − (ba.position + ra) into *diff: 1, or 0 when either body is missing. Mirrors `joint_bodies`.
+    fn joint_bodies(self, j: *ImJoint3d, c: *ImJointConstraint, diff: *ImVec3): i64 {
+        var ba: *ImRigidBody3d = self._body(j.body_a);
+        var bb: *ImRigidBody3d = self._body(j.body_b);
+        if (ba == 0 || bb == 0) { return 0; }
+        var ia: ImMat3;
+        var ib: ImMat3;
+        var ma: f64 = _im_b3_solver_mass(ba, &ia);
+        var mb: f64 = _im_b3_solver_mass(bb, &ib);
+        var ra: ImVec3 = ImQuat_mul_vec3(ba.rotation, j.local_anchor_a);
+        var rb: ImVec3 = ImQuat_mul_vec3(bb.rotation, j.local_anchor_b);
+        var pa: ImVec3 = ba.position + ra;
+        var pb: ImVec3 = bb.position + rb;
+        var d: ImVec3 = pb - pa;
+        diff.x = d.x;
+        diff.y = d.y;
+        diff.z = d.z;
+        c.handle = 0;
+        c.body_a = j.body_a;
+        c.body_b = j.body_b;
+        c.inv_mass_a = ma;
+        c.inv_mass_b = mb;
+        c.inv_i_a = ia;
+        c.inv_i_b = ib;
+        c.ra = ra;
+        c.rb = rb;
+        c.kind = _IM_B3_ROWS_NONE;
+        c.has_angular = 0;
+        c.impulse = ImVec3_zero();
+        c.rope = 0;
+        c.ax_impulse = 0.0;
+        c.position_impulse = 0.0;
+        c.i1 = 0.0;
+        c.i2 = 0.0;
+        c.explicit_force = 0.0;
+        c.has_break_force = 0;
+        c.break_force = 0.0;
+        c.broken = 0;
+        return 1;
+    }
+
+    # The effective mass along d for constraint c's bodies (`axial_mass` with c's arms, inverse masses and inertias).
+    #must_use
+    fn _jc_axial_mass(self, c: *ImJointConstraint, d: ImVec3): f64 {
+        var m: f64 = _im_b3_axial_mass(d, c.ra, c.rb, c.inv_mass_a, c.inv_mass_b, c.inv_i_a, c.inv_i_b);
+        return m;
+    }
+
+    # Joint j's constraint rows (handle h) into c from the current positions: 1, or 0 when either body is missing.
+    # No rows when neither body is dynamic with mass, or for a Spring, Mouse, Revolute or Prismatic joint; a Fixed
+    # joint whose blocks can't be inverted, a Distance or Rope joint at zero or with a non-finite length, and a Wheel
+    # with a zero or non-finite axis have none either. Mirrors `joint_rows`.
+    fn joint_rows(self, j: *ImJoint3d, h, c: *ImJointConstraint): i64 {
+        var diff: ImVec3;
+        if (self.joint_bodies(j, c, &diff) == 0) { return 0; }
+        c.handle = h;
+        c.has_break_force = j.has_break_force;
+        var bf: f64 = j.break_force;
+        c.break_force = bf;
+        var ma: f64 = c.inv_mass_a;
+        var mb: f64 = c.inv_mass_b;
+        if (ma == 0.0 && mb == 0.0) { return 1; }
+        var kind = j.joint_type.kind;
+        if (kind == IM_JOINT_FIXED) {
+            self._fixed_rows(j, c, diff);
+        } elif (kind == IM_JOINT_DISTANCE || kind == IM_JOINT_ROPE) {
+            var length: f64 = j.joint_type.length;
+            if (kind == IM_JOINT_ROPE) { length = j.joint_type.max_length; }
+            var dist: f64 = ImVec3_length(diff);
+            if (!(dist < _IM_B3_EPSILON) && _im_is_finite(length) == 1) {
+                var axis: ImVec3 = ImVec3_div_scalar(diff, dist);
+                var am: f64 = self._jc_axial_mass(c, axis);
+                c.kind = _IM_B3_ROWS_AXIAL;
+                c.axis = axis;
+                c.mass = am;
+                c.error = dist - length;
+                c.rope = 0;
+                if (kind == IM_JOINT_ROPE) { c.rope = 1; }
+            }
+        } elif (kind == IM_JOINT_WHEEL) {
+            var wx: f64 = j.joint_type.axis.x;
+            var wy: f64 = j.joint_type.axis.y;
+            var ax: ImVec3 = ImVec3_new(wx, wy, 0.0);
+            var len: f64 = ImVec3_length(ax);
+            if (!(len < _IM_B3_EPSILON) && _im_is_finite(len) == 1) {
+                var u: ImVec3 = ImVec3_div_scalar(ax, len);
+                var p1: ImVec3 = ImVec3_new(-u.y, u.x, 0.0);
+                var p2: ImVec3 = ImVec3_cross(u, p1);
+                var m1: f64 = self._jc_axial_mass(c, p1);
+                var m2: f64 = self._jc_axial_mass(c, p2);
+                var e1: f64 = ImVec3_dot(diff, p1);
+                var e2: f64 = ImVec3_dot(diff, p2);
+                c.kind = _IM_B3_ROWS_PERP;
+                c.p1 = p1;
+                c.p2 = p2;
+                c.m1 = m1;
+                c.m2 = m2;
+                c.e1 = e1;
+                c.e2 = e2;
+            }
+        }
+        return 1;
+    }
+
+    # A Fixed joint's rows into c, from the effective-mass blocks
+    #   K_pp = (m_a⁻¹ + m_b⁻¹)·1 − [ra]·I_a⁻¹·[ra] − [rb]·I_b⁻¹·[rb],
+    #   K_pl = −([rb]·I_b⁻¹) − [ra]·I_a⁻¹,  K_lp = I_b⁻¹·[rb] + I_a⁻¹·[ra],  K_ll = I_a⁻¹ + I_b⁻¹.
+    # With K_ll invertible and its Schur complement too, the coupled block; else the point block alone; else no rows.
+    # Part of `joint_rows`.
+    fn _fixed_rows(self, j: *ImJoint3d, c: *ImJointConstraint, diff: ImVec3) {
+        var sa: ImMat3 = _im_b3_skew(c.ra);
+        var sb: ImMat3 = _im_b3_skew(c.rb);
+        var ia: ImMat3 = c.inv_i_a;
+        var ib: ImMat3 = c.inv_i_b;
+        var msum: f64 = c.inv_mass_a + c.inv_mass_b;
+        var dg: ImMat3 = ImMat3_from_diagonal(ImVec3_splat(msum));
+        var sa_ia: ImMat3 = ImMat3_mul_mat3(sa, ia);
+        var sb_ib: ImMat3 = ImMat3_mul_mat3(sb, ib);
+        var t1: ImMat3 = ImMat3_mul_mat3(sa_ia, sa);
+        var t2: ImMat3 = ImMat3_mul_mat3(sb_ib, sb);
+        var k_pp: ImMat3 = (dg - t1) - t2;
+        var k_pl: ImMat3 = ImMat3_neg(sb_ib) - sa_ia;
+        var k_lp: ImMat3 = ImMat3_mul_mat3(ib, sb) + ImMat3_mul_mat3(ia, sa);
+        var k_ll: ImMat3 = ia + ib;
+        var k_ll_inv: ImMat3;
+        var pm: ImMat3;
+        var found = 0;
+        var angular = 0;
+        if (_im_b3_invert_mass(k_ll, &k_ll_inv) == 1) {
+            var kpl_kll: ImMat3 = ImMat3_mul_mat3(k_pl, k_ll_inv);
+            var schur: ImMat3 = k_pp - ImMat3_mul_mat3(kpl_kll, k_lp);
+            if (_im_b3_invert_mass(schur, &pm) == 1) {
+                found = 1;
+                angular = 1;
+            }
+        }
+        if (found == 0) { found = _im_b3_invert_mass(k_pp, &pm); }
+        if (found == 0) { return 0; }
+        var ba: *ImRigidBody3d = self._body(j.body_a);
+        var bb: *ImRigidBody3d = self._body(j.body_b);
+        var locked: ImQuat = ImQuat_mul_quat(ba.rotation, j.reference_rotation);
+        var rel: ImQuat = ImQuat_mul_quat(bb.rotation, ImQuat_inverse(locked));
+        var ae: ImVec3 = _im_b3_rotation_error(rel);
+        c.kind = _IM_B3_ROWS_FIXED;
+        c.point_mass = pm;
+        c.has_angular = angular;
+        if (angular == 1) {
+            c.k_pl = k_pl;
+            c.k_lp = k_lp;
+            c.k_ll_inv = k_ll_inv;
+        }
+        c.point_error = diff;
+        c.angular_error = ae;
+        c.impulse = ImVec3_zero();
+        return 0;
+    }
+
+    # The relative anchor velocity (B − A) of constraint c, real or pseudo (pseudo 1), with the relative angular
+    # velocity into *w_rel when it is not 0; a missing body moves at zero. Mirrors `joint_relative_velocity`.
+    fn joint_relative_velocity(self, c: *ImJointConstraint, pseudo, w_rel): ImVec3 {
+        var z: ImVec3 = ImVec3_zero();
+        var va: ImVec3 = z;
+        var wa: ImVec3 = z;
+        var vb: ImVec3 = z;
+        var wb: ImVec3 = z;
+        var ba: *ImRigidBody3d = self._body(c.body_a);
+        var bb: *ImRigidBody3d = self._body(c.body_b);
+        if (ba != 0) {
+            if (pseudo == 1) {
+                va = ba.pseudo_velocity;
+                wa = ba.pseudo_angular_velocity;
+            } else {
+                va = ba.linear_velocity;
+                wa = ba.angular_velocity;
+            }
+        }
+        if (bb != 0) {
+            if (pseudo == 1) {
+                vb = bb.pseudo_velocity;
+                wb = bb.pseudo_angular_velocity;
+            } else {
+                vb = bb.linear_velocity;
+                wb = bb.angular_velocity;
+            }
+        }
+        if (w_rel != 0) {
+            var wr: *ImVec3 = _im_b3_as_v3(w_rel);
+            var dw: ImVec3 = wb - wa;
+            wr.x = dw.x;
+            wr.y = dw.y;
+            wr.z = dw.z;
+        }
+        var cb: ImVec3 = ImVec3_cross(wb, c.rb);
+        var ca: ImVec3 = ImVec3_cross(wa, c.ra);
+        var r: ImVec3 = ((vb + cb) - va) - ca;
+        return r;
+    }
+
+    # Applies a linear impulse p at the anchors (−p on A, +p on B) and an angular impulse l (−l on A, +l on B) to the
+    # velocities, or to the pseudo-velocities (pseudo 1), of the sides that have mass. Mirrors `apply_joint_impulse`.
+    fn apply_joint_impulse(self, c: *ImJointConstraint, p: ImVec3, l: ImVec3, pseudo) {
+        var ma: f64 = c.inv_mass_a;
+        var mb: f64 = c.inv_mass_b;
+        if (ma > 0.0) {
+            var ba: *ImRigidBody3d = self._body(c.body_a);
+            if (ba != 0) {
+                var dva: ImVec3 = ImVec3_scale(p, ma);
+                var arm_a: ImVec3 = ImVec3_cross(c.ra, p) + l;
+                var dwa: ImVec3 = ImMat3_mul_vec3(c.inv_i_a, arm_a);
+                if (pseudo == 1) {
+                    var pva: ImVec3 = ba.pseudo_velocity - dva;
+                    var pwa: ImVec3 = ba.pseudo_angular_velocity - dwa;
+                    ba.pseudo_velocity = pva;
+                    ba.pseudo_angular_velocity = pwa;
+                } else {
+                    var lva: ImVec3 = ba.linear_velocity - dva;
+                    var lwa: ImVec3 = ba.angular_velocity - dwa;
+                    ba.linear_velocity = lva;
+                    ba.angular_velocity = lwa;
+                }
+            }
+        }
+        if (mb > 0.0) {
+            var bb: *ImRigidBody3d = self._body(c.body_b);
+            if (bb != 0) {
+                var dvb: ImVec3 = ImVec3_scale(p, mb);
+                var arm_b: ImVec3 = ImVec3_cross(c.rb, p) + l;
+                var dwb: ImVec3 = ImMat3_mul_vec3(c.inv_i_b, arm_b);
+                if (pseudo == 1) {
+                    var pvb: ImVec3 = bb.pseudo_velocity + dvb;
+                    var pwb: ImVec3 = bb.pseudo_angular_velocity + dwb;
+                    bb.pseudo_velocity = pvb;
+                    bb.pseudo_angular_velocity = pwb;
+                } else {
+                    var lvb: ImVec3 = bb.linear_velocity + dvb;
+                    var lwb: ImVec3 = bb.angular_velocity + dwb;
+                    bb.linear_velocity = lvb;
+                    bb.angular_velocity = lwb;
+                }
+            }
+        }
+        return 0;
+    }
+
+    # Solves a Fixed joint's coupled point and angular block in one shot through the Schur complement,
+    # [K_pp K_pl; K_lp K_ll]·[P; L] = −[ċ_p + b_p; ċ_l + b_l] (the point block alone without the angular lock), on the
+    # velocities or pseudo-velocities, and applies it when P and L are finite: P, or zero. The biases are zero for the
+    # velocity pass. Mirrors `solve_fixed_block`.
+    fn solve_fixed_block(self, c: *ImJointConstraint, bias_p: ImVec3, bias_l: ImVec3, pseudo): ImVec3 {
+        var w_rel: ImVec3;
+        var v_rel: ImVec3 = self.joint_relative_velocity(c, pseudo, &w_rel);
+        var rhs_p: ImVec3 = ImVec3_neg(v_rel + bias_p);
+        var p: ImVec3;
+        var l: ImVec3;
+        if (c.has_angular == 1) {
+            var rhs_l: ImVec3 = ImVec3_neg(w_rel + bias_l);
+            var t0: ImVec3 = ImMat3_mul_vec3(c.k_ll_inv, rhs_l);
+            var t1: ImVec3 = ImMat3_mul_vec3(c.k_pl, t0);
+            p = ImMat3_mul_vec3(c.point_mass, rhs_p - t1);
+            var t2: ImVec3 = ImMat3_mul_vec3(c.k_lp, p);
+            l = ImMat3_mul_vec3(c.k_ll_inv, rhs_l - t2);
+        } else {
+            p = ImMat3_mul_vec3(c.point_mass, rhs_p);
+            l = ImVec3_zero();
+        }
+        if (ImVec3_is_finite(p) == 1 && ImVec3_is_finite(l) == 1) {
+            self.apply_joint_impulse(c, p, l, pseudo);
+            return p;
+        }
+        return ImVec3_zero();
+    }
+
+    # One velocity pass over the prepared joints: Fixed blocks, the Distance and Rope rows (a slack rope may close the
+    # gap this step, never push) and the Wheel's two perpendicular rows. Mirrors `solve_joint_velocities`.
+    fn solve_joint_velocities(self, dt: f64) {
+        var z: ImVec3 = ImVec3_zero();
+        for (var i = 0; i < self.jc_len; i = i + 1) {
+            var c: *ImJointConstraint = self._jc_at(i);
+            if (c.broken == 0) {
+                if (c.kind == _IM_B3_ROWS_FIXED) {
+                    var pf: ImVec3 = self.solve_fixed_block(c, z, z, 0);
+                    var acc: ImVec3 = c.impulse + pf;
+                    c.impulse = acc;
+                } elif (c.kind == _IM_B3_ROWS_AXIAL) {
+                    var v_rel: ImVec3 = self.joint_relative_velocity(c, 0, 0);
+                    var cdot: f64 = ImVec3_dot(v_rel, c.axis);
+                    var mass: f64 = c.mass;
+                    var imp: f64 = c.ax_impulse;
+                    var lambda: f64 = 0.0;
+                    if (c.rope == 1) {
+                        var err: f64 = c.error;
+                        var bias: f64 = 0.0;
+                        if (err < 0.0 && dt > 0.0) { bias = err / dt; }
+                        var ni: f64 = _im_min(imp - (cdot + bias) * mass, 0.0);
+                        lambda = ni - imp;
+                        c.ax_impulse = ni;
+                    } else {
+                        var ncdot: f64 = -cdot;
+                        lambda = ncdot * mass;
+                        c.ax_impulse = imp + lambda;
+                    }
+                    if (lambda != 0.0) {
+                        var pa: ImVec3 = ImVec3_scale(c.axis, lambda);
+                        self.apply_joint_impulse(c, pa, z, 0);
+                    }
+                } elif (c.kind == _IM_B3_ROWS_PERP) {
+                    var v1: ImVec3 = self.joint_relative_velocity(c, 0, 0);
+                    var d1: f64 = ImVec3_dot(v1, c.p1);
+                    var nd1: f64 = -d1;
+                    var l1: f64 = nd1 * c.m1;
+                    var i1: f64 = c.i1;
+                    c.i1 = i1 + l1;
+                    var q1: ImVec3 = ImVec3_scale(c.p1, l1);
+                    self.apply_joint_impulse(c, q1, z, 0);
+                    var v2: ImVec3 = self.joint_relative_velocity(c, 0, 0);
+                    var d2: f64 = ImVec3_dot(v2, c.p2);
+                    var nd2: f64 = -d2;
+                    var l2: f64 = nd2 * c.m2;
+                    var i2: f64 = c.i2;
+                    c.i2 = i2 + l2;
+                    var q2: ImVec3 = ImVec3_scale(c.p2, l2);
+                    self.apply_joint_impulse(c, q2, z, 0);
+                }
+            }
+        }
+        return 0;
+    }
+
+    # One split-impulse position pass over the prepared joints: drives each row's pseudo relative velocity to
+    # −erp·error/dt (a rope only while stretched, its accumulated position impulse kept ≤ 0). Nothing for dt ≤ 0.
+    # Mirrors `solve_joint_positions`.
+    fn solve_joint_positions(self, erp: f64, dt: f64) {
+        if (dt <= 0.0) { return 0; }
+        var rate: f64 = erp / dt;
+        var z: ImVec3 = ImVec3_zero();
+        for (var i = 0; i < self.jc_len; i = i + 1) {
+            var c: *ImJointConstraint = self._jc_at(i);
+            if (c.broken == 0) {
+                if (c.kind == _IM_B3_ROWS_FIXED) {
+                    var bp: ImVec3 = ImVec3_scale(c.point_error, rate);
+                    var bl: ImVec3 = ImVec3_scale(c.angular_error, rate);
+                    var unused: ImVec3 = self.solve_fixed_block(c, bp, bl, 1);
+                } elif (c.kind == _IM_B3_ROWS_AXIAL) {
+                    var err: f64 = c.error;
+                    if (c.rope == 0 || err > 0.0) {
+                        var v_rel: ImVec3 = self.joint_relative_velocity(c, 1, 0);
+                        var dv: f64 = ImVec3_dot(v_rel, c.axis);
+                        var s: f64 = dv + err * rate;
+                        var ns: f64 = -s;
+                        var mass: f64 = c.mass;
+                        var lambda: f64 = ns * mass;
+                        if (c.rope == 1) {
+                            var pi: f64 = c.position_impulse;
+                            var ni: f64 = _im_min(pi + lambda, 0.0);
+                            lambda = ni - pi;
+                            c.position_impulse = ni;
+                        }
+                        if (lambda != 0.0) {
+                            var pa: ImVec3 = ImVec3_scale(c.axis, lambda);
+                            self.apply_joint_impulse(c, pa, z, 1);
+                        }
+                    }
+                } elif (c.kind == _IM_B3_ROWS_PERP) {
+                    var v1: ImVec3 = self.joint_relative_velocity(c, 1, 0);
+                    var d1: f64 = ImVec3_dot(v1, c.p1);
+                    var e1: f64 = c.e1;
+                    var s1: f64 = d1 + e1 * rate;
+                    var ns1: f64 = -s1;
+                    var l1: f64 = ns1 * c.m1;
+                    var q1: ImVec3 = ImVec3_scale(c.p1, l1);
+                    self.apply_joint_impulse(c, q1, z, 1);
+                    var v2: ImVec3 = self.joint_relative_velocity(c, 1, 0);
+                    var d2: f64 = ImVec3_dot(v2, c.p2);
+                    var e2: f64 = c.e2;
+                    var s2: f64 = d2 + e2 * rate;
+                    var ns2: f64 = -s2;
+                    var l2: f64 = ns2 * c.m2;
+                    var q2: ImVec3 = ImVec3_scale(c.p2, l2);
+                    self.apply_joint_impulse(c, q2, z, 1);
+                }
+            }
+        }
+        return 0;
+    }
+
+    # Removes, in prepared order, the joints whose reaction this sub-step (the rows' accumulated impulse over dt, or the
+    # explicit force, whichever is larger) exceeded their break_force. Mirrors `break_joints`.
+    fn break_joints(self, dt: f64) {
+        var ja: *ImArena = self._joints();
+        for (var i = 0; i < self.jc_len; i = i + 1) {
+            var c: *ImJointConstraint = self._jc_at(i);
+            if (c.has_break_force == 1) {
+                var impulse: f64 = 0.0;
+                if (c.kind == _IM_B3_ROWS_FIXED) {
+                    impulse = ImVec3_length(c.impulse);
+                } elif (c.kind == _IM_B3_ROWS_AXIAL) {
+                    var ai: f64 = c.ax_impulse;
+                    impulse = f64_abs(ai);
+                } elif (c.kind == _IM_B3_ROWS_PERP) {
+                    var pi1: f64 = c.i1;
+                    var pi2: f64 = c.i2;
+                    impulse = _im_hypot(pi1, pi2);
+                }
+                var reaction: f64 = 0.0;
+                if (dt > 0.0) { reaction = impulse / dt; }
+                var ef: f64 = c.explicit_force;
+                var bf: f64 = c.break_force;
+                var r: f64 = _im_max(reaction, ef);
+                if (r > bf) {
+                    c.broken = 1;
+                    ja.remove(c.handle, 0);
+                }
+            }
+        }
+        return 0;
+    }
+
+    # Applies the explicit joint forces for sub-step dt, then builds every joint's rows into the scratch, in joint slot
+    # order: the number prepared (-1 when there is no memory). A joint without its bodies has no rows; it is removed
+    # when its explicit force (a Mouse joint's needs only body A) exceeded its break_force. Mirrors `prepare_joints`.
+    fn prepare_joints(self, dt: f64): i64 {
+        self.jc_len = 0;
+        var ja: *ImArena = self._joints();
+        if (self._jc_scratch(ja.len()) == 0) { return 0 - 1; }
+        var n = 0;
+        for (var s = 0; s < ja.slot_count(); s = s + 1) {
+            var h = ja.slot_handle(s);
+            if (h != 0 - 1) {
+                var j: *ImJoint3d = _im_b3_as_joint(ja.get(h));
+                var ef: f64 = self.apply_joint_force(j, dt);
+                var c: *ImJointConstraint = self._jc_at(n);
+                if (self.joint_rows(j, h, c) == 1) {
+                    c.explicit_force = ef;
+                    n = n + 1;
+                } else {
+                    var bf: f64 = j.break_force;
+                    if (j.has_break_force == 1 && ef > bf) { ja.remove(h, 0); }
+                }
+            }
+        }
+        self.jc_len = n;
+        return n;
+    }
+
+    # Applies joint j's explicit forces for dt (a Spring; a Wheel's suspension along its unit axis at zero rest
+    # length; a Mouse drag), then its per-joint damping unless it is a Spring: the explicit force's magnitude (for
+    # breaking). Revolute and Prismatic joints have none in 3D. Mirrors `apply_joint_force`.
+    fn apply_joint_force(self, j: *ImJoint3d, dt: f64): f64 {
+        var kind = j.joint_type.kind;
+        var force: f64 = 0.0;
+        var z: ImVec3 = ImVec3_zero();
+        var k: f64 = j.joint_type.stiffness;
+        var cd: f64 = j.joint_type.damping;
+        if (kind == IM_JOINT_SPRING) {
+            var rest: f64 = j.joint_type.rest_length;
+            force = self.apply_axial_spring(j, 0, z, rest, k, cd, dt);
+        } elif (kind == IM_JOINT_WHEEL) {
+            var wx: f64 = j.joint_type.axis.x;
+            var wy: f64 = j.joint_type.axis.y;
+            var ax: ImVec3 = ImVec3_new(wx, wy, 0.0);
+            var len: f64 = ImVec3_length(ax);
+            if (!(len < _IM_B3_EPSILON) && _im_is_finite(len) == 1) {
+                var u: ImVec3 = ImVec3_div_scalar(ax, len);
+                force = self.apply_axial_spring(j, 1, u, 0.0, k, cd, dt);
+            }
+        } elif (kind == IM_JOINT_MOUSE) {
+            var mf: f64 = j.joint_type.max_force;
+            force = self.apply_mouse_force(j, j.joint_type.target, k, cd, mf, dt);
+        }
+        var jd: f64 = j.damping;
+        if (jd > 0.0 && kind != IM_JOINT_SPRING) { self.apply_joint_damping_3d(j, dt); }
+        return force;
+    }
+
+    # A spring-damper between joint j's anchors along their separation (has_axis 0), or along the fixed unit `axis`
+    # with zero rest length (the Wheel's suspension): F = k·stretch + c·(v_rel·n), applied as −F·n·dt on B and +F·n·dt
+    # on A. Its |F|, or 0 when a body is missing, the anchors coincide, or F is not finite. Mirrors
+    # `apply_axial_spring`.
+    fn apply_axial_spring(self, j: *ImJoint3d, has_axis, axis: ImVec3, rest_length: f64, stiffness: f64, damping: f64,
+      dt: f64): f64 {
+        var c: ImJointConstraint;
+        var diff: ImVec3;
+        if (self.joint_bodies(j, &c, &diff) == 0) { return 0.0; }
+        var n: ImVec3 = axis;
+        var stretch: f64 = 0.0;
+        if (has_axis == 1) {
+            stretch = ImVec3_dot(diff, axis);
+        } else {
+            var dist: f64 = ImVec3_length(diff);
+            if (dist < _IM_B3_EPSILON) { return 0.0; }
+            n = ImVec3_div_scalar(diff, dist);
+            stretch = dist - rest_length;
+        }
+        var v_rel: ImVec3 = self.joint_relative_velocity(&c, 0, 0);
+        var vn: f64 = ImVec3_dot(v_rel, n);
+        var total: f64 = stiffness * stretch + damping * vn;
+        if (_im_is_finite(total) == 0) { return 0.0; }
+        var nt: f64 = -total;
+        var p: ImVec3 = ImVec3_scale(n, nt * dt);
+        self.apply_joint_impulse(&c, p, ImVec3_zero(), 0);
+        var mag: f64 = f64_abs(total);
+        return mag;
+    }
+
+    # A Mouse joint: drags body A's anchor toward the world target with F = (target − anchor)·k − v_anchor·c, its
+    # length capped at max(max_force, 0) (0 for NaN), applied as an impulse F·dt at the anchor. |F|, or 0 when body A is
+    # missing or |F| is not finite. Mirrors `apply_mouse_force`.
+    fn apply_mouse_force(self, j: *ImJoint3d, target: ImVec3, stiffness: f64, damping: f64, max_force: f64,
+      dt: f64): f64 {
+        var ba: *ImRigidBody3d = self._body(j.body_a);
+        if (ba == 0) { return 0.0; }
+        var inv_i: ImMat3;
+        var im: f64 = _im_b3_solver_mass(ba, &inv_i);
+        var ra: ImVec3 = ImQuat_mul_vec3(ba.rotation, j.local_anchor_a);
+        var anchor: ImVec3 = ba.position + ra;
+        var wxr: ImVec3 = ImVec3_cross(ba.angular_velocity, ra);
+        var v_anchor: ImVec3 = ba.linear_velocity + wxr;
+        var pull: ImVec3 = ImVec3_scale(target - anchor, stiffness);
+        var drag: ImVec3 = ImVec3_scale(v_anchor, damping);
+        var force: ImVec3 = pull - drag;
+        var cap: f64 = 0.0;
+        if (max_force == max_force) { cap = _im_max(max_force, 0.0); }
+        var mag: f64 = ImVec3_length(force);
+        if (_im_is_finite(mag) == 0) { return 0.0; }
+        if (mag > cap) {
+            var s: f64 = 0.0;
+            if (mag > 0.0) { s = cap / mag; }
+            force = ImVec3_scale(force, s);
+        }
+        var impulse: ImVec3 = ImVec3_scale(force, dt);
+        if (im > 0.0) {
+            var lv: ImVec3 = ba.linear_velocity + ImVec3_scale(impulse, im);
+            var arm: ImVec3 = ImVec3_cross(ra, impulse);
+            var dw: ImVec3 = ImMat3_mul_vec3(inv_i, arm);
+            var av: ImVec3 = ba.angular_velocity + dw;
+            ba.linear_velocity = lv;
+            ba.angular_velocity = av;
+        }
+        var fl: f64 = ImVec3_length(force);
+        return fl;
+    }
+
+    # Damping proportional to the relative anchor velocity, limited so it never reverses it: an impulse of
+    # min(damping·speed·dt, speed·m) against the motion, m the effective mass along it. Nothing when a body is missing,
+    # the speed is below EPSILON or the mass is zero. Mirrors `apply_joint_damping_3d`.
+    fn apply_joint_damping_3d(self, j: *ImJoint3d, dt: f64) {
+        var c: ImJointConstraint;
+        var diff: ImVec3;
+        if (self.joint_bodies(j, &c, &diff) == 0) { return 0; }
+        var v_rel: ImVec3 = self.joint_relative_velocity(&c, 0, 0);
+        var speed: f64 = ImVec3_length(v_rel);
+        if (speed < _IM_B3_EPSILON) { return 0; }
+        var dir: ImVec3 = ImVec3_div_scalar(v_rel, speed);
+        var mass: f64 = self._jc_axial_mass(&c, dir);
+        if (mass == 0.0) { return 0; }
+        var jd: f64 = j.damping;
+        var magnitude: f64 = _im_min(jd * speed * dt, speed * mass);
+        var nm: f64 = -magnitude;
+        var p: ImVec3 = ImVec3_scale(dir, nm);
+        self.apply_joint_impulse(&c, p, ImVec3_zero(), 0);
+        return 0;
+    }
+}
+
+# --- b3_solver.cyr ---
+
+# b3_solver.cyr — the 3D backend's step (port of rust-old/src/backend_3d/solver.rs).
+#
+# Rust's `step` is one sub-step of the sequential-impulse solver: (1) integrate velocities and refresh each body's
+# world inverse inertia, (1b) the joints' explicit forces and rows (src/b3_joints.cyr), (2–3) the broadphase and the
+# narrowphase, (4) wake on contact, (5) the shock-propagation order, (6) the contact and joint velocity solves
+# interleaved, then breaking joints, (7) the split-impulse position solve, (8) integrate positions, (9) sleep, and
+# (10) the touching pairs recorded. `finish_step` ends the outer step.
+#
+# M5 part 2 ports the stages that run when nothing touches: 1, 6–9 without contacts, `finish_step`, `solver_mass`
+# (src/b3_joints.cyr) and `error_reduction`. The contact stages and `step` come with part 3. Every expression keeps
+# Rust's operation order on src/math3.cyr's glam transcriptions (ADR 0012).
+
+# The error-reduction parameter of the position solve: from the soft-constraint spring (frequency Hz, damping_ratio)
+# as dt·k / (d + dt·k), k = ω², d = 2ζω, ω = 2π·frequency, when frequency > 0 and dt > 0; else the Baumgarte fraction
+# `correction`. Clamped to [0, 1], and 0 when not finite. Mirrors `error_reduction`.
+#must_use
+fn _im_b3_error_reduction(frequency: f64, damping_ratio: f64, correction: f64, dt: f64): f64 {
+    var erp: f64 = correction;
+    if (frequency > 0.0 && dt > 0.0) {
+        var omega: f64 = 2.0 * _IM_PI * frequency;
+        var d: f64 = 2.0 * damping_ratio * omega;
+        var k: f64 = omega * omega;
+        erp = dt * k / (d + dt * k);
+    }
+    if (_im_is_finite(erp) == 1) {
+        var r: f64 = _im_clamp(erp, 0.0, 1.0);
+        return r;
+    }
+    return 0.0;
+}
+
+impl ImPhysicsState3d {
+    # Step 1: every body's velocity integrated (gravity, forces, the gyroscopic step, torques, damping, the speed
+    # cap), then its world inverse inertia refreshed, in slot order.
+    fn _integrate_velocities(self, gravity: ImVec3, dt: f64, max_velocity: f64) {
+        var ba: *ImArena = self._bodies();
+        for (var s = 0; s < ba.slot_count(); s = s + 1) {
+            var h = ba.slot_handle(s);
+            if (h != 0 - 1) {
+                var rb: *ImRigidBody3d = self._body(h);
+                rb.integrate_velocities(gravity, dt, max_velocity);
+                rb.update_inertia_world();
+            }
+        }
+        return 0;
+    }
+
+    # Zeroes every body's split-impulse pseudo-velocities, the start of step 7.
+    fn _clear_pseudo(self) {
+        var ba: *ImArena = self._bodies();
+        var z: ImVec3 = ImVec3_zero();
+        for (var s = 0; s < ba.slot_count(); s = s + 1) {
+            var h = ba.slot_handle(s);
+            if (h != 0 - 1) {
+                var rb: *ImRigidBody3d = self._body(h);
+                rb.pseudo_velocity = z;
+                rb.pseudo_angular_velocity = z;
+            }
+        }
+        return 0;
+    }
+
+    # Step 8: every body's position integrated, in slot order.
+    fn _integrate_positions(self, dt: f64) {
+        var ba: *ImArena = self._bodies();
+        for (var s = 0; s < ba.slot_count(); s = s + 1) {
+            var h = ba.slot_handle(s);
+            if (h != 0 - 1) {
+                var rb: *ImRigidBody3d = self._body(h);
+                rb.integrate_positions(dt);
+            }
+        }
+        return 0;
+    }
+
+    # Step 9, body by body (the 3D backend has no islands): a dynamic body with mass whose linear and angular speeds
+    # are both below SLEEP_VELOCITY_THRESHOLD_3D advances its sleep timer, and once that reaches
+    # SLEEP_TIME_THRESHOLD_3D it sleeps, its velocities dropped; any other resets the timer and wakes.
+    fn _sleep_check(self, dt: f64) {
+        var ba: *ImArena = self._bodies();
+        var z: ImVec3 = ImVec3_zero();
+        for (var s = 0; s < ba.slot_count(); s = s + 1) {
+            var h = ba.slot_handle(s);
+            if (h != 0 - 1) {
+                var rb: *ImRigidBody3d = self._body(h);
+                var im: f64 = rb.inv_mass;
+                if (rb.is_dynamic() == 1 && im != 0.0) {
+                    var lin: f64 = ImVec3_length(rb.linear_velocity);
+                    var ang: f64 = ImVec3_length(rb.angular_velocity);
+                    if (lin < _IM_B3_SLEEP_VELOCITY_THRESHOLD_3D && ang < _IM_B3_SLEEP_VELOCITY_THRESHOLD_3D) {
+                        var t: f64 = rb.sleep_timer;
+                        var nt: f64 = t + dt;
+                        rb.sleep_timer = nt;
+                        if (nt >= _IM_B3_SLEEP_TIME_THRESHOLD_3D) {
+                            rb.is_sleeping = 1;
+                            rb.linear_velocity = z;
+                            rb.angular_velocity = z;
+                        }
+                    } else {
+                        rb.sleep_timer = 0.0;
+                        rb.is_sleeping = 0;
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+
+    # The end of an outer step: clears every body's accumulated force and torque (they act across all sub-steps) and
+    # closes the frame's contact events: their count (ImContactTracker::event reads them). Mirrors `finish_step`.
+    fn finish_step(self): i64 {
+        var ba: *ImArena = self._bodies();
+        for (var s = 0; s < ba.slot_count(); s = s + 1) {
+            var h = ba.slot_handle(s);
+            if (h != 0 - 1) {
+                var rb: *ImRigidBody3d = self._body(h);
+                rb.clear_forces();
+            }
+        }
+        return self.contact_tracker.finish();
     }
 }
 

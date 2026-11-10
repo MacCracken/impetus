@@ -27,7 +27,8 @@ fn _im_b3_wake(rb: *ImRigidBody3d) {
 }
 
 # `bodies`, `colliders` and `joints` are *ImArena words; `body_colliders` is one ImWordList record (three words) per
-# body slot, `list_slots` of them. Mirrors `PhysicsState3d`.
+# body slot, `list_slots` of them. The rest is scratch reused from step to step: `gjk` the narrowphase's, and `jc`
+# (`jc_len` of `jc_cap` ImJointConstraint records) the joint solver's (src/b3_joints.cyr). Mirrors `PhysicsState3d`.
 struct ImPhysicsState3d {
     bodies;
     colliders;
@@ -36,6 +37,9 @@ struct ImPhysicsState3d {
     list_slots;
     contact_tracker: ImContactTracker;
     gjk: ImGjkScratch3d;
+    jc;
+    jc_len;
+    jc_cap;
 }
 
 # An empty state. Its arenas are 0 when there is no memory (every operation then refuses). Mirrors
@@ -50,6 +54,9 @@ fn ImPhysicsState3d_new(): ImPhysicsState3d {
     s.list_slots = 0;
     s.contact_tracker = ImContactTracker_new();
     s.gjk = ImGjkScratch3d_new();
+    s.jc = 0;
+    s.jc_len = 0;
+    s.jc_cap = 0;
     return s;
 }
 
@@ -435,6 +442,10 @@ impl ImPhysicsState3d {
         self.list_slots = 0;
         self.contact_tracker.free();
         self.gjk.free();
+        if (self.jc != 0) { fl_free(self.jc); }
+        self.jc = 0;
+        self.jc_len = 0;
+        self.jc_cap = 0;
         return 0;
     }
 }

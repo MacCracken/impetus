@@ -1,0 +1,83 @@
+# step3.cyr — the 3D sub-step when nothing touches, composed from the library's stages (M5 part 2) until `step`
+# arrives with the contact pipeline (part 3). Included after tests/lib_3d.cyr by tests/parity_3d.tcyr (the b3_step
+# rows), tests/b3_joints.tcyr and tests/impetus_3d.bcyr.
+#
+# It runs Rust's `PhysicsState3d::step` with its contact stages empty: (1) velocities and world inertias, (1b) the
+# joints' forces and rows, (6) the joint velocity passes, breaking, (7) the pseudo-velocities cleared and the joint
+# position passes, (8) positions, (9) sleep, (10) an empty set of touching pairs recorded. That equals the real step
+# only when the broadphase pairs nothing, so `_t3_substep` also runs the broadphase's own test on every collider pair:
+# the same body, two static bodies, two sensors and the layer filter skip a pair, as in Rust, and otherwise the
+# speculative world AABBs (expanded along velocity·dt, after steps 1 and 1b) must not overlap. A pair that could
+# touch sets `_t3_touch`: a b3_step row then fails, and a test asserts it stays 0.
+
+var _t3_touch = 0;
+# 0 skips the guard (the benches time the sub-step alone).
+var _t3_guard = 1;
+
+# The speculative world AABB of collider c on body rb for dt, as Rust's broadphase builds it.
+fn _t3_aabb(c: *ImCollider3d, rb: *ImRigidBody3d, dt: f64): ImAabb3d {
+    var a: ImAabb3d = c.world_aabb(rb.position, rb.rotation);
+    var vel: ImVec3 = ImVec3_scale(rb.linear_velocity, dt);
+    var lo: ImVec3 = ImVec3_min(a.min, a.min + vel);
+    var hi: ImVec3 = ImVec3_max(a.max, a.max + vel);
+    return ImAabb3d_new(lo, hi);
+}
+
+# 1 when the broadphase could pair two of st's colliders this sub-step.
+fn _t3_could_pair(st: *ImPhysicsState3d, dt: f64): i64 {
+    var ca: *ImArena = st._colliders();
+    for (var i = 0; i < ca.slot_count(); i = i + 1) {
+        var hi = ca.slot_handle(i);
+        if (hi != 0 - 1) {
+            for (var k = i + 1; k < ca.slot_count(); k = k + 1) {
+                var hk = ca.slot_handle(k);
+                if (hk != 0 - 1) {
+                    var a: *ImCollider3d = _im_b3_as_coll(ca.get(hi));
+                    var b: *ImCollider3d = _im_b3_as_coll(ca.get(hk));
+                    var ba: *ImRigidBody3d = st._body(a.body);
+                    var bb: *ImRigidBody3d = st._body(b.body);
+                    var skip = 0;
+                    if (ba == 0 || bb == 0 || a.body == b.body) { skip = 1; }
+                    if (skip == 0 && ba.is_static() == 1 && bb.is_static() == 1) { skip = 1; }
+                    if (a.is_sensor == 1 && b.is_sensor == 1) { skip = 1; }
+                    if ((a.collision_layer & b.collision_mask) == 0 && (b.collision_layer & a.collision_mask) == 0) {
+                        skip = 1;
+                    }
+                    if (skip == 0) {
+                        var xa: ImAabb3d = _t3_aabb(a, ba, dt);
+                        var xb: ImAabb3d = _t3_aabb(b, bb, dt);
+                        if (xa.overlaps(&xb) == 1) { return 1; }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# One sub-step of dt with the world's solver settings, contacts empty (see the header). Rust's
+# `PhysicsState3d::step` when nothing touches.
+fn _t3_substep(st: *ImPhysicsState3d, gravity: ImVec3, dt: f64, velocity_iterations, position_iterations, slop: f64,
+  correction: f64, max_velocity: f64, frequency: f64, damping_ratio: f64) {
+    st._integrate_velocities(gravity, dt, max_velocity);
+    st.prepare_joints(dt);
+    if (_t3_guard == 1 && _t3_could_pair(st, dt) == 1) { _t3_touch = 1; }
+    for (var i = 0; i < velocity_iterations; i = i + 1) { st.solve_joint_velocities(dt); }
+    st.break_joints(dt);
+    st._clear_pseudo();
+    if (dt > 0.0) {
+        var erp: f64 = _im_b3_error_reduction(frequency, damping_ratio, correction, dt);
+        for (var p = 0; p < position_iterations; p = p + 1) { st.solve_joint_positions(erp, dt); }
+    }
+    st._integrate_positions(dt);
+    st._sleep_check(dt);
+    st.contact_tracker.record_substep(0, 0);
+    return 0;
+}
+
+# The Rust tests' `frame`: one sub-step at 1/60 s with 4 velocity and 1 position iterations, slop 0.01, correction
+# 0.2, max velocity 100 and the soft constraint at 30 Hz, ζ = 1, then `finish_step`: the event count.
+fn _t3_frame(st: *ImPhysicsState3d, gravity: ImVec3): i64 {
+    _t3_substep(st, gravity, 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0, 30.0, 1.0);
+    return st.finish_step();
+}

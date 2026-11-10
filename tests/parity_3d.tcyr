@@ -7,6 +7,7 @@
 
 include "tests/ulp.cyr"
 include "tests/lib_3d.cyr"
+include "tests/step3.cyr"
 
 alloc_init();
 
@@ -581,10 +582,158 @@ fn _par_b3_state(fp, fl): i64 {
 
 # ── dispatch and hooks ──────────────────────────────────────────────────────────────
 
+# ── M5b: single steps ───────────────────────────────────────────────────────────────
+# A `b3::step` row is the config, then a 3D backend dump; the port loads the dump into an ImPhysicsState3d (every
+# arena slot, generation and free list as dumped), steps it as PhysicsWorld::step does (a sub-step per sub_steps, then
+# `finish_step`), and writes the dump and the frame's events. Until the contact pipeline arrives (part 3) the sub-step
+# is tests/step3.cyr's contact-free composition: every b3_step collider has mask 0, and step3's guard fails the row if
+# the broadphase could have paired two colliders.
+
+# A 3D backend dump at token k into st (fresh): the token after it.
+fn _par_load_state3d(st: *ImPhysicsState3d, k0): i64 {
+    var ba: *ImArena = st._bodies();
+    var k = _par_load_arena(ba, k0);
+    var nb = _par_in(k);
+    k = k + 1;
+    for (var i = 0; i < nb; i = i + 1) {
+        var rb: *ImRigidBody3d = _im_b3_as_body(_par_slot(ba, _par_in(k)));
+        rb.handle = _par_in(k);
+        rb.body_type = _par_in_enum(k + 1, "BodyType.", &body_type_name, 3);
+        rb.position = _par_in_v3(k + 2);
+        rb.rotation = _par_in_q4(k + 5);
+        rb.linear_velocity = _par_in_v3(k + 9);
+        rb.angular_velocity = _par_in_v3(k + 12);
+        var ld: f64 = _par_in(k + 15);
+        var ad: f64 = _par_in(k + 16);
+        var gs: f64 = _par_in(k + 18);
+        rb.linear_damping = ld;
+        rb.angular_damping = ad;
+        rb.fixed_rotation = _par_in(k + 17);
+        rb.gravity_scale = gs;
+        rb.force_accumulator = _par_in_v3(k + 19);
+        rb.torque_accumulator = _par_in_v3(k + 22);
+        var m: f64 = _par_in(k + 25);
+        var im: f64 = _par_in(k + 26);
+        rb.mass = m;
+        rb.inv_mass = im;
+        rb.inertia = _par_in_m9(k + 27);
+        rb.inv_inertia = _par_in_m9(k + 36);
+        rb.inv_inertia_world = _par_in_m9(k + 45);
+        rb.pseudo_velocity = _par_in_v3(k + 54);
+        rb.pseudo_angular_velocity = _par_in_v3(k + 57);
+        rb.is_sleeping = _par_in(k + 60);
+        var stm: f64 = _par_in(k + 61);
+        rb.sleep_timer = stm;
+        k = k + 62;
+    }
+    var ca: *ImArena = st._colliders();
+    k = _par_load_arena(ca, k);
+    var nc = _par_in(k);
+    k = k + 1;
+    for (var c = 0; c < nc; c = c + 1) {
+        var cp: *ImCollider3d = _im_b3_as_coll(_par_slot(ca, _par_in(k)));
+        cp.handle = _par_in(k);
+        cp.body = _par_in(k + 1);
+        var sh: ImColliderShape = _im_shape(IM_SHAPE_BALL);
+        k = _par_in_shape(k + 2, &sh);
+        cp.shape = sh;
+        cp.offset = _par_in_v3(k);
+        cp.material = _par_in_material(k + 3);
+        cp.is_sensor = _par_in(k + 10);
+        cp.has_mass = 0;
+        cp.mass = 0.0;
+        if (_par_in_is_none(k + 11) == 0) {
+            var cm: f64 = _par_in(k + 11);
+            cp.has_mass = 1;
+            cp.mass = cm;
+        }
+        cp.collision_layer = _par_in(k + 12);
+        cp.collision_mask = _par_in(k + 13);
+        k = k + 14;
+    }
+    var ja: *ImArena = st._joints();
+    k = _par_load_arena(ja, k);
+    var nj = _par_in(k);
+    k = k + 1;
+    for (var j = 0; j < nj; j = j + 1) {
+        var jp: *ImJoint3d = _im_b3_as_joint(_par_slot(ja, _par_in(k)));
+        jp.body_a = _par_in(k + 1);
+        jp.body_b = _par_in(k + 2);
+        var jt: ImJointType = ImJointType_fixed();
+        k = _par_in_joint_type(k + 3, &jt);
+        jp.joint_type = jt;
+        jp.local_anchor_a = _par_in_v3(k);
+        jp.local_anchor_b = _par_in_v3(k + 3);
+        jp.reference_rotation = _par_in_q4(k + 6);
+        k = k + 10;
+        jp.has_motor = 0;
+        if (_par_in_is_none(k) == 1) {
+            k = k + 1;
+        } else {
+            jp.has_motor = 1;
+            jp.motor = ImJointMotor_new(_par_in(k), _par_in(k + 1));
+            k = k + 2;
+        }
+        var dm: f64 = _par_in(k);
+        jp.damping = dm;
+        jp.has_break_force = 0;
+        jp.break_force = 0.0;
+        if (_par_in_is_none(k + 1) == 0) {
+            var bf: f64 = _par_in(k + 1);
+            jp.has_break_force = 1;
+            jp.break_force = bf;
+        }
+        k = k + 2;
+    }
+    var ne = _par_in(k);
+    k = k + 1;
+    for (var e = 0; e < ne; e = e + 1) {
+        var list: *ImWordList = st._list(_im_handle_index(_par_in(k)));
+        list.len = 0;
+        var n = _par_in(k + 1);
+        for (var q = 0; q < n; q = q + 1) { list.push(_par_in(k + 2 + q)); }
+        k = k + 2 + n;
+    }
+    k = _par_load_pairs(st.contact_tracker.prev, k);
+    k = _par_load_pairs(st.contact_tracker.current, k);
+    k = _par_load_pairs(st.contact_tracker.seen, k);
+    st.contact_tracker.recorded = _par_in(k);
+    return k + 1;
+}
+
+fn _par_b3_step(fp, fl): i64 {
+    if (_par_eq(fp, fl, "b3::step") != 1) { return 0; }
+    var cfg: ImWorldConfig = _par_in_config(0);
+    var st: ImPhysicsState3d = ImPhysicsState3d_new();
+    _par_load_state3d(&st, 16);
+    var sub = cfg.sub_steps;
+    if (sub < 1) { sub = 1; }
+    var ts: f64 = cfg.timestep;
+    var subf: f64 = f64_from(sub);
+    var dt: f64 = ts / subf;
+    _t3_touch = 0;
+    for (var s = 0; s < sub; s = s + 1) {
+        _t3_substep(&st, cfg.gravity, dt, cfg.velocity_iterations, cfg.position_iterations, cfg.position_slop,
+          cfg.position_correction, cfg.max_velocity, cfg.constraint_frequency, cfg.constraint_damping_ratio);
+    }
+    var ne = st.finish_step();
+    if (_t3_touch == 0) {
+        _par_got_state3d(&st);
+        _par_got_seq(ne);
+        for (var e = 0; e < ne; e = e + 1) { _par_got_event(st.contact_tracker.event(e)); }
+    } else {
+        # A pair the contact-free sub-step can't handle: no outputs, so the row fails visibly.
+        println("  b3::step: the broadphase could pair two colliders; the contact-free sub-step doesn't apply");
+    }
+    st.free();
+    return 1;
+}
+
 fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_got_n = 0;
     _par_mapped3 = 0;
     if (_par_eq(mp, ml, "b3_state") == 1) { return _par_b3_state(fp, fl); }
+    if (_par_eq(mp, ml, "b3_step") == 1) { return _par_b3_step(fp, fl); }
     if (_par_eq(mp, ml, "b3_body") == 1) { return _par_b3_body(fp, fl); }
     if (_par_eq(mp, ml, "b3_math") == 1) { return _par_b3_math(fp, fl); }
     if (_par_eq(mp, ml, "b3_narrow") == 1) { return _par_b3_narrow(fp, fl); }
@@ -606,6 +755,7 @@ fn _par_c_bound(fp, fl): i64 {
     if (_par_eq(fp, fl, "b3::raycast") == 1) { return 0; }
     if (_par_eq(fp, fl, "b3::state_script") == 1) { return 0; }
     if (_par_eq(fp, fl, "b3::state_script_orphan") == 1) { return 0; }
+    if (_par_eq(fp, fl, "b3::step") == 1) { return 0; }
     if (_par_eq(fp, fl, "DQuat::from_rotation_x") == 1) { return 0; }
     if (_par_eq(fp, fl, "DQuat::from_rotation_y") == 1) { return 0; }
     if (_par_eq(fp, fl, "DQuat::from_rotation_z") == 1) { return 0; }

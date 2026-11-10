@@ -35,11 +35,11 @@ MODULES = [
     "aabb_tree", "spatial_hash", "backend_2d/types", "backend_2d/narrowphase",
     "backend_2d/raycast", "backend_2d/state", "backend_2d/joints", "backend_2d/solver",
     "particle", "world", "backend_3d/types", "backend_3d/narrowphase", "backend_3d/raycast",
-    "backend_3d/state",
+    "backend_3d/state", "backend_3d/joints",
 ]
 PENDING_MODULES = {
     "backend_2d/tests": "M3",
-    "backend_3d/solver": "M5", "backend_3d/joints": "M5",
+    "backend_3d/solver": "M5 part 3 (part 2 has the contact-free stages)",
     "backend_3d/tests": "M5", "serialize": "M6",
 }
 DEFERRED_MODULES = {"bridge": "until a Cyrius consumer exists (port plan §3.2)"}
