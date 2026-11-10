@@ -1,7 +1,7 @@
-# b2_joints.tcyr — the 2D joint solver (M3b): the Rust test of backend_2d/tests.rs that steps a joint
-# without contacts (mouse_joint_drags_body_toward_target), plus Cyrius-only tests of the soft
+# b2_joints.tcyr — the 2D joint solver (M3b): the Rust test of backend_2d/tests.rs that drags a body
+# with a mouse joint (mouse_joint_drags_body_toward_target), plus Cyrius-only tests of the soft
 # coefficients, the impulse cap, rows and point blocks, preparation, breaking, islands and sleep. The
-# other joint tests of backend_2d/tests.rs touch contacts and come with the contact solver (M3c).
+# joint tests that step a full frame (wheel, rope, breaking) are in tests/b2_contacts.tcyr.
 
 include "tests/lib_2d.cyr"
 
@@ -14,17 +14,12 @@ fn near(got: f64, want: f64, eps: f64): i64 {
     return 0;
 }
 
-# One frame of a scene without contacts at timestep dt and `iters` velocity iterations: the stages of
-# `step_si` that run when nothing touches, then `finish_step`.
+# One frame at timestep dt with `iters` velocity iterations, as Rust's `step_frame` (the tests'
+# other settings: one position iteration, slop 0.01, correction 0.2, speed cap 100, constraint
+# frequency 30 at damping ratio 1, the spatial hash). These scenes touch nothing.
 fn step_nc(st: *ImPhysicsState2d, gx: f64, gy: f64, dt: f64, iters) {
-    st._integrate_velocities(ImVec2_new(gx, gy), dt, 100.0);
-    st.prepare_joints(dt);
-    for (var i = 0; i < iters; i = i + 1) { st.solve_joints_once(); }
-    st.break_joints(dt);
-    st._clear_pseudo();
-    st._integrate_positions(dt);
-    st.build_islands_and_sleep(dt);
-    st.contact_tracker.record_substep(0, 0);
+    st.step(ImVec3_new(gx, gy, 0.0), dt, iters, 1, 0.01, 0.2, 100.0, 30.0, 1.0, IM_BROADPHASE_SPATIAL_HASH,
+      IM_SOLVER_SEQUENTIAL_IMPULSE);
     st.finish_step();
     return 0;
 }

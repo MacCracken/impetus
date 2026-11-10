@@ -1,5 +1,6 @@
 # impetus golden corpus: one module per line; tests/parity_2d.tcyr replays the shared and
 # b2_ modules, tests/parity_3d.tcyr the b3_ modules
+b2_contact
 b2_mass
 b2_narrow
 b2_ray

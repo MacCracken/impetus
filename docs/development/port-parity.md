@@ -533,6 +533,50 @@ fails when either drifts from `cyrius.cyml`.
 - **Result, every target:** 16 modules, 0 failing; **97,778 ok, 0 failed, 0 measured, 7 pending, 164 accepted**
   (ADR 0011: 68).
 
+## 15. M3c: the contact pipeline and `step` (2026-11-09)
+
+- **The modules:**
+  - `src/b2_contacts.cyr`, the contact stages of `solver.rs`, each keeping Rust's operation order:
+    - the broadphase, both kinds, with each collider's AABB swept by its body's velocity, then the pair filters;
+    - the narrowphase and the manifold rebuild, with warm-start matching in either body's frame;
+    - waking on contact and warm starting;
+    - the contact solver: shock-propagation order, block-solved two-point normals, Coulomb friction with a static
+      threshold, rolling resistance and restitution targets;
+    - the split-impulse position solver.
+  - `src/b2_solver.cyr` gains `step`: Rust's `step_si`, then the touching pairs recorded. XPBD is not ported
+    (ADR 0008 #6), so `step` runs the sequential-impulse solver for every solver kind.
+- **Three departures that change no bit:**
+  - **The narrowphase and the manifold rebuild are fused.** The broadphase pairs arrive sorted, and each is its own
+    manifold key, so the fresh manifolds come out in key order.
+  - **Lever arms are computed once a sub-step.** Positions don't change from the rebuild to the position solver, so
+    each point's lever arms come from one `sin_cos` per manifold, and Rust's repeated expression gives the same bits.
+  - **Warm-start impulses are applied as they are computed.** Computing them reads no velocity, so the order and the
+    amounts are Rust's.
+- **The harness now runs the library.** `b2::step` rows run `step` once per sub-step, then `finish_step`, for both
+  modules. The 214 contact-free rows of §14 pass unchanged through it.
+- **`b2_contact.tsv`**, 418 rows. Every collider can pair, and every scene runs on the default config unless noted:
+  - drops (a ball, a box, a tilted box), each under both broadphases;
+  - a five-box stack and a six-box pyramid;
+  - restitution under four combine rules; friction on a slope (wood, ice, a static-friction override); a shove along
+    flat ground; rolling resistance at three strengths;
+  - capsules, hulls, a segment floor and an offset collider;
+  - a sensor; layer masks; a kinematic paddle; sleep, then wake on contact;
+  - five position-solver settings (Baumgarte, soft constraints, slop, iterations, sub-steps);
+  - fast bodies through the swept AABB; a revolute chain draped over the ground;
+  - 40 seeded scenes of random shapes, materials and velocities between walls.
+
+  Class C. **All 0 ulp** (83,695 floats) on three targets.
+- **The corrected oracle.** The transcription in `validate.py` now covers the whole sequential-impulse step: contacts,
+  the contact tracker and events. It reproduces all 632 step rows (b2_step and b2_contact) bit for bit on glibc.
+  - Its broadphase is brute force over every pair. Both of Rust's broadphases return a superset of the overlapping
+    pairs: the tree's boxes are fattened, cells are monotone in the coordinate, and a non-finite box pairs with
+    everything. The overlap test then keeps exactly the same set.
+  - On MPFR it writes `b2_contact.cr.tsv`, 2 rows, each a `cos` that glibc misrounds by one ulp. The port equals both.
+- **The harness reports where a row fails.** A failing row now names its first differing output and prints the pair
+  there, instead of the row's first output.
+- **Result, every target:** 17 modules, 0 failing; **98,194 ok, 0 failed, 0 measured, 7 pending, 166 accepted**
+  (ADR 0011: 70).
+
 ## How to reproduce
 
 ```sh

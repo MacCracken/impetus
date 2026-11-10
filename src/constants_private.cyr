@@ -28,6 +28,18 @@ var _IM_MAX_CELLS_PER_ENTRY: f64 = 4096.0;
 # Rust: `JOINT_BAUMGARTE: f64 = 0.2`
 var _IM_B2_JOINT_BAUMGARTE: f64 = 0.2;
 
+# ── rust-old/src/backend_2d/solver.rs ──
+
+# Approach speed below which restitution is ignored, so resting contacts
+# don't micro-bounce.
+# Rust: `RESTITUTION_VELOCITY_THRESHOLD: f64 = 1.0`
+var _IM_B2_RESTITUTION_VELOCITY_THRESHOLD: f64 = 1.0;
+
+# Block solver is used only when the 2x2 effective-mass matrix is well
+# conditioned (Box2D `k_maxConditionNumber`).
+# Rust: `MAX_CONDITION_NUMBER: f64 = 1000.0`
+var _IM_B2_MAX_CONDITION_NUMBER: f64 = 1000.0;
+
 # ── rust-old/src/backend_2d/types.rs ──
 
 # General-purpose geometry epsilon for zero-length checks (normals, axes, etc.).

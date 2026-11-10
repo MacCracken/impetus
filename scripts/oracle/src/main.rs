@@ -34,6 +34,8 @@ mod flat;
 mod glibc;
 mod grids;
 #[cfg(not(feature = "b3"))]
+mod m_b2_contact;
+#[cfg(not(feature = "b3"))]
 mod m_b2_mass;
 #[cfg(not(feature = "b3"))]
 mod m_b2_narrow;
@@ -83,6 +85,8 @@ fn golden_modules() -> Vec<tsv::Module> {
     } else {
         vec![
             // The 2D backend's bodies: the 3D dump's inertia is a tensor.
+            #[cfg(not(feature = "b3"))]
+            m_b2_contact::emit(),
             #[cfg(not(feature = "b3"))]
             m_b2_mass::emit(),
             #[cfg(not(feature = "b3"))]

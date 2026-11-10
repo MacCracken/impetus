@@ -645,8 +645,8 @@ def corrections(module, rows):
         elif module == "spring" and fn == "Spring::step":
             x = [tok_f(t) if t.startswith("f:") else int(t[2:]) for t in ins]
             want = list(_cr_spring_step(*x, prim))
-        elif module == "b2_step":
-            toks = _Step2d(prim["sin"], prim["cos"], _logged_hypot(log)).step(ins)
+        elif module in ("b2_step", "b2_contact"):
+            toks = _Step2d(prim["sin"], prim["cos"], _logged_hypot(log)).step(ins, module)
             if not _same_tokens(outs, toks):
                 seen = list(dict.fromkeys(log))
                 out.append((fn, " ".join(ins), " ".join(toks), "oracle (dump); " + "; ".join(seen)))
@@ -1960,16 +1960,30 @@ def check_b2_state(rows):
     return counted
 
 
-# ── single steps without contacts (backend_2d/joints.rs, the SI step's joint, integration and sleep
-# stages; M3b) ─────────────────────────────────────────────────────────────────────────────────────
-# A b2_step row's input is a backend dump; the transcription parses it, steps it as PhysicsWorld::step
-# does (sub-steps, then finish_step), and writes the dump again. Every M3b scene has collision mask 0 on
-# every collider, so the broadphase pairs nothing and the contact stages are empty (the check asserts
-# it). sin, cos and hypot are parameters: glibc's for the check, MPFR's for the corrected oracle.
+# ── single steps (backend_2d/solver.rs's sequential-impulse step, backend_2d/joints.rs; M3b–c) ──────
+# A b2_step or b2_contact row's input is a backend dump; the transcription parses it, steps it as
+# PhysicsWorld::step does (sub-steps, each recording the touching pairs, then finish_step), and writes the
+# dump and the frame's events. Every M3b scene (b2_step) has collision mask 0 on every collider, so its
+# contact stages are empty (the check asserts it); the M3c scenes (b2_contact) touch. sin, cos and hypot
+# are parameters: glibc's for the check, MPFR's for the corrected oracle.
+#
+# The broadphase is brute force over every collider pair: both of Rust's broadphases report a superset
+# of the pairs whose boxes overlap (the tree's fattened boxes contain the tight ones; overlapping boxes
+# share a hash cell, cells being monotone in the coordinate, and a non-finite or oversized box pairs with
+# everything), and the overlap test then keeps exactly those, so which one ran doesn't change the set.
 
 B2_SLEEP_VELOCITY = 0.01
 B2_SLEEP_TIME = 0.5
 B2_JOINT_BAUMGARTE = 0.2
+B2_MANIFOLD_MATCH = 0.02
+B2_MAX_MANIFOLD_POINTS = 4
+B2_WARM_START = 0.95
+B2_RESTITUTION_VELOCITY = 1.0
+B2_MAX_CONDITION = 1000.0
+B2_STATIC = "e:BodyType.Static"
+B2_DYNAMIC = "e:BodyType.Dynamic"
+B2_RULE_ORDER = {"e:CombineRule.Min": 0, "e:CombineRule.Average": 1, "e:CombineRule.Multiply": 2,
+                 "e:CombineRule.Max": 3}
 
 
 def _dump_arena(t, k):
@@ -2002,13 +2016,23 @@ def _dump_parse(t, k):
         st["body_arena"].slots[b["handle"] & 0xFFFFFFFF][3] = b
         k += 28
     st["coll_start"] = k
-    _, k = _dump_arena(t, k)
+    st["coll_arena"], k = _dump_arena(t, k)
     nc = int(t[k][2:])
     k += 1
     masks = []
     for _ in range(nc):
-        k2 = _st_shape_end(t, k + 2)
-        masks.append(tok_i(t[k2 + 13]))
+        h = _st_word(t[k])
+        shape, k2 = _np_shape(t, k + 2)
+        if k2 != _st_shape_end(t, k + 2):
+            fail("b2_step: the shape parsers disagree")
+        mt = t[k2 + 3:k2 + 10]
+        c = {"handle": h, "body": _st_word(t[k + 1]), "shape": shape, "off": (tok_f(t[k2]), tok_f(t[k2 + 1])),
+             "mat": {"fric": tok_f(mt[0]), "rest": tok_f(mt[1]),
+                     "sfric": None if mt[3] == "n:" else tok_f(mt[3]), "roll": tok_f(mt[4]), "fc": mt[5],
+                     "rc": mt[6]},
+             "sensor": tok_i(t[k2 + 10]) == 1, "layer": tok_i(t[k2 + 12]), "mask": tok_i(t[k2 + 13])}
+        masks.append(c["mask"])
+        st["coll_arena"].slots[h & 0xFFFFFFFF][3] = c
         k = k2 + 14
     st["masks"] = masks
     st["coll_tokens"] = t[st["coll_start"]:k]
@@ -2036,14 +2060,30 @@ def _dump_parse(t, k):
     for _ in range(nbc):
         k += 2 + int(t[k + 1][2:])
     st["body_colliders"] = t[s0:k]
-    st["manifolds"] = int(t[k][2:])
-    if st["manifolds"] != 0:
-        fail("b2_step: an M3b row's dump has manifolds")
+    nm = int(t[k][2:])
     k += 1
-    st["tracker"] = t[k:k + 4]
-    if st["tracker"] != ["v:0", "v:0", "v:0", "i:0"]:
-        fail("b2_step: an M3b row's tracker is not empty between frames")
-    return st, k + 4
+    ms = []
+    for _ in range(nm):
+        m = {"ca": _st_word(t[k]), "cb": _st_word(t[k + 1]), "ba": _st_word(t[k + 2]), "bb": _st_word(t[k + 3]),
+             "n": (tok_f(t[k + 4]), tok_f(t[k + 5])), "pts": []}
+        np_ = int(t[k + 6][2:])
+        k += 7
+        for _ in range(np_):
+            x = [tok_f(v) for v in t[k:k + 7]]
+            m["pts"].append([(x[0], x[1]), (x[2], x[3]), x[4], x[5], x[6]])
+            k += 7
+        m["roll"] = tok_f(t[k])
+        k += 1
+        ms.append(m)
+    st["manifolds"] = ms
+    tr = {}
+    for part in ("prev", "current", "seen"):
+        n = int(t[k][2:])
+        tr[part] = [(_st_word(t[k + 1 + 2 * i]), _st_word(t[k + 2 + 2 * i])) for i in range(n)]
+        k += 1 + 2 * n
+    tr["recorded"] = tok_i(t[k]) == 1
+    st["tracker"] = tr
+    return st, k + 1
 
 
 def _dump_emit(st):
@@ -2061,15 +2101,472 @@ def _dump_emit(st):
         out += [_st_f(x) for x in (*j["la"], *j["lb"])]
         out += ["n:"] if j["motor"] is None else [_st_f(j["motor"][0]), _st_f(j["motor"][1])]
         out += [_st_f(j["damping"]), "n:" if j["brk"] is None else _st_f(j["brk"]), _st_f(j["ref"])]
-    out += st["body_colliders"] + ["v:0", "v:0", "v:0", "v:0", "i:0"]
+    out += st["body_colliders"] + [f"v:{len(st['manifolds'])}"]
+    for m in st["manifolds"]:
+        out += [_st_h(m["ca"]), _st_h(m["cb"]), _st_h(m["ba"]), _st_h(m["bb"]), _st_f(m["n"][0]), _st_f(m["n"][1])]
+        out += [f"v:{len(m['pts'])}"]
+        for la, lb, ni, ti, d in m["pts"]:
+            out += [_st_f(x) for x in (la[0], la[1], lb[0], lb[1], ni, ti, d)]
+        out += [_st_f(m["roll"])]
+    tr = st["tracker"]
+    for part in ("prev", "current", "seen"):
+        out += [f"v:{len(tr[part])}"]
+        for a, b in tr[part]:
+            out += [_st_h(a), _st_h(b)]
+    out += [f"i:{int(tr['recorded'])}"]
     return out
 
 
+def _sim(b):
+    """`solver_inv_mass`: (inv_mass, inv_inertia) of an awake dynamic body, else zeros."""
+    if b["type"] == B2_DYNAMIC and not b["sleeping"]:
+        return b["inv_mass"], b["inv_inertia"]
+    return 0.0, 0.0
+
+
+def _cross(a, b):
+    return a[0] * b[1] - a[1] * b[0]
+
+
+def _at(v, r):
+    """`SolverVel::at`: the velocity of the point at offset r of a body moving at v = [vx, vy, w]."""
+    return (v[0] - v[2] * r[1], v[1] + v[2] * r[0])
+
+
+def _rel(va, vb, ra, rb, d):
+    """dot2(sub2(vb.at(rb), va.at(ra)), d)."""
+    pb, pa = _at(vb, rb), _at(va, ra)
+    return (pb[0] - pa[0]) * d[0] + (pb[1] - pa[1]) * d[1]
+
+
+def _apply(v, sign, imp, r, im, ii):
+    """`SolverVel::apply`."""
+    v[0] += sign * imp[0] * im
+    v[1] += sign * imp[1] * im
+    v[2] += sign * _cross(r, imp) * ii
+
+
+def _combine2(ra, rb, a, b):
+    """`combine_property`: the higher-priority rule of the two, applied to a and b."""
+    rule = rb if B2_RULE_ORDER[rb] > B2_RULE_ORDER[ra] else ra
+    return combine(rule, a, b)
+
+
+def _union(a, b):
+    return sorted(set(a) | set(b))
+
+
 class _Step2d:
-    """The contact-free SI step (joints, integration, islands and sleep) on the given sin, cos, hypot."""
+    """The sequential-impulse step (contacts, joints, integration, islands and sleep) on the given sin,
+    cos and hypot."""
 
     def __init__(self, sin, cos, hyp):
         self.sin, self.cos, self.hyp = sin, cos, hyp
+        self.geo = _Ray(sin, cos, hyp)
+
+    # ── the contact pipeline (solver.rs) ──
+
+    def broadphase(self, st, dt):
+        """The kept pairs, sorted: brute force over every collider pair (see the section comment)."""
+        bodies, colls = st["body_arena"], st["coll_arena"]
+        boxes = {}
+        for h, c in colls.values():
+            b = bodies.get(c["body"])
+            if b is None:
+                continue
+            x0, y0, x1, y1 = self.geo.world_aabb(c["shape"], c["off"], b["pos"], b["rot"])
+            dx, dy = b["vel"][0] * dt, b["vel"][1] * dt
+            if dx > 0.0:
+                x1 += dx
+            else:
+                x0 += dx
+            if dy > 0.0:
+                y1 += dy
+            else:
+                y0 += dy
+            boxes[h] = (x0, y0, x1, y1)
+        hs = sorted(boxes)
+        pairs = []
+        for i, ha in enumerate(hs):
+            for hb in hs[i + 1:]:
+                ca, cb = colls.get(ha), colls.get(hb)
+                if ca["body"] == cb["body"]:
+                    continue
+                ba, bb = bodies.get(ca["body"]), bodies.get(cb["body"])
+                if ba is not None and bb is not None and ba["type"] == B2_STATIC and bb["type"] == B2_STATIC:
+                    continue
+                if ca["sensor"] and cb["sensor"]:
+                    continue
+                if (ca["layer"] & cb["mask"]) == 0 and (cb["layer"] & ca["mask"]) == 0:
+                    continue
+                a, b = boxes[ha], boxes[hb]
+                if a[0] <= b[2] and a[2] >= b[0] and a[1] <= b[3] and a[3] >= b[1]:
+                    pairs.append((ha, hb))
+        return pairs
+
+    def update_manifolds(self, st, pairs):
+        """`narrowphase` then `update_manifolds`."""
+        bodies, colls = st["body_arena"], st["coll_arena"]
+        fresh = {}
+
+        def pose(h):
+            b = bodies.get(h)
+            return ((0.0, 0.0), 0.0) if b is None else (b["pos"], b["rot"])
+
+        for ha, hb in pairs:
+            ca, cb = colls.get(ha), colls.get(hb)
+            ba, bb = bodies.get(ca["body"]), bodies.get(cb["body"])
+            if ba is None or bb is None:
+                continue
+            pa = self.geo.world_pos(ba["pos"], ba["rot"], ca["off"])
+            pb = self.geo.world_pos(bb["pos"], bb["rot"], cb["off"])
+            for n, d, pt in self.geo.contacts(ca["shape"], pa, ba["rot"], cb["shape"], pb, bb["rot"]):
+                key = (ha, hb) if ha <= hb else (hb, ha)
+                if key[0] != ha:
+                    body_a, body_b, normal = cb["body"], ca["body"], (-n[0], -n[1])
+                else:
+                    body_a, body_b, normal = ca["body"], cb["body"], n
+                (qa, qra), (qb, qrb) = pose(body_a), pose(body_b)
+                point = [self.geo.world_to_local(pt, qa, qra), self.geo.world_to_local(pt, qb, qrb), 0.0, 0.0, d]
+                if key not in fresh:
+                    fresh[key] = {"ca": key[0], "cb": key[1], "ba": body_a, "bb": body_b, "n": normal, "pts": [],
+                                  "roll": 0.0}
+                m = fresh[key]
+                if len(m["pts"]) < B2_MAX_MANIFOLD_POINTS:
+                    m["pts"].append(point)
+        old = {(m["ca"], m["cb"]): m for m in st["manifolds"]}
+        for key in sorted(fresh):
+            m, o = fresh[key], old.get(key)
+            if o is None:
+                continue
+            if o["n"][0] * m["n"][0] + o["n"][1] * m["n"][1] < 0.9:
+                continue
+            m["roll"] = o["roll"]
+            single = len(m["pts"]) == 1 and len(o["pts"]) == 1
+            used = [False] * B2_MAX_MANIFOLD_POINTS
+            for p in m["pts"]:
+                best, best_d = None, B2_MANIFOLD_MATCH * B2_MANIFOLD_MATCH
+                for i, op in enumerate(o["pts"]):
+                    if i >= len(used) or used[i]:
+                        continue
+                    ex, ey = op[0][0] - p[0][0], op[0][1] - p[0][1]
+                    fx, fy = op[1][0] - p[1][0], op[1][1] - p[1][1]
+                    dd = rust_min(ex * ex + ey * ey, fx * fx + fy * fy)
+                    if dd < best_d or single:
+                        best_d, best = dd, i
+                if best is not None:
+                    used[best] = True
+                    p[2], p[3] = o["pts"][best][2], o["pts"][best][3]
+        st["manifolds"] = [fresh[k] for k in sorted(fresh)]
+
+    @staticmethod
+    def wake_on_contact(st):
+        bodies = st["body_arena"]
+
+        def moving(b):
+            t = B2_SLEEP_VELOCITY
+            return (b is not None and not b["sleeping"] and b["type"] == B2_DYNAMIC
+                    and (abs(b["vel"][0]) > t or abs(b["vel"][1]) > t or abs(b["w"]) > t))
+
+        for m in st["manifolds"]:
+            ba, bb = bodies.get(m["ba"]), bodies.get(m["bb"])
+            a_sl = ba is not None and ba["sleeping"]
+            b_sl = bb is not None and bb["sleeping"]
+            a_mv, b_mv = moving(ba), moving(bb)
+            if a_sl and b_mv:
+                _st_wake(ba)
+            if b_sl and a_mv:
+                _st_wake(bb)
+
+    @staticmethod
+    def sensor(st, m, missing):
+        ca, cb = st["coll_arena"].get(m["ca"]), st["coll_arena"].get(m["cb"])
+        if ca is None or cb is None:
+            return missing
+        return ca["sensor"] or cb["sensor"]
+
+    def arms(self, ba, bb, p):
+        cp = self.geo.local_to_world(p[0], ba["pos"], ba["rot"])
+        return (cp[0] - ba["pos"][0], cp[1] - ba["pos"][1]), (cp[0] - bb["pos"][0], cp[1] - bb["pos"][1])
+
+    def warm_start(self, st):
+        bodies = st["body_arena"]
+        pending = []
+        for m in st["manifolds"]:
+            m["roll"] *= B2_WARM_START
+            for p in m["pts"]:
+                p[2] *= B2_WARM_START
+                p[3] *= B2_WARM_START
+            if self.sensor(st, m, True):
+                continue
+            ba, bb = bodies.get(m["ba"]), bodies.get(m["bb"])
+            if ba is None or bb is None:
+                continue
+            n = m["n"]
+            t = (-n[1], n[0])
+            for p in m["pts"]:
+                if abs(p[2]) < B2_EPSILON and abs(p[3]) < B2_EPSILON:
+                    continue
+                ra, rb = self.arms(ba, bb, p)
+                imp = (p[2] * n[0] + p[3] * t[0], p[2] * n[1] + p[3] * t[1])
+                pending.append((m["ba"], m["bb"], imp, _cross(ra, imp), _cross(rb, imp)))
+            if m["roll"] != 0.0:
+                pending.append((m["ba"], m["bb"], (0.0, 0.0), m["roll"], m["roll"]))
+        for a, b, imp, aa, ab in pending:
+            ba = bodies.get(a)
+            if ba is not None:
+                im, ii = _sim(ba)
+                ba["vel"] = [ba["vel"][0] - imp[0] * im, ba["vel"][1] - imp[1] * im]
+                ba["w"] -= aa * ii
+            bb = bodies.get(b)
+            if bb is not None:
+                im, ii = _sim(bb)
+                bb["vel"] = [bb["vel"][0] + imp[0] * im, bb["vel"][1] + imp[1] * im]
+                bb["w"] += ab * ii
+
+    def prepare_contacts(self, st):
+        bodies, colls, ms = st["body_arena"], st["coll_arena"], st["manifolds"]
+        level = {}
+        for _, b in bodies.values():
+            if b["type"] == B2_STATIC or b["type"] != B2_DYNAMIC:
+                level[b["handle"]] = 0
+        changed = True
+        while changed:
+            changed = False
+            for m in ms:
+                la, lb = level.get(m["ba"]), level.get(m["bb"])
+                if la is not None and lb is None:
+                    level[m["bb"]], changed = la + 1, True
+                elif la is None and lb is not None:
+                    level[m["ba"]], changed = lb + 1, True
+                elif la is not None and lb is not None:
+                    if la + 1 < lb:
+                        level[m["bb"]], changed = la + 1, True
+                    elif lb + 1 < la:
+                        level[m["ba"]], changed = lb + 1, True
+        none = 0xFFFFFFFF
+        order = sorted(range(len(ms)), key=lambda i: min(level.get(ms[i]["ba"], none), level.get(ms[i]["bb"], none)))
+        prep = []
+        for i in order:
+            m = ms[i]
+            ca, cb = colls.get(m["ca"]), colls.get(m["cb"])
+            if ca is not None and cb is not None:
+                a, b = ca["mat"], cb["mat"]
+                rest = _combine2(a["rc"], b["rc"], a["rest"], b["rest"])
+                fric = _combine2(a["fc"], b["fc"], a["fric"], b["fric"])
+                sa = a["sfric"] if a["sfric"] is not None else a["fric"] * 1.5
+                sb = b["sfric"] if b["sfric"] is not None else b["fric"] * 1.5
+                sfric = _combine2(a["fc"], b["fc"], sa, sb)
+                roll = (a["roll"] + b["roll"]) * 0.5
+                sensor = ca["sensor"] or cb["sensor"]
+            else:
+                rest = fric = sfric = roll = 0.0
+                sensor = False
+            bias = [0.0] * B2_MAX_MANIFOLD_POINTS
+            if not (rest <= 0.0 or sensor):
+                ba, bb = bodies.get(m["ba"]), bodies.get(m["bb"])
+                if ba is not None and bb is not None:
+                    va, vb = [ba["vel"][0], ba["vel"][1], ba["w"]], [bb["vel"][0], bb["vel"][1], bb["w"]]
+                    for pi, p in enumerate(m["pts"][:B2_MAX_MANIFOLD_POINTS]):
+                        ra, rb = self.arms(ba, bb, p)
+                        vn = _rel(va, vb, ra, rb, m["n"])
+                        if vn < -B2_RESTITUTION_VELOCITY:
+                            bias[pi] = -rest * vn
+            prep.append((i, fric, sfric, roll, sensor, bias))
+        return prep
+
+    def solve_contacts_once(self, st, prep):
+        bodies, ms = st["body_arena"], st["manifolds"]
+        for i, fric, sfric, roll, sensor, bias in prep:
+            if sensor:
+                continue
+            m = ms[i]
+            ba, bb = bodies.get(m["ba"]), bodies.get(m["bb"])
+            if ba is None or bb is None:
+                continue
+            ima, iia = _sim(ba)
+            imb, iib = _sim(bb)
+            if ima == 0.0 and imb == 0.0:
+                continue
+            va, vb = [ba["vel"][0], ba["vel"][1], ba["w"]], [bb["vel"][0], bb["vel"][1], bb["w"]]
+            n = m["n"]
+            t = (-n[1], n[0])
+            np_ = min(len(m["pts"]), B2_MAX_MANIFOLD_POINTS)
+            ra, rb, acc_n, acc_t = [], [], [], []
+            for p in m["pts"][:np_]:
+                a, b = self.arms(ba, bb, p)
+                ra.append(a)
+                rb.append(b)
+                acc_n.append(p[2])
+                acc_t.append(p[3])
+            acc_roll = m["roll"]
+            a_dyn = ima > 0.0 or iia > 0.0
+            b_dyn = imb > 0.0 or iib > 0.0
+
+            def eff(r_a, r_b, d):
+                ca, cb = _cross(r_a, d), _cross(r_b, d)
+                return ima + imb + ca * ca * iia + cb * cb * iib
+
+            solved = False
+            if np_ == 2:
+                rn = ((_cross(ra[0], n), _cross(rb[0], n)), (_cross(ra[1], n), _cross(rb[1], n)))
+                k11, k22 = eff(ra[0], rb[0], n), eff(ra[1], rb[1], n)
+                k12 = ima + imb + rn[0][0] * rn[1][0] * iia + rn[0][1] * rn[1][1] * iib
+                det = k11 * k22 - k12 * k12
+                if k11 > B2_EPSILON and k22 > B2_EPSILON and k11 * k11 < B2_MAX_CONDITION * det:
+                    solved = True
+                    a0, a1 = acc_n
+                    vn0, vn1 = _rel(va, vb, ra[0], rb[0], n), _rel(va, vb, ra[1], rb[1], n)
+                    b0 = vn0 - bias[0] - (k11 * a0 + k12 * a1)
+                    b1 = vn1 - bias[1] - (k12 * a0 + k22 * a1)
+                    x0 = -(k22 * b0 - k12 * b1) / det
+                    x1 = -(-k12 * b0 + k11 * b1) / det
+                    if x0 >= 0.0 and x1 >= 0.0:
+                        x = [x0, x1]
+                    else:
+                        x0 = -b0 / k11
+                        if x0 >= 0.0 and k12 * x0 + b1 >= 0.0:
+                            x = [x0, 0.0]
+                        else:
+                            x1 = -b1 / k22
+                            if x1 >= 0.0 and k12 * x1 + b0 >= 0.0:
+                                x = [0.0, x1]
+                            elif b0 >= 0.0 and b1 >= 0.0:
+                                x = [0.0, 0.0]
+                            else:
+                                x = None
+                    if x is not None:
+                        for pi in range(2):
+                            d = x[pi] - acc_n[pi]
+                            imp = (n[0] * d, n[1] * d)
+                            _apply(va, -1.0, imp, ra[pi], ima, iia)
+                            _apply(vb, 1.0, imp, rb[pi], imb, iib)
+                            acc_n[pi] = x[pi]
+            if not solved:
+                for pi in range(np_):
+                    k = eff(ra[pi], rb[pi], n)
+                    if k < B2_EPSILON:
+                        continue
+                    vn = _rel(va, vb, ra[pi], rb[pi], n)
+                    new = rust_max(acc_n[pi] - (vn - bias[pi]) / k, 0.0)
+                    d = new - acc_n[pi]
+                    acc_n[pi] = new
+                    imp = (n[0] * d, n[1] * d)
+                    _apply(va, -1.0, imp, ra[pi], ima, iia)
+                    _apply(vb, 1.0, imp, rb[pi], imb, iib)
+            if fric > 0.0 or sfric > 0.0:
+                for pi in range(np_):
+                    k = eff(ra[pi], rb[pi], t)
+                    if k < B2_EPSILON:
+                        continue
+                    vt = _rel(va, vb, ra[pi], rb[pi], t)
+                    mu = sfric if abs(vt) < 0.01 else fric
+                    max_f = rust_max(mu * acc_n[pi], 0.0)
+                    new = rust_clamp(acc_t[pi] - vt / k, -max_f, max_f)
+                    if not math.isfinite(new):
+                        new = 0.0
+                    d = new - acc_t[pi]
+                    acc_t[pi] = new
+                    imp = (t[0] * d, t[1] * d)
+                    _apply(va, -1.0, imp, ra[pi], ima, iia)
+                    _apply(vb, 1.0, imp, rb[pi], imb, iib)
+            if roll > 0.0 and iia + iib > B2_EPSILON:
+                total = -0.0
+                for x in acc_n[:np_]:
+                    total += x
+                max_r = rust_max(roll * total, 0.0)
+                new = rust_clamp(acc_roll - (vb[2] - va[2]) / (iia + iib), -max_r, max_r)
+                if not math.isfinite(new):
+                    new = 0.0
+                d = new - acc_roll
+                acc_roll = new
+                va[2] -= d * iia
+                vb[2] += d * iib
+            for pi in range(np_):
+                m["pts"][pi][2], m["pts"][pi][3] = acc_n[pi], acc_t[pi]
+            m["roll"] = acc_roll
+            if a_dyn:
+                ba["vel"], ba["w"] = [va[0], va[1]], va[2]
+            if b_dyn:
+                bb["vel"], bb["w"] = [vb[0], vb[1]], vb[2]
+
+    def solve_positions(self, st, cfg, dt):
+        bodies = st["body_arena"]
+        for _, b in bodies.values():
+            b["pv"], b["pw"] = [0.0, 0.0], 0.0
+        if dt <= B2_EPSILON:
+            return
+        if cfg["freq"] > 0.0:
+            omega = 2.0 * math.pi * cfg["freq"]
+            d = 2.0 * cfg["ratio"] * omega
+            k = omega * omega
+            fraction = dt * k / (d + dt * k)
+        else:
+            fraction = cfg["corr"]
+        if math.isnan(fraction) or fraction <= 0.0:
+            return
+        fraction = rust_min(fraction, 1.0)
+        points = []
+        for m in st["manifolds"]:
+            if self.sensor(st, m, True):
+                continue
+            ba, bb = bodies.get(m["ba"]), bodies.get(m["bb"])
+            if ba is None or bb is None:
+                continue
+            for p in m["pts"]:
+                pen = p[4] - cfg["slop"]
+                if pen <= 0.0:
+                    continue
+                ra, rb = self.arms(ba, bb, p)
+                points.append([m["ba"], m["bb"], ra, rb, m["n"], fraction * pen / dt, 0.0])
+        for _ in range(max(cfg["piters"], 1)):
+            for pt in points:
+                ba, bb = bodies.get(pt[0]), bodies.get(pt[1])
+                if ba is None or bb is None:
+                    continue
+                ima, iia = _sim(ba)
+                imb, iib = _sim(bb)
+                va, vb = [ba["pv"][0], ba["pv"][1], ba["pw"]], [bb["pv"][0], bb["pv"][1], bb["pw"]]
+                n = pt[4]
+                ca, cb = _cross(pt[2], n), _cross(pt[3], n)
+                k = ima + imb + ca * ca * iia + cb * cb * iib
+                if k < B2_EPSILON:
+                    continue
+                vn = _rel(va, vb, pt[2], pt[3], n)
+                new = rust_max(pt[6] + (pt[5] - vn) / k, 0.0)
+                d = new - pt[6]
+                pt[6] = new
+                imp = (n[0] * d, n[1] * d)
+                _apply(va, -1.0, imp, pt[2], ima, iia)
+                _apply(vb, 1.0, imp, pt[3], imb, iib)
+                if ima > 0.0:
+                    ba["pv"], ba["pw"] = [va[0], va[1]], va[2]
+                if imb > 0.0:
+                    bb["pv"], bb["pw"] = [vb[0], vb[1]], vb[2]
+
+    @staticmethod
+    def record(st):
+        """`ContactTracker::record_substep` with the manifold keys."""
+        tr = st["tracker"]
+        if tr["recorded"] and tr["current"]:
+            tr["seen"] = _union(tr["seen"], tr["current"])
+        tr["current"] = sorted(set((m["ca"], m["cb"]) for m in st["manifolds"]))
+        tr["recorded"] = True
+
+    @staticmethod
+    def finish(st):
+        """`ContactTracker::finish`: the frame's events as (kind, a, b)."""
+        tr = st["tracker"]
+        prev, cur = set(tr["prev"]), set(tr["current"])
+        ev = [("Ongoing" if p in prev else "Started", p) for p in tr["current"]]
+        for p in (tr["prev"] if not tr["seen"] else _union(tr["prev"], tr["seen"])):
+            if p in cur:
+                continue
+            if p not in prev:
+                ev.append(("Started", p))
+            ev.append(("Stopped", p))
+        tr["prev"], tr["current"], tr["seen"], tr["recorded"] = tr["current"], [], [], False
+        return ev
 
     def rotate(self, v, rot):
         s, c = self.sin(rot), self.cos(rot)
@@ -2332,6 +2829,10 @@ class _Step2d:
                 vx *= scale
                 vy *= scale
             b["vel"] = [vx, vy]
+        self.update_manifolds(st, self.broadphase(st, dt))
+        self.wake_on_contact(st)
+        self.warm_start(st)
+        cprep = self.prepare_contacts(st)
         prepared = []
         if dt > B2_EPSILON:
             for h, j in st["joint_arena"].values():
@@ -2353,6 +2854,7 @@ class _Step2d:
                         b = bodies.get(side[0])
                         if b is not None:
                             b["vel"], b["w"] = [vel[0], vel[1]], vel[2]
+            self.solve_contacts_once(st, cprep)
         for pj in prepared:
             if pj["brk"] is None:
                 continue
@@ -2365,17 +2867,19 @@ class _Step2d:
             force = imp / dt if dt > B2_EPSILON else 0.0
             if force > pj["brk"]:
                 st["joint_arena"].remove(pj["handle"])
+        self.solve_positions(st, cfg, dt)
         for _, b in bodies.values():
-            b["pv"], b["pw"] = [0.0, 0.0], 0.0
-            if b["type"] == "e:BodyType.Static":
+            if b["type"] == B2_STATIC:
                 continue
-            if b["type"] == "e:BodyType.Dynamic" and (b["inv_mass"] == 0.0 or b["sleeping"]):
+            if b["type"] == B2_DYNAMIC and (b["inv_mass"] == 0.0 or b["sleeping"]):
+                b["pv"], b["pw"] = [0.0, 0.0], 0.0
                 continue
             b["pos"] = [b["pos"][0] + b["vel"][0] * dt, b["pos"][1] + b["vel"][1] * dt]
-            b["pos"] = [b["pos"][0] + 0.0 * dt, b["pos"][1] + 0.0 * dt]
+            b["pos"] = [b["pos"][0] + b["pv"][0] * dt, b["pos"][1] + b["pv"][1] * dt]
             if not b["fixed"]:
                 b["rot"] += b["w"] * dt
-                b["rot"] += 0.0 * dt
+                b["rot"] += b["pw"] * dt
+            b["pv"], b["pw"] = [0.0, 0.0], 0.0
         self.islands(st, dt)
 
     @staticmethod
@@ -2398,8 +2902,8 @@ class _Step2d:
             b = bodies.get(h)
             return b is not None and b["type"] == "e:BodyType.Dynamic"
 
-        links = [(idx[j["a"]], idx[j["b"]]) for _, j in st["joint_arena"].values()
-                 if dyn(j["a"]) and dyn(j["b"]) and j["a"] in idx and j["b"] in idx]
+        ends = [(m["ba"], m["bb"]) for m in st["manifolds"]] + [(j["a"], j["b"]) for _, j in st["joint_arena"].values()]
+        links = [(idx[a], idx[b]) for a, b in ends if dyn(a) and dyn(b) and a in idx and b in idx]
         for ia, ib in links:
             ra, rb = find(ia), find(ib)
             if ra == rb:
@@ -2446,39 +2950,50 @@ class _Step2d:
                     if b["type"] == "e:BodyType.Dynamic" and not b["sleeping"]:
                         b["sleeping"], b["vel"], b["w"] = True, [0.0, 0.0], 0.0
 
-    def step(self, ins):
-        """The output tokens of a b2_step row."""
+    def step(self, ins, module="b2_step"):
+        """The output tokens of a b2_step or b2_contact row."""
         cfg = {"dt": tok_f(ins[0]), "g": (tok_f(ins[1]), tok_f(ins[2])), "iters": tok_i(ins[4]),
-               "maxv": tok_f(ins[10]), "sub": tok_i(ins[11])}
+               "piters": tok_i(ins[5]), "slop": tok_f(ins[8]), "corr": tok_f(ins[9]), "maxv": tok_f(ins[10]),
+               "sub": tok_i(ins[11]), "freq": tok_f(ins[12]), "ratio": tok_f(ins[13])}
+        if ins[15] != "e:SolverKind.SequentialImpulse":
+            fail(f"{module}: a step row runs {ins[15]} (the port refuses XPBD, ADR 0008 #6)")
         st, k = _dump_parse(ins, 16)
         if k != len(ins):
-            fail(f"b2_step: {len(ins) - k} input tokens left over")
-        if any(m != 0 for m in st["masks"]):
-            fail("b2_step: an M3b scene has a collider that can pair (mask != 0)")
+            fail(f"{module}: {len(ins) - k} input tokens left over")
+        if module == "b2_step":
+            if any(m != 0 for m in st["masks"]):
+                fail("b2_step: an M3b scene has a collider that can pair (mask != 0)")
+            if st["manifolds"] or st["tracker"]["prev"]:
+                fail("b2_step: an M3b row's dump has manifolds or contacts")
         sub = max(cfg["sub"], 1)
         dt = cfg["dt"] / float(sub)
         for _ in range(sub):
             self.substep(st, cfg, dt)
+            self.record(st)
         for _, b in st["body_arena"].values():
             b["force"], b["torque"] = [0.0, 0.0], 0.0
-        return _dump_emit(st) + ["v:0"]
+        ev = self.finish(st)
+        out = _dump_emit(st) + [f"v:{len(ev)}"]
+        for kind, (a, b) in ev:
+            out += [f"e:CollisionEvent.{kind}", _st_h(a), _st_h(b)]
+        return out
 
 
 GLIBC_STEP = _Step2d(lambda x: _sin_cos(x)[0], lambda x: _sin_cos(x)[1], _glibc_hypot)
 
 
-def check_b2_step(rows):
+def check_b2_step(rows, module="b2_step"):
     """Recomputes every single-step row on glibc's sin, cos and hypot."""
     counted = 0
     for fn, cls, ins, outs, note in rows:
         if fn != "b2::step":
-            fail(f"b2_step: unknown function {fn}")
+            fail(f"{module}: unknown function {fn}")
             continue
-        want = GLIBC_STEP.step(ins)
+        want = GLIBC_STEP.step(ins, module)
         if not _same_tokens(outs, want):
             first = next((i for i, (a, b) in enumerate(zip(outs, want)) if not _same_tokens([a], [b])),
                          min(len(outs), len(want)))
-            fail(f"b2_step: row {counted}: the transcription differs at output {first}: "
+            fail(f"{module}: row {counted}: the transcription differs at output {first} of {len(outs)}: "
                  f"{' '.join(outs[first:first + 3])} vs {' '.join(want[first:first + 3])}")
         counted += 1
     return counted
@@ -2489,6 +3004,7 @@ PRIVATE_SOURCES = (
     ("aabb_tree.rs", "_IM_", {"NULL_NODE"}),
     ("spatial_hash.rs", "_IM_", set()),
     ("backend_2d/joints.rs", "_IM_B2_", set()),
+    ("backend_2d/solver.rs", "_IM_B2_", set()),
     ("backend_2d/types.rs", "_IM_B2_", {"FALLBACK"}),
 )
 PRIVATE_CONST = re.compile(r"^\s*(?:pub(?:\((?:super|crate)\))?\s+)?const\s+(\w+)\s*:\s*([\w(),\[\]; ]+?)\s*=\s*(.+?);")
@@ -2524,7 +3040,14 @@ def check_private(root):
     for name in sorted(set(cyr) - seen):
         fail(f"constants_private: {name} has no const in the listed Rust sources")
     for name, mine in (("_IM_B2_MIN_MASS", B2_MIN_MASS), ("_IM_B2_MIN_INERTIA", B2_MIN_INERTIA),
-                       ("_IM_B2_EPSILON_SQ", B2_EPSILON_SQ)):
+                       ("_IM_B2_EPSILON_SQ", B2_EPSILON_SQ), ("_IM_B2_EPSILON", B2_EPSILON),
+                       ("_IM_B2_SLEEP_VELOCITY_THRESHOLD", B2_SLEEP_VELOCITY),
+                       ("_IM_B2_SLEEP_TIME_THRESHOLD", B2_SLEEP_TIME), ("_IM_B2_JOINT_BAUMGARTE", B2_JOINT_BAUMGARTE),
+                       ("_IM_B2_MANIFOLD_MATCH_THRESHOLD", B2_MANIFOLD_MATCH),
+                       ("_IM_B2_MAX_MANIFOLD_POINTS", B2_MAX_MANIFOLD_POINTS),
+                       ("_IM_B2_WARM_START_FACTOR", B2_WARM_START),
+                       ("_IM_B2_RESTITUTION_VELOCITY_THRESHOLD", B2_RESTITUTION_VELOCITY),
+                       ("_IM_B2_MAX_CONDITION_NUMBER", B2_MAX_CONDITION)):
         if name in cyr and float(cyr[name]) != mine:
             fail(f"validate.py's {name} differs from the generated one")
     if len(FAILS) == before:
@@ -2779,7 +3302,7 @@ def main():
     for name in names:
         rows = read_module(golden / f"{name}.tsv")
         total += len(rows)
-        if name in ("math", "spring", "b2_narrow", "b2_ray", "b2_step"):
+        if name in ("math", "spring", "b2_narrow", "b2_ray", "b2_step", "b2_contact"):
             check_corrections(root, name, golden / f"{name}.tsv", rows)
         if name == "constants":
             check_constants(root, rows)
@@ -2794,6 +3317,8 @@ def main():
             print(f"broadphase: {check_broadphase(rows)} rows recomputed (brute force, rasterisation)")
         elif name == "b2_step":
             print(f"b2_step: {check_b2_step(rows)} single steps recomputed (joints, integration, sleep)")
+        elif name == "b2_contact":
+            print(f"b2_contact: {check_b2_step(rows, name)} single steps recomputed (contacts, joints, sleep)")
         elif name == "b2_state":
             print(f"b2_state: {check_b2_state(rows)} scripts replayed on a model of the arenas and the state")
         elif name == "b2_ray":

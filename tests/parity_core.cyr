@@ -358,6 +358,40 @@ fn _par_hist(slot, d) {
 }
 
 # ── row comparison ──────────────────────────────────────────────────────────────────
+# The index of the first output whose kind or value differs between got and want (bitwise; the
+# shorter count when one list is a prefix of the other), for a failure report.
+#must_use
+fn _par_first_diff(): i64 {
+    var n = _par_got_n;
+    if (_par_want_n < n) { n = _par_want_n; }
+    for (var k = 0; k < n; k = k + 1) {
+        var at = k * 8;
+        if (load64(_par_want_k + at) != load64(_par_got_k + at)) { return k; }
+        if (load64(_par_want_v + at) != load64(_par_got_v + at)) {
+            if (load64(_par_want_k + at) == 102 || load64(_par_want_k + at) == 105 || load64(_par_want_k + at) == 118) {
+                return k;
+            }
+        }
+    }
+    return n;
+}
+
+# Prints where a failing row first differs: the output index, both counts, and the pair there.
+fn _par_print_first_diff() {
+    var k = _par_first_diff();
+    eprint("    first difference at output ", 31);
+    efmt_int(k);
+    eprint(" (got ", 6);
+    efmt_int(_par_got_n);
+    eprint(" outputs, want ", 15);
+    efmt_int(_par_want_n);
+    eprint(")\n", 2);
+    if (k < _par_got_n && k < _par_want_n) {
+        ulp_print_pair(load64(_par_got_v + k * 8), load64(_par_want_v + k * 8));
+    }
+    return 0;
+}
+
 # Compares the got list with the wanted outputs under class `cls` ('A' 'B' 'C' 'D').
 # Returns 1 ok, 0 failed, 2 measured (class C with no bound yet). Sets _par_outlier when a
 # float is more than 16 ulp off, or a NaN / infinity disagrees.
@@ -826,9 +860,7 @@ fn _par_module(mp, ml): i64 {
                         eprint(buf + t4 + 1, eol - t4 - 1);
                     }
                     eprint("\n", 1);
-                    if (bad == 0 && _par_got_n > 0) {
-                        ulp_print_pair(load64(_par_got_v), load64(_par_want_v));
-                    }
+                    if (bad == 0 && _par_got_n > 0) { _par_print_first_diff(); }
                     fails_shown = fails_shown + 1;
                 }
             }

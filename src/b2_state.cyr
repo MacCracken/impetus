@@ -106,8 +106,9 @@ impl ImManifoldStore {
 # ── the state ───────────────────────────────────────────────────────────────────────
 
 # `bodies`, `colliders` and `joints` are *ImArena words; `body_colliders` is one ImWordList record (three
-# words) per body slot, `list_slots` of them; `prep` / `prep_rows` are the joint solver's scratch
-# (src/b2_joints.cyr), reused from step to step. Mirrors `PhysicsState2d`.
+# words) per body slot, `list_slots` of them. The rest is scratch reused from step to step: `prep` /
+# `prep_rows` the joint solver's (src/b2_joints.cyr), `bp_*` the broadphase's and `mf_fresh` / `ct_*` the
+# contact pipeline's (src/b2_contacts.cyr). Mirrors `PhysicsState2d`.
 struct ImPhysicsState2d {
     bodies;
     colliders;
@@ -121,6 +122,18 @@ struct ImPhysicsState2d {
     prep_len;
     prep_cap;
     prep_rows;
+    bp_grid: ImSpatialHashGrid;
+    bp_tree: ImAabbTree;
+    bp_boxes: ImWordList;
+    bp_dims: ImWordList;
+    bp_pairs: ImPairList;
+    mf_fresh: ImManifoldStore;
+    ct_geo: ImWordList;
+    ct_prep: ImWordList;
+    ct_level: ImWordList;
+    ct_sort: ImWordList;
+    ct_pos: ImWordList;
+    ct_keys: ImWordList;
 }
 
 # An empty state. Its arenas are 0 when there is no memory (every operation then refuses). Mirrors
@@ -140,6 +153,18 @@ fn ImPhysicsState2d_new(): ImPhysicsState2d {
     s.prep_len = 0;
     s.prep_cap = 0;
     s.prep_rows = 0;
+    s.bp_grid = ImSpatialHashGrid_new(1.0);
+    s.bp_tree = ImAabbTree_new();
+    s.bp_boxes = ImWordList_new();
+    s.bp_dims = ImWordList_new();
+    s.bp_pairs = ImPairList_new();
+    s.mf_fresh = ImManifoldStore_new();
+    s.ct_geo = ImWordList_new();
+    s.ct_prep = ImWordList_new();
+    s.ct_level = ImWordList_new();
+    s.ct_sort = ImWordList_new();
+    s.ct_pos = ImWordList_new();
+    s.ct_keys = ImWordList_new();
     return s;
 }
 
@@ -660,7 +685,7 @@ impl ImPhysicsState2d {
     }
 
     # Releases everything the state owns: the colliders' shapes, the arenas, the lists, the manifolds,
-    # the tracker and the island manager.
+    # the tracker, the island manager and the scratch.
     fn free(self) {
         if (self.colliders != 0) {
             var ca: *ImArena = self._colliders();
@@ -694,6 +719,18 @@ impl ImPhysicsState2d {
         self.prep_rows = 0;
         self.prep_len = 0;
         self.prep_cap = 0;
+        self.bp_grid.free();
+        self.bp_tree.free();
+        self.bp_boxes.free();
+        self.bp_dims.free();
+        self.bp_pairs.free();
+        self.mf_fresh.free();
+        self.ct_geo.free();
+        self.ct_prep.free();
+        self.ct_level.free();
+        self.ct_sort.free();
+        self.ct_pos.free();
+        self.ct_keys.free();
         return 0;
     }
 }

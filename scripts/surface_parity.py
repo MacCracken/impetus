@@ -4,8 +4,8 @@ Port plan §6 (a per-milestone gate) and M7 (the release gate). Adapted from kim
 tanmatra's scripts/surface_parity.py. Usage, from the repo root:
     python3 -I scripts/surface_parity.py .
 
-For each ported module it lists rust-old/src/<module>.rs's public items before `#[cfg(test)]` and
-checks that src/ defines the Cyrius name the naming rules give (port plan §7.4):
+For each ported module it lists rust-old/src/<module>.rs's public items before `#[cfg(test)]` (and
+skips a fn whose own attributes include `#[cfg(test)]`, a test helper) and checks that src/ defines the Cyrius name the naming rules give (port plan §7.4):
 - free `pub fn f`                         -> `fn f(`
 - `impl Struct { pub fn f(...) }`, no self -> `fn Im<Struct>_f(`
 - `impl Struct { pub fn m(&self ...) }`    -> `fn m(` inside `impl Im<Struct> {`
@@ -33,10 +33,9 @@ MODULES = [
     "error", "config", "material", "units", "force",
     "body", "collider", "joint", "event", "query", "arena", "contact_tracker", "spring",
     "aabb_tree", "spatial_hash", "backend_2d/types", "backend_2d/narrowphase",
-    "backend_2d/raycast", "backend_2d/state", "backend_2d/joints",
+    "backend_2d/raycast", "backend_2d/state", "backend_2d/joints", "backend_2d/solver",
 ]
 PENDING_MODULES = {
-    "backend_2d/solver": "M3",
     "backend_2d/tests": "M3", "particle": "M3", "world": "M3",
     "backend_3d/types": "M4", "backend_3d/narrowphase": "M4", "backend_3d/raycast": "M4",
     "backend_3d/solver": "M5", "backend_3d/joints": "M5", "backend_3d/state": "M5",
@@ -79,11 +78,12 @@ FN_RENAMES = {
     "pair_key": "_im_pair_key",
     # `union` is a reserved word in Cyrius.
     "IslandManager::union": "ImIslandManager::unite",
-    # The 2D narrowphase is backend-internal (`pub(super)`): private `_im_b2_` helpers here.
+    # The 2D narrowphase is backend-internal (`pub(super)`): private `_im_b2_` helpers here. (Rust's
+    # test-only generate_contact, ray_circle and ray_aabb_2d are ported too, for the ported tests.)
     **{f: f"_im_b2_{f}" for f in (
-        "world_pos", "world_to_local", "local_to_world", "ordered_manifold_key", "generate_contact",
+        "world_pos", "world_to_local", "local_to_world", "ordered_manifold_key",
         "shapes_touch", "circle_circle", "circle_aabb", "capsule_endpoints", "closest_point_on_segment",
-        "generate_contacts_multi", "ray_circle", "ray_aabb_2d",
+        "generate_contacts_multi",
     )},
 }
 # Rust field -> the Cyrius fields that carry it (Option<T> is a presence flag plus the value).
@@ -225,6 +225,14 @@ def rust_items(module):
         if struct_name and (m := re.match(r"pub (\w+):", s)):
             items.append(("field", struct_name, m.group(1), None))
         if (m := re.match(VIS + r" fn (\w+)(?:<[^>]*>)?\((&?(?:mut )?self)?", s)):
+            # A test-only helper (`#[cfg(test)]` among the attributes above it) is not library surface.
+            back = li - 1
+            test_only = False
+            while back >= 0 and lines[back].strip().startswith("#["):
+                test_only = test_only or lines[back].strip() == "#[cfg(test)]"
+                back -= 1
+            if test_only:
+                continue
             has_self = bool(m.group(2))
             # A signature that breaks after `(` names its receiver on the next line.
             if not has_self and s.endswith("(") and li + 1 < len(lines):

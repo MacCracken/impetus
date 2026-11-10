@@ -261,6 +261,38 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     - **97,778 ok, 0 failed, 0 measured, 7 pending, 164 accepted.**
   - The mouse-joint test is ported, with Cyrius-only joint, island and sleep tests (21 assertions).
     Surface parity is 421/421. `JOINT_BAUMGARTE` is generated.
+- **Cyrius port, M3 part 3: the contact pipeline and `step`** (`docs/development/port-parity.md` §15):
+  - `src/b2_contacts.cyr`: the contact stages of the sequential-impulse step.
+    - The broadphase, under either kind, sweeps each AABB by its body's velocity. It skips pairs on
+      the same body, pairs of static bodies, sensor pairs and pairs whose layers miss each other's
+      masks.
+    - One-shot manifolds are rebuilt each sub-step and warm started from last sub-step's matching
+      points, unless the normal flipped.
+    - Sleeping bodies wake on contact.
+    - The contact solver orders manifolds by shock propagation. It block-solves two-point manifolds
+      when well conditioned, applies Coulomb friction with static friction below 0.01 m/s, resists
+      rolling, and bounces above 1 m/s.
+    - Penetration is corrected by split impulses, through the soft constraint or Baumgarte.
+    - Storage is scratch reused every step; a test confirms the heap stays flat.
+  - `step` (`src/b2_solver.cyr`): one sub-step, then the touching pairs recorded for events. XPBD
+    stays refused (ADR 0008 #6), so `step` runs the sequential-impulse solver for any solver kind.
+  - The harness's `b2::step` rows now run the library's `step`. New `b2_contact.tsv`: 418 single
+    steps with contacts, under both broadphases. Its scenes cover every material rule, shape family
+    and position-solver setting, plus sensors, layers, sleep and wake, fast bodies, joints over
+    ground, and 40 seeded scenes.
+    - All 0 ulp against the corrected oracle on three targets. Two rows are corrected, each where
+      glibc's `cos` misrounds.
+    - `validate.py` now transcribes the whole step, contacts and events included, and reproduces all
+      632 step rows on glibc.
+    - **98,194 ok, 0 failed, 0 measured, 7 pending, 166 accepted.**
+  - 24 more Rust tests are ported in `tests/b2_contacts.tcyr`: sensors, kinematics, sleep and wake,
+    layers, manifold persistence, warm starting, the stepping joint tests, static friction and
+    sub-stepping. Cyrius-only groups check that the broadphase kinds agree, the block solver, restitution,
+    rolling resistance, the event order and the flat heap (62 assertions). The three xpbd_* tests are
+    not ported.
+  - Surface parity is 418/418 across 21 modules. It now skips `#[cfg(test)]` helpers.
+    `RESTITUTION_VELOCITY_THRESHOLD` and `MAX_CONDITION_NUMBER` are generated.
+  - The parity harness names a failing row's first differing output.
 
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
@@ -289,8 +321,16 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   `add_joint` 23.4 ns → 1.22 µs, `apply_force` 3.3 → 45 ns, `apply_impulse` 1.7 → 41 ns. Arena
   records (224 B per body, 320 B per collider) move by the stdlib's byte-loop `memcpy` (S5).
 - **2D joints, first numbers** (Cyrius only; Rust times its step whole): a 20-link revolute chain's
-  joints take 22.5 µs a sub-step to prepare and solve (4 iterations), and its whole contact-free
-  frame 54.7 µs.
+  joints take 22.5 µs a sub-step to prepare and solve (4 iterations). Its whole frame through `step`
+  takes 88.2 µs, broadphase included (54.7 µs for the contact-free stages alone).
+- **2D step, first numbers against Rust** (Rust's `world/step_*` scenes through the backend's `step`;
+  `docs/benchmarks-rust-v-cyrius.md`):
+  - empty: 438 ns against 115 ns (3.8×);
+  - 10 balls: 29.0 µs against 4.31 µs (6.7×);
+  - 100 balls: 374 µs against 101 µs (3.7×);
+  - 1,000 balls: 4.07 ms against 853 µs (4.8×).
+
+  A resting stack of five boxes steps in 51 µs.
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

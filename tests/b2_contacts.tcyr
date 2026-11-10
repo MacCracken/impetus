@@ -1,0 +1,652 @@
+# b2_contacts.tcyr — the 2D contact pipeline and the library step (M3c): the 24 Rust tests of
+# backend_2d/tests.rs that step with contacts or need the full step (Rust's `step_frame` is one `step`
+# then `finish_step`, as `frame` here), plus Cyrius-only tests of the broadphase kinds, the block
+# solver, restitution, rolling resistance, the event sequence and a flat heap. The three xpbd_* tests are
+# not ported: the port refuses XPBD (ADR 0008 #6).
+
+include "tests/lib_2d.cyr"
+
+var EPS: f64 = 0.000001;
+
+# 1 when |got − want| < eps.
+fn near(got: f64, want: f64, eps: f64): i64 {
+    var d: f64 = f64_abs(got - want);
+    if (d < eps) { return 1; }
+    return 0;
+}
+
+# One frame as Rust's `step_frame` with the tests' settings (1/60 s, slop 0.01, correction 0.2, speed
+# cap 100, constraint frequency 30 at damping ratio 1, the spatial hash): the frame's event count.
+fn frame(st: *ImPhysicsState2d, gx: f64, gy: f64, vi, pi): i64 {
+    var dt: f64 = 1.0 / 60.0;
+    st.step(ImVec3_new(gx, gy, 0.0), dt, vi, pi, 0.01, 0.2, 100.0, 30.0, 1.0, IM_BROADPHASE_SPATIAL_HASH,
+      IM_SOLVER_SEQUENTIAL_IMPULSE);
+    return st.finish_step();
+}
+
+# The same with the AABB tree broadphase.
+fn frame_tree(st: *ImPhysicsState2d, gx: f64, gy: f64, vi, pi): i64 {
+    var dt: f64 = 1.0 / 60.0;
+    st.step(ImVec3_new(gx, gy, 0.0), dt, vi, pi, 0.01, 0.2, 100.0, 30.0, 1.0, IM_BROADPHASE_AABB_TREE,
+      IM_SOLVER_SEQUENTIAL_IMPULSE);
+    return st.finish_step();
+}
+
+# A body of type t at (x, y) moving at (vx, vy).
+fn add(st: *ImPhysicsState2d, t, x: f64, y: f64, vx: f64, vy: f64): i64 {
+    var d: ImBodyDesc = ImBodyDesc_default();
+    d.body_type = t;
+    d.position = ImVec3_new(x, y, 0.0);
+    d.linear_velocity = ImVec3_new(vx, vy, 0.0);
+    return st.add_body(d);
+}
+
+# A material of friction f, restitution r and density 1.
+fn mat(f: f64, r: f64): ImPhysicsMaterial {
+    var m: ImPhysicsMaterial = ImPhysicsMaterial_default();
+    m.friction = f;
+    m.restitution = r;
+    m.density = 1.0;
+    return m;
+}
+
+# Adds a collider of shape s and material m to body h, on every layer: its handle.
+fn coll(st: *ImPhysicsState2d, h, s: ImColliderShape, m: ImPhysicsMaterial): i64 {
+    var d: ImColliderDesc = ImColliderDesc_new(s);
+    d.material = m;
+    var t, c = st.add_collider(h, d);
+    return c;
+}
+
+# The same with a collision layer and mask, or as a sensor.
+fn coll_lm(st: *ImPhysicsState2d, h, s: ImColliderShape, layer, mask, sensor): i64 {
+    var d: ImColliderDesc = ImColliderDesc_new(s);
+    d.collision_layer = layer;
+    d.collision_mask = mask;
+    d.is_sensor = sensor;
+    var t, c = st.add_collider(h, d);
+    return c;
+}
+
+# The body record at h.
+fn rec(st: *ImPhysicsState2d, h): *ImRigidBody2d {
+    return st._body(h);
+}
+
+# Two dynamic unit balls 0.5 apart on layers (la, ma) and (lb, mb): the first frame's event count.
+fn layered(la, ma, lb, mb): i64 {
+    var st: ImPhysicsState2d = ImPhysicsState2d_new();
+    var a = add(&st, IM_BODY_DYNAMIC, 0.0, 0.0, 0.0, 0.0);
+    coll_lm(&st, a, ImColliderShape_ball(1.0), la, ma, 0);
+    var b = add(&st, IM_BODY_DYNAMIC, 0.5, 0.0, 0.0, 0.0);
+    coll_lm(&st, b, ImColliderShape_ball(1.0), lb, mb, 0);
+    var n = frame(&st, 0.0, 0.0, 4, 1);
+    st.free();
+    return n;
+}
+
+# A static floor box of half extents (hx, hy) at (0, y) and friction f.
+fn floor_at(st: *ImPhysicsState2d, y: f64, hx: f64, hy: f64, f: f64): i64 {
+    var h = add(st, IM_BODY_STATIC, 0.0, y, 0.0, 0.0);
+    coll(st, h, ImColliderShape_box(hx, hy, 0.0), mat(f, 0.0));
+    return h;
+}
+
+# A dynamic body at (x, y) with a ball of radius 0.5 (density 1), hung from static body a by joint jt.
+fn hung(st: *ImPhysicsState2d, a, x: f64, y: f64, jt: ImJointType, has_brk, brk: f64): i64 {
+    var b = add(st, IM_BODY_DYNAMIC, x, y, 0.0, 0.0);
+    coll(st, b, ImColliderShape_ball(0.5), mat(0.5, 0.0));
+    var z2: ImVec2 = ImVec2_new(0.0, 0.0);
+    var d: ImJointDesc = ImJointDesc_new(a, b, jt, z2, z2);
+    d.has_break_force = has_brk;
+    d.break_force = brk;
+    var t, j = st.add_joint(d);
+    return j;
+}
+
+# The second body of joint j.
+fn joint_b(st: *ImPhysicsState2d, j): i64 {
+    var ja: *ImArena = st._joints();
+    var jp: *ImJoint2d = _im_b2_as_joint(ja.get(j));
+    return jp.body_b;
+}
+
+# A stack of five boxes of half size 0.5 on a floor at y = -0.5 (friction 0.8): the top box.
+fn box_stack(st: *ImPhysicsState2d): i64 {
+    floor_at(st, -0.5, 20.0, 0.5, 0.8);
+    var top = 0;
+    for (var i = 0; i < 5; i = i + 1) {
+        var y: f64 = 0.5 + f64_from(i) * 1.0;
+        top = add(st, IM_BODY_DYNAMIC, 0.0, y, 0.0, 0.0);
+        coll(st, top, ImColliderShape_box(0.5, 0.5, 0.0), mat(0.8, 0.0));
+    }
+    return top;
+}
+
+# 1 when some manifold point carries a normal impulse.
+fn any_impulse(st: *ImPhysicsState2d): i64 {
+    for (var i = 0; i < st.manifolds.count(); i = i + 1) {
+        var m: *ImContactManifold = _im_b2_as_manifold(st.manifolds.at(i));
+        for (var p = 0; p < m.point_count; p = p + 1) {
+            var mp: *ImManifoldPoint = _im_b2_mpoint(m, p);
+            var ni: f64 = mp.normal_impulse;
+            var a: f64 = f64_abs(ni);
+            if (a > EPS) { return 1; }
+        }
+    }
+    return 0;
+}
+
+# Runs the contact tests.
+fn main() {
+    alloc_init();
+    var st: ImPhysicsState2d = ImPhysicsState2d_new();
+
+    # ── backend_2d/tests.rs ──
+    test_group("sensor_generates_events_no_physics");
+    var fl = add(&st, IM_BODY_STATIC, 0.0, 0.0, 0.0, 0.0);
+    coll_lm(&st, fl, ImColliderShape_box(10.0, 0.5, 0.0), 4294967295, 4294967295, 1);
+    var ball = add(&st, IM_BODY_DYNAMIC, 0.0, 0.0, 0.0, 0.0);
+    coll(&st, ball, ImColliderShape_ball(0.5), ImPhysicsMaterial_default());
+    var rb: *ImRigidBody2d = rec(&st, ball);
+    var vx0: f64 = rb.linear_velocity.x;
+    var vy0: f64 = rb.linear_velocity.y;
+    var ne = frame(&st, 0.0, 0.0, 4, 1);
+    assert_eq(ne > 0, 1, "events");
+    rb = rec(&st, ball);
+    var vx1: f64 = rb.linear_velocity.x;
+    var vy1: f64 = rb.linear_velocity.y;
+    assert_eq(near(vx1, vx0, EPS) == 1 && near(vy1, vy0, EPS) == 1, 1, "no physical response");
+    st.free();
+
+    test_group("kinematic_body_moves_from_velocity");
+    st = ImPhysicsState2d_new();
+    var kb = add(&st, IM_BODY_KINEMATIC, 0.0, 0.0, 10.0, 0.0);
+    frame(&st, 0.0, -9.81, 4, 1);
+    rb = rec(&st, kb);
+    var kx: f64 = rb.position.x;
+    var kvy: f64 = rb.linear_velocity.y;
+    assert_eq(kx > 0.0, 1, "moved from its velocity");
+    assert_eq(near(kvy, 0.0, EPS), 1, "no gravity");
+    st.free();
+
+    test_group("remove_body_cleans_collision_pairs");
+    st = ImPhysicsState2d_new();
+    var ra = add(&st, IM_BODY_STATIC, 0.0, 0.0, 0.0, 0.0);
+    coll(&st, ra, ImColliderShape_ball(1.0), ImPhysicsMaterial_default());
+    var rbh = add(&st, IM_BODY_DYNAMIC, 0.5, 0.0, 0.0, 0.0);
+    coll(&st, rbh, ImColliderShape_ball(1.0), ImPhysicsMaterial_default());
+    frame(&st, 0.0, 0.0, 4, 1);
+    assert_eq(st.manifolds.count() > 0, 1, "a manifold");
+    st.remove_body(rbh);
+    assert_eq(st.manifolds.count(), 0, "cleaned with the body");
+    st.free();
+
+    test_group("spatial_hash_finds_nearby_pair");
+    var g: ImSpatialHashGrid = ImSpatialHashGrid_new(2.0);
+    g.insert_2d(0, ImVec2_new(0.0, 0.0), ImVec2_new(1.0, 1.0));
+    g.insert_2d(1, ImVec2_new(0.5, 0.5), ImVec2_new(1.5, 1.5));
+    var pl: ImPairList = ImPairList_new();
+    g.query_pairs(&pl);
+    assert_eq(pl.contains(0, 1), 1, "the pair");
+    g.free();
+
+    test_group("spatial_hash_no_false_pair");
+    g = ImSpatialHashGrid_new(1.0);
+    g.insert_2d(0, ImVec2_new(0.0, 0.0), ImVec2_new(0.5, 0.5));
+    g.insert_2d(1, ImVec2_new(10.0, 10.0), ImVec2_new(10.5, 10.5));
+    g.query_pairs(&pl);
+    assert_eq(pl.len, 0, "none");
+    g.free();
+    pl.free();
+
+    test_group("spatial_hash_auto_cell_size");
+    var dims[16];
+    var d1: f64 = 1.0;
+    var d2: f64 = 2.0;
+    store64(&dims, d1);
+    store64(&dims + 8, d2);
+    var cs: f64 = ImSpatialHashGrid_auto_cell_size(&dims, 2);
+    assert_eq(near(cs, 3.0, EPS), 1, "twice the mean");
+
+    test_group("spatial_hash_empty");
+    var ce: f64 = ImSpatialHashGrid_auto_cell_size(&dims, 0);
+    assert_eq(near(ce, 1.0, EPS), 1, "1 for none");
+
+    test_group("body_falls_asleep_when_stationary");
+    st = ImPhysicsState2d_new();
+    var sb = add(&st, IM_BODY_DYNAMIC, 0.0, 0.0, 0.0, 0.0);
+    coll(&st, sb, ImColliderShape_ball(1.0), ImPhysicsMaterial_default());
+    # (SLEEP_TIME_THRESHOLD / dt).ceil() + 10 = 31 + 10.
+    for (var f1 = 0; f1 < 41; f1 = f1 + 1) { frame(&st, 0.0, 0.0, 4, 1); }
+    rb = rec(&st, sb);
+    assert_eq(rb.is_sleeping, 1, "asleep after sitting still");
+    st.free();
+
+    test_group("sleeping_body_skips_integration");
+    st = ImPhysicsState2d_new();
+    var zb = add(&st, IM_BODY_DYNAMIC, 0.0, 0.0, 0.0, 0.0);
+    coll(&st, zb, ImColliderShape_ball(1.0), ImPhysicsMaterial_default());
+    rb = rec(&st, zb);
+    rb.is_sleeping = 1;
+    frame(&st, 0.0, -9.81, 4, 1);
+    rb = rec(&st, zb);
+    var zx: f64 = rb.position.x;
+    var zy: f64 = rb.position.y;
+    assert_eq(near(zx, 0.0, EPS) == 1 && near(zy, 0.0, EPS) == 1, 1, "did not move");
+    st.free();
+
+    test_group("moving_body_does_not_sleep");
+    st = ImPhysicsState2d_new();
+    var mb = add(&st, IM_BODY_DYNAMIC, 0.0, 0.0, 5.0, 0.0);
+    coll(&st, mb, ImColliderShape_ball(1.0), ImPhysicsMaterial_default());
+    for (var f2 = 0; f2 < 100; f2 = f2 + 1) { frame(&st, 0.0, 0.0, 4, 1); }
+    rb = rec(&st, mb);
+    assert_eq(rb.is_sleeping, 0, "awake while moving");
+    st.free();
+
+    test_group("contact_wakes_sleeping_body");
+    st = ImPhysicsState2d_new();
+    var wa = add(&st, IM_BODY_DYNAMIC, 0.0, 0.0, 0.0, 0.0);
+    coll(&st, wa, ImColliderShape_ball(1.0), ImPhysicsMaterial_default());
+    rb = rec(&st, wa);
+    rb.is_sleeping = 1;
+    var wb = add(&st, IM_BODY_DYNAMIC, 3.0, 0.0, -5.0, 0.0);
+    coll(&st, wb, ImColliderShape_ball(1.0), ImPhysicsMaterial_default());
+    for (var f3 = 0; f3 < 60; f3 = f3 + 1) { frame(&st, 0.0, 0.0, 4, 1); }
+    rb = rec(&st, wa);
+    assert_eq(rb.is_sleeping, 0, "woken by the impact");
+    st.free();
+
+    test_group("collision_layers_prevent_collision");
+    assert_eq(layered(1, 1, 2, 2), 0, "different layers: no events");
+    test_group("collision_layers_allow_same_layer");
+    assert_eq(layered(1, 1, 1, 1) > 0, 1, "the same layer: events");
+    test_group("collision_layers_asymmetric_mask");
+    assert_eq(layered(1, 3, 2, 2) > 0, 1, "one side's mask meets the other's layer");
+    test_group("collision_layers_default_collide_everything");
+    assert_eq(layered(4294967295, 4294967295, 4294967295, 4294967295) > 0, 1, "the defaults collide");
+
+    test_group("manifold_persistence");
+    st = ImPhysicsState2d_new();
+    floor_at(&st, -1.0, 10.0, 1.0, 0.5);
+    var pb = add(&st, IM_BODY_DYNAMIC, 0.0, 2.0, 0.0, 0.0);
+    coll(&st, pb, ImColliderShape_box(0.5, 0.5, 0.0), mat(0.5, 0.0));
+    for (var f4 = 0; f4 < 60; f4 = f4 + 1) { frame(&st, 0.0, -9.81, 8, 4); }
+    assert_eq(st.manifolds.count() > 0, 1, "the manifold persists");
+    assert_eq(any_impulse(&st), 1, "with an accumulated impulse");
+    st.free();
+
+    test_group("warm_start_stabilizes_stack");
+    st = ImPhysicsState2d_new();
+    var top = box_stack(&st);
+    rb = rec(&st, top);
+    var y0: f64 = rb.position.y;
+    for (var f5 = 0; f5 < 300; f5 = f5 + 1) { frame(&st, 0.0, -9.81, 8, 4); }
+    rb = rec(&st, top);
+    var y1: f64 = rb.position.y;
+    assert_eq(y1 > 3.0, 1, "the stack stands");
+    assert_eq(y1 < y0 + 1.0, 1, "nothing launched");
+    st.free();
+
+    test_group("wheel_joint_constrains_perpendicular");
+    st = ImPhysicsState2d_new();
+    var anchor = add(&st, IM_BODY_STATIC, 0.0, 0.0, 0.0, 0.0);
+    var wj = hung(&st, anchor, 0.0, -1.0, ImJointType_wheel(ImVec2_new(0.0, 1.0), 500.0, 10.0), 0, 0.0);
+    var wbody = joint_b(&st, wj);
+    for (var f6 = 0; f6 < 60; f6 = f6 + 1) { frame(&st, 0.0, -9.81, 4, 1); }
+    rb = rec(&st, wbody);
+    var wx: f64 = rb.position.x;
+    var awx: f64 = f64_abs(wx);
+    assert_eq(awx < 0.1, 1, "x held");
+    st.free();
+
+    test_group("rope_joint_allows_closer_than_max");
+    st = ImPhysicsState2d_new();
+    anchor = add(&st, IM_BODY_STATIC, 0.0, 0.0, 0.0, 0.0);
+    var rj = hung(&st, anchor, 1.0, 0.0, ImJointType_rope(5.0), 0, 0.0);
+    var rbody = joint_b(&st, rj);
+    for (var f7 = 0; f7 < 30; f7 = f7 + 1) { frame(&st, 0.0, -9.81, 4, 1); }
+    rb = rec(&st, rbody);
+    var ry: f64 = rb.position.y;
+    assert_eq(ry < 0.0, 1, "falls while slack");
+    st.free();
+
+    test_group("rope_joint_prevents_exceeding_max_length");
+    st = ImPhysicsState2d_new();
+    anchor = add(&st, IM_BODY_STATIC, 0.0, 0.0, 0.0, 0.0);
+    var rj2 = hung(&st, anchor, 0.0, -1.0, ImJointType_rope(2.0), 0, 0.0);
+    var rbody2 = joint_b(&st, rj2);
+    for (var f8 = 0; f8 < 120; f8 = f8 + 1) { frame(&st, 0.0, -9.81, 4, 1); }
+    rb = rec(&st, rbody2);
+    var px: f64 = rb.position.x;
+    var py: f64 = rb.position.y;
+    var dist: f64 = f64_sqrt(px * px + py * py);
+    assert_eq(dist < 2.5, 1, "held near max_length");
+    st.free();
+
+    test_group("joint_breaking_removes_joint");
+    st = ImPhysicsState2d_new();
+    anchor = add(&st, IM_BODY_STATIC, 0.0, 0.0, 0.0, 0.0);
+    var bj = hung(&st, anchor, 0.0, -3.0, ImJointType_fixed(), 1, 0.001);
+    var ja: *ImArena = st._joints();
+    assert_eq(ja.contains(bj), 1, "added");
+    for (var f9 = 0; f9 < 10; f9 = f9 + 1) { frame(&st, 0.0, -9.81, 4, 1); }
+    ja = st._joints();
+    assert_eq(ja.contains(bj), 0, "broken");
+    st.free();
+
+    test_group("joint_not_broken_when_force_below_threshold");
+    st = ImPhysicsState2d_new();
+    anchor = add(&st, IM_BODY_STATIC, 0.0, 0.0, 0.0, 0.0);
+    var sj = hung(&st, anchor, 0.0, 0.0, ImJointType_fixed(), 1, 100000.0);
+    for (var f10 = 0; f10 < 10; f10 = f10 + 1) { frame(&st, 0.0, -9.81, 4, 1); }
+    ja = st._joints();
+    assert_eq(ja.contains(sj), 1, "the strong joint survives");
+    st.free();
+
+    test_group("combine_rule_max_priority_wins");
+    var ra1 = IM_COMBINE_MAX;
+    var rb1 = IM_COMBINE_AVERAGE;
+    var top_rule = ra1;
+    if (rb1 > ra1) { top_rule = rb1; }
+    assert_eq(top_rule, IM_COMBINE_MAX, "Max outranks Average");
+    var cv: f64 = combine_rule_combine(IM_COMBINE_MAX, 0.2, 0.8);
+    assert_eq(near(cv, 0.8, EPS), 1, "the larger");
+    var cp: f64 = _im_b2_combine(0.2, 0.8, IM_COMBINE_AVERAGE, IM_COMBINE_MAX);
+    assert_eq(near(cp, 0.8, EPS), 1, "combine_property takes the higher rule");
+
+    test_group("multi_point_manifold");
+    st = ImPhysicsState2d_new();
+    floor_at(&st, -0.5, 20.0, 0.5, 0.8);
+    var wide = add(&st, IM_BODY_DYNAMIC, 0.0, 1.0, 0.0, 0.0);
+    coll(&st, wide, ImColliderShape_box(2.0, 0.5, 0.0), mat(0.8, 0.0));
+    var found = 0;
+    var max_points = 0;
+    for (var f11 = 0; f11 < 120; f11 = f11 + 1) {
+        frame(&st, 0.0, -9.81, 8, 4);
+        for (var mi = 0; mi < st.manifolds.count(); mi = mi + 1) {
+            var mm: *ImContactManifold = _im_b2_as_manifold(st.manifolds.at(mi));
+            if (mm.point_count > max_points) { max_points = mm.point_count; }
+        }
+        if (any_impulse(&st) == 1) { found = 1; }
+    }
+    assert_eq(max_points <= 4, 1, "at most four points");
+    assert_eq(max_points, 2, "two, one at each edge");
+    assert_eq(st.manifolds.count() > 0, 1, "manifolds");
+    assert_eq(found, 1, "impulses accumulated");
+    st.free();
+
+    test_group("simulation_islands_sleep");
+    st = ImPhysicsState2d_new();
+    var m5: ImPhysicsMaterial = mat(0.5, 0.0);
+    var fa = add(&st, IM_BODY_STATIC, 0.0, -1.0, 0.0, 0.0);
+    coll(&st, fa, ImColliderShape_box(5.0, 0.5, 0.0), m5);
+    var a1 = add(&st, IM_BODY_DYNAMIC, 0.0, -0.2, 0.0, 0.0);
+    coll(&st, a1, ImColliderShape_ball(0.3), m5);
+    var fb = add(&st, IM_BODY_STATIC, 100.0, -1.0, 0.0, 0.0);
+    coll(&st, fb, ImColliderShape_box(5.0, 0.5, 0.0), m5);
+    var b1 = add(&st, IM_BODY_DYNAMIC, 100.0, -0.2, 0.0, 0.0);
+    coll(&st, b1, ImColliderShape_ball(0.3), m5);
+    # (SLEEP_TIME_THRESHOLD / dt).ceil() + 30 = 31 + 30.
+    for (var f12 = 0; f12 < 61; f12 = f12 + 1) { frame(&st, 0.0, 0.0, 4, 1); }
+    rb = rec(&st, a1);
+    assert_eq(rb.is_sleeping, 1, "cluster A sleeps");
+    rb = rec(&st, b1);
+    assert_eq(rb.is_sleeping, 1, "cluster B sleeps");
+    st.apply_force(b1, ImForce_new(100.0, 0.0, 0.0));
+    frame(&st, 0.0, 0.0, 4, 1);
+    rb = rec(&st, a1);
+    assert_eq(rb.is_sleeping, 1, "A stays asleep");
+    rb = rec(&st, b1);
+    assert_eq(rb.is_sleeping, 0, "B is awake");
+    st.free();
+
+    test_group("static_friction_holds");
+    st = ImPhysicsState2d_new();
+    var sf: ImPhysicsMaterial = ImPhysicsMaterial_default();
+    sf.friction = 0.5;
+    sf.has_static_friction = 1;
+    sf.static_friction = 2.0;
+    var sfl = add(&st, IM_BODY_STATIC, 0.0, -1.0, 0.0, 0.0);
+    coll(&st, sfl, ImColliderShape_box(20.0, 1.0, 0.0), sf);
+    var sbox = add(&st, IM_BODY_DYNAMIC, 0.0, 0.5, 0.0, 0.0);
+    coll(&st, sbox, ImColliderShape_box(0.5, 0.5, 0.0), sf);
+    for (var f13 = 0; f13 < 60; f13 = f13 + 1) { frame(&st, 0.0, -9.81, 8, 4); }
+    rb = rec(&st, sbox);
+    var sx0: f64 = rb.position.x;
+    for (var f14 = 0; f14 < 30; f14 = f14 + 1) {
+        st.apply_force(sbox, ImForce_new(1.0, 0.0, 0.0));
+        frame(&st, 0.0, -9.81, 8, 4);
+    }
+    rb = rec(&st, sbox);
+    var sx1: f64 = rb.position.x;
+    var drift: f64 = f64_abs(sx1 - sx0);
+    assert_eq(drift < 0.5, 1, "held by static friction");
+    st.free();
+
+    test_group("static_friction_default_from_kinetic");
+    var k1: ImPhysicsMaterial = ImPhysicsMaterial_default();
+    k1.friction = 0.6;
+    var e1: f64 = k1.effective_static_friction();
+    assert_eq(near(e1, 0.9, EPS), 1, "friction × 1.5");
+    k1.has_static_friction = 1;
+    k1.static_friction = 1.2;
+    var e2: f64 = k1.effective_static_friction();
+    assert_eq(near(e2, 1.2, EPS), 1, "the override");
+
+    test_group("sub_stepping_stability");
+    # PhysicsWorld::step's 2D loop: `sub_steps` sub-steps of timestep / sub_steps, then finish_step.
+    var cfg: ImWorldConfig = ImWorldConfig_default();
+    for (var sub = 1; sub <= 4; sub = sub + 3) {
+        st = ImPhysicsState2d_new();
+        var tb = box_stack(&st);
+        var ts: f64 = cfg.timestep;
+        var subf: f64 = f64_from(sub);
+        var sdt: f64 = ts / subf;
+        for (var f15 = 0; f15 < 300; f15 = f15 + 1) {
+            for (var s = 0; s < sub; s = s + 1) {
+                st.step(cfg.gravity, sdt, cfg.velocity_iterations, cfg.position_iterations, cfg.position_slop,
+                  cfg.position_correction, cfg.max_velocity, cfg.constraint_frequency,
+                  cfg.constraint_damping_ratio, cfg.broadphase, cfg.solver);
+            }
+            st.finish_step();
+        }
+        rb = rec(&st, tb);
+        var tx: f64 = rb.position.x;
+        var ty: f64 = rb.position.y;
+        assert_eq(_im_is_nan(tx) == 0 && _im_is_nan(ty) == 0, 1, "no NaN");
+        assert_eq(ty > 0.0, 1, "the top box stays above the ground");
+        st.free();
+    }
+
+    # ── Cyrius-only ──
+    test_group("broadphase_kinds_agree");
+    # Thirty shapes over a 6 × 6 area, many overlapping: both broadphases keep the same sorted pairs.
+    st = ImPhysicsState2d_new();
+    floor_at(&st, -0.5, 4.0, 0.5, 0.5);
+    for (var q = 0; q < 30; q = q + 1) {
+        var qx: f64 = f64_from((q * 7) % 13) * 0.45 - 3.0;
+        var qy: f64 = f64_from((q * 5) % 11) * 0.5;
+        var qv: f64 = f64_from(q % 5) - 2.0;
+        var qh = add(&st, IM_BODY_DYNAMIC, qx, qy, qv, -qv);
+        if (q % 3 == 0) {
+            coll(&st, qh, ImColliderShape_box(0.4, 0.25, 0.0), mat(0.5, 0.0));
+        } else {
+            coll(&st, qh, ImColliderShape_ball(0.35), mat(0.5, 0.0));
+        }
+    }
+    var dtb: f64 = 1.0 / 60.0;
+    st._broadphase(IM_BROADPHASE_SPATIAL_HASH, dtb);
+    var hash: ImPairList = ImPairList_new();
+    for (var hp = 0; hp < st.bp_pairs.len; hp = hp + 1) { hash.push(st.bp_pairs.first(hp), st.bp_pairs.second(hp)); }
+    st._broadphase(IM_BROADPHASE_AABB_TREE, dtb);
+    var same = 1;
+    if (hash.len != st.bp_pairs.len) { same = 0; }
+    for (var tp = 0; tp < hash.len && same == 1; tp = tp + 1) {
+        if (hash.first(tp) != st.bp_pairs.first(tp) || hash.second(tp) != st.bp_pairs.second(tp)) { same = 0; }
+    }
+    assert_eq(hash.len > 20, 1, "a crowded scene");
+    assert_eq(same, 1, "the same pairs in the same order");
+    assert_eq(hash.is_sorted(), 1, "sorted");
+    hash.free();
+    # Stepping it with either broadphase gives the same bodies.
+    var st2: ImPhysicsState2d = ImPhysicsState2d_new();
+    floor_at(&st2, -0.5, 4.0, 0.5, 0.5);
+    for (var q2 = 0; q2 < 30; q2 = q2 + 1) {
+        var q2x: f64 = f64_from((q2 * 7) % 13) * 0.45 - 3.0;
+        var q2y: f64 = f64_from((q2 * 5) % 11) * 0.5;
+        var q2v: f64 = f64_from(q2 % 5) - 2.0;
+        var q2h = add(&st2, IM_BODY_DYNAMIC, q2x, q2y, q2v, -q2v);
+        if (q2 % 3 == 0) {
+            coll(&st2, q2h, ImColliderShape_box(0.4, 0.25, 0.0), mat(0.5, 0.0));
+        } else {
+            coll(&st2, q2h, ImColliderShape_ball(0.35), mat(0.5, 0.0));
+        }
+    }
+    for (var f16 = 0; f16 < 30; f16 = f16 + 1) {
+        frame(&st, 0.0, -9.81, 4, 1);
+        frame_tree(&st2, 0.0, -9.81, 4, 1);
+    }
+    var bits_same = 1;
+    var bar: *ImArena = st._bodies();
+    for (var bs = 0; bs < bar.slot_count(); bs = bs + 1) {
+        var bh = bar.slot_handle(bs);
+        var r1: *ImRigidBody2d = rec(&st, bh);
+        var r2: *ImRigidBody2d = rec(&st2, bh);
+        var x1: f64 = r1.position.x;
+        var x2: f64 = r2.position.x;
+        var y1b: f64 = r1.position.y;
+        var y2b: f64 = r2.position.y;
+        var o1: f64 = r1.rotation;
+        var o2: f64 = r2.rotation;
+        if (!(x1 == x2 && y1b == y2b && o1 == o2)) { bits_same = 0; }
+    }
+    assert_eq(bits_same, 1, "30 frames bit for bit");
+    st.free();
+    st2.free();
+
+    test_group("block_solver_two_points");
+    # A box at rest on the ground: one manifold of two points sharing the load.
+    st = ImPhysicsState2d_new();
+    floor_at(&st, -0.5, 10.0, 0.5, 0.5);
+    var bb = add(&st, IM_BODY_DYNAMIC, 0.0, 0.5, 0.0, 0.0);
+    coll(&st, bb, ImColliderShape_box(0.5, 0.5, 0.0), mat(0.5, 0.0));
+    for (var f17 = 0; f17 < 30; f17 = f17 + 1) { frame(&st, 0.0, -9.81, 4, 1); }
+    assert_eq(st.manifolds.count(), 1, "one manifold");
+    var m0: *ImContactManifold = _im_b2_as_manifold(st.manifolds.at(0));
+    assert_eq(m0.point_count, 2, "two points");
+    var p0: *ImManifoldPoint = _im_b2_mpoint(m0, 0);
+    var p1: *ImManifoldPoint = _im_b2_mpoint(m0, 1);
+    var n0: f64 = p0.normal_impulse;
+    var n1: f64 = p1.normal_impulse;
+    var mg: f64 = 9.81 / 60.0;
+    rb = rec(&st, bb);
+    var bm: f64 = rb.mass;
+    var load: f64 = n0 + n1;
+    assert_eq(n0 > 0.0 && n1 > 0.0, 1, "both carry load");
+    assert_eq(near(load, bm * mg, 0.05 * bm * mg), 1, "together about m g dt");
+    var bvy: f64 = rb.linear_velocity.y;
+    assert_eq(f64_abs(bvy) < 0.01, 1, "at rest");
+    st.free();
+
+    test_group("restitution_bounces");
+    # A ball arriving at 8 m/s: restitution 0.8 (Max of 0.8 and 0) bounces it back near 0.8 × 8; a dead
+    # one (restitution 0) doesn't bounce.
+    for (var e = 0; e < 2; e = e + 1) {
+        st = ImPhysicsState2d_new();
+        floor_at(&st, -0.5, 10.0, 0.5, 0.5);
+        var rest: f64 = 0.0;
+        if (e == 0) { rest = 0.8; }
+        var bm2: ImPhysicsMaterial = mat(0.4, rest);
+        bm2.restitution_combine = IM_COMBINE_MAX;
+        var bball = add(&st, IM_BODY_DYNAMIC, 0.0, 0.6, 0.0, -8.0);
+        coll(&st, bball, ImColliderShape_ball(0.5), bm2);
+        var best: f64 = -100.0;
+        for (var f18 = 0; f18 < 6; f18 = f18 + 1) {
+            frame(&st, 0.0, -9.81, 4, 1);
+            rb = rec(&st, bball);
+            var up: f64 = rb.linear_velocity.y;
+            best = _im_max(best, up);
+        }
+        if (e == 0) {
+            assert_eq(best > 5.0 && best < 7.0, 1, "bounces back near e × v");
+        } else {
+            assert_eq(best < 0.5, 1, "no bounce without restitution");
+        }
+        st.free();
+    }
+
+    test_group("rolling_resistance_slows");
+    # Two balls rolling at the same speed: the one with rolling friction spins down faster.
+    var spin0: f64 = 0.0;
+    var spin1: f64 = 0.0;
+    for (var r = 0; r < 2; r = r + 1) {
+        st = ImPhysicsState2d_new();
+        var rm: ImPhysicsMaterial = mat(0.8, 0.0);
+        if (r == 1) { rm.rolling_friction = 0.3; }
+        var rfl = add(&st, IM_BODY_STATIC, 0.0, -0.5, 0.0, 0.0);
+        coll(&st, rfl, ImColliderShape_box(50.0, 0.5, 0.0), rm);
+        var roller = add(&st, IM_BODY_DYNAMIC, 0.0, 0.5, 4.0, 0.0);
+        coll(&st, roller, ImColliderShape_ball(0.5), rm);
+        rb = rec(&st, roller);
+        rb.angular_velocity = -8.0;
+        for (var f19 = 0; f19 < 60; f19 = f19 + 1) { frame(&st, 0.0, -9.81, 4, 1); }
+        rb = rec(&st, roller);
+        var w: f64 = rb.angular_velocity;
+        if (r == 0) { spin0 = f64_abs(w); } else { spin1 = f64_abs(w); }
+        st.free();
+    }
+    assert_eq(spin1 < spin0 * 0.8, 1, "rolling friction resists the roll");
+
+    test_group("events_started_ongoing_stopped");
+    # A ball falls through a static sensor: Started on entry, Ongoing inside, Stopped on exit.
+    st = ImPhysicsState2d_new();
+    var sens = add(&st, IM_BODY_STATIC, 0.0, 0.0, 0.0, 0.0);
+    var sc = coll_lm(&st, sens, ImColliderShape_box(2.0, 0.3, 0.0), 4294967295, 4294967295, 1);
+    var faller = add(&st, IM_BODY_DYNAMIC, 0.0, 0.8, 0.0, -3.0);
+    var fc = coll(&st, faller, ImColliderShape_ball(0.2), ImPhysicsMaterial_default());
+    var started = 0;
+    var ongoing = 0;
+    var stopped = 0;
+    var order_ok = 1;
+    for (var f20 = 0; f20 < 40; f20 = f20 + 1) {
+        var n = frame(&st, 0.0, 0.0, 4, 1);
+        for (var ei = 0; ei < n; ei = ei + 1) {
+            var ev: *ImCollisionEvent = st.contact_tracker.event(ei);
+            if (ev.collider_a != sc || ev.collider_b != fc) { order_ok = 0; }
+            if (ev.kind == IM_EVENT_STARTED) {
+                if (started > 0 || stopped > 0) { order_ok = 0; }
+                started = started + 1;
+            }
+            if (ev.kind == IM_EVENT_ONGOING) {
+                if (started == 0 || stopped > 0) { order_ok = 0; }
+                ongoing = ongoing + 1;
+            }
+            if (ev.kind == IM_EVENT_STOPPED) { stopped = stopped + 1; }
+        }
+    }
+    assert_eq(started == 1 && stopped == 1 && ongoing > 3, 1, "one Started, Ongoing frames, one Stopped");
+    assert_eq(order_ok, 1, "in order, keyed (sensor, ball)");
+    rb = rec(&st, faller);
+    var fvy: f64 = rb.linear_velocity.y;
+    assert_eq(near(fvy, -3.0, EPS), 1, "a sensor exerts nothing");
+    st.free();
+
+    test_group("flat_heap_per_step");
+    # After warm-up, 200 frames of a settling stack take no new freelist memory.
+    st = ImPhysicsState2d_new();
+    box_stack(&st);
+    for (var f21 = 0; f21 < 60; f21 = f21 + 1) { frame(&st, 0.0, -9.81, 8, 4); }
+    var arena0 = _fl_arena;
+    var pos0 = _fl_arena_pos;
+    for (var f22 = 0; f22 < 200; f22 = f22 + 1) { frame(&st, 0.0, -9.81, 8, 4); }
+    assert_eq(_fl_arena == arena0 && _fl_arena_pos == pos0, 1, "no growth");
+    st.free();
+
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

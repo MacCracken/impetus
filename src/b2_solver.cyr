@@ -1,11 +1,51 @@
 # b2_solver.cyr — the 2D backend's step (port of rust-old/src/backend_2d/solver.rs).
 #
-# M3b ports the stages a step runs whether or not anything touches: velocity and position integration
-# over every body in slot order, islands and sleep, and the end of a frame (`finish_step`). The contact
-# stages (broadphase, narrowphase, manifolds, warm start, the contact and position solvers) and `step`
-# itself come with M3c. Every expression keeps Rust's operation order.
+# `step` is one sub-step of the sequential-impulse solver (`step_si`): integrate velocities, the contact
+# pipeline of src/b2_contacts.cyr (broadphase, narrowphase and manifolds, wake on contact, warm start),
+# the joint and contact velocity solves interleaved, breaking joints, the position solver, integrate
+# positions, islands and sleep. Then it records the touching pairs. `finish_step` ends the outer step.
+# Rust's XPBD solver (`step_xpbd`) is not ported: `config_validate` refuses SolverKind::Xpbd (ADR 0008
+# #6), so `step` runs the sequential-impulse solver for every kind. Every expression keeps Rust's
+# operation order.
 
 impl ImPhysicsState2d {
+    # One sub-step of dt with the world's solver settings, then the touching pairs recorded with the
+    # contact tracker. `solver_kind` selects nothing (see the header). Mirrors `PhysicsState2d::step`.
+    fn step(self, gravity: ImVec3, dt: f64, velocity_iterations, position_iterations, slop: f64,
+      correction: f64, max_velocity: f64, constraint_frequency: f64, constraint_damping_ratio: f64,
+      broadphase_kind, solver_kind) {
+        self._step_si(gravity, dt, velocity_iterations, position_iterations, slop, correction, max_velocity,
+          constraint_frequency, constraint_damping_ratio, broadphase_kind);
+        self._record_contacts();
+        return 0;
+    }
+
+    # The sequential-impulse sub-step, steps 1 to 11. Mirrors `step_si`.
+    fn _step_si(self, gravity: ImVec3, dt: f64, velocity_iterations, position_iterations, slop: f64,
+      correction: f64, max_velocity: f64, constraint_frequency: f64, constraint_damping_ratio: f64,
+      broadphase_kind) {
+        var gx: f64 = gravity.x;
+        var gy: f64 = gravity.y;
+        self._integrate_velocities(ImVec2_new(gx, gy), dt, max_velocity);
+        self._broadphase(broadphase_kind, dt);
+        self._update_manifolds();
+        self._wake_on_contact();
+        self._contact_geometry();
+        self._warm_start();
+        self._prepare_contacts();
+        self.prepare_joints(dt);
+        for (var i = 0; i < velocity_iterations; i = i + 1) {
+            self.solve_joints_once();
+            self._solve_contacts_once();
+        }
+        self.break_joints(dt);
+        self._solve_positions(position_iterations, slop, correction, dt, constraint_frequency,
+          constraint_damping_ratio);
+        self._integrate_positions(dt);
+        self.build_islands_and_sleep(dt);
+        return 0;
+    }
+
     # Integrates every body's velocity (gravity, forces, damping, the speed cap), in slot order. Step 1 of
     # `step_si`.
     fn _integrate_velocities(self, gravity: ImVec2, dt: f64, max_velocity: f64) {
@@ -33,7 +73,7 @@ impl ImPhysicsState2d {
         return 0;
     }
 
-    # Zeroes every body's split-impulse pseudo-velocity, which the position solver does first.
+    # Zeroes every body's split-impulse pseudo-velocity, the position solver's first act.
     fn _clear_pseudo(self) {
         var ba: *ImArena = self._bodies();
         for (var s = 0; s < ba.slot_count(); s = s + 1) {

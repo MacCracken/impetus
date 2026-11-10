@@ -1542,11 +1542,10 @@ fn _par_b2_state(fp, fl): i64 {
     return 1;
 }
 
-# ── M3b: single steps (joints, integration, islands and sleep) ──────────────────────
+# ── M3b–c: single steps ─────────────────────────────────────────────────────────────
 # A `b2::step` row is the config, then a backend dump; the port loads the dump into an ImPhysicsState2d
-# (every arena slot, generation and free list as dumped), steps it as PhysicsWorld::step does, and
-# writes the dump and the frame's events. M3b's scenes pair no colliders (collision mask 0), so the
-# sub-step is the stages that run without contacts; M3c replaces this composition with `step`.
+# (every arena slot, generation and free list as dumped), steps it as PhysicsWorld::step does (the
+# library's `step` per sub-step, then `finish_step`), and writes the dump and the frame's events.
 
 # An arena's dumped slots at token k into ar: the token after them.
 fn _par_load_arena(ar: *ImArena, k): i64 {
@@ -1720,18 +1719,10 @@ fn _par_b2_step(fp, fl): i64 {
     var ts: f64 = cfg.timestep;
     var subf: f64 = f64_from(sub);
     var dt: f64 = ts / subf;
-    var gx: f64 = cfg.gravity.x;
-    var gy: f64 = cfg.gravity.y;
-    var maxv: f64 = cfg.max_velocity;
     for (var s = 0; s < sub; s = s + 1) {
-        st._integrate_velocities(ImVec2_new(gx, gy), dt, maxv);
-        st.prepare_joints(dt);
-        for (var it = 0; it < cfg.velocity_iterations; it = it + 1) { st.solve_joints_once(); }
-        st.break_joints(dt);
-        st._clear_pseudo();
-        st._integrate_positions(dt);
-        st.build_islands_and_sleep(dt);
-        st.contact_tracker.record_substep(0, 0);
+        st.step(cfg.gravity, dt, cfg.velocity_iterations, cfg.position_iterations, cfg.position_slop,
+          cfg.position_correction, cfg.max_velocity, cfg.constraint_frequency, cfg.constraint_damping_ratio,
+          cfg.broadphase, cfg.solver);
     }
     var ne = st.finish_step();
     _par_got_state(&st);
@@ -2108,7 +2099,7 @@ fn _par_dispatch(mp, ml, fp, fl): i64 {
     if (_par_eq(mp, ml, "b2_narrow") == 1) { return _par_b2_narrow(fp, fl); }
     if (_par_eq(mp, ml, "b2_ray") == 1) { return _par_b2_ray(fp, fl); }
     if (_par_eq(mp, ml, "b2_state") == 1) { return _par_b2_state(fp, fl); }
-    if (_par_eq(mp, ml, "b2_step") == 1) { return _par_b2_step(fp, fl); }
+    if (_par_eq(mp, ml, "b2_step") == 1 || _par_eq(mp, ml, "b2_contact") == 1) { return _par_b2_step(fp, fl); }
     if (_par_eq(mp, ml, "broadphase") == 1) { return _par_broadphase(fp, fl); }
     if (_par_eq(mp, ml, "config") == 1) { return _par_config(fp, fl); }
     if (_par_eq(mp, ml, "fmtf") == 1) { return _par_fmtf(fp, fl); }

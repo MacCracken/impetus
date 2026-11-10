@@ -23,9 +23,9 @@ use crate::shapes::{ball, bx};
 use crate::tsv::{Class, Module, Tok};
 
 /// A scene: a built world and the force it applies to a body before each frame (if any).
-struct Scene {
-    world: PhysicsWorld,
-    push: Option<(BodyHandle, [f64; 2])>,
+pub struct Scene {
+    pub world: PhysicsWorld,
+    pub push: Option<(BodyHandle, [f64; 2])>,
 }
 
 fn body(
@@ -92,8 +92,9 @@ const S: BodyType = BodyType::Static;
 const D: BodyType = BodyType::Dynamic;
 const K: BodyType = BodyType::Kinematic;
 
-/// Runs a scene to the last frame asked, emitting a row for each frame k in `frames`.
-fn rows(m: &mut Module, mut sc: Scene, frames: &[u64]) {
+/// Runs a scene to the last frame asked, emitting a row for each frame k in `frames` (shared with
+/// `m_b2_contact`).
+pub fn rows(m: &mut Module, mut sc: Scene, frames: &[u64]) {
     let last = frames.iter().copied().max().unwrap_or(0);
     let cfg = sc.world.config().clone();
     for k in 0..=last {

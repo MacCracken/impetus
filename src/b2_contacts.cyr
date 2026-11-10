@@ -1,0 +1,1216 @@
+# b2_contacts.cyr — the 2D backend's contact pipeline (port of the contact stages of
+# rust-old/src/backend_2d/solver.rs): the broadphase, the narrowphase and the manifold rebuild with
+# warm-start matching, waking on contact, warm starting, the contact solver (block-solved normal impulses,
+# Coulomb friction with a static threshold, rolling resistance) and the split-impulse position solver.
+#
+# Every expression keeps Rust's operation order. Three departures change no bit:
+# - The narrowphase and the manifold rebuild are fused. The broadphase pairs arrive sorted and ordered
+#   (the smaller handle first, unsigned, as Rust's BTreeSet), which is also each pair's manifold key, so
+#   the fresh manifolds are appended in key order, as Rust's BTreeMap holds them.
+# - Body positions and rotations don't change from the manifold rebuild to the position solver. Each
+#   manifold point's lever arms (r_a, r_b) are therefore computed once a sub-step from one sin_cos per
+#   manifold (`_contact_geometry`). Rust recomputes the same expression at each use, and sin_cos is pure.
+# - Warm starting applies each impulse as it is computed. Rust collects them first, but computing them
+#   reads only positions and impulses, so the velocities change in the same order by the same amounts.
+#
+# Storage is the state's scratch, reused from step to step (port plan §7.5): the boxes, the pairs, the
+# fresh manifolds, the geometry, the solve order and materials, the positional points and the keys. All
+# of it is reserved before any manifold exists. With no memory the sub-step pairs nothing and runs
+# without contacts; nothing aborts.
+
+# Scratch record widths, in words.
+const _IM_B2_BOX_W = 5;
+const _IM_B2_GEO_W = 17;
+const _IM_B2_POS_W = 10;
+# Rust's `u32::MAX`, the solve level of a manifold with no grounded body.
+const _IM_B2_LEVEL_NONE = 4294967295;
+
+# One manifold's entry in a sub-step's contact preparation. Rust's ContactPrep holds three vectors in
+# solve order: the manifold keys, the combined materials and the restitution targets (velocity_bias);
+# the port zips them into one record per manifold, in solve order. bias0 .. bias3 are consecutive words,
+# a point's target at `_im_b2_prep_bias(p, i)`.
+struct ImContactPrep {
+    manifold;
+    restitution: f64;
+    friction: f64;
+    static_friction: f64;
+    rolling_friction: f64;
+    is_sensor;
+    bias0: f64;
+    bias1: f64;
+    bias2: f64;
+    bias3: f64;
+}
+
+#must_use
+fn _im_b2_as_cprep(p): *ImContactPrep { return p; }
+
+# The address of point i's restitution target in the prep record at p (bias0 is its seventh word).
+#must_use
+fn _im_b2_prep_bias(p, i): i64 { return p + 48 + i * 8; }
+
+#must_use
+fn _im_b2_as_mpoint(p): *ImManifoldPoint { return p; }
+
+# Point i of manifold m.
+#must_use
+fn _im_b2_mpoint(m: *ImContactManifold, i): *ImManifoldPoint {
+    return _im_b2_as_mpoint(m.points + i * sizeof(ImManifoldPoint));
+}
+
+# A world point in the frame of a body at (bx, by) whose rotation has sine s and cosine c: the
+# expression of `world_to_local`.
+#must_use
+fn _im_b2_to_local_sc(wx: f64, wy: f64, bx: f64, by: f64, s: f64, c: f64) {
+    var dx: f64 = wx - bx;
+    var dy: f64 = wy - by;
+    var x: f64 = c * dx + s * dy;
+    var y: f64 = -s * dx + c * dy;
+    return (x, y);
+}
+
+# 1 when body rb is awake, dynamic and moving faster than the sleep speed on some axis (a_moving of
+# `wake_on_contact`).
+#must_use
+fn _im_b2_moving(rb: *ImRigidBody2d): i64 {
+    if (rb.is_sleeping == 1 || rb.is_dynamic() == 0) { return 0; }
+    var t: f64 = _IM_B2_SLEEP_VELOCITY_THRESHOLD;
+    var vx: f64 = rb.linear_velocity.x;
+    var vy: f64 = rb.linear_velocity.y;
+    var w: f64 = rb.angular_velocity;
+    var ax: f64 = f64_abs(vx);
+    var ay: f64 = f64_abs(vy);
+    var aw: f64 = f64_abs(w);
+    if (ax > t || ay > t || aw > t) { return 1; }
+    return 0;
+}
+
+# The velocity of the point at (rx, ry) from a body moving at v: the x and y of `SolverVel::at`.
+#must_use
+fn _im_b2_vel_at(v: *ImJointVel, rx: f64, ry: f64) {
+    var x: f64 = v.vx - v.w * ry;
+    var y: f64 = v.vy + v.w * rx;
+    return (x, y);
+}
+
+# The relative velocity of the two points (rax, ray) on A and (rbx, rby) on B along (dx, dy):
+# dot2(sub2(vb.at(rb), va.at(ra)), d).
+#must_use
+fn _im_b2_rel_along(va: *ImJointVel, vb: *ImJointVel, rax: f64, ray: f64, rbx: f64, rby: f64, dx: f64,
+  dy: f64): f64 {
+    var bx, by = _im_b2_vel_at(vb, rbx, rby);
+    var ax, ay = _im_b2_vel_at(va, rax, ray);
+    var bxf: f64 = bx;
+    var byf: f64 = by;
+    var axf: f64 = ax;
+    var ayf: f64 = ay;
+    var sx: f64 = bxf - axf;
+    var sy: f64 = byf - ayf;
+    var r: f64 = sx * dx + sy * dy;
+    return r;
+}
+
+# Applies sign × impulse (ix, iy) at (rx, ry) to v, with inverse mass im and inertia ii. Mirrors
+# `SolverVel::apply`.
+fn _im_b2_vel_apply(v: *ImJointVel, sign: f64, ix: f64, iy: f64, rx: f64, ry: f64, im: f64, ii: f64) {
+    var cr: f64 = _im_b2_cross(rx, ry, ix, iy);
+    v.vx = v.vx + sign * ix * im;
+    v.vy = v.vy + sign * iy * im;
+    v.w = v.w + sign * cr * ii;
+    return 0;
+}
+
+# The effective mass along (dx, dy) of points (rax, ray) on A and (rbx, rby) on B: the `eff_mass` closure
+# of `solve_contacts_once`.
+#must_use
+fn _im_b2_eff_mass(rax: f64, ray: f64, rbx: f64, rby: f64, dx: f64, dy: f64, ima: f64, iia: f64, imb: f64,
+  iib: f64): f64 {
+    var ca: f64 = _im_b2_cross(rax, ray, dx, dy);
+    var cb: f64 = _im_b2_cross(rbx, rby, dx, dy);
+    var k: f64 = ima + imb + ca * ca * iia + cb * cb * iib;
+    return k;
+}
+
+# `rule_a.max(rule_b).combine(a, b)`: the higher-priority combine rule (the later variant) applied to
+# a and b. Mirrors `combine_property`.
+#must_use
+fn _im_b2_combine(a: f64, b: f64, rule_a, rule_b): f64 {
+    var rule = rule_a;
+    if (rule_b > rule_a) { rule = rule_b; }
+    var r: f64 = combine_rule_combine(rule, a, b);
+    return r;
+}
+
+# ── the manifold store's rebuild ────────────────────────────────────────────────────
+
+impl ImManifoldStore {
+    # Room for n manifolds: 1, or 0 when there is no memory (the store is unchanged).
+    fn _reserve(self, n): i64 {
+        if (n <= self.cap) { return 1; }
+        var cap = self.cap * 2;
+        if (cap < 8) { cap = 8; }
+        while (cap < n) { cap = cap * 2; }
+        var sz = sizeof(ImContactManifold);
+        var d = fl_alloc(cap * sz);
+        if (d == 0) { return 0; }
+        if (self.len > 0) { memcpy(d, self.data, self.len * sz); }
+        if (self.data != 0) { fl_free(self.data); }
+        self.data = d;
+        self.cap = cap;
+        return 1;
+    }
+
+    # Frees every manifold's points and empties the store, keeping its storage.
+    fn _clear(self) {
+        for (var i = 0; i < self.len; i = i + 1) {
+            var m: *ImContactManifold = _im_b2_as_manifold(self.at(i));
+            if (m.points != 0) { fl_free(m.points); }
+        }
+        self.len = 0;
+        return 0;
+    }
+
+    # Exchanges this store's contents with o's.
+    fn _swap(self, o: *ImManifoldStore) {
+        var d = self.data;
+        var l = self.len;
+        var c = self.cap;
+        self.data = o.data;
+        self.len = o.len;
+        self.cap = o.cap;
+        o.data = d;
+        o.len = l;
+        o.cap = c;
+        return 0;
+    }
+}
+
+impl ImPhysicsState2d {
+    # ── broadphase ──
+
+    # 1 when the candidate pair (ha, hb) is kept: two live colliders on different bodies, not both on
+    # static bodies, not both sensors, a layer meeting the other's mask, and overlapping boxes.
+    #must_use
+    fn _pair_kept(self, ha, hb): i64 {
+        var ar: *ImArena = self._colliders();
+        var ca: *ImCollider2d = _im_b2_as_coll(ar.get(ha));
+        var cb: *ImCollider2d = _im_b2_as_coll(ar.get(hb));
+        if (ca == 0 || cb == 0) { return 0; }
+        if (ca.body == cb.body) { return 0; }
+        var ba: *ImRigidBody2d = self._body(ca.body);
+        var bb: *ImRigidBody2d = self._body(cb.body);
+        if (ba != 0 && bb != 0) {
+            if (ba.is_static() == 1 && bb.is_static() == 1) { return 0; }
+        }
+        if (ca.is_sensor == 1 && cb.is_sensor == 1) { return 0; }
+        if ((ca.collision_layer & cb.collision_mask) == 0 && (cb.collision_layer & ca.collision_mask) == 0) {
+            return 0;
+        }
+        var bw = _IM_B2_BOX_W * 8;
+        var pa = self.bp_boxes.data + _im_handle_index(ha) * bw;
+        var pb = self.bp_boxes.data + _im_handle_index(hb) * bw;
+        if (load64(pa) == 0 || load64(pb) == 0) { return 0; }
+        var ax0: f64 = load64(pa + 8);
+        var ay0: f64 = load64(pa + 16);
+        var ax1: f64 = load64(pa + 24);
+        var ay1: f64 = load64(pa + 32);
+        var bx0: f64 = load64(pb + 8);
+        var by0: f64 = load64(pb + 16);
+        var bx1: f64 = load64(pb + 24);
+        var by1: f64 = load64(pb + 32);
+        if (ax0 <= bx1 && ax1 >= bx0 && ay0 <= by1 && ay1 >= by0) { return 1; }
+        return 0;
+    }
+
+    # The broadphase into bp_pairs: each collider's world AABB, swept by its body's velocity over dt, then
+    # the candidate pairs of the spatial hash (cell size automatic) or the AABB tree (`kind`), rebuilt
+    # from their kept storage, then the pairs `_pair_kept` keeps. The pairs are sorted, the smaller handle
+    # first. 1, or 0 when there is no memory (no pairs). Mirrors `broadphase`.
+    fn _broadphase(self, kind, dt: f64): i64 {
+        self.bp_pairs.clear();
+        var ar: *ImArena = self._colliders();
+        var ns = ar.slot_count();
+        if (self.bp_boxes.reserve(ns * _IM_B2_BOX_W) == 0 || self.bp_dims.reserve(ns) == 0) { return 0; }
+        self.bp_dims.len = 0;
+        var bw = _IM_B2_BOX_W * 8;
+        for (var s = 0; s < ns; s = s + 1) {
+            var bx = self.bp_boxes.data + s * bw;
+            store64(bx, 0);
+            var h = ar.slot_handle(s);
+            if (h != 0 - 1) {
+                var c: *ImCollider2d = _im_b2_as_coll(ar.get(h));
+                var rb: *ImRigidBody2d = self._body(c.body);
+                if (rb != 0) {
+                    var ab: ImAabb2d = c.world_aabb(rb.position, rb.rotation);
+                    var x0: f64 = ab.min.x;
+                    var y0: f64 = ab.min.y;
+                    var x1: f64 = ab.max.x;
+                    var y1: f64 = ab.max.y;
+                    var vx: f64 = rb.linear_velocity.x;
+                    var vy: f64 = rb.linear_velocity.y;
+                    var dx: f64 = vx * dt;
+                    var dy: f64 = vy * dt;
+                    if (dx > 0.0) { x1 = x1 + dx; } else { x0 = x0 + dx; }
+                    if (dy > 0.0) { y1 = y1 + dy; } else { y0 = y0 + dy; }
+                    store64(bx, 1);
+                    store64(bx + 8, x0);
+                    store64(bx + 16, y0);
+                    store64(bx + 24, x1);
+                    store64(bx + 32, y1);
+                    var w: f64 = x1 - x0;
+                    var hh: f64 = y1 - y0;
+                    var dim: f64 = _im_max(w, hh);
+                    store64(self.bp_dims.data + self.bp_dims.len * 8, dim);
+                    self.bp_dims.len = self.bp_dims.len + 1;
+                }
+            }
+        }
+        var ok = 1;
+        if (kind == IM_BROADPHASE_AABB_TREE) {
+            self.bp_tree.clear();
+            for (var t = 0; t < ns; t = t + 1) {
+                var tb = self.bp_boxes.data + t * bw;
+                if (load64(tb) == 1) {
+                    var tx0: f64 = load64(tb + 8);
+                    var ty0: f64 = load64(tb + 16);
+                    var tx1: f64 = load64(tb + 24);
+                    var ty1: f64 = load64(tb + 32);
+                    var box: ImTreeAabb = ImTreeAabb_from_2d(ImVec2_new(tx0, ty0), ImVec2_new(tx1, ty1));
+                    if (self.bp_tree.insert(ar.slot_handle(t), box) < 0) { ok = 0; }
+                }
+            }
+            if (ok == 1) { ok = self.bp_tree.query_pairs(self.bp_pairs); }
+        } else {
+            var cell: f64 = ImSpatialHashGrid_auto_cell_size(self.bp_dims.data, self.bp_dims.len);
+            self.bp_grid.reset(cell);
+            for (var g = 0; g < ns; g = g + 1) {
+                var gb = self.bp_boxes.data + g * bw;
+                if (load64(gb) == 1) {
+                    var gx0: f64 = load64(gb + 8);
+                    var gy0: f64 = load64(gb + 16);
+                    var gx1: f64 = load64(gb + 24);
+                    var gy1: f64 = load64(gb + 32);
+                    var mn: ImVec2 = ImVec2_new(gx0, gy0);
+                    var mx: ImVec2 = ImVec2_new(gx1, gy1);
+                    if (self.bp_grid.insert_2d(ar.slot_handle(g), mn, mx) == 0) { ok = 0; }
+                }
+            }
+            if (ok == 1) { ok = self.bp_grid.query_pairs(self.bp_pairs); }
+        }
+        if (ok == 0) {
+            self.bp_pairs.clear();
+            return 0;
+        }
+        var kept = 0;
+        for (var i = 0; i < self.bp_pairs.len; i = i + 1) {
+            var ha = self.bp_pairs.first(i);
+            var hb = self.bp_pairs.second(i);
+            if (self._pair_kept(ha, hb) == 1) {
+                store64(self.bp_pairs.data + kept * 16, ha);
+                store64(self.bp_pairs.data + kept * 16 + 8, hb);
+                kept = kept + 1;
+            }
+        }
+        self.bp_pairs.len = kept;
+        return 1;
+    }
+
+    # ── narrowphase and manifolds ──
+
+    # Reserves the sub-step's scratch for up to n manifolds: 1, or 0 when there is no memory.
+    fn _contact_scratch(self, n): i64 {
+        var ns = self._bodies().slot_count();
+        if (self.mf_fresh._reserve(n) == 0) { return 0; }
+        if (self.ct_geo.reserve(n * _IM_B2_GEO_W) == 0) { return 0; }
+        if (self.ct_prep.reserve(n * sizeof(ImContactPrep) / 8) == 0) { return 0; }
+        if (self.ct_level.reserve(ns * 2) == 0) { return 0; }
+        # The solve order's counting sort: keys and order (n each), then maxl + 3 bucket starts, a level
+        # being a contact-graph distance from a grounded body, so maxl < ns.
+        if (self.ct_sort.reserve(n * 2 + ns + 4) == 0) { return 0; }
+        if (self.ct_pos.reserve(n * _IM_B2_MAX_MANIFOLD_POINTS * _IM_B2_POS_W) == 0) { return 0; }
+        if (self.ct_keys.reserve(n * 2) == 0) { return 0; }
+        return 1;
+    }
+
+    # Appends the fresh manifold of pair (ha, hb), on bodies a and b, from its n contacts at cs (normal,
+    # depth, world point; 40 bytes each): keyed by the ordered pair, its bodies and normal swapped with
+    # the key, its first _IM_B2_MAX_MANIFOLD_POINTS points held in both bodies' frames. 1, or 0 when there
+    # is no memory (the manifold is dropped). Mirrors the first loop of `update_manifolds`.
+    fn _fresh_manifold(self, ha, hb, a, b, cs, n): i64 {
+        var k0, k1 = _im_b2_ordered_manifold_key(ha, hb);
+        var body_a = a;
+        var body_b = b;
+        var sign: f64 = 1.0;
+        if (k0 != ha) {
+            body_a = b;
+            body_b = a;
+            sign = -1.0;
+        }
+        var pax: f64 = 0.0;
+        var pay: f64 = 0.0;
+        var pra: f64 = 0.0;
+        var pbx: f64 = 0.0;
+        var pby: f64 = 0.0;
+        var prb: f64 = 0.0;
+        var ra: *ImRigidBody2d = self._body(body_a);
+        var rb: *ImRigidBody2d = self._body(body_b);
+        if (ra != 0) {
+            pax = ra.position.x;
+            pay = ra.position.y;
+            pra = ra.rotation;
+        }
+        if (rb != 0) {
+            pbx = rb.position.x;
+            pby = rb.position.y;
+            prb = rb.rotation;
+        }
+        var cap = _IM_B2_MAX_MANIFOLD_POINTS;
+        var pts = fl_alloc(cap * sizeof(ImManifoldPoint));
+        if (pts == 0) { return 0; }
+        var m: *ImContactManifold = _im_b2_as_manifold(self.mf_fresh.at(self.mf_fresh.len));
+        self.mf_fresh.len = self.mf_fresh.len + 1;
+        var nx0: f64 = load64(cs);
+        var ny0: f64 = load64(cs + 8);
+        if (sign < 0.0) {
+            nx0 = -nx0;
+            ny0 = -ny0;
+        }
+        m.collider_a = k0;
+        m.collider_b = k1;
+        m.body_a = body_a;
+        m.body_b = body_b;
+        m.normal = ImVec2_new(nx0, ny0);
+        m.points = pts;
+        m.point_count = 0;
+        m.rolling_impulse = 0.0;
+        var sna, csa = _im_sin_cos(pra);
+        var snb, csb = _im_sin_cos(prb);
+        for (var j = 0; j < n; j = j + 1) {
+            if (m.point_count < cap) {
+                var c = cs + j * 40;
+                var px: f64 = load64(c + 24);
+                var py: f64 = load64(c + 32);
+                var lax, lay = _im_b2_to_local_sc(px, py, pax, pay, sna, csa);
+                var lbx, lby = _im_b2_to_local_sc(px, py, pbx, pby, snb, csb);
+                var p: *ImManifoldPoint = _im_b2_mpoint(m, m.point_count);
+                p.local_a = ImVec2_new(lax, lay);
+                p.local_b = ImVec2_new(lbx, lby);
+                p.normal_impulse = 0.0;
+                p.tangent_impulse = 0.0;
+                var d: f64 = load64(c + 16);
+                p.depth = d;
+                m.point_count = m.point_count + 1;
+            }
+        }
+        return 1;
+    }
+
+    # Carries last sub-step's impulses from manifold `old` onto the fresh m of the same key, unless the
+    # normal flipped (n_old · n < 0.9): its rolling impulse, then each point's from the unused old point
+    # nearest in either body's frame within MANIFOLD_MATCH_THRESHOLD (or the single point, when both have
+    # one). Mirrors the second loop of `update_manifolds`.
+    fn _carry_impulses(self, old: *ImContactManifold, m: *ImContactManifold) {
+        var onx: f64 = old.normal.x;
+        var ony: f64 = old.normal.y;
+        var mnx: f64 = m.normal.x;
+        var mny: f64 = m.normal.y;
+        var dn: f64 = onx * mnx + ony * mny;
+        if (dn < 0.9) { return 0; }
+        var roll: f64 = old.rolling_impulse;
+        m.rolling_impulse = roll;
+        var single = 0;
+        if (m.point_count == 1 && old.point_count == 1) { single = 1; }
+        var used[32];
+        for (var u = 0; u < 4; u = u + 1) { store64(&used + u * 8, 0); }
+        var thr: f64 = _IM_B2_MANIFOLD_MATCH_THRESHOLD;
+        for (var pi = 0; pi < m.point_count; pi = pi + 1) {
+            var p: *ImManifoldPoint = _im_b2_mpoint(m, pi);
+            var best = 0 - 1;
+            var best_d: f64 = thr * thr;
+            var plax: f64 = p.local_a.x;
+            var play: f64 = p.local_a.y;
+            var plbx: f64 = p.local_b.x;
+            var plby: f64 = p.local_b.y;
+            for (var i = 0; i < old.point_count; i = i + 1) {
+                if (i < 4 && load64(&used + i * 8) == 0) {
+                    var op: *ImManifoldPoint = _im_b2_mpoint(old, i);
+                    var ex: f64 = op.local_a.x - plax;
+                    var ey: f64 = op.local_a.y - play;
+                    var fx: f64 = op.local_b.x - plbx;
+                    var fy: f64 = op.local_b.y - plby;
+                    var da: f64 = ex * ex + ey * ey;
+                    var db: f64 = fx * fx + fy * fy;
+                    var d: f64 = _im_min(da, db);
+                    if (d < best_d || single == 1) {
+                        best_d = d;
+                        best = i;
+                    }
+                }
+            }
+            if (best >= 0) {
+                store64(&used + best * 8, 1);
+                var bp: *ImManifoldPoint = _im_b2_mpoint(old, best);
+                var ni: f64 = bp.normal_impulse;
+                var ti: f64 = bp.tangent_impulse;
+                p.normal_impulse = ni;
+                p.tangent_impulse = ti;
+            }
+        }
+        return 0;
+    }
+
+    # The narrowphase over bp_pairs fused with the manifold rebuild (see the header): each pair's one-shot
+    # contacts at the colliders' world positions become a fresh manifold, matched against last sub-step's
+    # for warm starting; the fresh set then replaces the old. 1, or 0 when there is no memory (no
+    # manifolds remain). Mirrors `narrowphase` then `update_manifolds`.
+    fn _update_manifolds(self): i64 {
+        self.mf_fresh._clear();
+        if (self._contact_scratch(self.bp_pairs.len) == 0) {
+            self.manifolds._clear();
+            return 0;
+        }
+        var out[80];
+        var cr: *ImArena = self._colliders();
+        var ok = 1;
+        for (var i = 0; i < self.bp_pairs.len; i = i + 1) {
+            var ha = self.bp_pairs.first(i);
+            var hb = self.bp_pairs.second(i);
+            var ca: *ImCollider2d = _im_b2_as_coll(cr.get(ha));
+            var cb: *ImCollider2d = _im_b2_as_coll(cr.get(hb));
+            if (ca != 0 && cb != 0) {
+                var ba: *ImRigidBody2d = self._body(ca.body);
+                var bb: *ImRigidBody2d = self._body(cb.body);
+                if (ba != 0 && bb != 0) {
+                    var apx: f64 = ba.position.x;
+                    var apy: f64 = ba.position.y;
+                    var arot: f64 = ba.rotation;
+                    var aox: f64 = ca.offset.x;
+                    var aoy: f64 = ca.offset.y;
+                    var bpx: f64 = bb.position.x;
+                    var bpy: f64 = bb.position.y;
+                    var brot: f64 = bb.rotation;
+                    var bofx: f64 = cb.offset.x;
+                    var boy: f64 = cb.offset.y;
+                    var wax, way = _im_b2_world_pos(apx, apy, arot, aox, aoy);
+                    var wbx, wby = _im_b2_world_pos(bpx, bpy, brot, bofx, boy);
+                    var n = _im_b2_generate_contacts_multi(ca.shape, wax, way, arot, cb.shape, wbx, wby, brot, &out);
+                    if (n > 0) {
+                        if (self._fresh_manifold(ha, hb, ca.body, cb.body, &out, n) == 0) { ok = 0; }
+                    }
+                }
+            }
+        }
+        # Both stores are in key order: walk the old one beside the fresh.
+        var oi = 0;
+        for (var f = 0; f < self.mf_fresh.len; f = f + 1) {
+            var m: *ImContactManifold = _im_b2_as_manifold(self.mf_fresh.at(f));
+            var cmp = 1;
+            while (oi < self.manifolds.len && cmp > 0) {
+                var o: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(oi));
+                cmp = _im_pair_cmp(m.collider_a, m.collider_b, o.collider_a, o.collider_b);
+                if (cmp > 0) { oi = oi + 1; }
+            }
+            if (cmp == 0) { self._carry_impulses(_im_b2_as_manifold(self.manifolds.at(oi)), m); }
+        }
+        self.manifolds._clear();
+        self.manifolds._swap(self.mf_fresh);
+        return ok;
+    }
+
+    # Wakes a sleeping body touching an awake, moving dynamic one, for each manifold. Mirrors
+    # `wake_on_contact`.
+    fn _wake_on_contact(self) {
+        for (var i = 0; i < self.manifolds.len; i = i + 1) {
+            var m: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(i));
+            var ba: *ImRigidBody2d = self._body(m.body_a);
+            var bb: *ImRigidBody2d = self._body(m.body_b);
+            var a_sleeping = 0;
+            var b_sleeping = 0;
+            var a_moving = 0;
+            var b_moving = 0;
+            if (ba != 0) {
+                a_sleeping = ba.is_sleeping;
+                a_moving = _im_b2_moving(ba);
+            }
+            if (bb != 0) {
+                b_sleeping = bb.is_sleeping;
+                b_moving = _im_b2_moving(bb);
+            }
+            if (a_sleeping == 1 && b_moving == 1) { _im_b2_wake(ba); }
+            if (b_sleeping == 1 && a_moving == 1) { _im_b2_wake(bb); }
+        }
+        return 0;
+    }
+
+    # Each manifold's lever arms into ct_geo: whether both bodies are live, then per point (r_a, r_b),
+    # the offsets of the point (local_a in world space) from the two body centres.
+    fn _contact_geometry(self) {
+        var gw = _IM_B2_GEO_W * 8;
+        for (var i = 0; i < self.manifolds.len; i = i + 1) {
+            var g = self.ct_geo.data + i * gw;
+            var m: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(i));
+            var ba: *ImRigidBody2d = self._body(m.body_a);
+            var bb: *ImRigidBody2d = self._body(m.body_b);
+            store64(g, 0);
+            if (ba != 0 && bb != 0) {
+                store64(g, 1);
+                var px: f64 = ba.position.x;
+                var py: f64 = ba.position.y;
+                var rot: f64 = ba.rotation;
+                var qx: f64 = bb.position.x;
+                var qy: f64 = bb.position.y;
+                var sn, cs = _im_sin_cos(rot);
+                var s: f64 = sn;
+                var c: f64 = cs;
+                var np = m.point_count;
+                if (np > _IM_B2_MAX_MANIFOLD_POINTS) { np = _IM_B2_MAX_MANIFOLD_POINTS; }
+                for (var pi = 0; pi < np; pi = pi + 1) {
+                    var p: *ImManifoldPoint = _im_b2_mpoint(m, pi);
+                    var lx: f64 = p.local_a.x;
+                    var ly: f64 = p.local_a.y;
+                    var cx: f64 = px + c * lx - s * ly;
+                    var cy: f64 = py + s * lx + c * ly;
+                    var r = g + 8 + pi * 32;
+                    var rax: f64 = cx - px;
+                    var ray: f64 = cy - py;
+                    var rbx: f64 = cx - qx;
+                    var rby: f64 = cy - qy;
+                    store64(r, rax);
+                    store64(r + 8, ray);
+                    store64(r + 16, rbx);
+                    store64(r + 24, rby);
+                }
+            }
+        }
+        return 0;
+    }
+
+    # 1 when manifold m involves a sensor; `missing` when a collider is gone.
+    #must_use
+    fn _manifold_sensor(self, m: *ImContactManifold, missing): i64 {
+        var ar: *ImArena = self._colliders();
+        var ca: *ImCollider2d = _im_b2_as_coll(ar.get(m.collider_a));
+        var cb: *ImCollider2d = _im_b2_as_coll(ar.get(m.collider_b));
+        if (ca == 0 || cb == 0) { return missing; }
+        if (ca.is_sensor == 1 || cb.is_sensor == 1) { return 1; }
+        return 0;
+    }
+
+    # Applies a warm-start impulse: −(ix, iy) and −aa on body a, +(ix, iy) and +ab on body b, through the
+    # solver's inverse masses.
+    fn _warm_apply(self, ba: *ImRigidBody2d, bb: *ImRigidBody2d, ix: f64, iy: f64, aa: f64, ab: f64) {
+        var ima, iia = ba.solver_inv_mass();
+        var im1: f64 = ima;
+        var ii1: f64 = iia;
+        var avx: f64 = ba.linear_velocity.x;
+        var avy: f64 = ba.linear_velocity.y;
+        var aw: f64 = ba.angular_velocity;
+        avx = avx - ix * im1;
+        avy = avy - iy * im1;
+        aw = aw - aa * ii1;
+        ba.linear_velocity = ImVec2_new(avx, avy);
+        ba.angular_velocity = aw;
+        var imb, iib = bb.solver_inv_mass();
+        var im2: f64 = imb;
+        var ii2: f64 = iib;
+        var bvx: f64 = bb.linear_velocity.x;
+        var bvy: f64 = bb.linear_velocity.y;
+        var bw: f64 = bb.angular_velocity;
+        bvx = bvx + ix * im2;
+        bvy = bvy + iy * im2;
+        bw = bw + ab * ii2;
+        bb.linear_velocity = ImVec2_new(bvx, bvy);
+        bb.angular_velocity = bw;
+        return 0;
+    }
+
+    # Scales every accumulated impulse by WARM_START_FACTOR and applies the scaled impulses (skipping
+    # sensors and negligible points), then each manifold's rolling impulse. Mirrors `warm_start`.
+    fn _warm_start(self) {
+        var f: f64 = _IM_B2_WARM_START_FACTOR;
+        var gw = _IM_B2_GEO_W * 8;
+        var eps: f64 = _IM_B2_EPSILON;
+        for (var i = 0; i < self.manifolds.len; i = i + 1) {
+            var m: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(i));
+            var roll: f64 = m.rolling_impulse;
+            roll = roll * f;
+            m.rolling_impulse = roll;
+            for (var q = 0; q < m.point_count; q = q + 1) {
+                var sp: *ImManifoldPoint = _im_b2_mpoint(m, q);
+                var sn: f64 = sp.normal_impulse;
+                var st: f64 = sp.tangent_impulse;
+                sn = sn * f;
+                st = st * f;
+                sp.normal_impulse = sn;
+                sp.tangent_impulse = st;
+            }
+            var g = self.ct_geo.data + i * gw;
+            if (self._manifold_sensor(m, 1) == 0 && load64(g) == 1) {
+                var ba: *ImRigidBody2d = self._body(m.body_a);
+                var bb: *ImRigidBody2d = self._body(m.body_b);
+                var nx: f64 = m.normal.x;
+                var ny: f64 = m.normal.y;
+                var tx: f64 = -ny;
+                var ty: f64 = nx;
+                for (var pi = 0; pi < m.point_count; pi = pi + 1) {
+                    var p: *ImManifoldPoint = _im_b2_mpoint(m, pi);
+                    var ni: f64 = p.normal_impulse;
+                    var ti: f64 = p.tangent_impulse;
+                    var ani: f64 = f64_abs(ni);
+                    var ati: f64 = f64_abs(ti);
+                    if (!(ani < eps && ati < eps)) {
+                        var r = g + 8 + pi * 32;
+                        var rax: f64 = load64(r);
+                        var ray: f64 = load64(r + 8);
+                        var rbx: f64 = load64(r + 16);
+                        var rby: f64 = load64(r + 24);
+                        var ix: f64 = ni * nx + ti * tx;
+                        var iy: f64 = ni * ny + ti * ty;
+                        var ang_a: f64 = _im_b2_cross(rax, ray, ix, iy);
+                        var ang_b: f64 = _im_b2_cross(rbx, rby, ix, iy);
+                        self._warm_apply(ba, bb, ix, iy, ang_a, ang_b);
+                    }
+                }
+                if (roll != 0.0) { self._warm_apply(ba, bb, 0.0, 0.0, roll, roll); }
+            }
+        }
+        return 0;
+    }
+
+    # ── the contact solver ──
+
+    # The solve level of body h (0 grounded, then one more per contact away), or -1 for none.
+    #must_use
+    fn _level_get(self, h, ns): i64 {
+        var s = _im_handle_index(h);
+        if (s < 0 || s >= ns) { return 0 - 1; }
+        var e = self.ct_level.data + s * 16;
+        if (load64(e) != h) { return 0 - 1; }
+        return load64(e + 8);
+    }
+
+    # Sets body h's solve level to v: 1, or 0 for a handle past the body slots (none such reach here:
+    # every manifold's bodies are live).
+    fn _level_set(self, h, ns, v): i64 {
+        var s = _im_handle_index(h);
+        if (s < 0 || s >= ns) { return 0; }
+        var e = self.ct_level.data + s * 16;
+        store64(e, h);
+        store64(e + 8, v);
+        return 1;
+    }
+
+    # The sub-step's contact preparation into ct_prep, one entry per manifold in solve order:
+    # - the order (shock propagation): manifolds by the lower solve level of their bodies, a stable sort
+    #   of key order, with static and kinematic bodies at level 0 and each contact one level further;
+    # - each manifold's combined materials (the higher-priority rule; rolling friction averaged) and
+    #   whether it involves a sensor;
+    # - each point's restitution target, −e·vn for an approach faster than RESTITUTION_VELOCITY_THRESHOLD,
+    #   from the velocities after warm starting.
+    # Mirrors `prepare_contacts`.
+    fn _prepare_contacts(self) {
+        var nm = self.manifolds.len;
+        var bar: *ImArena = self._bodies();
+        var ns = bar.slot_count();
+        for (var z = 0; z < ns; z = z + 1) {
+            store64(self.ct_level.data + z * 16, 0 - 1);
+            store64(self.ct_level.data + z * 16 + 8, 0 - 1);
+        }
+        for (var s = 0; s < ns; s = s + 1) {
+            var h = bar.slot_handle(s);
+            if (h != 0 - 1) {
+                var rb: *ImRigidBody2d = self._body(h);
+                if (rb.is_static() == 1 || rb.is_dynamic() == 0) { self._level_set(h, ns, 0); }
+            }
+        }
+        var changed = 1;
+        while (changed == 1) {
+            changed = 0;
+            for (var i = 0; i < nm; i = i + 1) {
+                var m: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(i));
+                var la = self._level_get(m.body_a, ns);
+                var lb = self._level_get(m.body_b, ns);
+                if (la >= 0 && lb < 0) {
+                    if (self._level_set(m.body_b, ns, la + 1) == 1) { changed = 1; }
+                } elif (la < 0 && lb >= 0) {
+                    if (self._level_set(m.body_a, ns, lb + 1) == 1) { changed = 1; }
+                } elif (la >= 0 && lb >= 0) {
+                    if (la + 1 < lb) {
+                        if (self._level_set(m.body_b, ns, la + 1) == 1) { changed = 1; }
+                    } elif (lb + 1 < la) {
+                        if (self._level_set(m.body_a, ns, lb + 1) == 1) { changed = 1; }
+                    }
+                }
+            }
+        }
+        # A stable counting sort by level: keys at sort[0 .. nm), the order at sort[nm .. 2nm), then the
+        # bucket starts (levels 0 .. maxl, and one bucket for none).
+        var keys = self.ct_sort.data;
+        var order = keys + nm * 8;
+        var starts = order + nm * 8;
+        var maxl = 0 - 1;
+        for (var k = 0; k < nm; k = k + 1) {
+            var mk: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(k));
+            var ka = self._level_get(mk.body_a, ns);
+            var kb = self._level_get(mk.body_b, ns);
+            if (ka < 0) { ka = _IM_B2_LEVEL_NONE; }
+            if (kb < 0) { kb = _IM_B2_LEVEL_NONE; }
+            var kl = ka;
+            if (kb < ka) { kl = kb; }
+            store64(keys + k * 8, kl);
+            if (kl != _IM_B2_LEVEL_NONE && kl > maxl) { maxl = kl; }
+        }
+        var nbk = maxl + 2;
+        for (var c0 = 0; c0 <= nbk; c0 = c0 + 1) { store64(starts + c0 * 8, 0); }
+        for (var c1 = 0; c1 < nm; c1 = c1 + 1) {
+            var b1 = load64(keys + c1 * 8);
+            if (b1 == _IM_B2_LEVEL_NONE) { b1 = maxl + 1; }
+            store64(starts + (b1 + 1) * 8, load64(starts + (b1 + 1) * 8) + 1);
+        }
+        for (var c2 = 0; c2 < nbk; c2 = c2 + 1) {
+            store64(starts + (c2 + 1) * 8, load64(starts + (c2 + 1) * 8) + load64(starts + c2 * 8));
+        }
+        for (var c3 = 0; c3 < nm; c3 = c3 + 1) {
+            var b3 = load64(keys + c3 * 8);
+            if (b3 == _IM_B2_LEVEL_NONE) { b3 = maxl + 1; }
+            var at = load64(starts + b3 * 8);
+            store64(order + at * 8, c3);
+            store64(starts + b3 * 8, at + 1);
+        }
+        # Materials, then the restitution targets.
+        var pw = sizeof(ImContactPrep);
+        var gw = _IM_B2_GEO_W * 8;
+        var car: *ImArena = self._colliders();
+        for (var e = 0; e < nm; e = e + 1) {
+            var mi = load64(order + e * 8);
+            var me: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(mi));
+            var p = self.ct_prep.data + e * pw;
+            var pr: *ImContactPrep = _im_b2_as_cprep(p);
+            pr.manifold = mi;
+            var rest: f64 = 0.0;
+            var fric: f64 = 0.0;
+            var sfric: f64 = 0.0;
+            var rfric: f64 = 0.0;
+            var sensor = 0;
+            var ca: *ImCollider2d = _im_b2_as_coll(car.get(me.collider_a));
+            var cb: *ImCollider2d = _im_b2_as_coll(car.get(me.collider_b));
+            if (ca != 0 && cb != 0) {
+                rest = _im_b2_combine(ca.material.restitution, cb.material.restitution,
+                  ca.material.restitution_combine, cb.material.restitution_combine);
+                fric = _im_b2_combine(ca.material.friction, cb.material.friction, ca.material.friction_combine,
+                  cb.material.friction_combine);
+                var sa: f64 = ca.material.effective_static_friction();
+                var sb: f64 = cb.material.effective_static_friction();
+                sfric = _im_b2_combine(sa, sb, ca.material.friction_combine, cb.material.friction_combine);
+                var ra: f64 = ca.material.rolling_friction;
+                var rb2: f64 = cb.material.rolling_friction;
+                rfric = (ra + rb2) * 0.5;
+                if (ca.is_sensor == 1 || cb.is_sensor == 1) { sensor = 1; }
+            }
+            pr.restitution = rest;
+            pr.friction = fric;
+            pr.static_friction = sfric;
+            pr.rolling_friction = rfric;
+            pr.is_sensor = sensor;
+            pr.bias0 = 0.0;
+            pr.bias1 = 0.0;
+            pr.bias2 = 0.0;
+            pr.bias3 = 0.0;
+            var g = self.ct_geo.data + mi * gw;
+            if (!(rest <= 0.0) && sensor == 0 && load64(g) == 1) {
+                var va: ImJointVel;
+                var vb: ImJointVel;
+                var ba: *ImRigidBody2d = self._body(me.body_a);
+                var bb: *ImRigidBody2d = self._body(me.body_b);
+                va.vx = ba.linear_velocity.x;
+                va.vy = ba.linear_velocity.y;
+                va.w = ba.angular_velocity;
+                vb.vx = bb.linear_velocity.x;
+                vb.vy = bb.linear_velocity.y;
+                vb.w = bb.angular_velocity;
+                var nx: f64 = me.normal.x;
+                var ny: f64 = me.normal.y;
+                var np = me.point_count;
+                if (np > _IM_B2_MAX_MANIFOLD_POINTS) { np = _IM_B2_MAX_MANIFOLD_POINTS; }
+                for (var pi = 0; pi < np; pi = pi + 1) {
+                    var r = g + 8 + pi * 32;
+                    var rax: f64 = load64(r);
+                    var ray: f64 = load64(r + 8);
+                    var rbx: f64 = load64(r + 16);
+                    var rby: f64 = load64(r + 24);
+                    var vn: f64 = _im_b2_rel_along(&va, &vb, rax, ray, rbx, rby, nx, ny);
+                    var thr: f64 = _IM_B2_RESTITUTION_VELOCITY_THRESHOLD;
+                    if (vn < -thr) {
+                        var bias: f64 = -rest * vn;
+                        store64(_im_b2_prep_bias(p, pi), bias);
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+
+    # One Gauss–Seidel pass over every non-sensor manifold in solve order: the normal impulses (the 2×2
+    # block solve of a two-point manifold when its effective-mass matrix is well conditioned, else point by
+    # point, clamped non-negative, toward each point's restitution target), then Coulomb friction (static
+    # below a slip speed of 0.01), then rolling resistance; the accumulated impulses and the dynamic bodies'
+    # velocities written back. Mirrors `solve_contacts_once`.
+    fn _solve_contacts_once(self) {
+        var pw = sizeof(ImContactPrep);
+        var gw = _IM_B2_GEO_W * 8;
+        var ra[64];
+        var rb[64];
+        var acc_n[32];
+        var acc_t[32];
+        var va: ImJointVel;
+        var vb: ImJointVel;
+        for (var e = 0; e < self.manifolds.len; e = e + 1) {
+            var pe = self.ct_prep.data + e * pw;
+            var pr: *ImContactPrep = _im_b2_as_cprep(pe);
+            var mi = pr.manifold;
+            var g = self.ct_geo.data + mi * gw;
+            if (pr.is_sensor == 0 && load64(g) == 1) {
+                var m: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(mi));
+                var ba: *ImRigidBody2d = self._body(m.body_a);
+                var bb: *ImRigidBody2d = self._body(m.body_b);
+                var ima0, iia0 = ba.solver_inv_mass();
+                var imb0, iib0 = bb.solver_inv_mass();
+                var ima: f64 = ima0;
+                var iia: f64 = iia0;
+                var imb: f64 = imb0;
+                var iib: f64 = iib0;
+                if (!(ima == 0.0 && imb == 0.0)) {
+                    self._solve_manifold(m, pe, g, ba, bb, ima, iia, imb, iib, &ra, &rb, &acc_n, &acc_t, &va, &vb);
+                }
+            }
+        }
+        return 0;
+    }
+
+    # The body of `solve_contacts_once` for one manifold m (prep entry pe, geometry g); ra, rb, acc_n,
+    # acc_t, va and vb are the caller's scratch.
+    fn _solve_manifold(self, m: *ImContactManifold, pe, g, ba: *ImRigidBody2d, bb: *ImRigidBody2d, ima: f64,
+      iia: f64, imb: f64, iib: f64, ra, rb, acc_n, acc_t, va: *ImJointVel, vb: *ImJointVel) {
+        var eps: f64 = _IM_B2_EPSILON;
+        va.vx = ba.linear_velocity.x;
+        va.vy = ba.linear_velocity.y;
+        va.w = ba.angular_velocity;
+        vb.vx = bb.linear_velocity.x;
+        vb.vy = bb.linear_velocity.y;
+        vb.w = bb.angular_velocity;
+        var nx: f64 = m.normal.x;
+        var ny: f64 = m.normal.y;
+        var tx: f64 = -ny;
+        var ty: f64 = nx;
+        var np = m.point_count;
+        if (np > _IM_B2_MAX_MANIFOLD_POINTS) { np = _IM_B2_MAX_MANIFOLD_POINTS; }
+        for (var pi = 0; pi < np; pi = pi + 1) {
+            var r = g + 8 + pi * 32;
+            store64(ra + pi * 16, load64(r));
+            store64(ra + pi * 16 + 8, load64(r + 8));
+            store64(rb + pi * 16, load64(r + 16));
+            store64(rb + pi * 16 + 8, load64(r + 24));
+            var p: *ImManifoldPoint = _im_b2_mpoint(m, pi);
+            var pn: f64 = p.normal_impulse;
+            var pt: f64 = p.tangent_impulse;
+            store64(acc_n + pi * 8, pn);
+            store64(acc_t + pi * 8, pt);
+        }
+        var acc_roll: f64 = m.rolling_impulse;
+        var a_dynamic = 0;
+        var b_dynamic = 0;
+        if (ima > 0.0 || iia > 0.0) { a_dynamic = 1; }
+        if (imb > 0.0 || iib > 0.0) { b_dynamic = 1; }
+        var pr: *ImContactPrep = _im_b2_as_cprep(pe);
+        var bias = _im_b2_prep_bias(pe, 0);
+
+        # Normal impulses.
+        var solved_block = 0;
+        if (np == 2) {
+            var r0x: f64 = load64(ra);
+            var r0y: f64 = load64(ra + 8);
+            var r1x: f64 = load64(ra + 16);
+            var r1y: f64 = load64(ra + 24);
+            var s0x: f64 = load64(rb);
+            var s0y: f64 = load64(rb + 8);
+            var s1x: f64 = load64(rb + 16);
+            var s1y: f64 = load64(rb + 24);
+            var rn0a: f64 = _im_b2_cross(r0x, r0y, nx, ny);
+            var rn0b: f64 = _im_b2_cross(s0x, s0y, nx, ny);
+            var rn1a: f64 = _im_b2_cross(r1x, r1y, nx, ny);
+            var rn1b: f64 = _im_b2_cross(s1x, s1y, nx, ny);
+            var k11: f64 = _im_b2_eff_mass(r0x, r0y, s0x, s0y, nx, ny, ima, iia, imb, iib);
+            var k22: f64 = _im_b2_eff_mass(r1x, r1y, s1x, s1y, nx, ny, ima, iia, imb, iib);
+            var k12: f64 = ima + imb + rn0a * rn1a * iia + rn0b * rn1b * iib;
+            var det: f64 = k11 * k22 - k12 * k12;
+            var cond: f64 = _IM_B2_MAX_CONDITION_NUMBER;
+            if (k11 > eps && k22 > eps && k11 * k11 < cond * det) {
+                solved_block = 1;
+                var a0: f64 = load64(acc_n);
+                var a1: f64 = load64(acc_n + 8);
+                var vn0: f64 = _im_b2_rel_along(va, vb, r0x, r0y, s0x, s0y, nx, ny);
+                var vn1: f64 = _im_b2_rel_along(va, vb, r1x, r1y, s1x, s1y, nx, ny);
+                var bias0: f64 = load64(bias);
+                var bias1: f64 = load64(bias + 8);
+                var b0: f64 = vn0 - bias0 - (k11 * a0 + k12 * a1);
+                var b1: f64 = vn1 - bias1 - (k12 * a0 + k22 * a1);
+                var found = 1;
+                var x0: f64 = -(k22 * b0 - k12 * b1) / det;
+                var x1: f64 = -(-k12 * b0 + k11 * b1) / det;
+                if (!(x0 >= 0.0 && x1 >= 0.0)) {
+                    x0 = -b0 / k11;
+                    x1 = 0.0;
+                    if (!(x0 >= 0.0 && k12 * x0 + b1 >= 0.0)) {
+                        x1 = -b1 / k22;
+                        x0 = 0.0;
+                        if (!(x1 >= 0.0 && k12 * x1 + b0 >= 0.0)) {
+                            x0 = 0.0;
+                            x1 = 0.0;
+                            if (!(b0 >= 0.0 && b1 >= 0.0)) { found = 0; }
+                        }
+                    }
+                }
+                if (found == 1) {
+                    var d0: f64 = x0 - a0;
+                    var i0x: f64 = nx * d0;
+                    var i0y: f64 = ny * d0;
+                    _im_b2_vel_apply(va, -1.0, i0x, i0y, r0x, r0y, ima, iia);
+                    _im_b2_vel_apply(vb, 1.0, i0x, i0y, s0x, s0y, imb, iib);
+                    store64(acc_n, x0);
+                    var d1: f64 = x1 - a1;
+                    var i1x: f64 = nx * d1;
+                    var i1y: f64 = ny * d1;
+                    _im_b2_vel_apply(va, -1.0, i1x, i1y, r1x, r1y, ima, iia);
+                    _im_b2_vel_apply(vb, 1.0, i1x, i1y, s1x, s1y, imb, iib);
+                    store64(acc_n + 8, x1);
+                }
+            }
+        }
+        if (solved_block == 0) {
+            for (var si = 0; si < np; si = si + 1) {
+                var qax: f64 = load64(ra + si * 16);
+                var qay: f64 = load64(ra + si * 16 + 8);
+                var qbx: f64 = load64(rb + si * 16);
+                var qby: f64 = load64(rb + si * 16 + 8);
+                var k: f64 = _im_b2_eff_mass(qax, qay, qbx, qby, nx, ny, ima, iia, imb, iib);
+                if (!(k < eps)) {
+                    var vn: f64 = _im_b2_rel_along(va, vb, qax, qay, qbx, qby, nx, ny);
+                    var acc: f64 = load64(acc_n + si * 8);
+                    var bi: f64 = load64(bias + si * 8);
+                    var new: f64 = _im_max(acc - (vn - bi) / k, 0.0);
+                    var d: f64 = new - acc;
+                    store64(acc_n + si * 8, new);
+                    var ix: f64 = nx * d;
+                    var iy: f64 = ny * d;
+                    _im_b2_vel_apply(va, -1.0, ix, iy, qax, qay, ima, iia);
+                    _im_b2_vel_apply(vb, 1.0, ix, iy, qbx, qby, imb, iib);
+                }
+            }
+        }
+
+        # Friction (Coulomb, static below a slip speed).
+        var fric: f64 = pr.friction;
+        var sfric: f64 = pr.static_friction;
+        if (fric > 0.0 || sfric > 0.0) {
+            for (var fi = 0; fi < np; fi = fi + 1) {
+                var fax: f64 = load64(ra + fi * 16);
+                var fay: f64 = load64(ra + fi * 16 + 8);
+                var fbx: f64 = load64(rb + fi * 16);
+                var fby: f64 = load64(rb + fi * 16 + 8);
+                var kt: f64 = _im_b2_eff_mass(fax, fay, fbx, fby, tx, ty, ima, iia, imb, iib);
+                if (!(kt < eps)) {
+                    var vt: f64 = _im_b2_rel_along(va, vb, fax, fay, fbx, fby, tx, ty);
+                    var avt: f64 = f64_abs(vt);
+                    var mu: f64 = fric;
+                    if (avt < 0.01) { mu = sfric; }
+                    var an: f64 = load64(acc_n + fi * 8);
+                    var max_f: f64 = _im_max(mu * an, 0.0);
+                    var at: f64 = load64(acc_t + fi * 8);
+                    var nt: f64 = _im_clamp(at - vt / kt, -max_f, max_f);
+                    if (_im_is_finite(nt) == 0) { nt = 0.0; }
+                    var dtt: f64 = nt - at;
+                    store64(acc_t + fi * 8, nt);
+                    var jx: f64 = tx * dtt;
+                    var jy: f64 = ty * dtt;
+                    _im_b2_vel_apply(va, -1.0, jx, jy, fax, fay, ima, iia);
+                    _im_b2_vel_apply(vb, 1.0, jx, jy, fbx, fby, imb, iib);
+                }
+            }
+        }
+
+        # Rolling resistance: one accumulated angular impulse per manifold.
+        var rfric: f64 = pr.rolling_friction;
+        var iab: f64 = iia + iib;
+        if (rfric > 0.0 && iab > eps) {
+            var sum: f64 = -0.0;
+            for (var ri = 0; ri < np; ri = ri + 1) {
+                var ai: f64 = load64(acc_n + ri * 8);
+                sum = sum + ai;
+            }
+            var max_r: f64 = _im_max(rfric * sum, 0.0);
+            var vbw: f64 = vb.w;
+            var vaw: f64 = va.w;
+            var nr: f64 = _im_clamp(acc_roll - (vbw - vaw) / iab, -max_r, max_r);
+            if (_im_is_finite(nr) == 0) { nr = 0.0; }
+            var dr: f64 = nr - acc_roll;
+            acc_roll = nr;
+            va.w = vaw - dr * iia;
+            vb.w = vbw + dr * iib;
+        }
+
+        # Write back.
+        for (var wi = 0; wi < np; wi = wi + 1) {
+            var wp: *ImManifoldPoint = _im_b2_mpoint(m, wi);
+            var wn: f64 = load64(acc_n + wi * 8);
+            var wt: f64 = load64(acc_t + wi * 8);
+            wp.normal_impulse = wn;
+            wp.tangent_impulse = wt;
+        }
+        m.rolling_impulse = acc_roll;
+        if (a_dynamic == 1) {
+            var ax: f64 = va.vx;
+            var ay: f64 = va.vy;
+            var aw: f64 = va.w;
+            ba.linear_velocity = ImVec2_new(ax, ay);
+            ba.angular_velocity = aw;
+        }
+        if (b_dynamic == 1) {
+            var bx: f64 = vb.vx;
+            var by: f64 = vb.vy;
+            var bw: f64 = vb.w;
+            bb.linear_velocity = ImVec2_new(bx, by);
+            bb.angular_velocity = bw;
+        }
+        return 0;
+    }
+
+    # ── the position solver ──
+
+    # Split-impulse position correction: every pseudo-velocity cleared, then each non-sensor point
+    # deeper than `slop` accumulates a clamped (≥ 0) pseudo-impulse toward removing `fraction` of its
+    # penetration this sub-step. The fraction is the soft constraint's (constraint_frequency > 0) or
+    # `percent` (Baumgarte), at most 1; nothing is corrected when it is NaN or not positive, or when dt
+    # is not above EPSILON. Mirrors `solve_positions`.
+    fn _solve_positions(self, iterations, slop: f64, percent: f64, dt: f64, constraint_frequency: f64,
+      constraint_damping_ratio: f64) {
+        self._clear_pseudo();
+        var eps: f64 = _IM_B2_EPSILON;
+        if (dt <= eps) { return 0; }
+        var fraction: f64 = percent;
+        if (constraint_frequency > 0.0) {
+            var omega: f64 = 2.0 * _IM_PI * constraint_frequency;
+            var dd: f64 = 2.0 * constraint_damping_ratio * omega;
+            var kk: f64 = omega * omega;
+            fraction = dt * kk / (dd + dt * kk);
+        }
+        if (fraction != fraction || fraction <= 0.0) { return 0; }
+        fraction = _im_min(fraction, 1.0);
+        var gw = _IM_B2_GEO_W * 8;
+        var qw = _IM_B2_POS_W * 8;
+        var count = 0;
+        for (var i = 0; i < self.manifolds.len; i = i + 1) {
+            var m: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(i));
+            var g = self.ct_geo.data + i * gw;
+            if (self._manifold_sensor(m, 1) == 0 && load64(g) == 1) {
+                var nx: f64 = m.normal.x;
+                var ny: f64 = m.normal.y;
+                for (var pi = 0; pi < m.point_count; pi = pi + 1) {
+                    var p: *ImManifoldPoint = _im_b2_mpoint(m, pi);
+                    var depth: f64 = p.depth;
+                    var pen: f64 = depth - slop;
+                    if (!(pen <= 0.0)) {
+                        var q = self.ct_pos.data + count * qw;
+                        var r = g + 8 + pi * 32;
+                        store64(q, m.body_a);
+                        store64(q + 8, m.body_b);
+                        store64(q + 16, load64(r));
+                        store64(q + 24, load64(r + 8));
+                        store64(q + 32, load64(r + 16));
+                        store64(q + 40, load64(r + 24));
+                        store64(q + 48, nx);
+                        store64(q + 56, ny);
+                        var target: f64 = fraction * pen / dt;
+                        store64(q + 64, target);
+                        store64(q + 72, 0.0);
+                        count = count + 1;
+                    }
+                }
+            }
+        }
+        var iters = iterations;
+        if (iters < 1) { iters = 1; }
+        var va: ImJointVel;
+        var vb: ImJointVel;
+        for (var it = 0; it < iters; it = it + 1) {
+            for (var k = 0; k < count; k = k + 1) {
+                var pt = self.ct_pos.data + k * qw;
+                var ba: *ImRigidBody2d = self._body(load64(pt));
+                var bb: *ImRigidBody2d = self._body(load64(pt + 8));
+                if (ba != 0 && bb != 0) {
+                    var ima0, iia0 = ba.solver_inv_mass();
+                    var imb0, iib0 = bb.solver_inv_mass();
+                    var ima: f64 = ima0;
+                    var iia: f64 = iia0;
+                    var imb: f64 = imb0;
+                    var iib: f64 = iib0;
+                    va.vx = ba.pseudo_velocity.x;
+                    va.vy = ba.pseudo_velocity.y;
+                    va.w = ba.pseudo_angular_velocity;
+                    vb.vx = bb.pseudo_velocity.x;
+                    vb.vy = bb.pseudo_velocity.y;
+                    vb.w = bb.pseudo_angular_velocity;
+                    var rax: f64 = load64(pt + 16);
+                    var ray: f64 = load64(pt + 24);
+                    var rbx: f64 = load64(pt + 32);
+                    var rby: f64 = load64(pt + 40);
+                    var qnx: f64 = load64(pt + 48);
+                    var qny: f64 = load64(pt + 56);
+                    var kp: f64 = _im_b2_eff_mass(rax, ray, rbx, rby, qnx, qny, ima, iia, imb, iib);
+                    if (!(kp < eps)) {
+                        var vn: f64 = _im_b2_rel_along(&va, &vb, rax, ray, rbx, rby, qnx, qny);
+                        var tg: f64 = load64(pt + 64);
+                        var acc: f64 = load64(pt + 72);
+                        var new: f64 = _im_max(acc + (tg - vn) / kp, 0.0);
+                        var d: f64 = new - acc;
+                        store64(pt + 72, new);
+                        var ix: f64 = qnx * d;
+                        var iy: f64 = qny * d;
+                        _im_b2_vel_apply(&va, -1.0, ix, iy, rax, ray, ima, iia);
+                        _im_b2_vel_apply(&vb, 1.0, ix, iy, rbx, rby, imb, iib);
+                        if (ima > 0.0) {
+                            var pax: f64 = va.vx;
+                            var pay: f64 = va.vy;
+                            var paw: f64 = va.w;
+                            ba.pseudo_velocity = ImVec2_new(pax, pay);
+                            ba.pseudo_angular_velocity = paw;
+                        }
+                        if (imb > 0.0) {
+                            var pbx: f64 = vb.vx;
+                            var pby: f64 = vb.vy;
+                            var pbw: f64 = vb.w;
+                            bb.pseudo_velocity = ImVec2_new(pbx, pby);
+                            bb.pseudo_angular_velocity = pbw;
+                        }
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+
+    # Records the manifold keys touching at the end of a sub-step with the contact tracker.
+    fn _record_contacts(self) {
+        var n = self.manifolds.len;
+        if (n > 0 && self.ct_keys.reserve(n * 2) == 1) {
+            for (var i = 0; i < n; i = i + 1) {
+                var m: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(i));
+                store64(self.ct_keys.data + i * 16, m.collider_a);
+                store64(self.ct_keys.data + i * 16 + 8, m.collider_b);
+            }
+            self.contact_tracker.record_substep(self.ct_keys.data, n);
+            return 0;
+        }
+        self.contact_tracker.record_substep(0, 0);
+        return 0;
+    }
+}

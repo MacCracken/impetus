@@ -245,3 +245,28 @@ Cyrius-only rows, 2,000 iterations, x86_64 ELF. Rust times joints only inside it
   prepare, and a `hypot` (168 ns) on every point-block solve. That is about 1.1 µs a joint a sub-step.
 - **The rest of the frame is integration and the islands.** The island pass takes five freelist buffers a step and
   frees them, which keeps the heap flat.
+
+## M3 part 3: the 2D step with contacts (2026-11-09)
+
+Rust's `world/step_*` rows (criterion, the latest `rust-old/bench-history.csv` run) against the same scenes through the
+backend's `step` and `finish_step`. `PhysicsWorld` itself waits for M3 part 4, but its step adds only a frame counter
+and an empty particle pass. The balls sit in rows 1 apart (touching) and 2 apart vertically, and fall together; both
+sides time a world that has already stepped (criterion's warm-up; 20–100 frames here). x86_64 ELF.
+
+| Bench | Body | Rust | Cyrius | Cyrius / Rust |
+|---|---|---|---|---|
+| `b2/step_empty` | an empty world's frame (Rust: `world/step_empty`) | 115 ns | 438 ns | 3.8× |
+| `b2/step_10_bodies` | 10 balls in rows of 5 (`world/step_10_bodies`) | 4.31 µs | 29.0 µs | 6.7× |
+| `b2/step_100_bodies` | 100 balls in rows of 10 (`world/step_100_bodies`) | 101 µs | 374 µs | 3.7× |
+| `b2/step_1000_bodies` | 1,000 balls in rows of 32 (`world/step_1000_bodies`) | 853 µs | 4.07 ms | 4.8× |
+| `b2/step_stack5_resting` | a settled stack of five boxes, kept awake: two-point manifolds, block solver, warm start | — | 51.5 µs | — |
+| `b2/joints_chain20_frame` | the 20-link chain's frame, now through `step` (broadphase included; 54.7 µs before) | — | 88.2 µs | — |
+
+**Reading it.**
+- **The whole step is closer to Rust than its parts.** These ratios (3.7–6.7×) are well below the state benches'
+  10–52×. Rust's step allocates every frame (BTreeMaps for the AABBs, levels, islands and manifolds, a Vec of
+  contacts), while the port's scratch is reused, so its heap stays flat.
+- **Where the time goes.** The correctly rounded `sin_cos` (about 200 ns) runs in every AABB, narrowphase pair and
+  manifold, and `hypot` (168 ns) in the circle contacts. The 10-ball scene pays the most for both, relative to its
+  size.
+- **Not acted on.** Speed is measured, not gated. These are first numbers.

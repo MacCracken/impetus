@@ -588,19 +588,89 @@ fn bench_joints() {
     bench_report(bn);
     var bf = bench_new("b2/joints_chain20_frame");
     bench_batch_start(bf);
-    for (var r2 = 0; r2 < reps; r2 = r2 + 1) {
-        st._integrate_velocities(ImVec2_new(0.0, -9.81), dt, 100.0);
-        st.prepare_joints(dt);
-        for (var it2 = 0; it2 < 4; it2 = it2 + 1) { st.solve_joints_once(); }
-        st.break_joints(dt);
-        st._clear_pseudo();
-        st._integrate_positions(dt);
-        st.build_islands_and_sleep(dt);
-        st.contact_tracker.record_substep(0, 0);
-        g_sink = st.finish_step();
-    }
+    for (var r2 = 0; r2 < reps; r2 = r2 + 1) { g_sink = b2_frame(&st, 1); }
     bench_batch_stop(bf, reps);
     bench_report(bf);
+    st.free();
+    return 0;
+}
+
+# One frame with the default world config, as PhysicsWorld::step's 2D loop: `sub` sub-steps, then
+# finish_step. The event count.
+fn b2_frame(st: *ImPhysicsState2d, sub): i64 {
+    var cfg: ImWorldConfig = ImWorldConfig_default();
+    var ts: f64 = cfg.timestep;
+    var sf: f64 = f64_from(sub);
+    var dt: f64 = ts / sf;
+    for (var s = 0; s < sub; s = s + 1) {
+        st.step(cfg.gravity, dt, cfg.velocity_iterations, cfg.position_iterations, cfg.position_slop,
+          cfg.position_correction, cfg.max_velocity, cfg.constraint_frequency, cfg.constraint_damping_ratio,
+          cfg.broadphase, cfg.solver);
+    }
+    return st.finish_step();
+}
+
+# Rust's world/step_N_bodies scene: n dynamic balls of radius 0.5 in rows of `per` (1 apart, rows 2
+# apart), falling together; stepped `warm` frames first, then timed `reps` frames.
+fn bench_step_balls(name, n, per, warm, reps) {
+    var st: ImPhysicsState2d = ImPhysicsState2d_new();
+    for (var i = 0; i < n; i = i + 1) {
+        var d: ImBodyDesc = ImBodyDesc_default();
+        var x: f64 = f64_from(i % per);
+        var y: f64 = f64_from(i / per) * 2.0;
+        d.position = ImVec3_new(x, y, 0.0);
+        var h = st.add_body(d);
+        var t, c = st.add_collider(h, ImColliderDesc_new(ImColliderShape_ball(0.5)));
+    }
+    for (var w = 0; w < warm; w = w + 1) { b2_frame(&st, 1); }
+    var bn = bench_new(name);
+    bench_batch_start(bn);
+    for (var r = 0; r < reps; r = r + 1) { g_sink = b2_frame(&st, 1); }
+    bench_batch_stop(bn, reps);
+    bench_report(bn);
+    st.free();
+    return 0;
+}
+
+# The 2D step with contacts (M3c): Rust's world/step_* scenes through the backend, and a settled stack
+# of five boxes (two-point manifolds through the block solver, warm started).
+fn bench_step() {
+    var st: ImPhysicsState2d = ImPhysicsState2d_new();
+    var be = bench_new("b2/step_empty");
+    bench_batch_start(be);
+    for (var r = 0; r < 100000; r = r + 1) { g_sink = b2_frame(&st, 1); }
+    bench_batch_stop(be, 100000);
+    bench_report(be);
+    st.free();
+    bench_step_balls("b2/step_10_bodies", 10, 5, 100, 2000);
+    bench_step_balls("b2/step_100_bodies", 100, 10, 100, 200);
+    bench_step_balls("b2/step_1000_bodies", 1000, 32, 20, 20);
+    st = ImPhysicsState2d_new();
+    var gd: ImBodyDesc = ImBodyDesc_default();
+    gd.body_type = IM_BODY_STATIC;
+    gd.position = ImVec3_new(0.0, -0.5, 0.0);
+    var g = st.add_body(gd);
+    var tg, cg = st.add_collider(g, ImColliderDesc_new(ImColliderShape_box(20.0, 0.5, 0.0)));
+    for (var i = 0; i < 5; i = i + 1) {
+        var d: ImBodyDesc = ImBodyDesc_default();
+        var y: f64 = 0.5 + f64_from(i);
+        d.position = ImVec3_new(0.0, y, 0.0);
+        var h = st.add_body(d);
+        var t, c = st.add_collider(h, ImColliderDesc_new(ImColliderShape_box(0.5, 0.5, 0.0)));
+    }
+    # Settle, then wake the stack every frame so it never sleeps.
+    for (var w = 0; w < 120; w = w + 1) { b2_frame(&st, 1); }
+    var bs = bench_new("b2/step_stack5_resting");
+    bench_batch_start(bs);
+    for (var r2 = 0; r2 < 2000; r2 = r2 + 1) {
+        for (var k = 1; k <= 5; k = k + 1) {
+            var rb: *ImRigidBody2d = st._body(k);
+            _im_b2_wake(rb);
+        }
+        g_sink = b2_frame(&st, 1);
+    }
+    bench_batch_stop(bs, 2000);
+    bench_report(bs);
     st.free();
     return 0;
 }
@@ -634,6 +704,7 @@ fn main(): i64 {
     bench_b2_queries();
     bench_states();
     bench_joints();
+    bench_step();
     return 0;
 }
 
