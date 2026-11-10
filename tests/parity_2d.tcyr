@@ -656,10 +656,11 @@ fn _par_got_shape(s: ImColliderShape) {
     return 0;
 }
 
-# The collider descriptor at token 0 into *out (the shape's arrays on freelist).
-fn _par_in_collider_desc(out: *ImColliderDesc) {
+# The collider descriptor at token k0 into *out (the shape's arrays on freelist); returns the token
+# after it.
+fn _par_in_collider_desc_at(k0, out: *ImColliderDesc): i64 {
     var sh: ImColliderShape = _im_shape(IM_SHAPE_BALL);
-    var k = _par_in_shape(0, &sh);
+    var k = _par_in_shape(k0, &sh);
     var d: ImColliderDesc = ImColliderDesc_new(sh);
     d.offset = _par_in_v3(k);
     d.material = _par_in_material(k + 3);
@@ -672,6 +673,12 @@ fn _par_in_collider_desc(out: *ImColliderDesc) {
     d.collision_layer = _par_in(k + 12);
     d.collision_mask = _par_in(k + 13);
     memcpy(out, &d, sizeof(ImColliderDesc));
+    return k + 14;
+}
+
+# The collider descriptor at token 0 into *out.
+fn _par_in_collider_desc(out: *ImColliderDesc) {
+    _par_in_collider_desc_at(0, out);
     return 0;
 }
 
@@ -772,10 +779,11 @@ fn _par_got_joint_type(j: ImJointType) {
     return 0;
 }
 
-fn _par_in_joint_desc(): ImJointDesc {
+# The joint descriptor at token k0 into *out; returns the token after it.
+fn _par_in_joint_desc_at(k0, out: *ImJointDesc): i64 {
     var jt: ImJointType = ImJointType_fixed();
-    var k = _par_in_joint_type(2, &jt);
-    var d: ImJointDesc = ImJointDesc_new(_par_in(0), _par_in(1), jt, _par_in_v2(k), _par_in_v2(k + 2));
+    var k = _par_in_joint_type(k0 + 2, &jt);
+    var d: ImJointDesc = ImJointDesc_new(_par_in(k0), _par_in(k0 + 1), jt, _par_in_v2(k), _par_in_v2(k + 2));
     var next = k + 4;
     if (_par_in_is_none(next) == 1) {
         next = next + 1;
@@ -793,6 +801,13 @@ fn _par_in_joint_desc(): ImJointDesc {
         d.has_break_force = 1;
         d.break_force = bf;
     }
+    memcpy(out, &d, sizeof(ImJointDesc));
+    return next + 2;
+}
+
+fn _par_in_joint_desc(): ImJointDesc {
+    var d: ImJointDesc = ImJointDesc_new(0, 0, ImJointType_fixed(), ImVec2_new(0.0, 0.0), ImVec2_new(0.0, 0.0));
+    _par_in_joint_desc_at(0, &d);
     return d;
 }
 
@@ -1127,23 +1142,16 @@ fn _par_b2_narrow(fp, fl): i64 {
 
 # ── M2d: the 2D raycast and overlap queries ─────────────────────────────────────────
 # Inputs: `v:<bodies>`, then per body its x, y, rotation, collider shape, offset x, y and layer; then
-# the query. The loops are `raycast_filtered`'s and `overlap_shape`'s (M3's ImPhysicsState2d owns them):
-# the layer filter, the max-distance cut and the nearest hit (the first of equals), or the colliders
-# found in order. A collider's handle is its index (generation 0).
-
-const _PAR_RAY_MAX = 8;
+# the query. The world is an ImPhysicsState2d (static bodies, one collider each, handles in order) and
+# the queries are its methods: `raycast_filtered`, `overlap_sphere`, `overlap_aabb`.
 
 fn _par_b2_ray(fp, fl): i64 {
     var is_r = _par_eq(fp, fl, "b2::raycast");
     var is_s = _par_eq(fp, fl, "b2::overlap_sphere");
     var is_a = _par_eq(fp, fl, "b2::overlap_aabb");
     if (is_r == 0 && is_s == 0 && is_a == 0) { return 0; }
+    var st: ImPhysicsState2d = ImPhysicsState2d_new();
     var n = _par_in(0);
-    if (n > _PAR_RAY_MAX) { return 0; }
-    var bsz = sizeof(ImRigidBody2d);
-    var csz = sizeof(ImCollider2d);
-    var bodies = fl_alloc(n * bsz + 8);
-    var colls = fl_alloc(n * csz + 8);
     var k = 1;
     for (var i = 0; i < n; i = i + 1) {
         var x: f64 = _par_in(k);
@@ -1157,108 +1165,381 @@ fn _par_b2_ray(fp, fl): i64 {
         bd.body_type = IM_BODY_STATIC;
         bd.position = ImVec3_new(x, y, 0.0);
         bd.rotation = rot;
-        var rb: ImRigidBody2d = ImRigidBody2d_from_desc(i, bd);
+        var bh = st.add_body(bd);
         var cd: ImColliderDesc = ImColliderDesc_new(sh);
         cd.offset = ImVec3_new(ox, oy, 0.0);
         cd.collision_layer = _par_in(k + 2);
-        var c: ImCollider2d = ImCollider2d_from_desc(i, i, cd);
-        memcpy(bodies + i * bsz, &rb, bsz);
-        memcpy(colls + i * csz, &c, csz);
+        var t, h = st.add_collider(bh, cd);
         sh.free();
         k = k + 3;
     }
     if (is_r == 1) {
-        var rox: f64 = _par_in(k);
-        var roy: f64 = _par_in(k + 1);
-        var rdx: f64 = _par_in(k + 2);
-        var rdy: f64 = _par_in(k + 3);
+        var o: ImVec3 = ImVec3_new(_par_in_f(k), _par_in_f(k + 1), 0.0);
+        var d: ImVec3 = ImVec3_new(_par_in_f(k + 2), _par_in_f(k + 3), 0.0);
         var max: f64 = _par_in(k + 4);
-        var mask = _par_in(k + 5);
-        var ok, ux0, uy0 = _im_b2_ray_direction(rdx, rdy);
-        var best = 0 - 1;
-        var bt: f64 = 0.0;
-        var bnx: f64 = 0.0;
-        var bny: f64 = 0.0;
-        if (ok == 1) {
-            var ux: f64 = ux0;
-            var uy: f64 = uy0;
-            var hit[24];
-            for (var j = 0; j < n; j = j + 1) {
-                var cj = colls + j * csz;
-                var layer = _par_layer(cj);
-                if ((layer & mask) != 0) {
-                    if (_im_b2_raycast_collider(bodies + j * bsz, cj, rox, roy, ux, uy, &hit) == 1) {
-                        var t: f64 = load64(&hit);
-                        if (t <= max && (best < 0 || t < bt)) {
-                            best = j;
-                            bt = t;
-                            bnx = load64(&hit + 8);
-                            bny = load64(&hit + 16);
-                        }
-                    }
-                }
-            }
-            if (best >= 0) {
-                var px: f64 = rox + ux * bt;
-                var py: f64 = roy + uy * bt;
-                _par_got_i(best);
-                _par_got_f(px);
-                _par_got_f(py);
-                _par_got_f(bnx);
-                _par_got_f(bny);
-                _par_got_f(bt);
-            }
-        }
-        if (best < 0) { _par_got_none(); }
-    } else {
-        var probe: ImColliderShape = _im_shape(IM_SHAPE_BALL);
-        var cx: f64 = 0.0;
-        var cy: f64 = 0.0;
-        var pbox: ImAabb2d = ImAabb2d_new(0.0, 0.0, 0.0, 0.0);
-        if (is_s == 1) {
-            cx = _par_in(k);
-            cy = _par_in(k + 1);
-            var r: f64 = _par_in(k + 2);
-            probe = ImColliderShape_ball(r);
-            pbox = ImAabb2d_new(cx - r, cy - r, cx + r, cy + r);
+        var hit: ImRayHit;
+        if (st.raycast_filtered(o, d, max, _par_in(k + 5), &hit) == 1) {
+            var px: f64 = hit.point.x;
+            var py: f64 = hit.point.y;
+            var nx: f64 = hit.normal.x;
+            var ny: f64 = hit.normal.y;
+            var dist: f64 = hit.distance;
+            _par_got_i(hit.collider);
+            _par_got_f(px);
+            _par_got_f(py);
+            _par_got_f(nx);
+            _par_got_f(ny);
+            _par_got_f(dist);
         } else {
-            var lx: f64 = _par_in(k);
-            var ly: f64 = _par_in(k + 1);
-            var hx: f64 = _par_in(k + 2);
-            var hy: f64 = _par_in(k + 3);
-            pbox = ImAabb2d_new(lx, ly, hx, hy);
-            var wx: f64 = f64_abs(hx - lx) * 0.5;
-            var wy: f64 = f64_abs(hy - ly) * 0.5;
-            probe = ImColliderShape_box(wx, wy, 0.0);
-            cx = (lx + hx) * 0.5;
-            cy = (ly + hy) * 0.5;
+            _par_got_none();
         }
-        var found = 0;
-        var list[64];
-        for (var q = 0; q < n; q = q + 1) {
-            if (_im_b2_overlap_collider(bodies + q * bsz, colls + q * csz, &probe, cx, cy, &pbox) == 1) {
-                store64(&list + found * 8, q);
-                found = found + 1;
-            }
+    } else {
+        var found: ImWordList = ImWordList_new();
+        if (is_s == 1) {
+            var r: f64 = _par_in(k + 2);
+            st.overlap_sphere(ImVec3_new(_par_in_f(k), _par_in_f(k + 1), 0.0), r, &found);
+        } else {
+            var lo: ImVec3 = ImVec3_new(_par_in_f(k), _par_in_f(k + 1), 0.0);
+            var hi: ImVec3 = ImVec3_new(_par_in_f(k + 2), _par_in_f(k + 3), 0.0);
+            st.overlap_aabb(lo, hi, &found);
         }
-        _par_got_seq(found);
-        for (var w = 0; w < found; w = w + 1) { _par_got_i(load64(&list + w * 8)); }
+        _par_got_seq(found.len);
+        for (var w = 0; w < found.len; w = w + 1) { _par_got_i(found.at(w)); }
+        found.free();
     }
-    for (var f = 0; f < n; f = f + 1) { _par_free_collider(colls + f * csz); }
-    fl_free(bodies);
-    fl_free(colls);
+    st.free();
     return 1;
 }
 
-# The collision layer of the collider record at c.
-fn _par_layer(c: *ImCollider2d): i64 {
-    return c.collision_layer;
+# Input token k as an f64 (for an f64 argument).
+fn _par_in_f(k): f64 {
+    var x: f64 = _par_in(k);
+    return x;
 }
 
-# Frees the shape arrays of the collider record at c.
-fn _par_free_collider(c: *ImCollider2d) {
-    c.free();
+# ── M3a: the 2D backend's state ─────────────────────────────────────────────────────
+# A row is a script of ops on a fresh ImPhysicsState2d; its outputs are each op's result, then the
+# backend dump in `oracle_dump()`'s order. `b2::state_script_orphan` rows add a collider or a joint for a
+# missing body, which the port refuses (ADR 0008 #1): mapped, and counted.
+
+var _par_map_orphan = 0;
+
+fn _par_op_name(i): i64 {
+    if (i == 0) { return "AddBody"; }
+    if (i == 1) { return "AddCollider"; }
+    if (i == 2) { return "AddJoint"; }
+    if (i == 3) { return "ApplyForce"; }
+    if (i == 4) { return "ApplyImpulse"; }
+    if (i == 5) { return "ApplyTorque"; }
+    if (i == 6) { return "RemoveBody"; }
+    if (i == 7) { return "RemoveCollider"; }
+    if (i == 8) { return "RemoveJoint"; }
+    if (i == 9) { return "GetBodyState"; }
+    if (i == 10) { return "SetBodyState"; }
+    if (i == 11) { return "SetBodyType"; }
+    if (i == 12) { return "BodyCount"; }
+    return "Unknown";
+}
+
+# A vector and an optional point (`n:` or three floats) at token k into v, *has and p; the token after.
+fn _par_in_vec_point(k, v: *ImVec3, has, p: *ImVec3): i64 {
+    var x: ImVec3 = _par_in_v3(k);
+    memcpy(v, &x, sizeof(ImVec3));
+    if (_par_in_is_none(k + 3) == 1) {
+        store64(has, 0);
+        return k + 4;
+    }
+    store64(has, 1);
+    var q: ImVec3 = _par_in_v3(k + 3);
+    memcpy(p, &q, sizeof(ImVec3));
+    return k + 6;
+}
+
+# An optional u32 word (-1 for none).
+fn _par_got_opt_i(x) {
+    if (x == 0 - 1) { _par_got_none(); } else { _par_got_i(x); }
     return 0;
+}
+
+# An arena's slots, free-list head and staleness, as `ArenaDump`.
+fn _par_got_arena(ar: *ImArena) {
+    _par_got_seq(ar.slot_count());
+    for (var i = 0; i < ar.slot_count(); i = i + 1) {
+        var m = ar._meta(i);
+        _par_got_i(load64(m));
+        _par_got_i(load64(m + 8));
+        _par_got_opt_i(load64(m + 16));
+    }
+    _par_got_opt_i(ar.free_head);
+    _par_got_i(ar.free_list_stale);
+    return 0;
+}
+
+fn _par_got_body2d(rb: *ImRigidBody2d) {
+    var f[24];
+    _par_got_i(rb.handle);
+    _par_got_enum("BodyType.", body_type_name(rb.body_type));
+    _par_got_v2(rb.position);
+    var rot: f64 = rb.rotation;
+    _par_got_f(rot);
+    _par_got_v2(rb.linear_velocity);
+    var av: f64 = rb.angular_velocity;
+    var ld: f64 = rb.linear_damping;
+    var ad: f64 = rb.angular_damping;
+    var gs: f64 = rb.gravity_scale;
+    _par_got_f(av);
+    _par_got_f(ld);
+    _par_got_f(ad);
+    _par_got_i(rb.fixed_rotation);
+    _par_got_f(gs);
+    _par_got_v2(rb.force_accumulator);
+    var ta: f64 = rb.torque_accumulator;
+    var m: f64 = rb.mass;
+    var im: f64 = rb.inv_mass;
+    var ii: f64 = rb.inertia;
+    var iii: f64 = rb.inv_inertia;
+    _par_got_f(ta);
+    _par_got_f(m);
+    _par_got_f(im);
+    _par_got_f(ii);
+    _par_got_f(iii);
+    _par_got_v2(rb.pseudo_velocity);
+    var pw: f64 = rb.pseudo_angular_velocity;
+    _par_got_f(pw);
+    _par_got_v2(rb.prev_position);
+    var pr: f64 = rb.prev_rotation;
+    var stm: f64 = rb.sleep_timer;
+    _par_got_f(pr);
+    _par_got_i(rb.is_sleeping);
+    _par_got_f(stm);
+    _par_got_i(rb.island_id);
+    return 0;
+}
+
+fn _par_got_collider2d(c: *ImCollider2d) {
+    _par_got_i(c.handle);
+    _par_got_i(c.body);
+    _par_got_shape(c.shape);
+    var ox: f64 = c.offset.x;
+    var oy: f64 = c.offset.y;
+    _par_got_f(ox);
+    _par_got_f(oy);
+    _par_got_f(0.0);
+    _par_got_material(c.material);
+    _par_got_i(c.is_sensor);
+    var ms: f64 = c.mass;
+    _par_got_opt_f(c.has_mass, ms);
+    _par_got_i(c.collision_layer);
+    _par_got_i(c.collision_mask);
+    return 0;
+}
+
+fn _par_got_joint2d(h, j: *ImJoint2d) {
+    _par_got_i(h);
+    _par_got_i(j.body_a);
+    _par_got_i(j.body_b);
+    _par_got_joint_type(j.joint_type);
+    _par_got_v2(j.local_anchor_a);
+    _par_got_v2(j.local_anchor_b);
+    if (j.has_motor == 1) {
+        var tv: f64 = j.motor.target_velocity;
+        var mf: f64 = j.motor.max_force;
+        _par_got_f(tv);
+        _par_got_f(mf);
+    } else {
+        _par_got_none();
+    }
+    var dm: f64 = j.damping;
+    var bf: f64 = j.break_force;
+    var ra: f64 = j.reference_angle;
+    _par_got_f(dm);
+    _par_got_opt_f(j.has_break_force, bf);
+    _par_got_f(ra);
+    return 0;
+}
+
+fn _par_got_pairlist(pl: *ImPairList) {
+    _par_got_seq(pl.len);
+    for (var i = 0; i < pl.len; i = i + 1) {
+        _par_got_i(pl.first(i));
+        _par_got_i(pl.second(i));
+    }
+    return 0;
+}
+
+# The state's dump: arenas and values in slot order, body_colliders by handle, manifolds, tracker.
+fn _par_got_state(st: *ImPhysicsState2d) {
+    var ba: *ImArena = st._bodies();
+    _par_got_arena(ba);
+    _par_got_seq(ba.len());
+    for (var i = 0; i < ba.slot_count(); i = i + 1) {
+        var h = ba.slot_handle(i);
+        if (h != 0 - 1) { _par_got_body2d(ba.get(h)); }
+    }
+    var ca: *ImArena = st._colliders();
+    _par_got_arena(ca);
+    _par_got_seq(ca.len());
+    for (var c = 0; c < ca.slot_count(); c = c + 1) {
+        var ch = ca.slot_handle(c);
+        if (ch != 0 - 1) { _par_got_collider2d(ca.get(ch)); }
+    }
+    var ja: *ImArena = st._joints();
+    _par_got_arena(ja);
+    _par_got_seq(ja.len());
+    for (var j = 0; j < ja.slot_count(); j = j + 1) {
+        var jh = ja.slot_handle(j);
+        if (jh != 0 - 1) { _par_got_joint2d(jh, ja.get(jh)); }
+    }
+    # body_colliders: the live bodies in unsigned handle order (an insertion sort).
+    var n = ba.len();
+    var hs = fl_alloc(n * 8 + 8);
+    var cnt = 0;
+    for (var s = 0; s < ba.slot_count(); s = s + 1) {
+        var bh = ba.slot_handle(s);
+        if (bh != 0 - 1) {
+            var at = cnt;
+            while (at > 0 && _im_ult(bh, load64(hs + (at - 1) * 8)) == 1) {
+                store64(hs + at * 8, load64(hs + (at - 1) * 8));
+                at = at - 1;
+            }
+            store64(hs + at * 8, bh);
+            cnt = cnt + 1;
+        }
+    }
+    _par_got_seq(cnt);
+    for (var q = 0; q < cnt; q = q + 1) {
+        var b = load64(hs + q * 8);
+        _par_got_i(b);
+        var list: *ImWordList = st._list(_im_handle_index(b));
+        _par_got_seq(list.len);
+        for (var r = 0; r < list.len; r = r + 1) { _par_got_i(list.at(r)); }
+    }
+    fl_free(hs);
+    _par_got_seq(st.manifolds.count());
+    for (var mi = 0; mi < st.manifolds.count(); mi = mi + 1) {
+        var m: *ImContactManifold = _im_b2_as_manifold(st.manifolds.at(mi));
+        _par_got_i(m.collider_a);
+        _par_got_i(m.collider_b);
+        _par_got_i(m.body_a);
+        _par_got_i(m.body_b);
+        _par_got_v2(m.normal);
+        _par_got_seq(m.point_count);
+        for (var pi = 0; pi < m.point_count; pi = pi + 1) {
+            var p = m.points + pi * sizeof(ImManifoldPoint);
+            for (var w = 0; w < 7; w = w + 1) { _par_got_f(load64(p + w * 8)); }
+        }
+        var ri: f64 = m.rolling_impulse;
+        _par_got_f(ri);
+    }
+    _par_got_pairlist(st.contact_tracker.prev);
+    _par_got_pairlist(st.contact_tracker.current);
+    _par_got_pairlist(st.contact_tracker.seen);
+    _par_got_i(st.contact_tracker.recorded);
+    return 0;
+}
+
+# 0 for Ok, else the error token.
+fn _par_got_unit(t, v) {
+    if (is_ok(t) == 1) { _par_got_i(0); } else { _par_got_err(v); }
+    return 0;
+}
+
+fn _par_b2_state(fp, fl): i64 {
+    var plain = _par_eq(fp, fl, "b2::state_script");
+    var orphan = _par_eq(fp, fl, "b2::state_script_orphan");
+    if (plain == 0 && orphan == 0) { return 0; }
+    var st: ImPhysicsState2d = ImPhysicsState2d_new();
+    var n = _par_in(0);
+    var k = 1;
+    var refused = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var op = _par_in_enum(k, "Op.", &_par_op_name, 13);
+        k = k + 1;
+        if (op == 0) {
+            var bd: ImBodyDesc = _par_in_body_desc(k);
+            k = k + 13;
+            _par_got_i(st.add_body(bd));
+        } elif (op == 1) {
+            var body = _par_in(k);
+            var cd: ImColliderDesc = ImColliderDesc_new(_im_shape(IM_SHAPE_BALL));
+            k = _par_in_collider_desc_at(k + 1, &cd);
+            var t1, v1 = st.add_collider(body, cd);
+            cd.shape.free();
+            if (is_ok(t1) == 1) { _par_got_i(v1); } else { _par_got_err(v1); refused = 1; }
+        } elif (op == 2) {
+            var jd: ImJointDesc = _par_in_joint_desc();
+            k = _par_in_joint_desc_at(k, &jd);
+            var t2, v2 = st.add_joint(jd);
+            if (is_ok(t2) == 1) { _par_got_i(v2); } else { _par_got_err(v2); refused = 1; }
+        } elif (op == 3 || op == 4) {
+            var fb = _par_in(k);
+            var vec: ImVec3 = ImVec3_new(0.0, 0.0, 0.0);
+            var pt: ImVec3 = ImVec3_new(0.0, 0.0, 0.0);
+            var has = 0;
+            k = _par_in_vec_point(k + 1, &vec, &has, &pt);
+            if (op == 3) {
+                var fo: ImForce;
+                fo.vector = vec;
+                fo.has_point = has;
+                fo.point = pt;
+                st.apply_force(fb, fo);
+            } else {
+                var im: ImImpulse;
+                im.vector = vec;
+                im.has_point = has;
+                im.point = pt;
+                st.apply_impulse(fb, im);
+            }
+        } elif (op == 5) {
+            var tb = _par_in(k);
+            var tv: f64 = _par_in(k + 1);
+            var tq: ImTorque;
+            tq.value = tv;
+            st.apply_torque(tb, tq);
+            k = k + 2;
+        } elif (op == 6) {
+            st.remove_body(_par_in(k));
+            _par_got_i(0);
+            k = k + 1;
+        } elif (op == 7) {
+            var t7, v7 = st.remove_collider(_par_in(k));
+            _par_got_unit(t7, v7);
+            k = k + 1;
+        } elif (op == 8) {
+            var t8, v8 = st.remove_joint(_par_in(k));
+            _par_got_unit(t8, v8);
+            k = k + 1;
+        } elif (op == 9) {
+            var bs: ImBodyState = _par_in_body_state(0);
+            var t9, v9 = st.get_body_state(_par_in(k), &bs);
+            if (is_ok(t9) == 1) { _par_got_body_state(bs); } else { _par_got_err(v9); }
+            k = k + 1;
+        } elif (op == 10) {
+            var sh = _par_in(k);
+            var ss: ImBodyState = _par_in_body_state(k + 1);
+            var t10, v10 = st.set_body_state(sh, ss);
+            _par_got_unit(t10, v10);
+            k = k + 12;
+        } elif (op == 11) {
+            var th = _par_in(k);
+            var ty = _par_in_enum(k + 1, "BodyType.", &body_type_name, 3);
+            var t11, v11 = st.set_body_type(th, ty);
+            _par_got_unit(t11, v11);
+            k = k + 2;
+        } elif (op == 12) {
+            _par_got_i(st.body_count());
+        } else {
+            st.free();
+            return 0;
+        }
+    }
+    _par_got_state(&st);
+    st.free();
+    if (orphan == 1 && refused == 1) {
+        _par_mapped = 8;
+        _par_map_orphan = _par_map_orphan + 1;
+    }
+    return 1;
 }
 
 # `f64::fmt_display` and `serde_json::f64` rows: src/fmtf.cyr's two layouts (ADR 0010).
@@ -1627,6 +1908,7 @@ fn _par_dispatch(mp, ml, fp, fl): i64 {
     if (_par_eq(mp, ml, "b2_mass") == 1) { return _par_b2_mass(fp, fl); }
     if (_par_eq(mp, ml, "b2_narrow") == 1) { return _par_b2_narrow(fp, fl); }
     if (_par_eq(mp, ml, "b2_ray") == 1) { return _par_b2_ray(fp, fl); }
+    if (_par_eq(mp, ml, "b2_state") == 1) { return _par_b2_state(fp, fl); }
     if (_par_eq(mp, ml, "broadphase") == 1) { return _par_broadphase(fp, fl); }
     if (_par_eq(mp, ml, "config") == 1) { return _par_config(fp, fl); }
     if (_par_eq(mp, ml, "fmtf") == 1) { return _par_fmtf(fp, fl); }
@@ -1769,6 +2051,12 @@ fn _par_module_done(mp, ml) {
         fmt_int(_par_map_xpbd);
         print(" validate rows the oracle accepts and the port refuses", 54);
         println(" (Err(Unsupported)), accepted (ADR 8)");
+        return 0;
+    }
+    if (_par_eq(mp, ml, "b2_state") == 1) {
+        print("  ADR 0008 #1 orphans: ", 23);
+        fmt_int(_par_map_orphan);
+        println(" scripts add a collider or joint for a missing body, which the port refuses, accepted (ADR 8)");
         return 0;
     }
     if (_par_eq(mp, ml, "math") != 1) { return 0; }

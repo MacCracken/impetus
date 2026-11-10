@@ -76,7 +76,7 @@ pub fn impulse(x: &Impulse) -> Vec<Tok> {
 // A payload enum is `e:<Enum>.<Variant>` then the variant's fields; a `Vec` is `v:<len>` then its
 // elements.
 
-fn handle(x: u64) -> Tok {
+pub fn handle(x: u64) -> Tok {
     Tok::I(x.cast_signed())
 }
 

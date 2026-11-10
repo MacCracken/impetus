@@ -28,6 +28,8 @@
 //! `constants` and `math` (M0); `config`, `material`, `units` and `force` (M1a); `fmtf` and `json` (M1b, ADR 0010); …
 
 mod cyr;
+#[cfg(not(feature = "b3"))]
+mod dump2d;
 mod flat;
 mod glibc;
 mod grids;
@@ -37,6 +39,8 @@ mod m_b2_mass;
 mod m_b2_narrow;
 #[cfg(not(feature = "b3"))]
 mod m_b2_ray;
+#[cfg(not(feature = "b3"))]
+mod m_b2_state;
 mod m_broadphase;
 mod m_config;
 mod m_constants;
@@ -83,6 +87,8 @@ fn golden_modules() -> Vec<tsv::Module> {
             m_b2_narrow::emit(),
             #[cfg(not(feature = "b3"))]
             m_b2_ray::emit(),
+            #[cfg(not(feature = "b3"))]
+            m_b2_state::emit(),
             m_broadphase::emit(),
             m_config::emit(),
             m_constants::emit(),

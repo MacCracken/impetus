@@ -226,6 +226,23 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     `crmath.tcyr`. Surface parity is 394/394, with the 4 world query loops listed as pending M3.
   - The oracle's 2D emitters share their shape builders (`scripts/oracle/src/shapes.rs`), and their
     output is unchanged.
+- **Cyrius port, M3 part 1: the 2D backend's state** (`docs/development/port-parity.md` §13):
+  - `src/b2_state.cyr`, ImPhysicsState2d:
+    - bodies, colliders and joints in generational arenas, so handles are Rust's;
+    - each body's collider list beside its slot;
+    - the manifold store in key order, the contact tracker and the island union-find;
+    - every `state.rs` method: adds, removals with cascades and waking, `recompute_mass`, forces,
+      impulses, torques, the snapshot inserts, and the body-state getters and setters;
+    - the M2 query methods: `raycast`, `raycast_filtered`, `overlap_sphere`, `overlap_aabb`.
+
+    A collider or joint for a missing body is `Err(IM_ERR_BODY_NOT_FOUND)` (ADR 0008 #1).
+  - Golden `b2_state.tsv`: 411 scripts through the world API, each ending in the full backend dump
+    (`scripts/oracle/src/dump2d.rs`). All 0 ulp on three targets; the 3 orphan scripts are mapped.
+    `validate.py` replays every script on a model of Rust's arenas and the state.
+    **97,568 ok, 0 failed, 0 measured, 7 pending, 160 accepted.**
+  - The ray and overlap rows and the world-level raycast tests now run on ImPhysicsState2d. 5 more
+    Rust tests are ported (28 assertions). Surface parity is 417/417; it now reads a receiver on the
+    line after `pub fn name(`.
 
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
@@ -249,6 +266,10 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   these alone): `hypot` 168 ns, against ganita's 33 ns. A ray costs 389 ns on a ball, 433 ns on a
   rotated box, 667 ns on a capsule and 2.11 µs on an 8-vertex hull; a sphere overlap on a box costs
   872 ns. The correctly rounded `sin_cos` and `hypot` dominate.
+- **2D state, first numbers against Rust 1.4.0** (`docs/benchmarks-rust-v-cyrius.md`): `add_body`
+  81.7 ns → 1.20 µs, `add_remove_body` 60.9 → 618 ns, `add_body_with_collider` 213 ns → 3.23 µs,
+  `add_joint` 23.4 ns → 1.22 µs, `apply_force` 3.3 → 45 ns, `apply_impulse` 1.7 → 41 ns. Arena
+  records (224 B per body, 320 B per collider) move by the stdlib's byte-loop `memcpy` (S5).
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

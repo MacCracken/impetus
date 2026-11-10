@@ -2,9 +2,7 @@
 # 15 ray and overlap tests of backend_2d/tests.rs, plus Cyrius-only tests of the direction check and
 # the per-collider queries.
 #
-# The world-level tests (rays and overlaps through PhysicsState2d) run on a test-local world: bodies and
-# colliders in order, with `raycast_filtered`'s and `overlap_shape`'s loops over the per-collider
-# queries. M3 points them at ImPhysicsState2d.
+# The world-level tests (rays and overlaps through PhysicsState2d) run on an ImPhysicsState2d.
 
 include "tests/lib_2d.cyr"
 
@@ -24,90 +22,76 @@ fn hf(h, w): f64 {
     return r;
 }
 
-# ── the test-local world ──
-var W_N = 0;
-var W_BODIES = 0;
-var W_COLLS = 0;
+# ── the world: an ImPhysicsState2d of static bodies, one collider each ──
+var W_PTR = 0;
+
+fn w_state(): *ImPhysicsState2d {
+    return W_PTR;
+}
 
 fn w_reset() {
-    for (var i = 0; i < W_N; i = i + 1) { w_free_coll(W_COLLS + i * sizeof(ImCollider2d)); }
-    if (W_BODIES == 0) {
-        W_BODIES = fl_alloc(4 * sizeof(ImRigidBody2d));
-        W_COLLS = fl_alloc(4 * sizeof(ImCollider2d));
+    if (W_PTR == 0) {
+        W_PTR = fl_alloc(sizeof(ImPhysicsState2d));
+    } else {
+        var old: *ImPhysicsState2d = w_state();
+        old.free();
     }
-    W_N = 0;
+    var fresh: ImPhysicsState2d = ImPhysicsState2d_new();
+    memcpy(W_PTR, &fresh, sizeof(ImPhysicsState2d));
     return 0;
 }
 
-fn w_free_coll(c: *ImCollider2d) {
-    c.free();
-    return 0;
-}
-
-# Adds a static body at (x, y) with one collider of shape s (the world keeps its own copy).
+# Adds a static body at (x, y) with one collider of shape s (the state keeps its own copy).
 fn w_add(s: ImColliderShape, x: f64, y: f64) {
+    var st: *ImPhysicsState2d = w_state();
     var bd: ImBodyDesc = ImBodyDesc_default();
     bd.body_type = IM_BODY_STATIC;
     bd.position = ImVec3_new(x, y, 0.0);
-    var rb: ImRigidBody2d = ImRigidBody2d_from_desc(W_N, bd);
-    var c: ImCollider2d = ImCollider2d_from_desc(W_N, W_N, ImColliderDesc_new(s));
-    memcpy(W_BODIES + W_N * sizeof(ImRigidBody2d), &rb, sizeof(ImRigidBody2d));
-    memcpy(W_COLLS + W_N * sizeof(ImCollider2d), &c, sizeof(ImCollider2d));
-    W_N = W_N + 1;
+    var bh = st.add_body(bd);
+    var t, h = st.add_collider(bh, ImColliderDesc_new(s));
     return 0;
 }
 
-# `raycast`: the nearest hit within max into out (t, nx, ny): its collider index, or -1.
+# `raycast`: the nearest hit within max into out (t, nx, ny): its collider handle (its index here),
+# or -1.
 fn w_ray(ox: f64, oy: f64, dx: f64, dy: f64, max: f64, out): i64 {
-    var ok, ux0, uy0 = _im_b2_ray_direction(dx, dy);
-    if (ok == 0) { return 0 - 1; }
-    var ux: f64 = ux0;
-    var uy: f64 = uy0;
-    var best = 0 - 1;
-    var bt: f64 = 0.0;
-    var hit[24];
-    for (var i = 0; i < W_N; i = i + 1) {
-        var b = W_BODIES + i * sizeof(ImRigidBody2d);
-        var c = W_COLLS + i * sizeof(ImCollider2d);
-        if (_im_b2_raycast_collider(b, c, ox, oy, ux, uy, &hit) == 1) {
-            var t: f64 = load64(&hit);
-            if (t <= max && (best < 0 || t < bt)) {
-                best = i;
-                bt = t;
-                for (var w = 0; w < 3; w = w + 1) { store64(out + w * 8, load64(&hit + w * 8)); }
-            }
-        }
-    }
-    return best;
+    var st: *ImPhysicsState2d = w_state();
+    var hit: ImRayHit;
+    if (st.raycast(ImVec3_new(ox, oy, 0.0), ImVec3_new(dx, dy, 0.0), max, &hit) == 0) { return 0 - 1; }
+    var t: f64 = hit.distance;
+    var nx: f64 = hit.normal.x;
+    var ny: f64 = hit.normal.y;
+    store64(out, t);
+    store64(out + 8, nx);
+    store64(out + 16, ny);
+    return hit.collider;
 }
 
-# The colliders overlapping probe (at (px, py), box pbox), as a bit mask of their indices.
-fn w_overlap(probe: *ImColliderShape, px: f64, py: f64, pbox: *ImAabb2d): i64 {
+# The colliders in `found`, as a bit mask of their indices.
+fn w_mask(found: *ImWordList): i64 {
     var mask = 0;
-    for (var i = 0; i < W_N; i = i + 1) {
-        var b = W_BODIES + i * sizeof(ImRigidBody2d);
-        var c = W_COLLS + i * sizeof(ImCollider2d);
-        if (_im_b2_overlap_collider(b, c, probe, px, py, pbox) == 1) { mask = mask | (1 << i); }
-    }
+    for (var i = 0; i < found.len; i = i + 1) { mask = mask | (1 << _im_handle_index(found.at(i))); }
     return mask;
 }
 
-# `overlap_sphere`.
+# `overlap_sphere`, as a mask.
 fn w_sphere(cx: f64, cy: f64, r: f64): i64 {
-    var probe: ImColliderShape = ImColliderShape_ball(r);
-    var pbox: ImAabb2d = ImAabb2d_new(cx - r, cy - r, cx + r, cy + r);
-    return w_overlap(&probe, cx, cy, &pbox);
+    var st: *ImPhysicsState2d = w_state();
+    var found: ImWordList = ImWordList_new();
+    st.overlap_sphere(ImVec3_new(cx, cy, 0.0), r, &found);
+    var m = w_mask(&found);
+    found.free();
+    return m;
 }
 
-# `overlap_aabb`.
+# `overlap_aabb`, as a mask.
 fn w_aabb(lx: f64, ly: f64, hx: f64, hy: f64): i64 {
-    var wx: f64 = f64_abs(hx - lx) * 0.5;
-    var wy: f64 = f64_abs(hy - ly) * 0.5;
-    var probe: ImColliderShape = ImColliderShape_box(wx, wy, 0.0);
-    var pbox: ImAabb2d = ImAabb2d_new(lx, ly, hx, hy);
-    var cx: f64 = (lx + hx) * 0.5;
-    var cy: f64 = (ly + hy) * 0.5;
-    return w_overlap(&probe, cx, cy, &pbox);
+    var st: *ImPhysicsState2d = w_state();
+    var found: ImWordList = ImWordList_new();
+    st.overlap_aabb(ImVec3_new(lx, ly, 0.0), ImVec3_new(hx, hy, 0.0), &found);
+    var m = w_mask(&found);
+    found.free();
+    return m;
 }
 
 # Runs the ported raycast tests.

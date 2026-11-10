@@ -1,0 +1,239 @@
+# b2_state.tcyr — the ported Rust tests of rust-old/src/backend_2d/state.rs (M3a): the 5 tests of
+# backend_2d/tests.rs that use PhysicsState2d without stepping, plus Cyrius-only tests of handles and
+# slot reuse, mass recomputation, the orphan refusal (ADR 0008 #1), removals, waking, the restore
+# inserts and the manifold store.
+
+include "tests/lib_2d.cyr"
+
+var EPS: f64 = 0.000001;
+
+# 1 when |got − want| < eps.
+fn near(got: f64, want: f64, eps: f64): i64 {
+    var d: f64 = f64_abs(got - want);
+    if (d < eps) { return 1; }
+    return 0;
+}
+
+# A dynamic body at (x, y), rotated by rot.
+fn body_at(x: f64, y: f64, rot: f64): ImBodyDesc {
+    var d: ImBodyDesc = ImBodyDesc_default();
+    d.position = ImVec3_new(x, y, 0.0);
+    d.rotation = rot;
+    return d;
+}
+
+# A collider descriptor of shape s at offset (ox, oy).
+fn coll(s: ImColliderShape, ox: f64, oy: f64): ImColliderDesc {
+    var d: ImColliderDesc = ImColliderDesc_new(s);
+    d.offset = ImVec3_new(ox, oy, 0.0);
+    return d;
+}
+
+# Adds a collider and returns its handle (-1 on an error).
+fn add_c(st: *ImPhysicsState2d, body, d: ImColliderDesc): i64 {
+    var t, h = st.add_collider(body, d);
+    if (is_ok(t) == 0) { return 0 - 1; }
+    return h;
+}
+
+# The body record at h.
+fn rec(st: *ImPhysicsState2d, h): *ImRigidBody2d {
+    return st._body(h);
+}
+
+# Puts body h to sleep with a sleep timer of 1.
+fn sleep(st: *ImPhysicsState2d, h) {
+    var rb: *ImRigidBody2d = rec(st, h);
+    rb.is_sleeping = 1;
+    rb.sleep_timer = 1.0;
+    return 0;
+}
+
+# 1 when body h is awake with a zero sleep timer.
+fn awake(st: *ImPhysicsState2d, h): i64 {
+    var rb: *ImRigidBody2d = rec(st, h);
+    var t: f64 = rb.sleep_timer;
+    if (rb.is_sleeping == 0 && near(t, 0.0, EPS) == 1) { return 1; }
+    return 0;
+}
+
+# Runs the ported state tests.
+fn main() {
+    alloc_init();
+
+    # ── backend_2d/tests.rs ──
+    test_group("multiple_colliders_accumulate_mass");
+    var st: ImPhysicsState2d = ImPhysicsState2d_new();
+    var bh = st.add_body(ImBodyDesc_default());
+    add_c(&st, bh, coll(ImColliderShape_ball(1.0), 0.0, 0.0));
+    var rb: *ImRigidBody2d = rec(&st, bh);
+    var first: f64 = rb.mass;
+    add_c(&st, bh, coll(ImColliderShape_ball(1.0), 1.0, 0.0));
+    rb = rec(&st, bh);
+    var second: f64 = rb.mass;
+    assert_eq(second > first, 1, "grows");
+    assert_eq(near(second, 2.0 * first, EPS), 1, "doubles");
+    st.free();
+
+    test_group("force_wakes_sleeping_body");
+    st = ImPhysicsState2d_new();
+    bh = st.add_body(ImBodyDesc_default());
+    add_c(&st, bh, coll(ImColliderShape_ball(1.0), 0.0, 0.0));
+    sleep(&st, bh);
+    st.apply_force(bh, ImForce_new(10.0, 0.0, 0.0));
+    assert_eq(awake(&st, bh), 1, "awake, timer reset");
+    st.free();
+
+    test_group("impulse_wakes_sleeping_body");
+    st = ImPhysicsState2d_new();
+    bh = st.add_body(ImBodyDesc_default());
+    add_c(&st, bh, coll(ImColliderShape_ball(1.0), 0.0, 0.0));
+    sleep(&st, bh);
+    st.apply_impulse(bh, ImImpulse_new(10.0, 0.0, 0.0));
+    assert_eq(awake(&st, bh), 1, "awake");
+    st.free();
+
+    test_group("torque_wakes_sleeping_body");
+    st = ImPhysicsState2d_new();
+    bh = st.add_body(ImBodyDesc_default());
+    add_c(&st, bh, coll(ImColliderShape_ball(1.0), 0.0, 0.0));
+    sleep(&st, bh);
+    st.apply_torque(bh, ImTorque_new(5.0));
+    assert_eq(awake(&st, bh), 1, "awake");
+    st.free();
+
+    test_group("get_body_state_reports_sleeping");
+    st = ImPhysicsState2d_new();
+    bh = st.add_body(ImBodyDesc_default());
+    add_c(&st, bh, coll(ImColliderShape_ball(1.0), 0.0, 0.0));
+    var bs: ImBodyState;
+    var t1, v1 = st.get_body_state(bh, &bs);
+    assert_eq(is_ok(t1) == 1 && bs.is_sleeping == 0, 1, "awake");
+    rb = rec(&st, bh);
+    rb.is_sleeping = 1;
+    var t2, v2 = st.get_body_state(bh, &bs);
+    assert_eq(bs.is_sleeping, 1, "asleep");
+    st.free();
+
+    # ── Cyrius-only ──
+    test_group("handles_and_slot_reuse");
+    st = ImPhysicsState2d_new();
+    var b0 = st.add_body(body_at(0.0, 0.0, 0.0));
+    var b1 = st.add_body(body_at(1.0, 0.0, 0.0));
+    var b2 = st.add_body(body_at(2.0, 0.0, 0.0));
+    assert_eq(b0 == 0 && b1 == 1 && b2 == 2, 1, "slots 0, 1, 2 at generation 0");
+    st.remove_body(b1);
+    var b3 = st.add_body(body_at(3.0, 0.0, 0.0));
+    assert_eq(b3, _im_arena_handle(1, 1), "slot 1 again, generation 1");
+    var t3, v3 = st.get_body_state(b1, &bs);
+    assert_eq(is_ok(t3) == 0 && v3 == IM_ERR_BODY_NOT_FOUND, 1, "the stale handle is not found");
+    assert_eq(st.body_count(), 3, "three bodies");
+    st.free();
+
+    test_group("orphans_are_refused");
+    st = ImPhysicsState2d_new();
+    var t4, v4 = st.add_collider(7, coll(ImColliderShape_ball(1.0), 0.0, 0.0));
+    assert_eq(is_ok(t4) == 0 && v4 == IM_ERR_BODY_NOT_FOUND, 1, "a collider for a missing body");
+    var a = st.add_body(body_at(0.0, 0.0, 0.0));
+    var jd: ImJointDesc = ImJointDesc_new(a, 9, ImJointType_fixed(), ImVec2_new(0.0, 0.0), ImVec2_new(0.0, 0.0));
+    var t5, v5 = st.add_joint(jd);
+    assert_eq(is_ok(t5) == 0 && v5 == IM_ERR_BODY_NOT_FOUND, 1, "a joint to a missing body");
+    st.free();
+
+    test_group("removal_recomputes_mass");
+    st = ImPhysicsState2d_new();
+    bh = st.add_body(ImBodyDesc_default());
+    var c0 = add_c(&st, bh, coll(ImColliderShape_ball(1.0), 0.0, 0.0));
+    var c1 = add_c(&st, bh, coll(ImColliderShape_box(1.0, 0.5, 0.0), 2.0, 0.0));
+    var t6, v6 = st.remove_collider(c1);
+    rb = rec(&st, bh);
+    var after: f64 = rb.mass;
+    var ball_only: f64 = _IM_PI;
+    assert_eq(is_ok(t6) == 1 && near(after, ball_only, EPS) == 1, 1, "back to the ball's mass");
+    var t7, v7 = st.remove_collider(c1);
+    assert_eq(is_ok(t7) == 0 && v7 == IM_ERR_COLLIDER_NOT_FOUND, 1, "removed twice: not found");
+    st.free();
+
+    test_group("set_body_type");
+    st = ImPhysicsState2d_new();
+    var sd: ImBodyDesc = body_at(0.0, 0.0, 0.0);
+    sd.body_type = IM_BODY_STATIC;
+    bh = st.add_body(sd);
+    add_c(&st, bh, coll(ImColliderShape_box(1.0, 1.0, 0.0), 0.0, 0.0));
+    rb = rec(&st, bh);
+    var sim: f64 = rb.inv_mass;
+    assert_eq(sim == 0.0, 1, "static: no inverse mass");
+    var t8, v8 = st.set_body_type(bh, IM_BODY_DYNAMIC);
+    rb = rec(&st, bh);
+    var dim: f64 = rb.inv_mass;
+    assert_eq(near(dim, 0.25, EPS), 1, "dynamic: its mass counts");
+    rb.linear_velocity = ImVec2_new(3.0, 4.0);
+    rb.angular_velocity = 1.0;
+    var t9, v9 = st.set_body_type(bh, IM_BODY_KINEMATIC);
+    rb = rec(&st, bh);
+    var kvx: f64 = rb.linear_velocity.x;
+    var kw: f64 = rb.angular_velocity;
+    assert_eq(kvx == 0.0 && kw == 0.0, 1, "kinematic: stopped");
+    st.free();
+
+    test_group("remove_body_takes_colliders_and_joints");
+    st = ImPhysicsState2d_new();
+    var p = st.add_body(body_at(0.0, 0.0, 0.25));
+    var q = st.add_body(body_at(1.0, 0.0, 1.0));
+    add_c(&st, p, coll(ImColliderShape_ball(0.5), 0.0, 0.0));
+    var qc = add_c(&st, q, coll(ImColliderShape_ball(0.5), 0.0, 0.0));
+    var z2: ImVec2 = ImVec2_new(0.0, 0.0);
+    var jt, jh = st.add_joint(ImJointDesc_new(p, q, ImJointType_distance(1.0), z2, z2));
+    var ja: *ImArena = st._joints();
+    var jr: *ImJoint2d = _im_b2_as_joint(ja.get(jh));
+    var ref: f64 = jr.reference_angle;
+    assert_eq(ref == 0.75, 1, "reference angle rot(b) − rot(a)");
+    sleep(&st, q);
+    st.remove_body(p);
+    assert_eq(ja.len(), 0, "the joint went with the body");
+    assert_eq(awake(&st, q), 1, "the jointed body woke");
+    var ca: *ImArena = st._colliders();
+    assert_eq(ca.len(), 1, "the body's collider went too");
+    assert_eq(ca.contains(qc), 1, "the other's stayed");
+    st.free();
+
+    test_group("restore_inserts");
+    st = ImPhysicsState2d_new();
+    var rh = _im_arena_handle(3, 2);
+    assert_eq(st.add_body_at(rh, body_at(0.0, 0.0, 0.0)), 1, "a body at slot 3, generation 2");
+    assert_eq(st.add_body_at(rh, body_at(0.0, 0.0, 0.0)), 0, "the slot is taken");
+    var t10, v10 = st.add_collider_at(_im_arena_handle(5, 1), rh, coll(ImColliderShape_ball(1.0), 0.0, 0.0));
+    rb = rec(&st, rh);
+    var rm: f64 = rb.mass;
+    assert_eq(is_ok(t10) == 1 && near(rm, ball_only, EPS) == 1, 1, "a collider at a handle, the mass recomputed");
+    var nb = st.add_body(body_at(0.0, 0.0, 0.0));
+    assert_eq(nb, 0, "the next insert rebuilds the free list, lowest slot first");
+    st.free();
+
+    test_group("manifold_store_retain");
+    var ms: ImManifoldStore = ImManifoldStore_new();
+    ms.data = fl_alloc(3 * sizeof(ImContactManifold));
+    ms.len = 3;
+    ms.cap = 3;
+    for (var i = 0; i < 3; i = i + 1) {
+        var m: *ImContactManifold = _im_b2_as_manifold(ms.at(i));
+        m.collider_a = i;
+        m.collider_b = i + 10;
+        m.points = fl_alloc(sizeof(ImManifoldPoint));
+        m.point_count = 1;
+    }
+    var gone[8];
+    store64(&gone, 11);
+    ms.retain_without(&gone, 1);
+    var m0: *ImContactManifold = _im_b2_as_manifold(ms.at(0));
+    var m1: *ImContactManifold = _im_b2_as_manifold(ms.at(1));
+    var kept = ms.count() == 2 && m0.collider_a == 0 && m1.collider_a == 2;
+    assert_eq(kept, 1, "the one touching 11 is gone, order kept");
+    ms.free();
+
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

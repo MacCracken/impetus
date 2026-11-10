@@ -502,6 +502,57 @@ fn bench_b2_queries() {
     return 0;
 }
 
+# bodies/* and forces/apply_*: the Rust benches' loops on an ImPhysicsState2d (PhysicsWorld's 2D
+# calls are the backend's, M3a). As in Rust, add_body and add_joint grow one world.
+fn bench_state(name, which) {
+    var st: ImPhysicsState2d = ImPhysicsState2d_new();
+    var a = st.add_body(ImBodyDesc_default());
+    var b2 = st.add_body(ImBodyDesc_default());
+    var bd: ImBodyDesc = ImBodyDesc_default();
+    bd.position = ImVec3_new(1.0, 2.0, 0.0);
+    var cd: ImColliderDesc = ImColliderDesc_new(ImColliderShape_ball(0.5));
+    var z2: ImVec2 = ImVec2_new(0.0, 0.0);
+    var jd: ImJointDesc = ImJointDesc_new(a, b2, ImJointType_spring(2.0, 100.0, 5.0), z2, z2);
+    var fo: ImForce = ImForce_new(10.0, -5.0, 0.0);
+    var im: ImImpulse = ImImpulse_new(0.0, 20.0, 0.0);
+    var bn = bench_new(name);
+    var reps = 100000;
+    bench_batch_start(bn);
+    for (var r = 0; r < reps; r = r + 1) {
+        if (which == 0) {
+            g_sink = st.add_body(ImBodyDesc_default());
+        } elif (which == 1) {
+            var h = st.add_body(ImBodyDesc_default());
+            st.remove_body(h);
+        } elif (which == 2) {
+            var h2 = st.add_body(bd);
+            var t, c = st.add_collider(h2, cd);
+            g_sink = c;
+        } elif (which == 3) {
+            var tj, j = st.add_joint(jd);
+            g_sink = j;
+        } elif (which == 4) {
+            st.apply_force(a, fo);
+        } else {
+            st.apply_impulse(a, im);
+        }
+    }
+    bench_batch_stop(bn, reps);
+    bench_report(bn);
+    st.free();
+    return 0;
+}
+
+fn bench_states() {
+    bench_state("bodies/add_body", 0);
+    bench_state("bodies/add_remove_body", 1);
+    bench_state("bodies/add_body_with_collider", 2);
+    bench_state("bodies/add_joint", 3);
+    bench_state("forces/apply_force", 4);
+    bench_state("forces/apply_impulse", 5);
+    return 0;
+}
+
 # Runs every bench.
 fn main(): i64 {
     alloc_init();
@@ -529,6 +580,7 @@ fn main(): i64 {
     bench_b2_world_aabb();
     bench_b2_narrowphase();
     bench_b2_queries();
+    bench_states();
     return 0;
 }
 

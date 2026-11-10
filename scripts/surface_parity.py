@@ -33,10 +33,10 @@ MODULES = [
     "error", "config", "material", "units", "force",
     "body", "collider", "joint", "event", "query", "arena", "contact_tracker", "spring",
     "aabb_tree", "spatial_hash", "backend_2d/types", "backend_2d/narrowphase",
-    "backend_2d/raycast",
+    "backend_2d/raycast", "backend_2d/state",
 ]
 PENDING_MODULES = {
-    "backend_2d/solver": "M3", "backend_2d/joints": "M3", "backend_2d/state": "M3",
+    "backend_2d/solver": "M3", "backend_2d/joints": "M3",
     "backend_2d/tests": "M3", "particle": "M3", "world": "M3",
     "backend_3d/types": "M4", "backend_3d/narrowphase": "M4", "backend_3d/raycast": "M4",
     "backend_3d/solver": "M5", "backend_3d/joints": "M5", "backend_3d/state": "M5",
@@ -101,14 +101,7 @@ FIELD_RENAMES = {
 PRIVATE_PREFIX = {"backend_2d/types": "_IM_B2_"}
 PENDING_CONSTS = {"MAX_SNAPSHOT_INDEX": "M6, with the snapshot module"}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
-_STATE_QUERY = ("M3, as ImPhysicsState2d methods: the loop over its colliders of _im_b2_raycast_collider "
-                "or _im_b2_overlap_collider (src/b2_raycast.cyr), as tests/parity_2d.tcyr's b2_ray rows run")
-PENDING_FNS = {
-    "PhysicsState2d::raycast": _STATE_QUERY,
-    "PhysicsState2d::raycast_filtered": _STATE_QUERY,
-    "PhysicsState2d::overlap_sphere": _STATE_QUERY,
-    "PhysicsState2d::overlap_aabb": _STATE_QUERY,
-}
+PENDING_FNS = {}
 EXCEPTIONS = {
     "units::impl Display for Quantity": "`impl ImQuantity { fn fmt(self, sb) }`: src/fmtf.cyr's "
                                          "shortest digits in Rust's Display layout, then the symbol",
@@ -206,7 +199,8 @@ def rust_items(module):
     owner, owner_kind, trait = None, None, None
     enum_name = None
     struct_name = None
-    for line in text.splitlines():
+    lines = text.splitlines()
+    for li, line in enumerate(lines):
         s = line.strip()
         if (m := re.match(r"impl (\w+(?:::\w+)*) for (\w+)", s)):
             owner, trait = m.group(2), m.group(1).split("::")[-1]
@@ -231,7 +225,11 @@ def rust_items(module):
         if struct_name and (m := re.match(r"pub (\w+):", s)):
             items.append(("field", struct_name, m.group(1), None))
         if (m := re.match(VIS + r" fn (\w+)(?:<[^>]*>)?\((&?(?:mut )?self)?", s)):
-            items.append(("fn", owner, m.group(1), bool(m.group(2))))
+            has_self = bool(m.group(2))
+            # A signature that breaks after `(` names its receiver on the next line.
+            if not has_self and s.endswith("(") and li + 1 < len(lines):
+                has_self = bool(re.match(r"&?(?:mut )?self\b", lines[li + 1].strip()))
+            items.append(("fn", owner, m.group(1), has_self))
         if (m := re.match(r"pub const (\w+):", s)):
             items.append(("const", owner, m.group(1), None))
         if (m := re.match(r"pub\((?:crate|super)\) const (\w+):", s)):

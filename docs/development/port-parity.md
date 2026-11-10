@@ -455,6 +455,41 @@ fails when either drifts from `cyrius.cyml`.
   (ADR 0011: 64). Every query row is 0 ulp or exact. The `hypot` digest is identical on x86_64 ELF, x86_64 PE and
   aarch64.
 
+## 13. M3a: the 2D backend's state (2026-11-09)
+
+- **The module:** `src/b2_state.cyr`, ImPhysicsState2d:
+  - the bodies, colliders and joints in M1b's generational arenas, so its handles are Rust's, handle for handle;
+  - each body's collider list;
+  - the manifold store, sorted by collider pair as unsigned words (Rust's BTreeMap order), with removal by
+    collider (the solver fills it in M3's later parts);
+  - the contact tracker and the island union-find;
+  - every method of `state.rs`: add and remove bodies, colliders and joints; `recompute_mass`; the forces,
+    impulses and torques; waking neighbours; the snapshot inserts (`add_*_at`); `get_body_state`,
+    `set_body_state` and `set_body_type`;
+  - `raycast`, `raycast_filtered`, `overlap_sphere` and `overlap_aabb`, pending since M2d, looping M2's
+    per-collider queries.
+- **`body_colliders` beside the slots.** Rust's `add_collider` creates a map entry even for a missing body. The
+  port refuses that orphan (ADR 0008 #1), so the map holds exactly the live bodies, and the port keeps each list
+  beside its body's arena slot. The dump sorts them by handle, as the BTreeMap iterates.
+- **`b2_state.tsv`**, 411 rows driven through the public world API. Each row is a script of ops ending in a full
+  `oracle_dump()` of the backend (`scripts/oracle/src/dump2d.rs`): the three arenas' slots, generations and free
+  lists; every field of every body, collider and joint; `body_colliders`; the manifolds; the tracker.
+  - 8 hand scripts: slot reuse and LIFO free lists; mass that adds up, recomputes on removal, and follows
+    `set_body_type`; forces with points and impulses on bodies without mass; reference angles from rotations;
+    removals that wake and cascade; teleports; errors for missing handles.
+  - 400 seeded scripts of 5 to 30 ops over live and stale handles. Every op runs hundreds of times, and 530
+    results are errors.
+  - 3 orphan scripts (`b2::state_script_orphan`), mapped under ADR 0008 #1 and counted.
+
+  Class B, and **all 0 ulp** (53,812 floats) on three targets.
+- **The model.** `validate.py` replays every script on a Python model of Rust's arenas (free list, generations,
+  the stale rebuild) and the state, using the b2_mass helpers for the mass sums. It rebuilds every result and dump
+  token, orphans included, and a tampered float fails it.
+- **The queries move onto the state.** The 14,754 `b2_ray` rows now build an ImPhysicsState2d and call its
+  methods, and they still all pass. So do the 9 world-level raycast tests, which no longer need a test-local world.
+- **Result, every target:** 15 modules, 0 failing; **97,568 ok, 0 failed, 0 measured, 7 pending, 160 accepted**
+  (ADR 0008 #6 92, #1 3; ADR 0009 1; ADR 0011 64).
+
 ## How to reproduce
 
 ```sh

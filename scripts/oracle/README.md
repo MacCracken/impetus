@@ -56,6 +56,7 @@ harness reads the same files. This README records what is specific to impetus.
 | `b2_mass` | b2 | M2 | 75 | `src/m_b2_mass.rs` | — |
 | `b2_narrow` | b2 | M2 | 17,854 (+ 3 corrected) | `src/m_b2_narrow.rs` | — |
 | `b2_ray` | b2 | M2 | 14,754 (+ 39 corrected) | `src/m_b2_ray.rs` | — |
+| `b2_state` | b2 | M3 | 411 | `src/m_b2_state.rs` | — |
 | (private constants) | b2 | M2 | — | — | `src/constants_private.cyr` (`src/t_private.rs`: every library `const` of `aabb_tree.rs`, `spatial_hash.rs` and `backend_2d/types.rs`, emitted or excused) |
 
 ## Format 1
@@ -99,6 +100,12 @@ impetus specifics:
   (`raycast_filtered`), and outputs `n:` or the hit's collider handle, point x, y, normal x, y and distance.
   `b2::overlap_sphere` (centre, radius) and `b2::overlap_aabb` (min, max), class A, output `v:N` and the handles found.
   The emitters share their shape builders (`src/shapes.rs`).
+- State rows (`b2_state.tsv`, the 2D build only) are scripts. Inputs: `v:<ops>`, then each op as `e:Op.<Name>` and its
+  arguments (descriptors as `flat.rs` writes them, handles as `i:` words). Outputs: each op's result (a handle, `i:0`,
+  an error `E:`, a `BodyState`, a count), then the backend dump, `src/dump2d.rs`. The dump gives the three arenas'
+  slots (occupied, generation, next free), free-list heads and staleness, every body, collider and joint field,
+  `body_colliders` in handle order, the manifolds in key order and the tracker. `b2::state_script_orphan` rows add a
+  collider or joint for a missing body (ADR 0008 #1).
 - `Spring::step` rows (`spring.tsv`) carry a note `[<regime> S=<n>]`: the regime the transition took
   and its **sensitivity**, the most the two outputs move, in ulps, when one exp, sin or cos result
   on the path moves by one ulp. `m_spring.rs` computes it from a transcription of `transition` and
@@ -162,6 +169,8 @@ Standard-library Python, run with `-I`. It never calls the oracle:
 - every `b2_ray` row is recomputed by the same transcription extended with the ray tests, `world_aabb` and the overlap
   loop, on glibc's sin, cos and hypot (hypot through ctypes: CPython's `math.hypot` is its own implementation). On
   MPFR's it writes `b2_ray.cr.tsv`;
+- every `b2_state` script is replayed on a Python model of the arenas (Rust's free list and generations) and the
+  state, rebuilding every result and dump token;
 - every `b2_mass` body is recomputed: its own `shape_props` and `polygon_mass_props` in Rust's operation order,
   the floors, the parallel-axis sum and `refresh_inverse_mass`;
 - `src/constants_private.cyr` holds every library `const` of the ported modules, each equal to Python's parse of

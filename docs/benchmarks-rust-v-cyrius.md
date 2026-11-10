@@ -204,3 +204,29 @@ Cyrius-only rows, x86_64 ELF. Rust has no bench for `hypot` or the queries alone
   - The sphere overlap pays four `sin_cos` of one angle: `world_aabb`, `world_pos`, and `circle_obb`'s two
     transforms. Rust takes four as well. Sharing them, as the narrowphase's box paths now do, is open for M3's
     profiling.
+
+## M3 part 1: the 2D state (2026-11-09)
+
+The Rust benches' own loops, on ImPhysicsState2d (PhysicsWorld's 2D calls are the backend's). Rust 1.4.0 is from
+`rust-old/bench-history.csv` (criterion); Cyrius is 100,000 iterations on x86_64 ELF. As in Rust, `add_body` and
+`add_joint` grow one world.
+
+| Bench | Rust 1.4.0 | Cyrius | Ratio |
+|---|---|---|---|
+| `bodies/add_body` | 81.7 ns | 1.20 µs | 15× |
+| `bodies/add_remove_body` | 60.9 ns | 618 ns | 10× |
+| `bodies/add_body_with_collider` | 213 ns | 3.23 µs | 15× |
+| `bodies/add_joint` | 23.4 ns | 1.22 µs | 52× |
+| `forces/apply_force` | 3.31 ns | 45 ns | 14× |
+| `forces/apply_impulse` | 1.69 ns | 41 ns | 24× |
+
+**Reading it.**
+- **The arenas copy their records with `memcpy`, which moves a byte at a time (S5).** A body is 224 B and a
+  collider 320 B. A grown arena copies all its records again, and a struct returned by value is copied once more.
+  `add_body_with_collider` also pays the shape clone and the mass properties (M2b).
+- **`add_joint` is the worst ratio.** Rust's is a small move. The port builds the joint record by value, then
+  copies it into the arena: two byte-loop copies of the `ImJointType` payload.
+- **The force calls build their sums through `ImVec2_new`** and read three words through a typed pointer.
+
+These are first numbers: correctness first, then profiling, which the M2a broadphase finding already asks for
+before M3's step. A word-at-a-time `memcpy` upstream (S5) would cut most of the gap.

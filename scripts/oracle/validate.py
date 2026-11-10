@@ -1614,6 +1614,346 @@ def check_b2_ray(rows):
     return counted
 
 
+# ── the 2D backend's state (rust-old/src/backend_2d/state.rs, arena.rs) ──────────────────────
+# A model that replays each script: generational arenas with Rust's free list, the bodies' fields, the
+# colliders' mass sums (the b2_mass helpers), joints, body_colliders, waking. It rebuilds every op's
+# result and the dump in dump2d.rs's order, token for token.
+
+
+class _Arena:
+    """rust-old/src/arena.rs: slots of [occupied, generation, next_free, value]."""
+
+    def __init__(self):
+        self.slots, self.free_head, self.stale = [], None, False
+
+    @staticmethod
+    def handle(i, g):
+        return (g << 32) | i
+
+    def live(self, h):
+        i, g = h & 0xFFFFFFFF, (h >> 32) & 0xFFFFFFFF
+        return i if i < len(self.slots) and self.slots[i][0] and self.slots[i][1] == g else None
+
+    def get(self, h):
+        i = self.live(h)
+        return None if i is None else self.slots[i][3]
+
+    def insert(self, v):
+        if self.stale:
+            self.free_head = None
+            for i in range(len(self.slots) - 1, -1, -1):
+                if not self.slots[i][0]:
+                    self.slots[i][2] = self.free_head
+                    self.free_head = i
+            self.stale = False
+        if self.free_head is not None:
+            i = self.free_head
+            s = self.slots[i]
+            self.free_head = s[2]
+            s[0], s[2], s[3] = True, None, v
+            return self.handle(i, s[1])
+        self.slots.append([True, 0, None, v])
+        return self.handle(len(self.slots) - 1, 0)
+
+    def _free(self, i):
+        s = self.slots[i]
+        v = s[3]
+        s[0], s[1], s[2], s[3] = False, (s[1] + 1) & 0xFFFFFFFF, self.free_head, None
+        self.free_head = i
+        return v
+
+    def remove(self, h):
+        i = self.live(h)
+        return None if i is None else self._free(i)
+
+    def retain(self, keep):
+        for i, s in enumerate(self.slots):
+            if s[0] and not keep(s[3]):
+                self._free(i)
+
+    def values(self):
+        return [(self.handle(i, s[1]), s[3]) for i, s in enumerate(self.slots) if s[0]]
+
+    def tokens(self):
+        t = [f"v:{len(self.slots)}"]
+        for s in self.slots:
+            t += [f"i:{int(s[0])}", f"i:{s[1]}", "n:" if s[2] is None else f"i:{s[2]}"]
+        t += ["n:" if self.free_head is None else f"i:{self.free_head}", f"i:{int(self.stale)}"]
+        return t
+
+
+def _st_word(t):
+    """A handle token's u64 word."""
+    return int(t[2:]) & 0xFFFFFFFFFFFFFFFF
+
+
+def _st_h(w):
+    """The `i:` token of a u64 handle word (two's complement above i64::MAX)."""
+    return f"i:{w - (1 << 64) if w >= 1 << 63 else w}"
+
+
+def _st_f(x):
+    return f"f:{bits(x):016x}"
+
+
+def _st_shape_end(ins, k):
+    """The token after the shape at k."""
+    return _b2_shape(ins, k)[1]
+
+
+def _st_joint_type_end(ins, k):
+    kind = ins[k].split(".", 1)[1]
+    k += 1
+    if kind in ("Revolute", "Prismatic"):
+        return k + 2 + (1 if ins[k + 2] == "n:" else 2)
+    return k + {"Fixed": 0, "Spring": 3, "Distance": 1, "Wheel": 4, "Rope": 1, "Mouse": 6}[kind]
+
+
+def _st_refresh(b):
+    if b["type"] == "e:BodyType.Dynamic" and b["mass"] > 0.0 and math.isfinite(b["mass"]):
+        b["inv_mass"] = 1.0 / b["mass"]
+        i = b["inertia"]
+        b["inv_inertia"] = 0.0 if (b["fixed"] or math.isnan(i) or i <= 0.0 or not math.isfinite(i)) else 1.0 / i
+    else:
+        b["inv_mass"] = b["inv_inertia"] = 0.0
+
+
+def _st_mass_terms(c):
+    """(mass, inertia about the body origin) of a collider: mass_properties and the parallel-axis shift."""
+    (area, cen, ipm) = c["props"]
+    m = rust_max(c["explicit"] if c["explicit"] is not None else area * c["density"], B2_MIN_MASS)
+    ic = rust_max(m * ipm, B2_MIN_INERTIA)
+    dx, dy = c["off"][0] + cen[0], c["off"][1] + cen[1]
+    return m, ic + m * (dx * dx + dy * dy)
+
+
+def _st_wake(b):
+    b["sleeping"], b["sleep_timer"] = False, 0.0
+
+
+def _b2_state_row(ins):
+    """The outputs of a state script: each op's result, then the backend dump."""
+    bodies, colls, joints = _Arena(), _Arena(), _Arena()
+    lists = {}
+    out = []
+
+    def wake_neighbours(h):
+        wake = [h]
+        for _, j in joints.values():
+            if j["a"] == h:
+                wake.append(j["b"])
+            elif j["b"] == h:
+                wake.append(j["a"])
+        for w in wake:
+            b = bodies.get(w)
+            if b is not None:
+                _st_wake(b)
+
+    def recompute(h):
+        mass = inertia = 0.0
+        for ch in lists.get(h, []):
+            c = colls.get(ch)
+            if c is not None:
+                m, i = _st_mass_terms(c)
+                mass += m
+                inertia += i
+        b = bodies.get(h)
+        if b is not None:
+            b["mass"], b["inertia"] = mass, inertia
+            _st_refresh(b)
+
+    n = int(ins[0][2:])
+    k = 1
+    for _ in range(n):
+        op = ins[k].split(".", 1)[1]
+        k += 1
+        if op == "AddBody":
+            d = ins[k:k + 13]
+            k += 13
+            px, py, rot = tok_f(d[1]), tok_f(d[2]), tok_f(d[4])
+            b = {"type": d[0], "pos": (px, py), "rot": rot, "vel": (tok_f(d[5]), tok_f(d[6])),
+                 "w": tok_f(d[8]), "ld": tok_f(d[9]), "ad": tok_f(d[10]), "fixed": tok_i(d[11]) == 1,
+                 "gs": 1.0 if d[12] == "n:" else tok_f(d[12]), "force": (0.0, 0.0), "torque": 0.0,
+                 "mass": 0.0, "inv_mass": 0.0, "inertia": 0.0, "inv_inertia": 0.0,
+                 "sleeping": False, "sleep_timer": 0.0, "prev": (px, py), "prev_rot": rot}
+            h = bodies.insert(b)
+            b["handle"] = h
+            lists[h] = []
+            out.append(_st_h(h))
+        elif op == "AddCollider":
+            body = _st_word(ins[k])
+            s0 = k + 1
+            props, k2 = _b2_shape(ins, s0)
+            shape = ins[s0:k2]
+            mat = ins[k2 + 3:k2 + 10]
+            c = {"body": body, "shape": shape, "off": (tok_f(ins[k2]), tok_f(ins[k2 + 1])), "mat": mat,
+                 "density": tok_f(mat[2]), "props": props, "sensor": ins[k2 + 10],
+                 "mass_tok": ins[k2 + 11], "explicit": None if ins[k2 + 11] == "n:" else tok_f(ins[k2 + 11]),
+                 "layer": ins[k2 + 12], "mask": ins[k2 + 13]}
+            k = k2 + 14
+            b = bodies.get(body)
+            if b is not None:
+                m, i = _st_mass_terms(c)
+                b["mass"] += m
+                b["inertia"] += i
+                _st_refresh(b)
+            h = colls.insert(c)
+            c["handle"] = h
+            lists.setdefault(body, []).append(h)
+            out.append(_st_h(h))
+        elif op == "AddJoint":
+            a, bb = _st_word(ins[k]), _st_word(ins[k + 1])
+            ke = _st_joint_type_end(ins, k + 2)
+            jt = ins[k + 2:ke]
+            anchors = ins[ke:ke + 4]
+            k = ke + 4
+            motor = ins[k:k + 1] if ins[k] == "n:" else ins[k:k + 2]
+            k += len(motor)
+            damping, brk = ins[k], ins[k + 1]
+            k += 2
+            ra = bodies.get(a)["rot"] if bodies.get(a) is not None else 0.0
+            rb = bodies.get(bb)["rot"] if bodies.get(bb) is not None else 0.0
+            j = {"a": a, "b": bb, "jt": jt, "anchors": anchors, "motor": motor, "damping": damping,
+                 "brk": brk, "ref": rb - ra}
+            out.append(_st_h(joints.insert(j)))
+        elif op in ("ApplyForce", "ApplyImpulse"):
+            h = _st_word(ins[k])
+            v = (tok_f(ins[k + 1]), tok_f(ins[k + 2]))
+            pt = None if ins[k + 4] == "n:" else (tok_f(ins[k + 4]), tok_f(ins[k + 5]))
+            k += 5 if pt is None else 7
+            b = bodies.get(h)
+            if b is None:
+                continue
+            if op == "ApplyForce":
+                _st_wake(b)
+                b["force"] = (b["force"][0] + v[0], b["force"][1] + v[1])
+                if pt is not None:
+                    b["torque"] += pt[0] * v[1] - pt[1] * v[0]
+            elif b["type"] == "e:BodyType.Dynamic" and b["inv_mass"] > 0.0:
+                _st_wake(b)
+                b["vel"] = (b["vel"][0] + v[0] * b["inv_mass"], b["vel"][1] + v[1] * b["inv_mass"])
+                if pt is not None:
+                    b["w"] += (pt[0] * v[1] - pt[1] * v[0]) * b["inv_inertia"]
+        elif op == "ApplyTorque":
+            b = bodies.get(_st_word(ins[k]))
+            if b is not None:
+                _st_wake(b)
+                b["torque"] += tok_f(ins[k + 1])
+            k += 2
+        elif op == "RemoveBody":
+            h = _st_word(ins[k])
+            k += 1
+            wake_neighbours(h)
+            bodies.remove(h)
+            if h in lists:
+                for ch in lists.pop(h):
+                    colls.remove(ch)
+            joints.retain(lambda j, h=h: j["a"] != h and j["b"] != h)
+            out.append("i:0")
+        elif op == "RemoveCollider":
+            h = _st_word(ins[k])
+            k += 1
+            c = colls.remove(h)
+            if c is None:
+                out.append("E:ColliderNotFound")
+                continue
+            wake_neighbours(c["body"])
+            if c["body"] in lists:
+                lists[c["body"]] = [x for x in lists[c["body"]] if x != h]
+            recompute(c["body"])
+            out.append("i:0")
+        elif op == "RemoveJoint":
+            h = _st_word(ins[k])
+            k += 1
+            j = joints.remove(h)
+            if j is None:
+                out.append("E:JointNotFound")
+                continue
+            for x in (j["a"], j["b"]):
+                b = bodies.get(x)
+                if b is not None:
+                    _st_wake(b)
+            out.append("i:0")
+        elif op == "GetBodyState":
+            b = bodies.get(_st_word(ins[k]))
+            k += 1
+            if b is None:
+                out.append("E:BodyNotFound")
+                continue
+            out += [_st_h(b["handle"]), b["type"], _st_f(b["pos"][0]), _st_f(b["pos"][1]), _st_f(0.0),
+                    _st_f(b["rot"]), _st_f(b["vel"][0]), _st_f(b["vel"][1]), _st_f(0.0), _st_f(b["w"]),
+                    f"i:{int(b['sleeping'])}"]
+        elif op == "SetBodyState":
+            b = bodies.get(_st_word(ins[k]))
+            s = ins[k + 1:k + 12]
+            k += 12
+            if b is None:
+                out.append("E:BodyNotFound")
+                continue
+            b["pos"], b["rot"] = (tok_f(s[2]), tok_f(s[3])), tok_f(s[5])
+            b["vel"], b["w"] = (tok_f(s[6]), tok_f(s[7])), tok_f(s[9])
+            _st_wake(b)
+            out.append("i:0")
+        elif op == "SetBodyType":
+            h = _st_word(ins[k])
+            t = ins[k + 1]
+            k += 2
+            b = bodies.get(h)
+            if b is None:
+                out.append("E:BodyNotFound")
+                continue
+            b["type"] = t
+            _st_wake(b)
+            if t in ("e:BodyType.Static", "e:BodyType.Kinematic"):
+                b["vel"], b["w"] = (0.0, 0.0), 0.0
+            recompute(h)
+            out.append("i:0")
+        elif op == "BodyCount":
+            out.append(f"i:{len(bodies.values())}")
+        else:
+            fail(f"b2_state: unknown op {op}")
+            return out
+    if k != len(ins):
+        fail(f"b2_state: {len(ins) - k} input tokens left over")
+    # The dump, in dump2d.rs's order.
+    out += bodies.tokens() + [f"v:{len(bodies.values())}"]
+    for h, b in bodies.values():
+        out += [_st_h(h), b["type"]] + [_st_f(x) for x in (*b["pos"], b["rot"], *b["vel"], b["w"], b["ld"], b["ad"])]
+        out += [f"i:{int(b['fixed'])}"] + [_st_f(x) for x in (b["gs"], *b["force"], b["torque"], b["mass"],
+                                                               b["inv_mass"], b["inertia"], b["inv_inertia"],
+                                                               0.0, 0.0, 0.0, *b["prev"], b["prev_rot"])]
+        out += [f"i:{int(b['sleeping'])}", _st_f(b["sleep_timer"]), "i:0"]
+    out += colls.tokens() + [f"v:{len(colls.values())}"]
+    for h, c in colls.values():
+        out += [_st_h(h), _st_h(c["body"])] + c["shape"] + [_st_f(c["off"][0]), _st_f(c["off"][1]), _st_f(0.0)]
+        out += c["mat"] + [c["sensor"], c["mass_tok"], c["layer"], c["mask"]]
+    out += joints.tokens() + [f"v:{len(joints.values())}"]
+    for h, j in joints.values():
+        out += [_st_h(h), _st_h(j["a"]), _st_h(j["b"])] + j["jt"] + j["anchors"] + j["motor"]
+        out += [j["damping"], j["brk"], _st_f(j["ref"])]
+    out.append(f"v:{len(lists)}")
+    for h in sorted(lists):
+        out += [_st_h(h), f"v:{len(lists[h])}"] + [_st_h(x) for x in lists[h]]
+    out += ["v:0", "v:0", "v:0", "v:0", "i:0"]
+    return out
+
+
+def check_b2_state(rows):
+    """Replays every state script on the model and compares its results and dump."""
+    counted = 0
+    for fn, cls, ins, outs, note in rows:
+        if fn not in ("b2::state_script", "b2::state_script_orphan"):
+            fail(f"b2_state: unknown function {fn}")
+            continue
+        want = _b2_state_row(ins)
+        if not _same_tokens(outs, want):
+            first = next((i for i, (a, b) in enumerate(zip(outs, want)) if a != b), min(len(outs), len(want)))
+            fail(f"b2_state: {note[:120]}: the model differs at output {first}: "
+                 f"{' '.join(outs[first:first + 4])} vs {' '.join(want[first:first + 4])}")
+        counted += 1
+    return counted
+
+
 # The private constants t_private.rs extracts: file, Cyrius prefix, consts it doesn't carry.
 PRIVATE_SOURCES = (
     ("aabb_tree.rs", "_IM_", {"NULL_NODE"}),
@@ -1921,6 +2261,8 @@ def main():
             print(f"json: {check_json(rows)} documents checked against Python's json")
         elif name == "broadphase":
             print(f"broadphase: {check_broadphase(rows)} rows recomputed (brute force, rasterisation)")
+        elif name == "b2_state":
+            print(f"b2_state: {check_b2_state(rows)} scripts replayed on a model of the arenas and the state")
         elif name == "b2_ray":
             print(f"b2_ray: {check_b2_ray(rows)} rows recomputed (a transcription on glibc's sin, cos, hypot)")
         elif name == "b2_narrow":
