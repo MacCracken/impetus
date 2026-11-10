@@ -27,8 +27,8 @@ Decisions about impetus — what we chose, the context, and the consequences we 
 | [0004](0004-xpbd-solver.md) | XPBD solver for 2D backend | Accepted (not carried into 2.0, see 0008) |
 | [0005](0005-velocity-level-joints.md) | Velocity-level joint constraints | Accepted |
 | [0006](0006-manifold-rebuild-per-frame.md) | Rebuild contact manifolds every frame | Accepted |
-| [0007](0007-cyrius-port-hisab-first.md) | Port to Cyrius on hisab, with Rust 1.4.0 frozen as the oracle | Accepted; amended in M0 step 9 (hisab off the step path until S1/H9) |
-| [0008](0008-port-api-divergences.md) | API changes in the Cyrius 2.0 port | Accepted (serde no longer "not carried": see 0010) |
+| [0007](0007-cyrius-port-hisab-first.md) | Port to Cyrius on hisab, with Rust 1.4.0 frozen as the oracle | Accepted; amended in M0 step 9 (hisab off the step path until S1/H9) and M7 part 3 (hisab test-scoped until the library calls it) |
+| [0008](0008-port-api-divergences.md) | API changes in the Cyrius 2.0 port | Accepted (serde no longer "not carried": see 0010); amended when #4 was implemented |
 | [0009](0009-accept-ganita-pow-minus-one-divergence.md) | Accept ganita's pow(−1, DBL_MAX) divergence | Superseded by 0011 (pow) |
 | [0010](0010-serde-compatible-json.md) | Serde-compatible JSON codecs on bayan, with a shortest-digit float printer | Accepted |
 | [0011](0011-correctly-rounded-exp-sin-cos.md) | Correctly rounded exp, sin and cos, gated exactly against a corrected oracle (amended: hypot, pow, atan2) | Accepted |

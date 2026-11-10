@@ -12,6 +12,39 @@ the parity oracle, together with the port-tooling changes below. Those are not
 scheduled for a Rust release; they exist so the port's golden-value generator
 can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
 
+### Breaking
+**impetus 2.0 is a Cyrius library.** The Rust crate stays at 1.4.0, frozen in `rust-old/`. Code that used it moves
+with the [migration guide](docs/guides/migration-2.0.md), whose every Cyrius example compiles and runs
+(`scripts/doc_examples.py`).
+- **The language.** The API keeps Rust's names in Cyrius form:
+  - structs are `Im<Name>` with methods of the Rust names, constructors `Im<Name>_<constructor>`, and enum members
+    and constants carry `IM_`;
+  - a fallible call returns a value-form `Result` whose `Err` is an `IM_ERR_*` code. `ImpetusError`'s message
+    strings are gone (`im_error_message(code)` gives fixed text), and `IM_ERR_UNSUPPORTED` is new;
+  - an `Option` return becomes an out-pointer and a 1/0 return, a `Vec` return an `ImWordList` the caller owns, and
+    a slice a pointer and a count;
+  - what a caller creates, it frees: `world.free()`, and `free()` on snapshots, word lists and array-holding shapes.
+- **Cargo's features become two bundles:** `dist/impetus.cyr` (2D, Rust's default `2d`) and `dist/impetus-3d.cyr`
+  (`3d`, `full`). Snapshots and JSON are in both, so `serialize` has no counterpart; `oracle` stays in `rust-old/`.
+- **Seven API changes** ([ADR 0008](docs/adr/0008-port-api-divergences.md)):
+  1. `add_collider` and `add_joint` return `Err(IM_ERR_BODY_NOT_FOUND)` for a missing body, where 1.4.0 stored an
+     orphan. Find the call sites by search: a discarded `Result` still compiles.
+  2. One fallible `restore`, Rust's `try_restore`; the deprecated `restore` is gone.
+  3. Snapshots hold the whole world ([ADR 0013](docs/adr/0013-complete-snapshots.md)), in a new checksummed binary
+     form and in JSON, so a restored world steps to the original's bits. 1.4.0's bitcode bytes and snapshot JSON
+     can't be read: rebuild those worlds once from scene data, then save 2.0 snapshots.
+  4. The 3D `ImBodyState` has `rotation: ImQuat` and `angular_velocity: ImVec3`; 1.4.0's angle θ and spin ω are
+     `ImQuat_from_rotation_z(θ)` and (0, 0, ω), bit for bit. Its JSON changes to match, and 1.4.0's 3D document is
+     refused. The 2D `ImBodyState` is unchanged.
+  5. The 3D profile refuses Revolute and Prismatic joints and motors with `Err(IM_ERR_UNSUPPORTED)`, in `add_joint`
+     and `restore`. 1.4.0's 3D world accepted them and ignored them.
+  6. `IM_SOLVER_XPBD` is refused by `ImPhysicsWorld_try_new` and `restore` with `Err(IM_ERR_UNSUPPORTED)`.
+     `ImPhysicsWorld_new` doesn't validate, as Rust's `new`, and steps such a world as sequential impulses.
+  7. Results are bit-identical across x86_64 Linux, x86_64 Windows and aarch64; 1.4.0's were only on the same
+     platform.
+- **Not carried over:** XPBD (#6); the dravya, sharira and ushma bridges, deferred until a Cyrius consumer needs
+  them (port plan §9).
+
 ### Added
 - **oracle** — a hidden, non-default `oracle` feature (`impetus::oracle`, not
   public API):
@@ -655,6 +688,28 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     to the whole-step twin.
   - `scripts/bench_record.py` holds the mapping. Its `--check` fails when a Rust bench lacks a twin. Given Rust's and
     Cyrius's bench logs, it prints the record's table.
+
+- **Cyrius port, M7 part 3: the 2.0 docs and a final review:**
+  - **README** rewritten for the Cyrius library, on tanmatra's model: how it is checked against Rust, the features,
+    the dependency declaration, Rust's two README examples as Cyrius programs, the API conventions, the two
+    profiles, the known limitations, building, and the oracle checks.
+  - **`docs/guides/migration-2.0.md`**: moving from the Rust crate. The Cargo features as bundles, a table of Rust
+    idioms in Cyrius, and each ADR 0008 change with code that handles it.
+  - **`scripts/doc_examples.py`**: the Cyrius form of Rust's doc tests. It compiles and runs every `cyrius` block in
+    the README and the guides against the shipped bundles, and fails on a warning, a failed build or a nonzero exit:
+    9 blocks, 9 ran. A planted syntax error and two wrong expected error codes each failed it.
+  - **hisab is a test-scope dependency** (`cyrius.cyml`; [ADR 0007](docs/adr/0007-cyrius-port-hisab-first.md)'s
+    second amendment). No library module calls hisab (ADR 0012), but as a production dependency it reached every
+    consumer's resolve. A scratch consumer that only creates and frees a world vendored hisab and sakshi and
+    built a 3,681,032-byte binary in 1.56 s; with test scope it vendors only impetus and builds 1,702,480 bytes
+    in 0.55 s. impetus's own resolve, `cyrius.lock` and the bundles are unchanged, and the 3D bench's two hisab
+    rows still compile.
+  - The final review also rewrote `docs/guides/getting-started.md` (using the library, the layout, changing a
+    module), `CONTRIBUTING.md` (the shipped library, the parity scripts), `SECURITY.md` (the bundles in scope; the
+    parsed inputs and their checks as the attack surface), and the roadmap's "2.0 — Breaking Cleanup": the API
+    items are done, and the new-physics items (3D islands, consistent joint frames) and shape validation are open.
+    The README's links to a root `docs/architecture/overview.md` and `docs/guides/testing.md`, which never existed
+    in the port, now point at the Rust copies in `rust-old/docs/`.
 
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and

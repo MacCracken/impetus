@@ -13,10 +13,13 @@
 | 1.3 | sharira bridge additions (muscle torque, cylinder inertia, gait GRF, CoM gravity) |
 | 1.4 | Rust 1.99 / hisab 1.4; audit and repair sweep — contact normal orientation, polygon clipping, solver (restitution, block solver, warm start, split impulse), velocity-level joints, sub-step forces/events, 3D world-space inertia, GJK/EPA/SAT fixes, mass properties, sleep/islands, balanced AABB tree, validated config and snapshot restore, exact springs |
 
-**Next: the Cyrius port (2.0.0).** Rust 1.4.0 is the final Rust feature release and the parity
-oracle; see [`impetus-port-plan.md`](impetus-port-plan.md) and
-[ADR 0007](../adr/0007-cyrius-port-hisab-first.md). The 2.0 breaking items below land in the Cyrius
-API; the themed sections continue in Cyrius after 2.0.
+**2.0 is the Cyrius port.** Rust 1.4.0 is the final Rust release and stays in `rust-old/` as the
+parity oracle; see [`impetus-port-plan.md`](impetus-port-plan.md),
+[ADR 0007](../adr/0007-cyrius-port-hisab-first.md) and, for code moving from the Rust crate, the
+[migration guide](../guides/migration-2.0.md). The 2.0 breaking items below that change only the API
+landed in the port ([ADR 0008](../adr/0008-port-api-divergences.md)). The ones that are new physics, and
+the themed sections, continue in Cyrius after 2.0 (port plan §9), with reference tests, since no oracle
+covers them.
 
 Planned sections below are grouped by theme; version numbers are assigned when work is scheduled.
 
@@ -69,11 +72,11 @@ Rich environmental effects without leaving the physics engine.
 
 ## Developer Experience
 
-Make impetus the obvious choice for anyone writing a game or sim in Rust.
+Make impetus the obvious choice for anyone writing a game or sim in Cyrius.
 
 - [ ] **Debug stats API** — expose per-frame counters: broadphase pairs, narrowphase tests, solver iterations, active/sleeping bodies, island count
 - [ ] **Debug wireframe data** — emit AABB, contact point, contact normal, joint anchor geometry for external renderers; zero rendering deps
-- [ ] **Profiling spans** — `tracing` spans on broadphase, narrowphase, solver, integration, sleep; plug into any subscriber (no `tracing` instrumentation exists yet)
+- [ ] **Profiling spans** — sakshi spans on broadphase, narrowphase, solver, integration, sleep, behind a level (Rust's `tracing`; no instrumentation exists yet)
 - [ ] **Deterministic replay** — record input forces/impulses per frame, replay with bit-exact results; network sync, testing, bug repro
 - [ ] **Migration guide** — rapier-to-impetus, nphysics-to-impetus API mapping docs
 - [ ] **Cookbook examples** — platformer, top-down, billiards, ragdoll, stacking, breakable, vehicle, chain
@@ -91,11 +94,14 @@ Each item needs a public-API or snapshot-format change, so it waits for a major 
 
 - [x] **Complete snapshots** (the Cyrius port, M6, [ADR 0013](../adr/0013-complete-snapshots.md)) — force fields, contact manifolds and warm-start impulses, sleep state, and arena slot generations + free-list order, so a restored world steps bit-identically and allocates the same handles (regression tests `restore_replaces_force_fields`, `restore_preserves_handle_allocation` are `#[ignore]`d until then). Bitcode is not self-describing, so this changes the format.
 - [x] **3D orientation in `BodyState` / `BodySnapshot`** (the Cyrius port, ADR 0008 #4 and M6) — full quaternion and angular velocity; today 3D get/set/snapshot keep only rotation about Z
-- [ ] **Fallible `add_collider` / `add_joint`** — return `Result` instead of storing orphans for missing bodies; validate shapes (negative extents) and materials
+- [x] **Fallible `add_collider` / `add_joint`** — return `Result` instead of storing orphans for missing bodies (the Cyrius port, ADR 0008 #1)
+- [ ] **Validate shapes and materials at `add_collider`** — negative extents, non-finite values; 2.0 accepts what Rust 1.4.0 accepted
 - [x] **Remove deprecated `PhysicsWorld::restore`** in favour of `try_restore` (the Cyrius port: one fallible `restore`, ADR 0008 #2)
-- [ ] **Consistent joint frames** — prismatic/wheel axis in body A's frame in 3D as in 2D
-- [ ] **3D islands** — island-atomic sleep, sleeping bodies as infinite mass in the solver, waking neighbours on removal (2D does all three)
-- [ ] **Cross-platform determinism** — `sin_cos`, `atan2` and `powf` come from the platform libm, so results are only bit-identical on the same platform
+- [ ] **Consistent joint frames** (new physics, after 2.0) — prismatic/wheel axis in body A's frame in 3D as in 2D
+- [ ] **3D islands** (new physics, after 2.0) — island-atomic sleep, sleeping bodies as infinite mass in the solver, waking neighbours on removal (2D does all three)
+- [x] **Cross-platform determinism** (the Cyrius port, ADR 0008 #7 and [ADR 0011](../adr/0011-correctly-rounded-exp-sin-cos.md)) — every transcendental the step calls is impetus's own and correctly rounded, so results are bit-identical on x86_64 Linux, x86_64 Windows and aarch64
+- [x] **XPBD** refused by validation rather than shipped experimental (the Cyrius port, ADR 0008 #6); XPBD parity stays in Joints & Constraints, demand-gated
+- [x] **3D Revolute / Prismatic / motors** refused in 3D rather than accepted and ignored (the Cyrius port, ADR 0008 #5); implementing them is new physics, after 2.0
 
 ---
 

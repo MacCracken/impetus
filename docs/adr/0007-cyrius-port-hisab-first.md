@@ -114,3 +114,30 @@ redirects `alloc` to a caller's arena (request S1, port plan §8), or allocator-
 **M4 decision (2026-11-09).** The maintainer chose the stopgap: [ADR 0012](0012-impetus-owned-3d-math-stopgap.md)
 transcribes glam's 3D math by value and ports impetus's own GJK/EPA, gated at classes A–C. H9 is filed in hisab
 (`hisab/docs/development/issues/2026-11-09-allocator-scoped-calls.md`) alongside S1.
+
+## Amendment — M7 part 3 (2026-11-10): hisab is a test-scope dependency until the library calls it
+
+**Context.** At 2.0 no library module calls hisab. The step path, the queries and the setup are all
+impetus-owned: the 2D backend never needed hisab, the 3D math and GJK/EPA are ADR 0012's stopgap, and
+the inertia at `add_collider` is the oracle's own formula, transcribed. The one caller is
+`tests/impetus_3d.bcyr`, whose two `(allocates)` rows measure hisab's forms beside ADR 0012's. Yet
+`[deps.hisab]` was a production dependency, and Cyrius walks a dependency's production deps into its
+consumer's resolve and prepends every module it vendors to every compile. A scratch consumer that only
+creates and frees a 2D world (M7 part 3) showed what that cost:
+
+| `[deps.hisab]` in impetus | vendored into the consumer | binary | `cyrius build` |
+|---|---|---:|---:|
+| production | impetus, hisab, sakshi | 3,681,032 B | 1.56 s |
+| `scope = "test"` | impetus | 1,702,480 B | 0.55 s |
+
+**Decision.** `[deps.hisab]` carries `scope = "test"`: impetus's own tests and benches still get it, and
+no consumer does. hisab-first stands as the direction. The dependency returns to production scope with
+the first library call, which waits on S1 or H9 as the first amendment says.
+
+**Consequences.**
+- A consumer's resolve, binary and compile time carry only impetus and the stdlib leaves in
+  `dist/impetus.deps`.
+- `cyrius deps --locked`, `cyrius.lock` and the bundles are unchanged: impetus's own resolve still
+  includes hisab for its test pass.
+- When a library module first calls hisab, the scope goes and the CHANGELOG says so, since every
+  consumer's resolve grows by hisab and sakshi.

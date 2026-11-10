@@ -19,8 +19,10 @@ output = "build/impetus"
 #   fnptr    — hisab's GJK/EPA support-function callbacks
 #   bayan    — the JSON value tree the serde-compatible codecs read (src/json.cyr, ADR 0010)
 # hisab's own bundle needs math, alloc, vec, ganita, result, str and fmt (dist/hisab.deps).
-# sakshi (logging: tracing → sakshi spans) arrives through hisab's own [deps.sakshi] 2.5.10;
-# listing it here too makes `cyrius deps` refuse one copy.
+# sakshi (logging: tracing → sakshi spans) arrives through hisab's own [deps.sakshi] 2.5.10, in test
+# compiles only since hisab is test-scoped; listing it here too makes `cyrius deps` refuse one copy.
+# No library module logs yet (roadmap: profiling spans). A consumer's resolve takes only the leaves
+# dist/impetus.deps names (str, bayan, freelist) and what they pull in.
 [deps]
 stdlib = ["syscalls", "string", "alloc", "str", "fmt", "io", "vec", "math", "ganita",
     "tagged", "result", "freelist", "fnptr", "bayan"]
@@ -28,10 +30,18 @@ stdlib = ["syscalls", "string", "alloc", "str", "fmt", "io", "vec", "math", "gan
 # hisab 3.4.1, pinned by tag: vectors, quaternions, mat3, ray tests, GJK/EPA, BVH, islands,
 # inertia (ADR 0007, hisab-first). No `path =` override, which would bypass the commit pin that
 # cyrius.lock records.
+# `scope = "test"` (M7 part 3, ADR 0007's second amendment): no library module calls hisab while its
+# calls allocate unscoped (S1/H9; src/math3.cyr and the 3D GJK/EPA are impetus's own, ADR 0012). Only
+# tests/impetus_3d.bcyr's two rows that measure hisab's forms do. Cyrius walks a dependency's deps but
+# never its test-scope ones, and prepends every module it vendors to every compile, so a production
+# hisab reached each consumer: hisab and its sakshi package vendored, and an empty-world program 3.68 MB
+# built in 1.56 s rather than 1.70 MB in 0.55 s. It returns to production scope with the first library
+# call.
 [deps.hisab]
 git = "https://github.com/MacCracken/hisab.git"
 tag = "3.4.1"
 modules = ["dist/hisab.cyr"]
+scope = "test"
 
 # Test / bench / fuzz compiles only. overflow: tests/ulp.cyr's saturating `-|` (ulp distance); args: the fuzz
 # harnesses' optional iteration multiplier.
