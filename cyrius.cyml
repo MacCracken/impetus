@@ -68,5 +68,7 @@ modules = [
     "src/b2_narrowphase.cyr",
     "src/b2_raycast.cyr",
     "src/b2_state.cyr",
+    "src/b2_joints.cyr",
+    "src/b2_solver.cyr",
     "src/json.cyr",
 ]

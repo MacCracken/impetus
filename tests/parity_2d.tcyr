@@ -1542,6 +1542,205 @@ fn _par_b2_state(fp, fl): i64 {
     return 1;
 }
 
+# ── M3b: single steps (joints, integration, islands and sleep) ──────────────────────
+# A `b2::step` row is the config, then a backend dump; the port loads the dump into an ImPhysicsState2d
+# (every arena slot, generation and free list as dumped), steps it as PhysicsWorld::step does, and
+# writes the dump and the frame's events. M3b's scenes pair no colliders (collision mask 0), so the
+# sub-step is the stages that run without contacts; M3c replaces this composition with `step`.
+
+# An arena's dumped slots at token k into ar: the token after them.
+fn _par_load_arena(ar: *ImArena, k): i64 {
+    var n = _par_in(k);
+    if (ar._reserve(n) == 0) { return 0 - 1; }
+    ar.count = n;
+    ar.len = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var m = ar._meta(i);
+        var occ = _par_in(k + 1 + i * 3);
+        store64(m, occ);
+        store64(m + 8, _par_in(k + 2 + i * 3));
+        var nx = 0 - 1;
+        if (_par_in_is_none(k + 3 + i * 3) == 0) { nx = _par_in(k + 3 + i * 3); }
+        store64(m + 16, nx);
+        if (occ == 1) { ar.len = ar.len + 1; }
+    }
+    var j = k + 1 + n * 3;
+    ar.free_head = 0 - 1;
+    if (_par_in_is_none(j) == 0) { ar.free_head = _par_in(j); }
+    ar.free_list_stale = _par_in(j + 1);
+    return j + 2;
+}
+
+# The record slot of handle h in arena ar.
+fn _par_slot(ar: *ImArena, h): i64 {
+    return ar.values + _im_handle_index(h) * ar.elem_size;
+}
+
+fn _par_load_pairs(pl: *ImPairList, k): i64 {
+    var n = _par_in(k);
+    for (var i = 0; i < n; i = i + 1) { pl.push(_par_in(k + 1 + i * 2), _par_in(k + 2 + i * 2)); }
+    return k + 1 + n * 2;
+}
+
+# A backend dump at token k into st (fresh): the token after it.
+fn _par_load_state(st: *ImPhysicsState2d, k0): i64 {
+    var ba: *ImArena = st._bodies();
+    var k = _par_load_arena(ba, k0);
+    var nb = _par_in(k);
+    k = k + 1;
+    for (var i = 0; i < nb; i = i + 1) {
+        var rb: *ImRigidBody2d = _im_b2_as_body(_par_slot(ba, _par_in(k)));
+        rb.handle = _par_in(k);
+        rb.body_type = _par_in_enum(k + 1, "BodyType.", &body_type_name, 3);
+        rb.position = _par_in_v2(k + 2);
+        rb.rotation = _par_in_f(k + 4);
+        rb.linear_velocity = _par_in_v2(k + 5);
+        rb.angular_velocity = _par_in_f(k + 7);
+        rb.linear_damping = _par_in_f(k + 8);
+        rb.angular_damping = _par_in_f(k + 9);
+        rb.fixed_rotation = _par_in(k + 10);
+        rb.gravity_scale = _par_in_f(k + 11);
+        rb.force_accumulator = _par_in_v2(k + 12);
+        rb.torque_accumulator = _par_in_f(k + 14);
+        rb.mass = _par_in_f(k + 15);
+        rb.inv_mass = _par_in_f(k + 16);
+        rb.inertia = _par_in_f(k + 17);
+        rb.inv_inertia = _par_in_f(k + 18);
+        rb.pseudo_velocity = _par_in_v2(k + 19);
+        rb.pseudo_angular_velocity = _par_in_f(k + 21);
+        rb.prev_position = _par_in_v2(k + 22);
+        rb.prev_rotation = _par_in_f(k + 24);
+        rb.is_sleeping = _par_in(k + 25);
+        rb.sleep_timer = _par_in_f(k + 26);
+        rb.island_id = _par_in(k + 27);
+        k = k + 28;
+    }
+    var ca: *ImArena = st._colliders();
+    k = _par_load_arena(ca, k);
+    var nc = _par_in(k);
+    k = k + 1;
+    for (var c = 0; c < nc; c = c + 1) {
+        var cp: *ImCollider2d = _im_b2_as_coll(_par_slot(ca, _par_in(k)));
+        cp.handle = _par_in(k);
+        cp.body = _par_in(k + 1);
+        var sh: ImColliderShape = _im_shape(IM_SHAPE_BALL);
+        k = _par_in_shape(k + 2, &sh);
+        cp.shape = sh;
+        cp.offset = _par_in_v2(k);
+        cp.material = _par_in_material(k + 3);
+        cp.is_sensor = _par_in(k + 10);
+        cp.has_mass = 0;
+        cp.mass = 0.0;
+        if (_par_in_is_none(k + 11) == 0) {
+            cp.has_mass = 1;
+            cp.mass = _par_in_f(k + 11);
+        }
+        cp.collision_layer = _par_in(k + 12);
+        cp.collision_mask = _par_in(k + 13);
+        k = k + 14;
+    }
+    var ja: *ImArena = st._joints();
+    k = _par_load_arena(ja, k);
+    var nj = _par_in(k);
+    k = k + 1;
+    for (var j = 0; j < nj; j = j + 1) {
+        var jp: *ImJoint2d = _im_b2_as_joint(_par_slot(ja, _par_in(k)));
+        jp.body_a = _par_in(k + 1);
+        jp.body_b = _par_in(k + 2);
+        var jt: ImJointType = ImJointType_fixed();
+        k = _par_in_joint_type(k + 3, &jt);
+        jp.joint_type = jt;
+        jp.local_anchor_a = _par_in_v2(k);
+        jp.local_anchor_b = _par_in_v2(k + 2);
+        k = k + 4;
+        jp.has_motor = 0;
+        if (_par_in_is_none(k) == 1) {
+            k = k + 1;
+        } else {
+            jp.has_motor = 1;
+            jp.motor = ImJointMotor_new(_par_in_f(k), _par_in_f(k + 1));
+            k = k + 2;
+        }
+        jp.damping = _par_in_f(k);
+        jp.has_break_force = 0;
+        jp.break_force = 0.0;
+        if (_par_in_is_none(k + 1) == 0) {
+            jp.has_break_force = 1;
+            jp.break_force = _par_in_f(k + 1);
+        }
+        jp.reference_angle = _par_in_f(k + 2);
+        k = k + 3;
+    }
+    var ne = _par_in(k);
+    k = k + 1;
+    for (var e = 0; e < ne; e = e + 1) {
+        var list: *ImWordList = st._list(_im_handle_index(_par_in(k)));
+        list.len = 0;
+        var m = _par_in(k + 1);
+        for (var q = 0; q < m; q = q + 1) { list.push(_par_in(k + 2 + q)); }
+        k = k + 2 + m;
+    }
+    var nm = _par_in(k);
+    k = k + 1;
+    if (nm > 0) {
+        st.manifolds.data = fl_alloc(nm * sizeof(ImContactManifold));
+        st.manifolds.cap = nm;
+    }
+    for (var mi = 0; mi < nm; mi = mi + 1) {
+        var mf: *ImContactManifold = _im_b2_as_manifold(st.manifolds.data + mi * sizeof(ImContactManifold));
+        mf.collider_a = _par_in(k);
+        mf.collider_b = _par_in(k + 1);
+        mf.body_a = _par_in(k + 2);
+        mf.body_b = _par_in(k + 3);
+        mf.normal = _par_in_v2(k + 4);
+        var np = _par_in(k + 6);
+        mf.point_count = np;
+        mf.points = 0;
+        if (np > 0) { mf.points = fl_alloc(np * sizeof(ImManifoldPoint)); }
+        for (var pi = 0; pi < np * 7; pi = pi + 1) { store64(mf.points + pi * 8, _par_in(k + 7 + pi)); }
+        k = k + 7 + np * 7;
+        mf.rolling_impulse = _par_in_f(k);
+        k = k + 1;
+        st.manifolds.len = mi + 1;
+    }
+    k = _par_load_pairs(st.contact_tracker.prev, k);
+    k = _par_load_pairs(st.contact_tracker.current, k);
+    k = _par_load_pairs(st.contact_tracker.seen, k);
+    st.contact_tracker.recorded = _par_in(k);
+    return k + 1;
+}
+
+fn _par_b2_step(fp, fl): i64 {
+    if (_par_eq(fp, fl, "b2::step") != 1) { return 0; }
+    var cfg: ImWorldConfig = _par_in_config(0);
+    var st: ImPhysicsState2d = ImPhysicsState2d_new();
+    _par_load_state(&st, 16);
+    var sub = cfg.sub_steps;
+    if (sub < 1) { sub = 1; }
+    var ts: f64 = cfg.timestep;
+    var subf: f64 = f64_from(sub);
+    var dt: f64 = ts / subf;
+    var gx: f64 = cfg.gravity.x;
+    var gy: f64 = cfg.gravity.y;
+    var maxv: f64 = cfg.max_velocity;
+    for (var s = 0; s < sub; s = s + 1) {
+        st._integrate_velocities(ImVec2_new(gx, gy), dt, maxv);
+        st.prepare_joints(dt);
+        for (var it = 0; it < cfg.velocity_iterations; it = it + 1) { st.solve_joints_once(); }
+        st.break_joints(dt);
+        st._clear_pseudo();
+        st._integrate_positions(dt);
+        st.build_islands_and_sleep(dt);
+        st.contact_tracker.record_substep(0, 0);
+    }
+    var ne = st.finish_step();
+    _par_got_state(&st);
+    _par_got_seq(ne);
+    for (var e = 0; e < ne; e = e + 1) { _par_got_event(st.contact_tracker.event(e)); }
+    st.free();
+    return 1;
+}
+
 # `f64::fmt_display` and `serde_json::f64` rows: src/fmtf.cyr's two layouts (ADR 0010).
 fn _par_fmtf(fp, fl): i64 {
     var x: f64 = _par_in(0);
@@ -1909,6 +2108,7 @@ fn _par_dispatch(mp, ml, fp, fl): i64 {
     if (_par_eq(mp, ml, "b2_narrow") == 1) { return _par_b2_narrow(fp, fl); }
     if (_par_eq(mp, ml, "b2_ray") == 1) { return _par_b2_ray(fp, fl); }
     if (_par_eq(mp, ml, "b2_state") == 1) { return _par_b2_state(fp, fl); }
+    if (_par_eq(mp, ml, "b2_step") == 1) { return _par_b2_step(fp, fl); }
     if (_par_eq(mp, ml, "broadphase") == 1) { return _par_broadphase(fp, fl); }
     if (_par_eq(mp, ml, "config") == 1) { return _par_config(fp, fl); }
     if (_par_eq(mp, ml, "fmtf") == 1) { return _par_fmtf(fp, fl); }
@@ -2015,6 +2215,7 @@ fn _par_c_bound(fp, fl): i64 {
     if (_par_eq(fp, fl, "Spring::step") == 1) { return 0; }
     if (_par_eq(fp, fl, "b2::contacts") == 1) { return 0; }
     if (_par_eq(fp, fl, "b2::raycast") == 1) { return 0; }
+    if (_par_eq(fp, fl, "b2::step") == 1) { return 0; }
     if (_par_eq(fp, fl, "f64::atan2") == 1) { return 2; }
     if (_par_eq(fp, fl, "f64::hypot") == 1) { return 0; }
     if (_par_eq(fp, fl, "f64::powf") == 1) { return 2; }

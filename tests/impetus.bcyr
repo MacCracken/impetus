@@ -553,6 +553,58 @@ fn bench_states() {
     return 0;
 }
 
+# b2/joints_chain20_*: a revolute chain of 20 boxes hanging from a static anchor (collision mask 0, so
+# nothing touches): preparing and solving its joints for one sub-step (4 iterations), and a whole frame
+# of the stages a step runs without contacts (Cyrius only; Rust times its step whole, M3c).
+fn bench_joints() {
+    var st: ImPhysicsState2d = ImPhysicsState2d_new();
+    var ad: ImBodyDesc = ImBodyDesc_default();
+    ad.body_type = IM_BODY_STATIC;
+    var prev = st.add_body(ad);
+    var pdx: f64 = 0.0;
+    for (var i = 0; i < 20; i = i + 1) {
+        var d: ImBodyDesc = ImBodyDesc_default();
+        var x: f64 = 0.5 + f64_from(i);
+        d.position = ImVec3_new(x, 0.0, 0.0);
+        var h = st.add_body(d);
+        var cd: ImColliderDesc = ImColliderDesc_new(ImColliderShape_box(0.5, 0.1, 0.0));
+        cd.collision_layer = 1;
+        cd.collision_mask = 0;
+        var t, c = st.add_collider(h, cd);
+        var rev: ImJointType = ImJointType_revolute(ImVec2_new(0.0, 0.0), 0, 0.0, 0.0);
+        var tj, j = st.add_joint(ImJointDesc_new(prev, h, rev, ImVec2_new(pdx, 0.0), ImVec2_new(-0.5, 0.0)));
+        prev = h;
+        pdx = 0.5;
+    }
+    var dt: f64 = 1.0 / 60.0;
+    var bn = bench_new("b2/joints_chain20_prepare_solve");
+    var reps = 2000;
+    bench_batch_start(bn);
+    for (var r = 0; r < reps; r = r + 1) {
+        st.prepare_joints(dt);
+        for (var it = 0; it < 4; it = it + 1) { st.solve_joints_once(); }
+    }
+    bench_batch_stop(bn, reps);
+    bench_report(bn);
+    var bf = bench_new("b2/joints_chain20_frame");
+    bench_batch_start(bf);
+    for (var r2 = 0; r2 < reps; r2 = r2 + 1) {
+        st._integrate_velocities(ImVec2_new(0.0, -9.81), dt, 100.0);
+        st.prepare_joints(dt);
+        for (var it2 = 0; it2 < 4; it2 = it2 + 1) { st.solve_joints_once(); }
+        st.break_joints(dt);
+        st._clear_pseudo();
+        st._integrate_positions(dt);
+        st.build_islands_and_sleep(dt);
+        st.contact_tracker.record_substep(0, 0);
+        g_sink = st.finish_step();
+    }
+    bench_batch_stop(bf, reps);
+    bench_report(bf);
+    st.free();
+    return 0;
+}
+
 # Runs every bench.
 fn main(): i64 {
     alloc_init();
@@ -581,6 +633,7 @@ fn main(): i64 {
     bench_b2_narrowphase();
     bench_b2_queries();
     bench_states();
+    bench_joints();
     return 0;
 }
 

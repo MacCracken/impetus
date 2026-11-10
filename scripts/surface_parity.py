@@ -33,10 +33,10 @@ MODULES = [
     "error", "config", "material", "units", "force",
     "body", "collider", "joint", "event", "query", "arena", "contact_tracker", "spring",
     "aabb_tree", "spatial_hash", "backend_2d/types", "backend_2d/narrowphase",
-    "backend_2d/raycast", "backend_2d/state",
+    "backend_2d/raycast", "backend_2d/state", "backend_2d/joints",
 ]
 PENDING_MODULES = {
-    "backend_2d/solver": "M3", "backend_2d/joints": "M3",
+    "backend_2d/solver": "M3",
     "backend_2d/tests": "M3", "particle": "M3", "world": "M3",
     "backend_3d/types": "M4", "backend_3d/narrowphase": "M4", "backend_3d/raycast": "M4",
     "backend_3d/solver": "M5", "backend_3d/joints": "M5", "backend_3d/state": "M5",

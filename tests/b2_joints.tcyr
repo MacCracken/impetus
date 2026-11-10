@@ -1,0 +1,171 @@
+# b2_joints.tcyr — the 2D joint solver (M3b): the Rust test of backend_2d/tests.rs that steps a joint
+# without contacts (mouse_joint_drags_body_toward_target), plus Cyrius-only tests of the soft
+# coefficients, the impulse cap, rows and point blocks, preparation, breaking, islands and sleep. The
+# other joint tests of backend_2d/tests.rs touch contacts and come with the contact solver (M3c).
+
+include "tests/lib_2d.cyr"
+
+var EPS: f64 = 0.000001;
+
+# 1 when |got − want| < eps.
+fn near(got: f64, want: f64, eps: f64): i64 {
+    var d: f64 = f64_abs(got - want);
+    if (d < eps) { return 1; }
+    return 0;
+}
+
+# One frame of a scene without contacts at timestep dt and `iters` velocity iterations: the stages of
+# `step_si` that run when nothing touches, then `finish_step`.
+fn step_nc(st: *ImPhysicsState2d, gx: f64, gy: f64, dt: f64, iters) {
+    st._integrate_velocities(ImVec2_new(gx, gy), dt, 100.0);
+    st.prepare_joints(dt);
+    for (var i = 0; i < iters; i = i + 1) { st.solve_joints_once(); }
+    st.break_joints(dt);
+    st._clear_pseudo();
+    st._integrate_positions(dt);
+    st.build_islands_and_sleep(dt);
+    st.contact_tracker.record_substep(0, 0);
+    st.finish_step();
+    return 0;
+}
+
+# A body of type t at (x, y) with a ball collider of radius r (none when r is 0).
+fn body(st: *ImPhysicsState2d, t, x: f64, y: f64, r: f64): i64 {
+    var d: ImBodyDesc = ImBodyDesc_default();
+    d.body_type = t;
+    d.position = ImVec3_new(x, y, 0.0);
+    var h = st.add_body(d);
+    if (r > 0.0) {
+        var c: ImColliderDesc = ImColliderDesc_new(ImColliderShape_ball(r));
+        var tt, ch = st.add_collider(h, c);
+    }
+    return h;
+}
+
+# The body record at h.
+fn rec(st: *ImPhysicsState2d, h): *ImRigidBody2d {
+    return st._body(h);
+}
+
+# Runs the joint tests.
+fn main() {
+    alloc_init();
+    var z2: ImVec2 = ImVec2_new(0.0, 0.0);
+    var dt: f64 = 1.0 / 60.0;
+
+    # ── backend_2d/tests.rs ──
+    test_group("mouse_joint_drags_body_toward_target");
+    var st: ImPhysicsState2d = ImPhysicsState2d_new();
+    var a = body(&st, IM_BODY_DYNAMIC, 0.0, 0.0, 0.5);
+    var b = body(&st, IM_BODY_STATIC, 0.0, 0.0, 0.0);
+    var mouse: ImJointType = ImJointType_mouse(ImVec3_new(5.0, 0.0, 0.0), 500.0, 20.0, 1000.0);
+    var jt, jh = st.add_joint(ImJointDesc_new(a, b, mouse, z2, z2));
+    for (var f = 0; f < 120; f = f + 1) { step_nc(&st, 0.0, 0.0, dt, 4); }
+    var ra: *ImRigidBody2d = rec(&st, a);
+    var px: f64 = ra.position.x;
+    assert_eq(px > 2.0, 1, "pulled toward x = 5");
+    st.free();
+
+    # ── Cyrius-only ──
+    test_group("soft_coefficients");
+    var ok1, g1, b1 = _im_b2_soft(0.0, 0.0, dt);
+    assert_eq(ok1, 0, "no stiffness, no damping: none");
+    var ok2, g2, b2 = _im_b2_soft(100.0, 2.0, 0.5);
+    var gf: f64 = g2;
+    var bf: f64 = b2;
+    assert_eq(ok2 == 1 && near(gf, 1.0 / (0.5 * (2.0 + 0.5 * 100.0)), EPS) == 1, 1, "gamma 1 / (dt (c + dt k))");
+    assert_eq(near(bf, 0.5 * 100.0 * gf, EPS), 1, "bias dt k gamma");
+    var zero: f64 = 0.0;
+    var nan: f64 = zero / zero;
+    var ok3, g3, b3 = _im_b2_soft(nan, -5.0, dt);
+    assert_eq(ok3, 0, "NaN and negative clamp to zero");
+    var capn: f64 = _im_b2_impulse_cap(nan, dt);
+    var capm: f64 = _im_b2_impulse_cap(-30.0, 0.5);
+    assert_eq(capn == 0.0 && capm == 15.0, 1, "the cap: |max_force dt|, NaN 0");
+
+    test_group("rows_and_points");
+    var sa: ImBodyRef;
+    _im_b2_bodyref(&sa, 0, 0);
+    var row: ImJointRow;
+    _im_b2_row(&row, 1.0, 0.0, 0.5, 0.5, &sa, &sa, 0.0);
+    var rm: f64 = row.mass;
+    assert_eq(rm == 0.0, 1, "between two massless sides: no effective mass");
+    var pb: ImPointBlock;
+    assert_eq(_im_b2_point(&pb, 0.0, 0.0, 1.0, 0.0, &sa, &sa, 0.0), 0, "a singular block: none");
+    var dref: ImBodyRef;
+    dref.has = 1;
+    dref.handle = 0;
+    dref.inv_mass = 1.0;
+    dref.inv_inertia = 2.0;
+    _im_b2_row(&row, 1.0, 0.0, 0.0, 0.5, &sa, &dref, 0.0);
+    var rm2: f64 = row.mass;
+    assert_eq(near(rm2, 1.0 / (1.0 + 2.0 * 0.25), EPS), 1, "1 / ((ma + mb) |lin|² + ib ang_b²)");
+    _im_b2_row_one_sided(&row, 0.3, 0.5);
+    var rb1: f64 = row.bias;
+    var rlo: f64 = row.lo;
+    assert_eq(near(rb1, 0.6, EPS) == 1 && rlo == 0.0, 1, "one-sided, apart: closes the gap this step");
+    _im_b2_row_one_sided(&row, -0.3, 0.5);
+    var rb2: f64 = row.bias;
+    assert_eq(near(rb2, 0.2 * -0.3 / 0.5, EPS), 1, "one-sided, violated: Baumgarte");
+
+    test_group("prepare_skips");
+    st = ImPhysicsState2d_new();
+    var s1 = body(&st, IM_BODY_STATIC, 0.0, 0.0, 0.5);
+    var s2 = body(&st, IM_BODY_STATIC, 1.0, 0.0, 0.5);
+    var d1 = body(&st, IM_BODY_DYNAMIC, 2.0, 0.0, 0.5);
+    var t1, j1 = st.add_joint(ImJointDesc_new(s1, s2, ImJointType_fixed(), z2, z2));
+    assert_eq(st.prepare_joints(dt), 0, "two static bodies: nothing to solve");
+    var t2, j2 = st.add_joint(ImJointDesc_new(s1, d1, ImJointType_distance(2.0), z2, z2));
+    assert_eq(st.prepare_joints(dt), 1, "a dynamic side: one joint");
+    assert_eq(st.prepare_joints(0.0), 0, "dt 0: none");
+    var t3, j3 = st.add_joint(ImJointDesc_new(d1, s2, ImJointType_spring(1.0, 0.0, 0.0), z2, z2));
+    assert_eq(st.prepare_joints(dt), 1, "a spring with no stiffness or damping is skipped");
+    st.free();
+
+    test_group("breaking");
+    st = ImPhysicsState2d_new();
+    var top = body(&st, IM_BODY_STATIC, 0.0, 0.0, 0.0);
+    var hang = body(&st, IM_BODY_DYNAMIC, 0.0, -3.0, 0.5);
+    var weak: ImJointDesc = ImJointDesc_new(top, hang, ImJointType_fixed(), ImVec2_new(0.0, -3.0), z2);
+    weak.has_break_force = 1;
+    weak.break_force = 0.001;
+    var t4, wj = st.add_joint(weak);
+    var strong: ImJointDesc = ImJointDesc_new(top, hang, ImJointType_distance(3.0), z2, z2);
+    strong.has_break_force = 1;
+    strong.break_force = 100000.0;
+    var t5, sj = st.add_joint(strong);
+    step_nc(&st, 0.0, -9.81, dt, 4);
+    var ja: *ImArena = st._joints();
+    assert_eq(ja.contains(wj), 0, "the weak joint broke");
+    assert_eq(ja.contains(sj), 1, "the strong one held");
+    st.free();
+
+    test_group("islands_and_sleep");
+    st = ImPhysicsState2d_new();
+    var p = body(&st, IM_BODY_DYNAMIC, 0.0, 0.0, 0.25);
+    var q = body(&st, IM_BODY_DYNAMIC, 3.0, 0.0, 0.25);
+    var lone = body(&st, IM_BODY_DYNAMIC, 9.0, 0.0, 0.25);
+    var t6, pq = st.add_joint(ImJointDesc_new(p, q, ImJointType_distance(3.0), z2, z2));
+    st.build_islands_and_sleep(dt);
+    var rp: *ImRigidBody2d = rec(&st, p);
+    var rq: *ImRigidBody2d = rec(&st, q);
+    var rl: *ImRigidBody2d = rec(&st, lone);
+    assert_eq(rp.island_id == rq.island_id, 1, "jointed bodies share an island");
+    assert_eq(rl.island_id != rp.island_id, 1, "the lone body has its own");
+    for (var f2 = 0; f2 < 40; f2 = f2 + 1) { step_nc(&st, 0.0, 0.0, dt, 4); }
+    rp = rec(&st, p);
+    rq = rec(&st, q);
+    assert_eq(rp.is_sleeping == 1 && rq.is_sleeping == 1, 1, "at rest for 0.5 s: asleep together");
+    rq.linear_velocity = ImVec2_new(1.0, 0.0);
+    rq.is_sleeping = 0;
+    st.build_islands_and_sleep(dt);
+    rp = rec(&st, p);
+    assert_eq(rp.is_sleeping, 0, "a fast member wakes its island");
+    st.free();
+
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

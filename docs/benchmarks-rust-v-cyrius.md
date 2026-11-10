@@ -230,3 +230,18 @@ The Rust benches' own loops, on ImPhysicsState2d (PhysicsWorld's 2D calls are th
 
 These are first numbers: correctness first, then profiling, which the M2a broadphase finding already asks for
 before M3's step. A word-at-a-time `memcpy` upstream (S5) would cut most of the gap.
+
+## M3 part 2: joints (2026-11-09)
+
+Cyrius-only rows, 2,000 iterations, x86_64 ELF. Rust times joints only inside its world step, which M3c brings.
+
+| Bench | Body | Cyrius |
+|---|---|---|
+| `b2/joints_chain20_prepare_solve` | a 20-link revolute chain: prepare its joints, 4 velocity iterations | 22.5 µs |
+| `b2/joints_chain20_frame` | the same chain's whole frame without contacts (integration, joints, islands, sleep) | 54.7 µs |
+
+**Reading it.**
+- **Correctly rounded primitives again.** Each revolute joint pays two rotations (`sin_cos`, about 200 ns each) to
+  prepare, and a `hypot` (168 ns) on every point-block solve. That is about 1.1 µs a joint a sub-step.
+- **The rest of the frame is integration and the islands.** The island pass takes five freelist buffers a step and
+  frees them, which keeps the heap flat.

@@ -41,6 +41,8 @@ mod m_b2_narrow;
 mod m_b2_ray;
 #[cfg(not(feature = "b3"))]
 mod m_b2_state;
+#[cfg(not(feature = "b3"))]
+mod m_b2_step;
 mod m_broadphase;
 mod m_config;
 mod m_constants;
@@ -89,6 +91,8 @@ fn golden_modules() -> Vec<tsv::Module> {
             m_b2_ray::emit(),
             #[cfg(not(feature = "b3"))]
             m_b2_state::emit(),
+            #[cfg(not(feature = "b3"))]
+            m_b2_step::emit(),
             m_broadphase::emit(),
             m_config::emit(),
             m_constants::emit(),

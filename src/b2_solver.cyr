@@ -1,0 +1,224 @@
+# b2_solver.cyr — the 2D backend's step (port of rust-old/src/backend_2d/solver.rs).
+#
+# M3b ports the stages a step runs whether or not anything touches: velocity and position integration
+# over every body in slot order, islands and sleep, and the end of a frame (`finish_step`). The contact
+# stages (broadphase, narrowphase, manifolds, warm start, the contact and position solvers) and `step`
+# itself come with M3c. Every expression keeps Rust's operation order.
+
+impl ImPhysicsState2d {
+    # Integrates every body's velocity (gravity, forces, damping, the speed cap), in slot order. Step 1 of
+    # `step_si`.
+    fn _integrate_velocities(self, gravity: ImVec2, dt: f64, max_velocity: f64) {
+        var ba: *ImArena = self._bodies();
+        for (var s = 0; s < ba.slot_count(); s = s + 1) {
+            var h = ba.slot_handle(s);
+            if (h != 0 - 1) {
+                var rb: *ImRigidBody2d = self._body(h);
+                rb.integrate_velocities(gravity, dt, max_velocity);
+            }
+        }
+        return 0;
+    }
+
+    # Integrates every body's position, in slot order. Step 10 of `step_si`.
+    fn _integrate_positions(self, dt: f64) {
+        var ba: *ImArena = self._bodies();
+        for (var s = 0; s < ba.slot_count(); s = s + 1) {
+            var h = ba.slot_handle(s);
+            if (h != 0 - 1) {
+                var rb: *ImRigidBody2d = self._body(h);
+                rb.integrate_positions(dt);
+            }
+        }
+        return 0;
+    }
+
+    # Zeroes every body's split-impulse pseudo-velocity, which the position solver does first.
+    fn _clear_pseudo(self) {
+        var ba: *ImArena = self._bodies();
+        for (var s = 0; s < ba.slot_count(); s = s + 1) {
+            var h = ba.slot_handle(s);
+            if (h != 0 - 1) {
+                var rb: *ImRigidBody2d = self._body(h);
+                rb.pseudo_velocity = ImVec2_new(0.0, 0.0);
+                rb.pseudo_angular_velocity = 0.0;
+            }
+        }
+        return 0;
+    }
+
+    # 1 when handle h is a live dynamic body.
+    #must_use
+    fn _is_dynamic_body(self, h): i64 {
+        var rb: *ImRigidBody2d = self._body(h);
+        if (rb == 0) { return 0; }
+        return rb.is_dynamic();
+    }
+
+    # The body index (its position in slot order) of handle h among the n handles at hs, or -1.
+    #must_use
+    fn _island_index(self, hs, n, h): i64 {
+        var ba: *ImArena = self._bodies();
+        if (ba.contains(h) == 0) { return 0 - 1; }
+        # Slot order is handle order within one generation's slots; search by slot, not by value.
+        var lo = 0;
+        var hi = n - 1;
+        var slot = _im_handle_index(h);
+        while (lo <= hi) {
+            var mid = (lo + hi) / 2;
+            var ms = _im_handle_index(load64(hs + mid * 8));
+            if (ms == slot) { return mid; }
+            if (ms < slot) { lo = mid + 1; } else { hi = mid - 1; }
+        }
+        return 0 - 1;
+    }
+
+    # Unites the dynamic bodies that a manifold or a joint connects (static and kinematic bodies don't
+    # carry an island), then, island by island, advances or resets the sleep timers of its dynamic bodies
+    # with mass together: an island sleeps, its bodies stopped, once all are below the sleep speed and the
+    # most recently active has rested SLEEP_TIME_THRESHOLD. Mirrors `build_islands_and_sleep`.
+    fn build_islands_and_sleep(self, dt: f64) {
+        var ba: *ImArena = self._bodies();
+        var n = ba.len();
+        if (n == 0) { return 0; }
+        var hs = fl_alloc(n * 8);
+        var root = fl_alloc(n * 8);
+        var order = fl_alloc(n * 8);
+        var start = fl_alloc((n + 1) * 8);
+        var fill = fl_alloc((n + 1) * 8);
+        if (hs == 0 || root == 0 || order == 0 || start == 0 || fill == 0) {
+            # No memory: leave the islands as they were (nothing aborts).
+            if (hs != 0) { fl_free(hs); }
+            if (root != 0) { fl_free(root); }
+            if (order != 0) { fl_free(order); }
+            if (start != 0) { fl_free(start); }
+            if (fill != 0) { fl_free(fill); }
+            return 0;
+        }
+        var k = 0;
+        for (var s = 0; s < ba.slot_count(); s = s + 1) {
+            var h = ba.slot_handle(s);
+            if (h != 0 - 1) {
+                store64(hs + k * 8, h);
+                k = k + 1;
+            }
+        }
+        self.island_manager.reset(n);
+        for (var m = 0; m < self.manifolds.count(); m = m + 1) {
+            var mf: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(m));
+            self._island_link(hs, n, mf.body_a, mf.body_b);
+        }
+        var ja: *ImArena = self._joints();
+        for (var js = 0; js < ja.slot_count(); js = js + 1) {
+            var jh = ja.slot_handle(js);
+            if (jh != 0 - 1) {
+                var j: *ImJoint2d = _im_b2_as_joint(ja.get(jh));
+                self._island_link(hs, n, j.body_a, j.body_b);
+            }
+        }
+        # Group the bodies by root, roots ascending and members ascending (Rust's BTreeMap of islands).
+        for (var z = 0; z <= n; z = z + 1) { store64(start + z * 8, 0); }
+        for (var i = 0; i < n; i = i + 1) {
+            var r = self.island_manager.find(i);
+            store64(root + i * 8, r);
+            store64(start + (r + 1) * 8, load64(start + (r + 1) * 8) + 1);
+        }
+        for (var c = 0; c < n; c = c + 1) {
+            store64(start + (c + 1) * 8, load64(start + (c + 1) * 8) + load64(start + c * 8));
+        }
+        for (var f = 0; f <= n; f = f + 1) { store64(fill + f * 8, load64(start + f * 8)); }
+        for (var q = 0; q < n; q = q + 1) {
+            var rq = load64(root + q * 8);
+            var at = load64(fill + rq * 8);
+            store64(order + at * 8, q);
+            store64(fill + rq * 8, at + 1);
+        }
+        fl_free(fill);
+        for (var isl = 0; isl < n; isl = isl + 1) {
+            var b0 = load64(start + isl * 8);
+            var b1 = load64(start + (isl + 1) * 8);
+            if (b1 > b0) { self._island_sleep(hs, order, b0, b1, isl, dt); }
+        }
+        fl_free(hs);
+        fl_free(root);
+        fl_free(order);
+        fl_free(start);
+        return 0;
+    }
+
+    # Links the bodies a and b in the island union-find when both are live dynamic bodies.
+    fn _island_link(self, hs, n, a, b) {
+        if (self._is_dynamic_body(a) == 0 || self._is_dynamic_body(b) == 0) { return 0; }
+        var ia = self._island_index(hs, n, a);
+        var ib = self._island_index(hs, n, b);
+        if (ia >= 0 && ib >= 0) { self.island_manager.unite(ia, ib); }
+        return 0;
+    }
+
+    # The sleep pass over one island: the members are order[b0 .. b1) (body indices), its root `isl`.
+    fn _island_sleep(self, hs, order, b0, b1, isl, dt: f64) {
+        var all_slow = 1;
+        var has_dynamic = 0;
+        for (var i = b0; i < b1; i = i + 1) {
+            var rb: *ImRigidBody2d = self._body(load64(hs + load64(order + i * 8) * 8));
+            var im: f64 = rb.inv_mass;
+            if (rb.is_dynamic() == 1 && im != 0.0) {
+                has_dynamic = 1;
+                var vx: f64 = rb.linear_velocity.x;
+                var vy: f64 = rb.linear_velocity.y;
+                var w: f64 = rb.angular_velocity;
+                var lin: f64 = f64_sqrt(vx * vx + vy * vy);
+                var ang: f64 = f64_abs(w);
+                if (lin >= _IM_B2_SLEEP_VELOCITY_THRESHOLD || ang >= _IM_B2_SLEEP_VELOCITY_THRESHOLD) {
+                    all_slow = 0;
+                    i = b1;
+                }
+            }
+        }
+        if (has_dynamic == 0) { return 0; }
+        var zero: f64 = 0.0;
+        var min_timer: f64 = 1.0 / zero;
+        for (var j = b0; j < b1; j = j + 1) {
+            var rj: *ImRigidBody2d = self._body(load64(hs + load64(order + j * 8) * 8));
+            var jm: f64 = rj.inv_mass;
+            if (rj.is_dynamic() == 1 && jm != 0.0) {
+                rj.island_id = isl;
+                if (all_slow == 1) {
+                    var t: f64 = rj.sleep_timer;
+                    var nt: f64 = t + dt;
+                    rj.sleep_timer = nt;
+                    min_timer = _im_min(min_timer, nt);
+                } else {
+                    rj.sleep_timer = 0.0;
+                    rj.is_sleeping = 0;
+                }
+            }
+        }
+        if (all_slow == 1 && min_timer >= _IM_B2_SLEEP_TIME_THRESHOLD) {
+            for (var q = b0; q < b1; q = q + 1) {
+                var rq: *ImRigidBody2d = self._body(load64(hs + load64(order + q * 8) * 8));
+                if (rq.is_dynamic() == 1 && rq.is_sleeping == 0) {
+                    rq.is_sleeping = 1;
+                    rq.linear_velocity = ImVec2_new(0.0, 0.0);
+                    rq.angular_velocity = 0.0;
+                }
+            }
+        }
+        return 0;
+    }
+
+    # The end of an outer step: clears every body's accumulated force and torque (they act across all
+    # sub-steps) and closes the frame's contact events: their count (ImContactTracker::event reads them).
+    # Mirrors `finish_step`.
+    fn finish_step(self): i64 {
+        var ba: *ImArena = self._bodies();
+        for (var s = 0; s < ba.slot_count(); s = s + 1) {
+            var h = ba.slot_handle(s);
+            if (h != 0 - 1) {
+                var rb: *ImRigidBody2d = self._body(h);
+                rb.clear_forces();
+            }
+        }
+        return self.contact_tracker.finish();
+    }
+}

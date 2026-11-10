@@ -57,7 +57,8 @@ harness reads the same files. This README records what is specific to impetus.
 | `b2_narrow` | b2 | M2 | 17,854 (+ 3 corrected) | `src/m_b2_narrow.rs` | — |
 | `b2_ray` | b2 | M2 | 14,754 (+ 39 corrected) | `src/m_b2_ray.rs` | — |
 | `b2_state` | b2 | M3 | 411 | `src/m_b2_state.rs` | — |
-| (private constants) | b2 | M2 | — | — | `src/constants_private.cyr` (`src/t_private.rs`: every library `const` of `aabb_tree.rs`, `spatial_hash.rs` and `backend_2d/types.rs`, emitted or excused) |
+| `b2_step` | b2 | M3 | 214 (+ 4 corrected) | `src/m_b2_step.rs` | — |
+| (private constants) | b2 | M2 | — | — | `src/constants_private.cyr` (`src/t_private.rs`: every library `const` of `aabb_tree.rs`, `spatial_hash.rs`, `backend_2d/joints.rs` and `backend_2d/types.rs`, emitted or excused) |
 
 ## Format 1
 
@@ -106,6 +107,10 @@ impetus specifics:
   slots (occupied, generation, next free), free-list heads and staleness, every body, collider and joint field,
   `body_colliders` in handle order, the manifolds in key order and the tracker. `b2::state_script_orphan` rows add a
   collider or joint for a missing body (ADR 0008 #1).
+- Single-step rows (`b2_step.tsv`, class S at class C, the 2D build only): inputs are the world config (`flat::config`,
+  its `step` the frame index) and the backend dump at frame k, taken after that frame's forces; outputs are the dump at
+  k + 1 and the frame's events. M3b's scenes give every collider collision mask 0, so nothing pairs and the contact
+  stages are empty.
 - `Spring::step` rows (`spring.tsv`) carry a note `[<regime> S=<n>]`: the regime the transition took
   and its **sensitivity**, the most the two outputs move, in ulps, when one exp, sin or cos result
   on the path moves by one ulp. `m_spring.rs` computes it from a transcription of `transition` and
@@ -169,6 +174,9 @@ Standard-library Python, run with `-I`. It never calls the oracle:
 - every `b2_ray` row is recomputed by the same transcription extended with the ray tests, `world_aabb` and the overlap
   loop, on glibc's sin, cos and hypot (hypot through ctypes: CPython's `math.hypot` is its own implementation). On
   MPFR's it writes `b2_ray.cr.tsv`;
+- every `b2_step` row is recomputed by a transcription of the contact-free step (sub-steps, integration, the eight
+  joint types, islands and sleep, `finish_step`) on glibc's sin, cos and hypot; the same on MPFR's writes
+  `b2_step.cr.tsv`. It asserts every collider's mask is 0;
 - every `b2_state` script is replayed on a Python model of the arenas (Rust's free list and generations) and the
   state, rebuilding every result and dump token;
 - every `b2_mass` body is recomputed: its own `shape_props` and `polygon_mass_props` in Rust's operation order,

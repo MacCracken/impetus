@@ -490,6 +490,49 @@ fails when either drifts from `cyrius.cyml`.
 - **Result, every target:** 15 modules, 0 failing; **97,568 ok, 0 failed, 0 measured, 7 pending, 160 accepted**
   (ADR 0008 #6 92, #1 3; ADR 0009 1; ADR 0011 64).
 
+## 14. M3b: joints, integration, islands and sleep; the first single-step rows (2026-11-09)
+
+- **The modules:**
+  - `src/b2_joints.cyr`:
+    - the velocity-level joint solver, with Rust's `Row`, `PointBlock`, `BodyRef`, `Vel` and `PreparedJoint` as
+      records;
+    - `prepare_joints` for all eight joint types, with limits, motors, damping and the soft constraints;
+    - `solve_joints_once` and `break_joints`.
+
+    The prepared joints and their rows (at most 6 a joint) live in the state's scratch, reused from step to step,
+    so the heap stays flat. `JOINT_BAUMGARTE` is generated with the other private constants.
+  - `src/b2_solver.cyr`, the step stages that run when nothing touches:
+    - velocity and position integration over every body;
+    - `build_islands_and_sleep`, whose islands are grouped by root as Rust's BTreeMap orders them;
+    - `finish_step`.
+
+    The contact stages and `step` come with M3c.
+- **Single-step rows (class S, the plan's §5).** A `b2::step` row is the world config and the backend dump at frame k,
+  taken after that frame's forces; its outputs are the dump at k + 1 and the frame's events. The harness loads the dump
+  into an ImPhysicsState2d (every arena slot, generation and free list as dumped), steps it, and compares the whole
+  state. Every frame is therefore checked on its own, and errors can't compound.
+- **Why these scenes pair nothing.** The broadphase drops a pair when neither collider's layer meets the other's mask.
+  Every M3b collider has mask 0, so the contact stages are provably empty, and the colliders are there for mass. A body
+  with no collider has no mass and would never move. Until M3c the harness composes the contact-free sub-step from the
+  library's stages.
+- **`b2_step.tsv`**, 214 rows. Scenes at frames 0, 1, 2, 10, 60 and 300:
+  - a pendulum at 1, 4 and 8 sub-steps, and a 20-link revolute chain;
+  - a fixed pair pinned to the world; a revolute with limits, a motor and damping; a prismatic slider with limits and
+    a motor; a wheel on a suspension;
+  - a spring, a damped distance joint and a rope that goes from slack to taut; a mouse drag;
+  - joints that break and that hold; a kinematic driver; a push every frame;
+  - a pair at rest that falls asleep (frames 25 to 31);
+  - 40 seeded scenes of random joints at random frames.
+
+  Class C (`sin_cos` in the rotations, `hypot` in normalisation, lengths and impulse caps). **All 0 ulp** (30,078
+  floats) on three targets.
+- **The corrected oracle.** `validate.py` transcribes this part of the step. It parses each dump, steps it (sub-steps,
+  integration, all eight joints, islands, sleep, `finish_step`) and writes the dump again. On glibc's `sin`, `cos` and
+  `hypot` it reproduces all 214 rows bit for bit, and it asserts that every collider's mask is 0. On MPFR's it writes
+  `b2_step.cr.tsv`: 4 rows (3 through `hypot`, 1 through `sin`/`cos`), and the port equals all 4.
+- **Result, every target:** 16 modules, 0 failing; **97,778 ok, 0 failed, 0 measured, 7 pending, 164 accepted**
+  (ADR 0011: 68).
+
 ## How to reproduce
 
 ```sh

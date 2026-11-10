@@ -645,6 +645,12 @@ def corrections(module, rows):
         elif module == "spring" and fn == "Spring::step":
             x = [tok_f(t) if t.startswith("f:") else int(t[2:]) for t in ins]
             want = list(_cr_spring_step(*x, prim))
+        elif module == "b2_step":
+            toks = _Step2d(prim["sin"], prim["cos"], _logged_hypot(log)).step(ins)
+            if not _same_tokens(outs, toks):
+                seen = list(dict.fromkeys(log))
+                out.append((fn, " ".join(ins), " ".join(toks), "oracle (dump); " + "; ".join(seen)))
+            continue
         elif module == "b2_ray":
             toks = _ray_tokens(fn, _Ray(prim["sin"], prim["cos"], _logged_hypot(log)), ins)
             if not _same_tokens(outs, toks):
@@ -1954,10 +1960,535 @@ def check_b2_state(rows):
     return counted
 
 
+# ── single steps without contacts (backend_2d/joints.rs, the SI step's joint, integration and sleep
+# stages; M3b) ─────────────────────────────────────────────────────────────────────────────────────
+# A b2_step row's input is a backend dump; the transcription parses it, steps it as PhysicsWorld::step
+# does (sub-steps, then finish_step), and writes the dump again. Every M3b scene has collision mask 0 on
+# every collider, so the broadphase pairs nothing and the contact stages are empty (the check asserts
+# it). sin, cos and hypot are parameters: glibc's for the check, MPFR's for the corrected oracle.
+
+B2_SLEEP_VELOCITY = 0.01
+B2_SLEEP_TIME = 0.5
+B2_JOINT_BAUMGARTE = 0.2
+
+
+def _dump_arena(t, k):
+    n = int(t[k][2:])
+    slots = [[tok_i(t[k + 1 + 3 * i]) == 1, tok_i(t[k + 2 + 3 * i]),
+              None if t[k + 3 + 3 * i] == "n:" else tok_i(t[k + 3 + 3 * i]), None] for i in range(n)]
+    k += 1 + 3 * n
+    a = _Arena()
+    a.slots = slots
+    a.free_head = None if t[k] == "n:" else tok_i(t[k])
+    a.stale = tok_i(t[k + 1]) == 1
+    return a, k + 2
+
+
+def _dump_parse(t, k):
+    """A backend dump at token k: (state dict, token after it)."""
+    st = {}
+    st["body_arena"], k = _dump_arena(t, k)
+    nb = int(t[k][2:])
+    k += 1
+    for _ in range(nb):
+        x = t[k:k + 29]
+        b = {"handle": _st_word(x[0]), "type": x[1], "pos": [tok_f(x[2]), tok_f(x[3])], "rot": tok_f(x[4]),
+             "vel": [tok_f(x[5]), tok_f(x[6])], "w": tok_f(x[7]), "ld": tok_f(x[8]), "ad": tok_f(x[9]),
+             "fixed": tok_i(x[10]) == 1, "gs": tok_f(x[11]), "force": [tok_f(x[12]), tok_f(x[13])],
+             "torque": tok_f(x[14]), "mass": tok_f(x[15]), "inv_mass": tok_f(x[16]), "inertia": tok_f(x[17]),
+             "inv_inertia": tok_f(x[18]), "pv": [tok_f(x[19]), tok_f(x[20])], "pw": tok_f(x[21]),
+             "prev": [tok_f(x[22]), tok_f(x[23])], "prev_rot": tok_f(x[24]), "sleeping": tok_i(x[25]) == 1,
+             "sleep_timer": tok_f(x[26]), "island": tok_i(x[27])}
+        st["body_arena"].slots[b["handle"] & 0xFFFFFFFF][3] = b
+        k += 28
+    st["coll_start"] = k
+    _, k = _dump_arena(t, k)
+    nc = int(t[k][2:])
+    k += 1
+    masks = []
+    for _ in range(nc):
+        k2 = _st_shape_end(t, k + 2)
+        masks.append(tok_i(t[k2 + 13]))
+        k = k2 + 14
+    st["masks"] = masks
+    st["coll_tokens"] = t[st["coll_start"]:k]
+    st["joint_arena"], k = _dump_arena(t, k)
+    nj = int(t[k][2:])
+    k += 1
+    for _ in range(nj):
+        h = _st_word(t[k])
+        ke = _st_joint_type_end(t, k + 3)
+        j = {"handle": h, "a": _st_word(t[k + 1]), "b": _st_word(t[k + 2]), "jt": t[k + 3:ke],
+             "la": (tok_f(t[ke]), tok_f(t[ke + 1])), "lb": (tok_f(t[ke + 2]), tok_f(t[ke + 3]))}
+        k = ke + 4
+        if t[k] == "n:":
+            j["motor"], k = None, k + 1
+        else:
+            j["motor"], k = (tok_f(t[k]), tok_f(t[k + 1])), k + 2
+        j["damping"] = tok_f(t[k])
+        j["brk"] = None if t[k + 1] == "n:" else tok_f(t[k + 1])
+        j["ref"] = tok_f(t[k + 2])
+        k += 3
+        st["joint_arena"].slots[h & 0xFFFFFFFF][3] = j
+    s0 = k
+    nbc = int(t[k][2:])
+    k += 1
+    for _ in range(nbc):
+        k += 2 + int(t[k + 1][2:])
+    st["body_colliders"] = t[s0:k]
+    st["manifolds"] = int(t[k][2:])
+    if st["manifolds"] != 0:
+        fail("b2_step: an M3b row's dump has manifolds")
+    k += 1
+    st["tracker"] = t[k:k + 4]
+    if st["tracker"] != ["v:0", "v:0", "v:0", "i:0"]:
+        fail("b2_step: an M3b row's tracker is not empty between frames")
+    return st, k + 4
+
+
+def _dump_emit(st):
+    out = st["body_arena"].tokens() + [f"v:{len(st['body_arena'].values())}"]
+    for _, b in st["body_arena"].values():
+        out += [_st_h(b["handle"]), b["type"]] + [_st_f(x) for x in (*b["pos"], b["rot"], *b["vel"], b["w"], b["ld"], b["ad"])]
+        out += [f"i:{int(b['fixed'])}"] + [_st_f(x) for x in (b["gs"], *b["force"], b["torque"], b["mass"],
+                                                               b["inv_mass"], b["inertia"], b["inv_inertia"],
+                                                               *b["pv"], b["pw"], *b["prev"], b["prev_rot"])]
+        out += [f"i:{int(b['sleeping'])}", _st_f(b["sleep_timer"]), f"i:{b['island']}"]
+    out += st["coll_tokens"]
+    out += st["joint_arena"].tokens() + [f"v:{len(st['joint_arena'].values())}"]
+    for h, j in st["joint_arena"].values():
+        out += [_st_h(h), _st_h(j["a"]), _st_h(j["b"])] + j["jt"]
+        out += [_st_f(x) for x in (*j["la"], *j["lb"])]
+        out += ["n:"] if j["motor"] is None else [_st_f(j["motor"][0]), _st_f(j["motor"][1])]
+        out += [_st_f(j["damping"]), "n:" if j["brk"] is None else _st_f(j["brk"]), _st_f(j["ref"])]
+    out += st["body_colliders"] + ["v:0", "v:0", "v:0", "v:0", "i:0"]
+    return out
+
+
+class _Step2d:
+    """The contact-free SI step (joints, integration, islands and sleep) on the given sin, cos, hypot."""
+
+    def __init__(self, sin, cos, hyp):
+        self.sin, self.cos, self.hyp = sin, cos, hyp
+
+    def rotate(self, v, rot):
+        s, c = self.sin(rot), self.cos(rot)
+        return (c * v[0] - s * v[1], s * v[0] + c * v[1])
+
+    def normalize(self, v):
+        ln = self.hyp(v[0], v[1])
+        return (v[0] / ln, v[1] / ln) if (ln > B2_EPSILON and math.isfinite(ln)) else None
+
+    @staticmethod
+    def soft(k, c, dt):
+        k = rust_max(k, 0.0) if math.isfinite(k) else 0.0
+        c = rust_max(c, 0.0) if math.isfinite(c) else 0.0
+        g = dt * (c + dt * k)
+        if not g > B2_EPSILON:
+            return None
+        gamma = 1.0 / g
+        return (gamma, dt * k * gamma)
+
+    @staticmethod
+    def cap(mf, dt):
+        c = abs(mf * dt)
+        return 0.0 if math.isnan(c) else c
+
+    @staticmethod
+    def row(lin, aa, ab, a, b, gamma):
+        k = (a[1] + b[1]) * (lin[0] * lin[0] + lin[1] * lin[1]) + a[2] * aa * aa + b[2] * ab * ab + gamma
+        return [lin[0], lin[1], aa, ab, 1.0 / k if k > B2_EPSILON else 0.0, 0.0, gamma, -math.inf, math.inf, 0.0]
+
+    @staticmethod
+    def rigid(r, err, dt):
+        r[5] = B2_JOINT_BAUMGARTE * err / dt
+        return r
+
+    @staticmethod
+    def one_sided(r, c, dt):
+        r[5] = c / dt if c > 0.0 else B2_JOINT_BAUMGARTE * c / dt
+        r[7] = 0.0
+        return r
+
+    @staticmethod
+    def point(ra, rb, a, b, gamma):
+        ma, ia, mb, ib = a[1], a[2], b[1], b[2]
+        k11 = ma + mb + ia * ra[1] * ra[1] + ib * rb[1] * rb[1] + gamma
+        k12 = -ia * ra[0] * ra[1] - ib * rb[0] * rb[1]
+        k22 = ma + mb + ia * ra[0] * ra[0] + ib * rb[0] * rb[0] + gamma
+        det = k11 * k22 - k12 * k12
+        if math.isnan(det) or abs(det) <= B2_EPSILON or not math.isfinite(det):
+            return None
+        inv = 1.0 / det
+        return {"ra": ra, "rb": rb, "ik": [k22 * inv, -k12 * inv, -k12 * inv, k11 * inv], "bias": [0.0, 0.0],
+                "gamma": gamma, "max": math.inf, "acc": [0.0, 0.0]}
+
+    @staticmethod
+    def bodyref(h, b):
+        if b is None:
+            return (None, 0.0, 0.0)
+        if b["type"] == "e:BodyType.Dynamic" and not b["sleeping"]:
+            return (h, b["inv_mass"], b["inv_inertia"])
+        return (h, 0.0, 0.0)
+
+    def prepare_joint(self, st, h, j, dt):
+        ba = st["body_arena"].get(j["a"])
+        bb = st["body_arena"].get(j["b"])
+        a = self.bodyref(j["a"], ba)
+        b = self.bodyref(j["b"], bb)
+        kind = j["jt"][0].split(".", 1)[1]
+        f = [tok_f(x) for x in j["jt"][1:] if x.startswith("f:")]
+        if kind == "Mouse":
+            if ba is None:
+                return None
+            anchor = self.rotate(j["la"], ba["rot"])
+            ground = (None, 0.0, 0.0)
+            gb = self.soft(f[3], f[4], dt) or (0.0, 0.0)
+            p = self.point((0.0, 0.0), anchor, ground, a, gb[0])
+            if p is None:
+                return None
+            c = (ba["pos"][0] + anchor[0] - f[0], ba["pos"][1] + anchor[1] - f[1])
+            p["bias"] = [c[0] * gb[1], c[1] * gb[1]]
+            p["max"] = self.cap(f[5], dt)
+            return {"handle": h, "a": ground, "b": a, "point": p, "rows": [], "break_row": None, "brk": j["brk"]}
+        pa, rot_a = (ba["pos"], ba["rot"]) if ba is not None else ((0.0, 0.0), 0.0)
+        pb, rot_b = (bb["pos"], bb["rot"]) if bb is not None else ((0.0, 0.0), 0.0)
+        if a[1] == 0.0 and b[1] == 0.0 and a[2] == 0.0 and b[2] == 0.0:
+            return None
+        ra = self.rotate(j["la"], rot_a) if ba is not None else (0.0, 0.0)
+        rb = self.rotate(j["lb"], rot_b) if bb is not None else (0.0, 0.0)
+        anchor_a = (pa[0] + ra[0], pa[1] + ra[1]) if ba is not None else j["la"]
+        anchor_b = (pb[0] + rb[0], pb[1] + rb[1]) if bb is not None else j["lb"]
+        d = (anchor_b[0] - anchor_a[0], anchor_b[1] - anchor_a[1])
+        angle = rot_b - rot_a
+        point, rows, break_row = None, [], None
+
+        def cross(u, v):
+            return u[0] * v[1] - u[1] * v[0]
+
+        def dot(u, v):
+            return u[0] * v[0] + u[1] * v[1]
+
+        def rigid_point(gamma):
+            p = self.point(ra, rb, a, b, gamma)
+            if p is not None:
+                p["bias"] = [B2_JOINT_BAUMGARTE * d[0] / dt, B2_JOINT_BAUMGARTE * d[1] / dt]
+            return p
+
+        def angular():
+            return self.row((0.0, 0.0), 1.0, 1.0, a, b, 0.0)
+
+        def anchor_row(u, gamma):
+            return self.row(u, cross(ra, u), cross(rb, u), a, b, gamma)
+
+        def axis_row(u):
+            arm = (d[0] + ra[0], d[1] + ra[1])
+            return self.row(u, cross(arm, u), cross(rb, u), a, b, 0.0)
+
+        jt = j["jt"]
+        if kind == "Fixed":
+            point = rigid_point(0.0)
+            rows.append(self.rigid(angular(), angle - j["ref"], dt))
+        elif kind == "Revolute":
+            point = rigid_point(0.0)
+            if jt[3] != "n:":
+                lo, hi = tok_f(jt[3]), tok_f(jt[4])
+                rows.append(self.one_sided(angular(), angle - lo, dt))
+                rows.append(self.one_sided(self.row((0.0, 0.0), -1.0, -1.0, a, b, 0.0), hi - angle, dt))
+            if j["motor"] is not None:
+                r = angular()
+                r[5] = -j["motor"][0]
+                c = self.cap(j["motor"][1], dt)
+                r[7], r[8] = -c, c
+                rows.append(r)
+        elif kind in ("Prismatic", "Wheel"):
+            ax = self.normalize(self.rotate((tok_f(jt[1]), tok_f(jt[2])), rot_a))
+            if ax is None:
+                return None
+            perp = (-ax[1], ax[0])
+            break_row = len(rows)
+            rows.append(self.rigid(axis_row(perp), dot(d, perp), dt))
+            if kind == "Prismatic":
+                rows.append(self.rigid(angular(), angle - j["ref"], dt))
+                tr = dot(d, ax)
+                if jt[3] != "n:":
+                    lo, hi = tok_f(jt[3]), tok_f(jt[4])
+                    rows.append(self.one_sided(axis_row(ax), tr - lo, dt))
+                    up = axis_row(ax)
+                    up[0], up[1], up[2], up[3] = -ax[0], -ax[1], -up[2], -up[3]
+                    rows.append(self.one_sided(up, hi - tr, dt))
+                if j["motor"] is not None:
+                    r = axis_row(ax)
+                    r[5] = -j["motor"][0]
+                    c = self.cap(j["motor"][1], dt)
+                    r[7], r[8] = -c, c
+                    rows.append(r)
+            else:
+                gb = self.soft(tok_f(jt[3]), tok_f(jt[4]), dt)
+                if gb is not None:
+                    r = axis_row(ax)
+                    r = self.row((r[0], r[1]), r[2], r[3], a, b, gb[0])
+                    r[5] = dot(d, ax) * gb[1]
+                    rows.append(r)
+        elif kind == "Spring":
+            u = self.normalize(d)
+            if u is None:
+                return None
+            gb = self.soft(tok_f(jt[2]), tok_f(jt[3]), dt)
+            if gb is None:
+                return None
+            r = anchor_row(u, gb[0])
+            r[5] = (self.hyp(d[0], d[1]) - tok_f(jt[1])) * gb[1]
+            break_row = len(rows)
+            rows.append(r)
+        elif kind == "Distance":
+            u = self.normalize(d)
+            if u is None:
+                return None
+            break_row = len(rows)
+            rows.append(self.rigid(anchor_row(u, 0.0), self.hyp(d[0], d[1]) - tok_f(jt[1]), dt))
+        elif kind == "Rope":
+            u = self.normalize(d)
+            if u is None:
+                return None
+            r = self.row((-u[0], -u[1]), -cross(ra, u), -cross(rb, u), a, b, 0.0)
+            break_row = len(rows)
+            rows.append(self.one_sided(r, tok_f(jt[1]) - self.hyp(d[0], d[1]), dt))
+        if j["damping"] > 0.0 and math.isfinite(j["damping"]):
+            gamma = 1.0 / (dt * j["damping"])
+            if kind in ("Revolute", "Wheel"):
+                rows.append(self.row((0.0, 0.0), 1.0, 1.0, a, b, gamma))
+            elif kind == "Prismatic":
+                ax2 = self.normalize(self.rotate((tok_f(jt[1]), tok_f(jt[2])), rot_a))
+                if ax2 is not None:
+                    r = axis_row(ax2)
+                    rows.append(self.row((r[0], r[1]), r[2], r[3], a, b, gamma))
+            elif kind in ("Distance", "Rope"):
+                u2 = self.normalize(d)
+                if u2 is not None:
+                    rows.append(anchor_row(u2, gamma))
+        return {"handle": h, "a": a, "b": b, "point": point, "rows": rows, "break_row": break_row, "brk": j["brk"]}
+
+    @staticmethod
+    def solve_row(r, va, vb, a, b):
+        if r[4] == 0.0:
+            return
+        cdot = r[0] * (vb[0] - va[0]) + r[1] * (vb[1] - va[1]) + r[3] * vb[2] - r[2] * va[2]
+        lam = -r[4] * (cdot + r[5] + r[6] * r[9])
+        new = rust_clamp(r[9] + lam, r[7], r[8])
+        if not math.isfinite(new):
+            new = 0.0
+        d = new - r[9]
+        r[9] = new
+        va[0] -= r[0] * d * a[1]
+        va[1] -= r[1] * d * a[1]
+        va[2] -= r[2] * d * a[2]
+        vb[0] += r[0] * d * b[1]
+        vb[1] += r[1] * d * b[1]
+        vb[2] += r[3] * d * b[2]
+
+    def solve_point(self, p, va, vb, a, b):
+        ra, rb = p["ra"], p["rb"]
+        pa = (va[0] - va[2] * ra[1], va[1] + va[2] * ra[0])
+        pb = (vb[0] - vb[2] * rb[1], vb[1] + vb[2] * rb[0])
+        cd = (pb[0] - pa[0], pb[1] - pa[1])
+        rhs = (cd[0] + p["bias"][0] + p["gamma"] * p["acc"][0], cd[1] + p["bias"][1] + p["gamma"] * p["acc"][1])
+        ik = p["ik"]
+        lam = (-(ik[0] * rhs[0] + ik[1] * rhs[1]), -(ik[2] * rhs[0] + ik[3] * rhs[1]))
+        new = [p["acc"][0] + lam[0], p["acc"][1] + lam[1]]
+        mag = self.hyp(new[0], new[1])
+        if mag > p["max"]:
+            new = [new[0] * p["max"] / mag, new[1] * p["max"] / mag]
+        if not (math.isfinite(new[0]) and math.isfinite(new[1])):
+            new = [0.0, 0.0]
+        d = (new[0] - p["acc"][0], new[1] - p["acc"][1])
+        p["acc"] = new
+        va[0] -= d[0] * a[1]
+        va[1] -= d[1] * a[1]
+        va[2] -= (ra[0] * d[1] - ra[1] * d[0]) * a[2]
+        vb[0] += d[0] * b[1]
+        vb[1] += d[1] * b[1]
+        vb[2] += (rb[0] * d[1] - rb[1] * d[0]) * b[2]
+
+    def substep(self, st, cfg, dt):
+        bodies = st["body_arena"]
+        g = (cfg["g"][0], cfg["g"][1])
+        for _, b in bodies.values():
+            if b["type"] != "e:BodyType.Dynamic" or b["inv_mass"] == 0.0 or b["sleeping"]:
+                continue
+            vx, vy = b["vel"]
+            vx += g[0] * b["gs"] * dt
+            vy += g[1] * b["gs"] * dt
+            vx += b["force"][0] * b["inv_mass"] * dt
+            vy += b["force"][1] * b["inv_mass"] * dt
+            if not b["fixed"]:
+                b["w"] += b["torque"] * b["inv_inertia"] * dt
+            vx *= 1.0 / (1.0 + dt * b["ld"])
+            vy *= 1.0 / (1.0 + dt * b["ld"])
+            b["w"] *= 1.0 / (1.0 + dt * b["ad"])
+            sq = vx * vx + vy * vy
+            if sq > cfg["maxv"] * cfg["maxv"]:
+                scale = cfg["maxv"] / rust_sqrt(sq)
+                vx *= scale
+                vy *= scale
+            b["vel"] = [vx, vy]
+        prepared = []
+        if dt > B2_EPSILON:
+            for h, j in st["joint_arena"].values():
+                pj = self.prepare_joint(st, h, j, dt)
+                if pj is not None:
+                    prepared.append(pj)
+        for _ in range(cfg["iters"]):
+            for pj in prepared:
+                def read(ref):
+                    b = bodies.get(ref[0]) if ref[0] is not None else None
+                    return [0.0, 0.0, 0.0] if b is None else [b["vel"][0], b["vel"][1], b["w"]]
+                va, vb = read(pj["a"]), read(pj["b"])
+                for r in pj["rows"]:
+                    self.solve_row(r, va, vb, pj["a"], pj["b"])
+                if pj["point"] is not None:
+                    self.solve_point(pj["point"], va, vb, pj["a"], pj["b"])
+                for side, vel in ((pj["a"], va), (pj["b"], vb)):
+                    if (side[1] > 0.0 or side[2] > 0.0) and side[0] is not None:
+                        b = bodies.get(side[0])
+                        if b is not None:
+                            b["vel"], b["w"] = [vel[0], vel[1]], vel[2]
+        for pj in prepared:
+            if pj["brk"] is None:
+                continue
+            if pj["point"] is not None:
+                imp = self.hyp(pj["point"]["acc"][0], pj["point"]["acc"][1])
+            elif pj["break_row"] is not None:
+                imp = abs(pj["rows"][pj["break_row"]][9]) if pj["break_row"] < len(pj["rows"]) else 0.0
+            else:
+                imp = 0.0
+            force = imp / dt if dt > B2_EPSILON else 0.0
+            if force > pj["brk"]:
+                st["joint_arena"].remove(pj["handle"])
+        for _, b in bodies.values():
+            b["pv"], b["pw"] = [0.0, 0.0], 0.0
+            if b["type"] == "e:BodyType.Static":
+                continue
+            if b["type"] == "e:BodyType.Dynamic" and (b["inv_mass"] == 0.0 or b["sleeping"]):
+                continue
+            b["pos"] = [b["pos"][0] + b["vel"][0] * dt, b["pos"][1] + b["vel"][1] * dt]
+            b["pos"] = [b["pos"][0] + 0.0 * dt, b["pos"][1] + 0.0 * dt]
+            if not b["fixed"]:
+                b["rot"] += b["w"] * dt
+                b["rot"] += 0.0 * dt
+        self.islands(st, dt)
+
+    @staticmethod
+    def islands(st, dt):
+        bodies = st["body_arena"]
+        hs = [b["handle"] for _, b in bodies.values()]
+        n = len(hs)
+        if n == 0:
+            return
+        idx = {h: i for i, h in enumerate(hs)}
+        parent, rank = list(range(n)), [0] * n
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def dyn(h):
+            b = bodies.get(h)
+            return b is not None and b["type"] == "e:BodyType.Dynamic"
+
+        links = [(idx[j["a"]], idx[j["b"]]) for _, j in st["joint_arena"].values()
+                 if dyn(j["a"]) and dyn(j["b"]) and j["a"] in idx and j["b"] in idx]
+        for ia, ib in links:
+            ra, rb = find(ia), find(ib)
+            if ra == rb:
+                continue
+            if rank[ra] < rank[rb]:
+                parent[ra] = rb
+            elif rank[ra] > rank[rb]:
+                parent[rb] = ra
+            else:
+                parent[rb] = ra
+                rank[ra] += 1
+        islands = {}
+        for i in range(n):
+            islands.setdefault(find(i), []).append(i)
+        for root in sorted(islands):
+            members = islands[root]
+            all_slow, has_dyn = True, False
+            for i in members:
+                b = bodies.get(hs[i])
+                if b["type"] != "e:BodyType.Dynamic" or b["inv_mass"] == 0.0:
+                    continue
+                has_dyn = True
+                lin = rust_sqrt(b["vel"][0] * b["vel"][0] + b["vel"][1] * b["vel"][1])
+                if lin >= B2_SLEEP_VELOCITY or abs(b["w"]) >= B2_SLEEP_VELOCITY:
+                    all_slow = False
+                    break
+            if not has_dyn:
+                continue
+            min_t = math.inf
+            for i in members:
+                isl = find(i)
+                b = bodies.get(hs[i])
+                if b["type"] != "e:BodyType.Dynamic" or b["inv_mass"] == 0.0:
+                    continue
+                b["island"] = isl
+                if all_slow:
+                    b["sleep_timer"] += dt
+                    min_t = rust_min(min_t, b["sleep_timer"])
+                else:
+                    b["sleep_timer"], b["sleeping"] = 0.0, False
+            if all_slow and min_t >= B2_SLEEP_TIME:
+                for i in members:
+                    b = bodies.get(hs[i])
+                    if b["type"] == "e:BodyType.Dynamic" and not b["sleeping"]:
+                        b["sleeping"], b["vel"], b["w"] = True, [0.0, 0.0], 0.0
+
+    def step(self, ins):
+        """The output tokens of a b2_step row."""
+        cfg = {"dt": tok_f(ins[0]), "g": (tok_f(ins[1]), tok_f(ins[2])), "iters": tok_i(ins[4]),
+               "maxv": tok_f(ins[10]), "sub": tok_i(ins[11])}
+        st, k = _dump_parse(ins, 16)
+        if k != len(ins):
+            fail(f"b2_step: {len(ins) - k} input tokens left over")
+        if any(m != 0 for m in st["masks"]):
+            fail("b2_step: an M3b scene has a collider that can pair (mask != 0)")
+        sub = max(cfg["sub"], 1)
+        dt = cfg["dt"] / float(sub)
+        for _ in range(sub):
+            self.substep(st, cfg, dt)
+        for _, b in st["body_arena"].values():
+            b["force"], b["torque"] = [0.0, 0.0], 0.0
+        return _dump_emit(st) + ["v:0"]
+
+
+GLIBC_STEP = _Step2d(lambda x: _sin_cos(x)[0], lambda x: _sin_cos(x)[1], _glibc_hypot)
+
+
+def check_b2_step(rows):
+    """Recomputes every single-step row on glibc's sin, cos and hypot."""
+    counted = 0
+    for fn, cls, ins, outs, note in rows:
+        if fn != "b2::step":
+            fail(f"b2_step: unknown function {fn}")
+            continue
+        want = GLIBC_STEP.step(ins)
+        if not _same_tokens(outs, want):
+            first = next((i for i, (a, b) in enumerate(zip(outs, want)) if not _same_tokens([a], [b])),
+                         min(len(outs), len(want)))
+            fail(f"b2_step: row {counted}: the transcription differs at output {first}: "
+                 f"{' '.join(outs[first:first + 3])} vs {' '.join(want[first:first + 3])}")
+        counted += 1
+    return counted
+
+
 # The private constants t_private.rs extracts: file, Cyrius prefix, consts it doesn't carry.
 PRIVATE_SOURCES = (
     ("aabb_tree.rs", "_IM_", {"NULL_NODE"}),
     ("spatial_hash.rs", "_IM_", set()),
+    ("backend_2d/joints.rs", "_IM_B2_", set()),
     ("backend_2d/types.rs", "_IM_B2_", {"FALLBACK"}),
 )
 PRIVATE_CONST = re.compile(r"^\s*(?:pub(?:\((?:super|crate)\))?\s+)?const\s+(\w+)\s*:\s*([\w(),\[\]; ]+?)\s*=\s*(.+?);")
@@ -2248,7 +2779,7 @@ def main():
     for name in names:
         rows = read_module(golden / f"{name}.tsv")
         total += len(rows)
-        if name in ("math", "spring", "b2_narrow", "b2_ray"):
+        if name in ("math", "spring", "b2_narrow", "b2_ray", "b2_step"):
             check_corrections(root, name, golden / f"{name}.tsv", rows)
         if name == "constants":
             check_constants(root, rows)
@@ -2261,6 +2792,8 @@ def main():
             print(f"json: {check_json(rows)} documents checked against Python's json")
         elif name == "broadphase":
             print(f"broadphase: {check_broadphase(rows)} rows recomputed (brute force, rasterisation)")
+        elif name == "b2_step":
+            print(f"b2_step: {check_b2_step(rows)} single steps recomputed (joints, integration, sleep)")
         elif name == "b2_state":
             print(f"b2_state: {check_b2_state(rows)} scripts replayed on a model of the arenas and the state")
         elif name == "b2_ray":

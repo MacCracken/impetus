@@ -243,6 +243,24 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - The ray and overlap rows and the world-level raycast tests now run on ImPhysicsState2d. 5 more
     Rust tests are ported (28 assertions). Surface parity is 417/417; it now reads a receiver on the
     line after `pub fn name(`.
+- **Cyrius port, M3 part 2: joints, integration, islands and sleep** (`docs/development/port-parity.md`
+  §14):
+  - `src/b2_joints.cyr`: the velocity-level joint solver for all eight joint types. Rigid points,
+    angles and axes carry Baumgarte bias; springs, wheels, mice and joint damping are soft; limits
+    are one-sided; motors are clamped to `max_force · dt`; joints break above their force limit. The
+    rows live in scratch the state reuses each step.
+  - `src/b2_solver.cyr`: the stages a step runs whether or not anything touches. These are
+    integration, islands and sleep, and `finish_step`.
+  - The first single-step rows, `b2_step.tsv`: 214 rows, each a backend dump at frame k in and the
+    dump at k + 1 out. The scenes cover every joint type, sub-steps, breaking, a kinematic driver,
+    sleep onset and 40 seeded scenes; their colliders pair nothing. The harness loads each dump into
+    an ImPhysicsState2d.
+    - All 0 ulp against the corrected oracle on three targets, with 4 rows corrected where glibc
+      misrounds.
+    - `validate.py` transcribes the step and reproduces every row.
+    - **97,778 ok, 0 failed, 0 measured, 7 pending, 164 accepted.**
+  - The mouse-joint test is ported, with Cyrius-only joint, island and sleep tests (21 assertions).
+    Surface parity is 421/421. `JOINT_BAUMGARTE` is generated.
 
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
@@ -270,6 +288,9 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   81.7 ns → 1.20 µs, `add_remove_body` 60.9 → 618 ns, `add_body_with_collider` 213 ns → 3.23 µs,
   `add_joint` 23.4 ns → 1.22 µs, `apply_force` 3.3 → 45 ns, `apply_impulse` 1.7 → 41 ns. Arena
   records (224 B per body, 320 B per collider) move by the stdlib's byte-loop `memcpy` (S5).
+- **2D joints, first numbers** (Cyrius only; Rust times its step whole): a 20-link revolute chain's
+  joints take 22.5 µs a sub-step to prepare and solve (4 iterations), and its whole contact-free
+  frame 54.7 µs.
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

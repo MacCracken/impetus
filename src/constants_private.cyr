@@ -22,6 +22,12 @@ var _IM_AABB_MARGIN: f64 = 0.1;
 # Rust: `MAX_CELLS_PER_ENTRY: f64 = 4096.0`
 var _IM_MAX_CELLS_PER_ENTRY: f64 = 4096.0;
 
+# ── rust-old/src/backend_2d/joints.rs ──
+
+# Fraction of a rigid joint's position error removed per step.
+# Rust: `JOINT_BAUMGARTE: f64 = 0.2`
+var _IM_B2_JOINT_BAUMGARTE: f64 = 0.2;
+
 # ── rust-old/src/backend_2d/types.rs ──
 
 # General-purpose geometry epsilon for zero-length checks (normals, axes, etc.).

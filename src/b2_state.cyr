@@ -106,7 +106,8 @@ impl ImManifoldStore {
 # ── the state ───────────────────────────────────────────────────────────────────────
 
 # `bodies`, `colliders` and `joints` are *ImArena words; `body_colliders` is one ImWordList record (three
-# words) per body slot, `list_slots` of them. Mirrors `PhysicsState2d`.
+# words) per body slot, `list_slots` of them; `prep` / `prep_rows` are the joint solver's scratch
+# (src/b2_joints.cyr), reused from step to step. Mirrors `PhysicsState2d`.
 struct ImPhysicsState2d {
     bodies;
     colliders;
@@ -116,6 +117,10 @@ struct ImPhysicsState2d {
     manifolds: ImManifoldStore;
     contact_tracker: ImContactTracker;
     island_manager: ImIslandManager;
+    prep;
+    prep_len;
+    prep_cap;
+    prep_rows;
 }
 
 # An empty state. Its arenas are 0 when there is no memory (every operation then refuses). Mirrors
@@ -131,6 +136,10 @@ fn ImPhysicsState2d_new(): ImPhysicsState2d {
     s.manifolds = ImManifoldStore_new();
     s.contact_tracker = ImContactTracker_new();
     s.island_manager = ImIslandManager_new(0);
+    s.prep = 0;
+    s.prep_len = 0;
+    s.prep_cap = 0;
+    s.prep_rows = 0;
     return s;
 }
 
@@ -679,6 +688,12 @@ impl ImPhysicsState2d {
         self.manifolds.free();
         self.contact_tracker.free();
         self.island_manager.free();
+        if (self.prep != 0) { fl_free(self.prep); }
+        if (self.prep_rows != 0) { fl_free(self.prep_rows); }
+        self.prep = 0;
+        self.prep_rows = 0;
+        self.prep_len = 0;
+        self.prep_cap = 0;
         return 0;
     }
 }

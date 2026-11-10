@@ -1,0 +1,752 @@
+# b2_joints.cyr — 2D joint constraints (port of rust-old/src/backend_2d/joints.rs).
+#
+# Joints are velocity-level constraints solved with accumulated, clamped impulses (sequential impulses),
+# interleaved with the contact solver. Rigid constraints (point, distance, angle, axis) carry a
+# Baumgarte bias β·C/dt; springs (Spring, the Wheel suspension, Mouse) and joint damping are soft
+# constraints (Box2D's implicit springs); limits are one-sided and motors are velocity constraints whose
+# impulse is clamped to max_force·dt. `prepare_joints` computes each joint's rows once per sub-step
+# into the state's scratch (reused from step to step, so the heap stays flat), `solve_joints_once` runs
+# one Gauss–Seidel pass, `break_joints` removes the joints whose force exceeded their limit.
+#
+# Every expression keeps Rust's operation order; rotations go through `_im_sin_cos` and lengths through
+# `_im_hypot`, both correctly rounded (ADR 0011 and its hypot amendment).
+
+# JOINT_BAUMGARTE (0.2) is joints.rs's private constant, generated: _IM_B2_JOINT_BAUMGARTE.
+
+# Rows a joint can need: a prismatic joint with limits, a motor and damping has six.
+const _IM_B2_MAX_JOINT_ROWS = 6;
+
+# ── records ─────────────────────────────────────────────────────────────────────────
+
+# A body as the joint solver sees it: its handle (has = 0 for none) and its solver inverses. Mirrors
+# `BodyRef`.
+struct ImBodyRef { has; handle; inv_mass: f64; inv_inertia: f64; }
+
+# A scalar velocity constraint `Cdot = lin·(vB − vA) + ang_b·ωB − ang_a·ωA`. Mirrors `Row`.
+struct ImJointRow {
+    lx: f64;
+    ly: f64;
+    ang_a: f64;
+    ang_b: f64;
+    mass: f64;
+    bias: f64;
+    gamma: f64;
+    lo: f64;
+    hi: f64;
+    acc: f64;
+}
+
+# A point-to-point constraint solved as a 2×2 block: the anchors' arms, the inverse of K + γI, the bias,
+# the impulse cap (∞ for rigid) and the accumulated impulse. Mirrors `PointBlock`.
+struct ImPointBlock {
+    rax: f64;
+    ray: f64;
+    rbx: f64;
+    rby: f64;
+    k00: f64;
+    k01: f64;
+    k10: f64;
+    k11: f64;
+    bx: f64;
+    by: f64;
+    gamma: f64;
+    max_impulse: f64;
+    accx: f64;
+    accy: f64;
+}
+
+# A body's velocity during a joint solve. Mirrors `Vel`.
+struct ImJointVel { vx: f64; vy: f64; w: f64; }
+
+# One joint's constraints for the current sub-step: its rows are `row_count` records from `row_start`
+# in the state's row scratch; break_row is -1 for none. Mirrors `PreparedJoint`.
+struct ImPreparedJoint {
+    handle;
+    a: ImBodyRef;
+    b: ImBodyRef;
+    has_point;
+    point: ImPointBlock;
+    row_start;
+    row_count;
+    break_row;
+    has_break_force;
+    break_force: f64;
+}
+
+#must_use
+fn _im_b2_as_row(p): *ImJointRow { return p; }
+#must_use
+fn _im_b2_as_prep(p): *ImPreparedJoint { return p; }
+
+# ── helpers ─────────────────────────────────────────────────────────────────────────
+
+# v / |v|: (1, x, y), or (0, 0, 0) when the length is not above EPSILON or not finite. Mirrors
+# `normalize`.
+#must_use
+fn _im_b2_normalize(vx: f64, vy: f64): i64 {
+    var len: f64 = _im_hypot(vx, vy);
+    var z: f64 = 0.0;
+    if (len > _IM_B2_EPSILON && _im_is_finite(len) == 1) {
+        var x: f64 = vx / len;
+        var y: f64 = vy / len;
+        return (1, x, y);
+    }
+    return (0, z, z);
+}
+
+# The soft-constraint coefficients of a spring of stiffness k and damping c (Box2D): (1, gamma,
+# bias per unit error), or (0, 0, 0) when both vanish. Mirrors `soft`.
+#must_use
+fn _im_b2_soft(k0: f64, c0: f64, dt: f64): i64 {
+    var k: f64 = 0.0;
+    var c: f64 = 0.0;
+    if (_im_is_finite(k0) == 1) { k = _im_max(k0, 0.0); }
+    if (_im_is_finite(c0) == 1) { c = _im_max(c0, 0.0); }
+    var g: f64 = dt * (c + dt * k);
+    var z: f64 = 0.0;
+    if (!(g > _IM_B2_EPSILON)) { return (0, z, z); }
+    var gamma: f64 = 1.0 / g;
+    var beta: f64 = dt * k * gamma;
+    return (1, gamma, beta);
+}
+
+# The clamp bound of a motor or mouse impulse, |max_force · dt| (0 for NaN). Mirrors `impulse_cap`.
+#must_use
+fn _im_b2_impulse_cap(mf: f64, dt: f64): f64 {
+    var p: f64 = mf * dt;
+    var cap: f64 = f64_abs(p);
+    if (cap != cap) { return 0.0; }
+    return cap;
+}
+
+# The 2D cross product a × b.
+#must_use
+fn _im_b2_cross(ax: f64, ay: f64, bx: f64, by: f64): f64 {
+    var r: f64 = ax * by - ay * bx;
+    return r;
+}
+
+# ── rows and point blocks ───────────────────────────────────────────────────────────
+
+# Fills r with the row along (lx, ly) with angular terms aa, ab and softness gamma: its effective mass
+# 1/k (0 when k is not above EPSILON), no bias, the bounds (−∞, ∞). Mirrors `Row::new`.
+fn _im_b2_row(r: *ImJointRow, lx: f64, ly: f64, aa: f64, ab: f64, a: *ImBodyRef, b: *ImBodyRef, gamma: f64) {
+    var ma: f64 = a.inv_mass;
+    var mb: f64 = b.inv_mass;
+    var ia: f64 = a.inv_inertia;
+    var ib: f64 = b.inv_inertia;
+    var ll: f64 = lx * lx + ly * ly;
+    var k: f64 = (ma + mb) * ll + ia * aa * aa + ib * ab * ab + gamma;
+    var mass: f64 = 0.0;
+    if (k > _IM_B2_EPSILON) { mass = 1.0 / k; }
+    var zero: f64 = 0.0;
+    var inf: f64 = 1.0 / zero;
+    r.lx = lx;
+    r.ly = ly;
+    r.ang_a = aa;
+    r.ang_b = ab;
+    r.mass = mass;
+    r.bias = 0.0;
+    r.gamma = gamma;
+    r.lo = -inf;
+    r.hi = inf;
+    r.acc = 0.0;
+    return 0;
+}
+
+# A rigid bilateral row: the Baumgarte bias for position error `err`. Mirrors `Row::rigid`.
+fn _im_b2_row_rigid(r: *ImJointRow, err: f64, dt: f64) {
+    var bias: f64 = _IM_B2_JOINT_BAUMGARTE * err / dt;
+    r.bias = bias;
+    return 0;
+}
+
+# A one-sided row C ≥ 0 (impulse ≥ 0): closes a gap within the step, corrects a violation by Baumgarte.
+# Mirrors `Row::one_sided`.
+fn _im_b2_row_one_sided(r: *ImJointRow, c: f64, dt: f64) {
+    var bias: f64 = _IM_B2_JOINT_BAUMGARTE * c / dt;
+    if (c > 0.0) { bias = c / dt; }
+    r.bias = bias;
+    r.lo = 0.0;
+    return 0;
+}
+
+# One iteration of row r between the velocities va and vb. Mirrors `Row::solve`.
+fn _im_b2_row_solve(r: *ImJointRow, va: *ImJointVel, vb: *ImJointVel, a: *ImBodyRef, b: *ImBodyRef) {
+    var mass: f64 = r.mass;
+    if (mass == 0.0) { return 0; }
+    var lx: f64 = r.lx;
+    var ly: f64 = r.ly;
+    var aa: f64 = r.ang_a;
+    var ab: f64 = r.ang_b;
+    var avx: f64 = va.vx;
+    var avy: f64 = va.vy;
+    var aw: f64 = va.w;
+    var bvx: f64 = vb.vx;
+    var bvy: f64 = vb.vy;
+    var bw: f64 = vb.w;
+    var dvx: f64 = bvx - avx;
+    var dvy: f64 = bvy - avy;
+    var cdot: f64 = lx * dvx + ly * dvy + ab * bw - aa * aw;
+    var bias: f64 = r.bias;
+    var gamma: f64 = r.gamma;
+    var acc: f64 = r.acc;
+    var lambda: f64 = -mass * (cdot + bias + gamma * acc);
+    var lo: f64 = r.lo;
+    var hi: f64 = r.hi;
+    var sum: f64 = acc + lambda;
+    var nw: f64 = _im_clamp(sum, lo, hi);
+    if (_im_is_finite(nw) == 0) { nw = 0.0; }
+    var d: f64 = nw - acc;
+    r.acc = nw;
+    var ma: f64 = a.inv_mass;
+    var ia: f64 = a.inv_inertia;
+    var mb: f64 = b.inv_mass;
+    var ib: f64 = b.inv_inertia;
+    va.vx = avx - lx * d * ma;
+    va.vy = avy - ly * d * ma;
+    va.w = aw - aa * d * ia;
+    vb.vx = bvx + lx * d * mb;
+    vb.vy = bvy + ly * d * mb;
+    vb.w = bw + ab * d * ib;
+    return 0;
+}
+
+# Fills p with the point block for arms ra, rb and softness gamma: 1, or 0 when K + γI is singular or
+# not finite. Mirrors `PointBlock::new`.
+fn _im_b2_point(p: *ImPointBlock, rax: f64, ray: f64, rbx: f64, rby: f64, a: *ImBodyRef, b: *ImBodyRef,
+  gamma: f64): i64 {
+    var ma: f64 = a.inv_mass;
+    var ia: f64 = a.inv_inertia;
+    var mb: f64 = b.inv_mass;
+    var ib: f64 = b.inv_inertia;
+    var k11: f64 = ma + mb + ia * ray * ray + ib * rby * rby + gamma;
+    var k12: f64 = -ia * rax * ray - ib * rbx * rby;
+    var k22: f64 = ma + mb + ia * rax * rax + ib * rbx * rbx + gamma;
+    var det: f64 = k11 * k22 - k12 * k12;
+    var adet: f64 = f64_abs(det);
+    if (det != det || adet <= _IM_B2_EPSILON || _im_is_finite(det) == 0) { return 0; }
+    var inv: f64 = 1.0 / det;
+    var zero: f64 = 0.0;
+    var inf: f64 = 1.0 / zero;
+    p.rax = rax;
+    p.ray = ray;
+    p.rbx = rbx;
+    p.rby = rby;
+    p.k00 = k22 * inv;
+    p.k01 = -k12 * inv;
+    p.k10 = -k12 * inv;
+    p.k11 = k11 * inv;
+    p.bx = 0.0;
+    p.by = 0.0;
+    p.gamma = gamma;
+    p.max_impulse = inf;
+    p.accx = 0.0;
+    p.accy = 0.0;
+    return 1;
+}
+
+# One iteration of point block p between va and vb. Mirrors `PointBlock::solve`.
+fn _im_b2_point_solve(p: *ImPointBlock, va: *ImJointVel, vb: *ImJointVel, a: *ImBodyRef, b: *ImBodyRef) {
+    var rax: f64 = p.rax;
+    var ray: f64 = p.ray;
+    var rbx: f64 = p.rbx;
+    var rby: f64 = p.rby;
+    var avx: f64 = va.vx;
+    var avy: f64 = va.vy;
+    var aw: f64 = va.w;
+    var bvx: f64 = vb.vx;
+    var bvy: f64 = vb.vy;
+    var bw: f64 = vb.w;
+    var pax: f64 = avx - aw * ray;
+    var pay: f64 = avy + aw * rax;
+    var pbx: f64 = bvx - bw * rby;
+    var pby: f64 = bvy + bw * rbx;
+    var cdx: f64 = pbx - pax;
+    var cdy: f64 = pby - pay;
+    var bx: f64 = p.bx;
+    var by: f64 = p.by;
+    var gamma: f64 = p.gamma;
+    var accx: f64 = p.accx;
+    var accy: f64 = p.accy;
+    var rhx: f64 = cdx + bx + gamma * accx;
+    var rhy: f64 = cdy + by + gamma * accy;
+    var k00: f64 = p.k00;
+    var k01: f64 = p.k01;
+    var k10: f64 = p.k10;
+    var k11: f64 = p.k11;
+    var lx: f64 = -(k00 * rhx + k01 * rhy);
+    var ly: f64 = -(k10 * rhx + k11 * rhy);
+    var nx: f64 = accx + lx;
+    var ny: f64 = accy + ly;
+    var mag: f64 = _im_hypot(nx, ny);
+    var maxi: f64 = p.max_impulse;
+    if (mag > maxi) {
+        nx = nx * maxi / mag;
+        ny = ny * maxi / mag;
+    }
+    if (_im_is_finite(nx) == 0 || _im_is_finite(ny) == 0) {
+        nx = 0.0;
+        ny = 0.0;
+    }
+    var dx: f64 = nx - accx;
+    var dy: f64 = ny - accy;
+    p.accx = nx;
+    p.accy = ny;
+    var ma: f64 = a.inv_mass;
+    var ia: f64 = a.inv_inertia;
+    var mb: f64 = b.inv_mass;
+    var ib: f64 = b.inv_inertia;
+    var ca: f64 = _im_b2_cross(rax, ray, dx, dy);
+    var cb: f64 = _im_b2_cross(rbx, rby, dx, dy);
+    va.vx = avx - dx * ma;
+    va.vy = avy - dy * ma;
+    va.w = aw - ca * ia;
+    vb.vx = bvx + dx * mb;
+    vb.vy = bvy + dy * mb;
+    vb.w = bw + cb * ib;
+    return 0;
+}
+
+# The body reference of handle h (rb its record, or 0): its solver inverses, zero for a static,
+# kinematic or sleeping body. Mirrors `BodyRef::of`.
+fn _im_b2_bodyref(r: *ImBodyRef, h, rb: *ImRigidBody2d) {
+    if (rb == 0) {
+        r.has = 0;
+        r.handle = 0;
+        r.inv_mass = 0.0;
+        r.inv_inertia = 0.0;
+        return 0;
+    }
+    var im, ii = rb.solver_inv_mass();
+    var imf: f64 = im;
+    var iif: f64 = ii;
+    r.has = 1;
+    r.handle = h;
+    r.inv_mass = imf;
+    r.inv_inertia = iif;
+    return 0;
+}
+
+# The prepared joint's linear constraint force this step (for break_force): the point block's impulse
+# magnitude, or the break row's |impulse|, over dt. Mirrors `PreparedJoint::linear_force`.
+#must_use
+fn _im_b2_linear_force(pj: *ImPreparedJoint, rows, dt: f64): f64 {
+    var imp: f64 = 0.0;
+    if (pj.has_point == 1) {
+        var ax: f64 = pj.point.accx;
+        var ay: f64 = pj.point.accy;
+        imp = _im_hypot(ax, ay);
+    } elif (pj.break_row >= 0) {
+        if (pj.break_row < pj.row_count) {
+            var r: *ImJointRow = _im_b2_as_row(rows + (pj.row_start + pj.break_row) * sizeof(ImJointRow));
+            var acc: f64 = r.acc;
+            imp = f64_abs(acc);
+        }
+    }
+    if (dt > _IM_B2_EPSILON) {
+        var f: f64 = imp / dt;
+        return f;
+    }
+    return 0.0;
+}
+
+impl ImPhysicsState2d {
+    # Room in the scratch for n prepared joints and their rows: 1, or 0 when there is no memory.
+    fn _joint_scratch(self, n): i64 {
+        if (n > self.prep_cap) {
+            var cap = n;
+            if (cap < 8) { cap = 8; }
+            var p = fl_alloc(cap * sizeof(ImPreparedJoint));
+            var r = fl_alloc(cap * _IM_B2_MAX_JOINT_ROWS * sizeof(ImJointRow));
+            if (p == 0 || r == 0) { return 0; }
+            if (self.prep != 0) { fl_free(self.prep); }
+            if (self.prep_rows != 0) { fl_free(self.prep_rows); }
+            self.prep = p;
+            self.prep_rows = r;
+            self.prep_cap = cap;
+        }
+        return 1;
+    }
+
+    # Joint j (handle h) prepared for sub-step dt into pj, its rows from row slot `rows`: 1, or 0 when
+    # it constrains nothing (no dynamic mass on either side, a degenerate axis or direction, a spring with
+    # no stiffness or damping, a mouse joint without its body). Mirrors `prepare_joint`.
+    fn _prepare_joint(self, h, j: *ImJoint2d, dt: f64, pj: *ImPreparedJoint, rows): i64 {
+        var ba: *ImRigidBody2d = self._body(j.body_a);
+        var bb: *ImRigidBody2d = self._body(j.body_b);
+        var a: ImBodyRef;
+        var b: ImBodyRef;
+        _im_b2_bodyref(&a, j.body_a, ba);
+        _im_b2_bodyref(&b, j.body_b, bb);
+        var kind = j.joint_type.kind;
+        var rsz = sizeof(ImJointRow);
+        pj.handle = h;
+        pj.has_point = 0;
+        pj.row_count = 0;
+        pj.break_row = 0 - 1;
+        pj.has_break_force = j.has_break_force;
+        var bf: f64 = j.break_force;
+        pj.break_force = bf;
+
+        if (kind == IM_JOINT_MOUSE) {
+            if (ba == 0) { return 0; }
+            var lax: f64 = j.local_anchor_a.x;
+            var lay: f64 = j.local_anchor_a.y;
+            var brot: f64 = ba.rotation;
+            var anx, any = _im_b2_rotate(lax, lay, brot);
+            var gnd: ImBodyRef;
+            _im_b2_bodyref(&gnd, 0, 0);
+            var st: f64 = j.joint_type.stiffness;
+            var dm: f64 = j.joint_type.damping;
+            var sok, sg, sb = _im_b2_soft(st, dm, dt);
+            var gamma: f64 = 0.0;
+            var beta: f64 = 0.0;
+            if (sok == 1) {
+                gamma = sg;
+                beta = sb;
+            }
+            if (_im_b2_point(pj.point, 0.0, 0.0, anx, any, &gnd, &a, gamma) == 0) { return 0; }
+            var px: f64 = ba.position.x;
+            var py: f64 = ba.position.y;
+            var tx: f64 = j.joint_type.target.x;
+            var ty: f64 = j.joint_type.target.y;
+            var ax: f64 = anx;
+            var ay: f64 = any;
+            var cx: f64 = px + ax - tx;
+            var cy: f64 = py + ay - ty;
+            pj.point.bx = cx * beta;
+            pj.point.by = cy * beta;
+            var mf: f64 = j.joint_type.max_force;
+            pj.point.max_impulse = _im_b2_impulse_cap(mf, dt);
+            pj.has_point = 1;
+            pj.a = gnd;
+            pj.b = a;
+            return 1;
+        }
+
+        var pax: f64 = 0.0;
+        var pay: f64 = 0.0;
+        var rot_a: f64 = 0.0;
+        var pbx: f64 = 0.0;
+        var pby: f64 = 0.0;
+        var rot_b: f64 = 0.0;
+        if (ba != 0) {
+            pax = ba.position.x;
+            pay = ba.position.y;
+            rot_a = ba.rotation;
+        }
+        if (bb != 0) {
+            pbx = bb.position.x;
+            pby = bb.position.y;
+            rot_b = bb.rotation;
+        }
+        var ama: f64 = a.inv_mass;
+        var bma: f64 = b.inv_mass;
+        var aia: f64 = a.inv_inertia;
+        var bia: f64 = b.inv_inertia;
+        if (ama == 0.0 && bma == 0.0 && aia == 0.0 && bia == 0.0) { return 0; }
+        var lax2: f64 = j.local_anchor_a.x;
+        var lay2: f64 = j.local_anchor_a.y;
+        var lbx: f64 = j.local_anchor_b.x;
+        var lby: f64 = j.local_anchor_b.y;
+        var rax: f64 = 0.0;
+        var ray: f64 = 0.0;
+        var rbx: f64 = 0.0;
+        var rby: f64 = 0.0;
+        var aax: f64 = lax2;
+        var aay: f64 = lay2;
+        var abx: f64 = lbx;
+        var aby: f64 = lby;
+        if (ba != 0) {
+            var t1, t2 = _im_b2_rotate(lax2, lay2, rot_a);
+            rax = t1;
+            ray = t2;
+            aax = pax + rax;
+            aay = pay + ray;
+        }
+        if (bb != 0) {
+            var t3, t4 = _im_b2_rotate(lbx, lby, rot_b);
+            rbx = t3;
+            rby = t4;
+            abx = pbx + rbx;
+            aby = pby + rby;
+        }
+        var dx: f64 = abx - aax;
+        var dy: f64 = aby - aay;
+        var angle: f64 = rot_b - rot_a;
+        var ref: f64 = j.reference_angle;
+        var n = 0;
+
+        if (kind == IM_JOINT_FIXED || kind == IM_JOINT_REVOLUTE) {
+            if (_im_b2_point(pj.point, rax, ray, rbx, rby, &a, &b, 0.0) == 1) {
+                var pbx2: f64 = _IM_B2_JOINT_BAUMGARTE * dx / dt;
+                var pby2: f64 = _IM_B2_JOINT_BAUMGARTE * dy / dt;
+                pj.point.bx = pbx2;
+                pj.point.by = pby2;
+                pj.has_point = 1;
+            }
+        }
+        if (kind == IM_JOINT_FIXED) {
+            var r0: *ImJointRow = _im_b2_as_row(rows);
+            _im_b2_row(r0, 0.0, 0.0, 1.0, 1.0, &a, &b, 0.0);
+            _im_b2_row_rigid(r0, angle - ref, dt);
+            n = 1;
+        } elif (kind == IM_JOINT_REVOLUTE) {
+            if (j.joint_type.has_limits == 1) {
+                var lo: f64 = j.joint_type.limits.x;
+                var hi: f64 = j.joint_type.limits.y;
+                var rl: *ImJointRow = _im_b2_as_row(rows + n * rsz);
+                _im_b2_row(rl, 0.0, 0.0, 1.0, 1.0, &a, &b, 0.0);
+                _im_b2_row_one_sided(rl, angle - lo, dt);
+                n = n + 1;
+                var ru: *ImJointRow = _im_b2_as_row(rows + n * rsz);
+                _im_b2_row(ru, 0.0, 0.0, -1.0, -1.0, &a, &b, 0.0);
+                _im_b2_row_one_sided(ru, hi - angle, dt);
+                n = n + 1;
+            }
+            if (j.has_motor == 1) {
+                var rm: *ImJointRow = _im_b2_as_row(rows + n * rsz);
+                _im_b2_row(rm, 0.0, 0.0, 1.0, 1.0, &a, &b, 0.0);
+                var tv: f64 = j.motor.target_velocity;
+                rm.bias = -tv;
+                var mf2: f64 = j.motor.max_force;
+                var cap: f64 = _im_b2_impulse_cap(mf2, dt);
+                rm.lo = -cap;
+                rm.hi = cap;
+                n = n + 1;
+            }
+        } elif (kind == IM_JOINT_PRISMATIC || kind == IM_JOINT_WHEEL) {
+            var axx: f64 = j.joint_type.axis.x;
+            var axy: f64 = j.joint_type.axis.y;
+            var wx, wy = _im_b2_rotate(axx, axy, rot_a);
+            var nok, ux0, uy0 = _im_b2_normalize(wx, wy);
+            if (nok == 0) { return 0; }
+            var ux: f64 = ux0;
+            var uy: f64 = uy0;
+            var px2: f64 = -uy;
+            var py2: f64 = ux;
+            var armx: f64 = dx + rax;
+            var army: f64 = dy + ray;
+            pj.break_row = n;
+            var rp: *ImJointRow = _im_b2_as_row(rows + n * rsz);
+            _im_b2_row(rp, px2, py2, _im_b2_cross(armx, army, px2, py2), _im_b2_cross(rbx, rby, px2, py2), &a, &b, 0.0);
+            var perr: f64 = dx * px2 + dy * py2;
+            _im_b2_row_rigid(rp, perr, dt);
+            n = n + 1;
+            var tr: f64 = dx * ux + dy * uy;
+            var caa: f64 = _im_b2_cross(armx, army, ux, uy);
+            var cbb: f64 = _im_b2_cross(rbx, rby, ux, uy);
+            if (kind == IM_JOINT_PRISMATIC) {
+                var rg: *ImJointRow = _im_b2_as_row(rows + n * rsz);
+                _im_b2_row(rg, 0.0, 0.0, 1.0, 1.0, &a, &b, 0.0);
+                _im_b2_row_rigid(rg, angle - ref, dt);
+                n = n + 1;
+                if (j.joint_type.has_limits == 1) {
+                    var plo: f64 = j.joint_type.limits.x;
+                    var phi: f64 = j.joint_type.limits.y;
+                    var rpl: *ImJointRow = _im_b2_as_row(rows + n * rsz);
+                    _im_b2_row(rpl, ux, uy, caa, cbb, &a, &b, 0.0);
+                    _im_b2_row_one_sided(rpl, tr - plo, dt);
+                    n = n + 1;
+                    var rpu: *ImJointRow = _im_b2_as_row(rows + n * rsz);
+                    _im_b2_row(rpu, ux, uy, caa, cbb, &a, &b, 0.0);
+                    rpu.lx = -ux;
+                    rpu.ly = -uy;
+                    rpu.ang_a = -caa;
+                    rpu.ang_b = -cbb;
+                    _im_b2_row_one_sided(rpu, phi - tr, dt);
+                    n = n + 1;
+                }
+                if (j.has_motor == 1) {
+                    var rpm: *ImJointRow = _im_b2_as_row(rows + n * rsz);
+                    _im_b2_row(rpm, ux, uy, caa, cbb, &a, &b, 0.0);
+                    var ptv: f64 = j.motor.target_velocity;
+                    rpm.bias = -ptv;
+                    var pmf: f64 = j.motor.max_force;
+                    var pcap: f64 = _im_b2_impulse_cap(pmf, dt);
+                    rpm.lo = -pcap;
+                    rpm.hi = pcap;
+                    n = n + 1;
+                }
+            } else {
+                var wst: f64 = j.joint_type.stiffness;
+                var wdm: f64 = j.joint_type.damping;
+                var wok, wg, wb = _im_b2_soft(wst, wdm, dt);
+                if (wok == 1) {
+                    var wgf: f64 = wg;
+                    var wbf: f64 = wb;
+                    var rw: *ImJointRow = _im_b2_as_row(rows + n * rsz);
+                    _im_b2_row(rw, ux, uy, caa, cbb, &a, &b, wgf);
+                    rw.bias = tr * wbf;
+                    n = n + 1;
+                }
+            }
+        } elif (kind == IM_JOINT_SPRING || kind == IM_JOINT_DISTANCE || kind == IM_JOINT_ROPE) {
+            var dok, du0, dv0 = _im_b2_normalize(dx, dy);
+            if (dok == 0) { return 0; }
+            var dux: f64 = du0;
+            var duy: f64 = dv0;
+            var dist: f64 = _im_hypot(dx, dy);
+            var cra: f64 = _im_b2_cross(rax, ray, dux, duy);
+            var crb: f64 = _im_b2_cross(rbx, rby, dux, duy);
+            var rs: *ImJointRow = _im_b2_as_row(rows);
+            if (kind == IM_JOINT_SPRING) {
+                var sst: f64 = j.joint_type.stiffness;
+                var sdm: f64 = j.joint_type.damping;
+                var sok2, sg2, sb2 = _im_b2_soft(sst, sdm, dt);
+                if (sok2 == 0) { return 0; }
+                var sgf: f64 = sg2;
+                var sbf: f64 = sb2;
+                _im_b2_row(rs, dux, duy, cra, crb, &a, &b, sgf);
+                var rl2: f64 = j.joint_type.rest_length;
+                rs.bias = (dist - rl2) * sbf;
+            } elif (kind == IM_JOINT_DISTANCE) {
+                _im_b2_row(rs, dux, duy, cra, crb, &a, &b, 0.0);
+                var len: f64 = j.joint_type.length;
+                _im_b2_row_rigid(rs, dist - len, dt);
+            } else {
+                _im_b2_row(rs, -dux, -duy, -cra, -crb, &a, &b, 0.0);
+                var ml: f64 = j.joint_type.max_length;
+                _im_b2_row_one_sided(rs, ml - dist, dt);
+            }
+            pj.break_row = 0;
+            n = 1;
+        } else {
+            return 0;
+        }
+
+        # Generic joint damping (springs, wheels and mice have their own).
+        var jd: f64 = j.damping;
+        if (jd > 0.0 && _im_is_finite(jd) == 1) {
+            var gamma2: f64 = 1.0 / (dt * jd);
+            if (kind == IM_JOINT_REVOLUTE || kind == IM_JOINT_WHEEL) {
+                _im_b2_row(_im_b2_as_row(rows + n * rsz), 0.0, 0.0, 1.0, 1.0, &a, &b, gamma2);
+                n = n + 1;
+            } elif (kind == IM_JOINT_PRISMATIC) {
+                var dax: f64 = j.joint_type.axis.x;
+                var day: f64 = j.joint_type.axis.y;
+                var qx, qy = _im_b2_rotate(dax, day, rot_a);
+                var qok, qu0, qv0 = _im_b2_normalize(qx, qy);
+                if (qok == 1) {
+                    var qux: f64 = qu0;
+                    var quy: f64 = qv0;
+                    var qarmx: f64 = dx + rax;
+                    var qarmy: f64 = dy + ray;
+                    var qa: f64 = _im_b2_cross(qarmx, qarmy, qux, quy);
+                    var qb: f64 = _im_b2_cross(rbx, rby, qux, quy);
+                    _im_b2_row(_im_b2_as_row(rows + n * rsz), qux, quy, qa, qb, &a, &b, gamma2);
+                    n = n + 1;
+                }
+            } elif (kind == IM_JOINT_DISTANCE || kind == IM_JOINT_ROPE) {
+                var eok, eu0, ev0 = _im_b2_normalize(dx, dy);
+                if (eok == 1) {
+                    var eux: f64 = eu0;
+                    var euy: f64 = ev0;
+                    var ea: f64 = _im_b2_cross(rax, ray, eux, euy);
+                    var eb: f64 = _im_b2_cross(rbx, rby, eux, euy);
+                    _im_b2_row(_im_b2_as_row(rows + n * rsz), eux, euy, ea, eb, &a, &b, gamma2);
+                    n = n + 1;
+                }
+            }
+        }
+        pj.a = a;
+        pj.b = b;
+        pj.row_count = n;
+        return 1;
+    }
+
+    # Every joint's constraints for sub-step dt, in joint slot order, into the scratch: the number
+    # prepared (none for dt not above EPSILON; -1 when there is no memory). Mirrors `prepare_joints`.
+    fn prepare_joints(self, dt: f64): i64 {
+        self.prep_len = 0;
+        if (!(dt > _IM_B2_EPSILON)) { return 0; }
+        var ja: *ImArena = self._joints();
+        if (self._joint_scratch(ja.len()) == 0) { return 0 - 1; }
+        var psz = sizeof(ImPreparedJoint);
+        var rsz = sizeof(ImJointRow);
+        var n = 0;
+        for (var s = 0; s < ja.slot_count(); s = s + 1) {
+            var h = ja.slot_handle(s);
+            if (h != 0 - 1) {
+                var pj: *ImPreparedJoint = _im_b2_as_prep(self.prep + n * psz);
+                var rows = self.prep_rows + n * _IM_B2_MAX_JOINT_ROWS * rsz;
+                if (self._prepare_joint(h, ja.get(h), dt, pj, rows) == 1) {
+                    pj.row_start = n * _IM_B2_MAX_JOINT_ROWS;
+                    n = n + 1;
+                }
+            }
+        }
+        self.prep_len = n;
+        return n;
+    }
+
+    # One Gauss–Seidel pass over the prepared joints: each joint's rows, then its point block, on its
+    # bodies' velocities, written back to the sides that have mass. Mirrors `solve_joints_once`.
+    fn solve_joints_once(self) {
+        var psz = sizeof(ImPreparedJoint);
+        var rsz = sizeof(ImJointRow);
+        for (var i = 0; i < self.prep_len; i = i + 1) {
+            var pj: *ImPreparedJoint = _im_b2_as_prep(self.prep + i * psz);
+            var va: ImJointVel;
+            var vb: ImJointVel;
+            self._joint_vel(pj.a, &va);
+            self._joint_vel(pj.b, &vb);
+            for (var r = 0; r < pj.row_count; r = r + 1) {
+                _im_b2_row_solve(_im_b2_as_row(self.prep_rows + (pj.row_start + r) * rsz), &va, &vb, pj.a, pj.b);
+            }
+            if (pj.has_point == 1) { _im_b2_point_solve(pj.point, &va, &vb, pj.a, pj.b); }
+            self._joint_store(pj.a, &va);
+            self._joint_store(pj.b, &vb);
+        }
+        return 0;
+    }
+
+    # The velocity of body reference r into v (zero for none or a missing body).
+    fn _joint_vel(self, r: *ImBodyRef, v: *ImJointVel) {
+        v.vx = 0.0;
+        v.vy = 0.0;
+        v.w = 0.0;
+        if (r.has == 0) { return 0; }
+        var rb: *ImRigidBody2d = self._body(r.handle);
+        if (rb == 0) { return 0; }
+        var vx: f64 = rb.linear_velocity.x;
+        var vy: f64 = rb.linear_velocity.y;
+        var w: f64 = rb.angular_velocity;
+        v.vx = vx;
+        v.vy = vy;
+        v.w = w;
+        return 0;
+    }
+
+    # Writes v back to body reference r's body when that side has mass.
+    fn _joint_store(self, r: *ImBodyRef, v: *ImJointVel) {
+        var im: f64 = r.inv_mass;
+        var ii: f64 = r.inv_inertia;
+        if (!(im > 0.0 || ii > 0.0) || r.has == 0) { return 0; }
+        var rb: *ImRigidBody2d = self._body(r.handle);
+        if (rb == 0) { return 0; }
+        var vx: f64 = v.vx;
+        var vy: f64 = v.vy;
+        var w: f64 = v.w;
+        rb.linear_velocity = ImVec2_new(vx, vy);
+        rb.angular_velocity = w;
+        return 0;
+    }
+
+    # Removes, in prepared order, the joints whose linear constraint force this step exceeded their
+    # break_force. Mirrors `break_joints`.
+    fn break_joints(self, dt: f64) {
+        var psz = sizeof(ImPreparedJoint);
+        var ja: *ImArena = self._joints();
+        for (var i = 0; i < self.prep_len; i = i + 1) {
+            var pj: *ImPreparedJoint = _im_b2_as_prep(self.prep + i * psz);
+            if (pj.has_break_force == 1) {
+                var limit: f64 = pj.break_force;
+                var f: f64 = _im_b2_linear_force(pj, self.prep_rows, dt);
+                if (f > limit) { ja.remove(pj.handle, 0); }
+            }
+        }
+        return 0;
+    }
+}
