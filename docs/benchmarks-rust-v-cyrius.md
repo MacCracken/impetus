@@ -524,3 +524,23 @@ now run through `ImPhysicsWorld`, as Rust's do; part 3 ran them through the back
   broadphase's rebuild for that one box; the world adds 0.28 µs. Rust's whole frame takes 338 ns. That fixed cost is
   a small part of the 10-body frame's 56 µs, so part 3's 11× rows are still unexplained. Recorded as a finding, not
   acted on (speed is measured, not gated).
+
+## ADR 0008 #4: the full 3D body state (2026-11-10)
+
+x86_64 ELF, quiet machine. Rust's rows are criterion on the 3D build (`cargo bench --all-features --
+'mutation/get_body_state|mutation/set_body_state'`, medians). Cyrius runs the same scenes through the 3D world.
+
+| Bench | Body | Rust (3D build) | Cyrius | Ratio |
+|---|---|---|---|---|
+| `b3/mutation/get_body_state` | a ball's state read (`mutation/get_body_state`) | 11.5 ns | 40 ns | 3.5× |
+| `b3/mutation/set_body_state` | a state written (`mutation/set_body_state`) | 26.9 ns | 379 ns | 14× |
+| `b3/get_body_state` | part 1's row: a state read on the 3D state | — | 40 ns | — |
+
+**Reading it.**
+- **A get is now a copy.** Part 1's `b3/get_body_state` took 338 ns, nearly all of it the correctly rounded `atan2`
+  of 2·atan2(q.z, q.w). The 2.0 state copies the quaternion instead, and Rust, which still computes its `atan2`, is
+  3.5× faster.
+- **A set is mostly the inertia refresh.** Rust's set computes a `sin_cos` for its angle; the 2.0 set stores the
+  quaternion. Both then refresh R·I⁻¹·Rᵀ: a quaternion-to-matrix conversion and two 3×3 products. A one-off probe
+  timed the port's refresh alone at 304 ns of the 379. Its chain of by-value struct calls is the cost, as in M4's math
+  rows. Recorded, not acted on.

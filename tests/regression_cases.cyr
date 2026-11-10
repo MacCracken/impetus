@@ -1,7 +1,9 @@
 # regression_cases.cyr — the tests of rust-old/tests/integration.rs (9) and rust-old/tests/regressions.rs that
 # Rust runs on both backends (12), as class R references (port plan §5). tests/regressions.tcyr runs them on the
 # 2D profile with its 14 2D-only tests, tests/b3_regressions.tcyr on the 3D profile with its one 3D-only test, as
-# Rust's own cfg gates split them. The including file includes its profile's module list first.
+# Rust's own cfg gates split them. The including file includes its profile's module list first, and defines
+# `rot_angle(s: ImBodyState): f64`, a state's rotation angle (the 2D angle; in 3D the quaternion's whole angle,
+# ADR 0008 #4).
 
 var EPS: f64 = 0.000001;
 
@@ -361,7 +363,7 @@ fn regression_cases() {
     s = state(&w, ob);
     var ox: f64 = s.position.x;
     var oy: f64 = s.position.y;
-    var orr: f64 = s.rotation;
+    var orr: f64 = rot_angle(s);
     var aor: f64 = f64_abs(orr);
     assert_eq(near(ox, 8.0, 0.05) == 1 && near(oy, 1.0, 0.05) == 1 && aor < 0.05, 1, "rests, no spin");
     w.free();

@@ -7,11 +7,17 @@
 //!   `AddJoint` + `JointDesc` → the joint handle;
 //! - `ApplyForce` / `ApplyImpulse` + body handle + vector and point; `ApplyTorque` + handle + value → nothing;
 //! - `RemoveBody`, `RemoveCollider`, `RemoveJoint` + handle → `i:0`, or the error (`E:`);
-//! - `GetBodyState` + handle → the `BodyState` (its rotation 2·atan2(q.z, q.w)), or `E:BodyNotFound`; `SetBodyState`
-//!   + handle + state and `SetBodyType` + handle + type → `i:0` or the error; `BodyCount` → the count.
+//! - `GetBodyState` + handle → the body's full state, or `E:BodyNotFound`; `SetBodyState` + handle + state and
+//!   `SetBodyType` + handle + type → `i:0` or the error; `BodyCount` → the count.
 //!
-//! Class C: a body's rotation is `from_rotation_z` (a `sin_cos`) and a state's is an `atan2`, both correctly rounded
-//! in the port (ADR 0011), so the reference is the corrected oracle; the rest is copies and the mass sums. Rows whose
+//! A state is the 2.0 3D `BodyState` (ADR 0008 #4, 16 tokens: handle, type, position, the rotation quaternion
+//! x, y, z, w, linear velocity, the angular-velocity vector, sleeping). Rust 1.4.0's has an angle and a spin about z, so
+//! the hidden oracle hook supplies the rest: a get is the body's full state from the dump, and a set carries the state
+//! Rust stores for its angle and spin, `DQuat::from_rotation_z(angle)` and (0, 0, spin), checked against the dump after
+//! the call.
+//!
+//! Class C: a body's rotation is `from_rotation_z` (a `sin_cos`), correctly rounded in the port (ADR 0011), so the
+//! reference is the corrected oracle; the rest is copies and the mass sums. Rows whose
 //! script adds a collider or joint for a missing body (an orphan, ADR 0008 #1) are `b3::state_script_orphan`; rows
 //! adding a Revolute or Prismatic joint or a motor, which the 3D API refuses (ADR 0008 #5), are
 //! `b3::state_script_unsupported`. No other script adds one.
@@ -24,10 +30,12 @@ use impetus::{
     WorldConfig,
 };
 
+use hisab::DQuat;
+
 use crate::dump3d;
 use crate::flat::{self, handle};
 use crate::grids::Rng;
-use crate::tsv::{Class, Module, Tok, e, f};
+use crate::tsv::{Class, Module, Tok, b, e, f};
 
 #[derive(Debug, Clone, Copy)]
 enum Op {
@@ -71,6 +79,20 @@ fn unit<E: std::fmt::Debug>(r: Result<(), E>) -> Vec<Tok> {
             vec![Tok::Err(s.split('(').next().unwrap_or("").to_string())]
         }
     }
+}
+
+/// The body with this handle in a 3D dump.
+fn body_dump(d: &impetus::oracle::Backend3dDump, h: u64) -> &impetus::oracle::Body3dDump {
+    d.bodies.iter().find(|b| b.handle == h).expect("a live body is in the dump")
+}
+
+/// The 16 tokens of a 2.0 3D `BodyState` (ADR 0008 #4): handle, type, position, the rotation quaternion (x, y, z, w),
+/// linear velocity, angular velocity, sleeping.
+fn state3(h: u64, t: BodyType, pos: [f64; 3], q: [f64; 4], v: [f64; 3], w: [f64; 3], sleeping: bool) -> Vec<Tok> {
+    let mut out = vec![handle(h), e("BodyType", t)];
+    out.extend(pos.iter().chain(&q).chain(&v).chain(&w).map(|&x| f(x)));
+    out.push(b(sleeping));
+    out
 }
 
 /// Runs a script on a fresh world: (inputs, outputs).
@@ -124,14 +146,44 @@ fn run(steps: &[Step]) -> (Vec<Tok>, Vec<Tok>) {
             Step::GetBodyState(h) => {
                 ins.extend([e("Op", Op::GetBodyState), handle(h.0)]);
                 match w.get_body_state(*h) {
-                    Ok(st) => outs.extend(flat::body_state(&st)),
+                    Ok(st) => {
+                        let d = w.oracle_dump();
+                        let b = body_dump(&d.backend, h.0);
+                        assert!(b.position == st.position && b.linear_velocity == st.linear_velocity);
+                        outs.extend(state3(
+                            st.handle.0,
+                            st.body_type,
+                            st.position,
+                            b.rotation,
+                            st.linear_velocity,
+                            b.angular_velocity,
+                            st.is_sleeping,
+                        ));
+                    }
                     Err(err) => outs.extend(unit::<impetus::ImpetusError>(Err(err))),
                 }
             }
             Step::SetBodyState(h, st) => {
                 ins.extend([e("Op", Op::SetBodyState), handle(h.0)]);
-                ins.extend(flat::body_state(st));
-                outs.extend(unit(w.set_body_state(*h, st)));
+                let q = DQuat::from_rotation_z(st.rotation).to_array();
+                let spin = [0.0, 0.0, st.angular_velocity];
+                ins.extend(state3(
+                    st.handle.0,
+                    st.body_type,
+                    st.position,
+                    q,
+                    st.linear_velocity,
+                    spin,
+                    st.is_sleeping,
+                ));
+                let r = w.set_body_state(*h, st);
+                if r.is_ok() {
+                    let d = w.oracle_dump();
+                    let b = body_dump(&d.backend, h.0);
+                    let same = |a: &[f64], c: &[f64]| a.iter().zip(c).all(|(x, y)| x.to_bits() == y.to_bits());
+                    assert!(same(&b.rotation, &q) && same(&b.angular_velocity, &spin), "set_body_state stores another state");
+                }
+                outs.extend(unit(r));
             }
             Step::SetBodyType(h, t) => {
                 ins.extend([e("Op", Op::SetBodyType), handle(h.0), e("BodyType", *t)]);

@@ -6,10 +6,12 @@
 # M4 part 1: glam's value math (src/math3.cyr) beside hisab's allocating calls for the same operation (ADR 0012's
 # trade), the gyroscopic step, body integration, the mass recompute and a world AABB. M4 part 2: the narrowphase.
 # M4 part 3: the raycast. M5 part 1: the 3D state, Rust's bodies/* and forces/apply_* loops (Rust's own numbers from the
-# 3D build), and get_body_state, which reads the rotation back through the correctly rounded atan2. M5 part 2: the
+# 3D build), and get_body_state (since ADR 0008 #4 a copy of the full state; part 1 read the rotation back through the
+# correctly rounded atan2). M5 part 2: the
 # gyroscopic velocity step, a 20-link chain's joint work for one sub-step, and its whole frame (mask 0, so no
 # contacts). M5 part 3: Rust's `world/step_*` scenes on the 3D build. M5 part 4: those scenes through ImPhysicsWorld
-# (as Rust's rows run), and Rust's `particles/*` rows on the 3D world.
+# (as Rust's rows run), and Rust's `particles/*` rows on the 3D world. ADR 0008 #4: Rust's `mutation/get_body_state`
+# and `set_body_state` on the 3D world.
 
 include "tests/lib_3d.cyr"
 include "tests/frame3.cyr"
@@ -570,6 +572,41 @@ fn bench_step3_world() {
     return 0;
 }
 
+# Rust's mutation/get_body_state and mutation/set_body_state on the 3D world: a ball's state read, and a state written
+# (Rust's angle 0.5 and spin 0.1 about z, as the 2.0 state of that rotation, ADR 0008 #4).
+fn bench_mutation3() {
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    var h = w.add_body(ImBodyDesc_default());
+    var tc, cc = w.add_collider(h, ImColliderDesc_new(ImColliderShape_ball(0.5)));
+    var bs: ImBodyState;
+    var bg = bench_new("b3/mutation/get_body_state");
+    bench_batch_start(bg);
+    for (var r = 0; r < 1000000; r = r + 1) {
+        var tg, vg = w.get_body_state(h, &bs);
+        g_sink = tg;
+    }
+    bench_batch_stop(bg, 1000000);
+    bench_report(bg);
+    var st: ImBodyState;
+    st.handle = h;
+    st.body_type = IM_BODY_DYNAMIC;
+    st.position = ImVec3_new(5.0, 10.0, 0.0);
+    st.rotation = ImQuat_from_rotation_z(0.5);
+    st.linear_velocity = ImVec3_new(1.0, 2.0, 0.0);
+    st.angular_velocity = ImVec3_new(0.0, 0.0, 0.1);
+    st.is_sleeping = 0;
+    var bset = bench_new("b3/mutation/set_body_state");
+    bench_batch_start(bset);
+    for (var r2 = 0; r2 < 1000000; r2 = r2 + 1) {
+        var ts, vs = w.set_body_state(h, st);
+        g_sink = ts;
+    }
+    bench_batch_stop(bset, 1000000);
+    bench_report(bset);
+    w.free();
+    return 0;
+}
+
 # Runs the 3D benches.
 fn main() {
     alloc_init();
@@ -581,6 +618,7 @@ fn main() {
     bench_states3();
     bench_step3();
     bench_step3_world();
+    bench_mutation3();
     return 0;
 }
 

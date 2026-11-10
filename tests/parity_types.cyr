@@ -161,32 +161,7 @@ fn _par_got_body_desc(d: ImBodyDesc) {
     return 0;
 }
 
-fn _par_in_body_state(k): ImBodyState {
-    var s: ImBodyState;
-    s.handle = _par_in(k);
-    s.body_type = _par_in_enum(k + 1, "BodyType.", &body_type_name, 3);
-    s.position = _par_in_v3(k + 2);
-    var rot: f64 = _par_in(k + 5);
-    s.rotation = rot;
-    s.linear_velocity = _par_in_v3(k + 6);
-    var av: f64 = _par_in(k + 9);
-    s.angular_velocity = av;
-    s.is_sleeping = _par_in(k + 10);
-    return s;
-}
-
-fn _par_got_body_state(s: ImBodyState) {
-    var rot: f64 = s.rotation;
-    var av: f64 = s.angular_velocity;
-    _par_got_i(s.handle);
-    _par_got_enum("BodyType.", body_type_name(s.body_type));
-    _par_got_v3(s.position);
-    _par_got_f(rot);
-    _par_got_v3(s.linear_velocity);
-    _par_got_f(av);
-    _par_got_i(s.is_sleeping);
-    return 0;
-}
+# `_par_in_body_state` and `_par_got_body_state` are each harness's own: `ImBodyState` differs by profile (ADR 0008 #4).
 
 # A freelist copy of the n input words from token k (0 when n is 0).
 fn _par_in_words(k, n): i64 {

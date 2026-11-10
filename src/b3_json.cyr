@@ -1,0 +1,73 @@
+# b3_json.cyr — the 3D profile's JSON (ADR 0010): `BodyState` with its full orientation (ADR 0008 #4). It comes after
+# the shared src/json.cyr, whose writers and readers it uses; src/b2_json.cyr is the 2D counterpart.
+#
+# The document is what serde_json writes for the 2.0 struct: `rotation` the quaternion as glam serializes a `DQuat`,
+# `[x,y,z,w]`, and `angular_velocity` a 3-element array. Rust 1.4.0's 3D `BodyState` has a number in each; that
+# document is refused here, as any other with a field of the wrong shape.
+
+impl ImBodyState {
+    # Appends the state as serde_json writes the 2.0 3D `BodyState`.
+    fn to_json(self, sb) {
+        var q[32];
+        var qx: f64 = self.rotation.x;
+        var qy: f64 = self.rotation.y;
+        var qz: f64 = self.rotation.z;
+        var qw: f64 = self.rotation.w;
+        store64(&q, qx);
+        store64(&q + 8, qy);
+        store64(&q + 16, qz);
+        store64(&q + 24, qw);
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "handle", 1);
+        _im_jw_u64(sb, self.handle);
+        _im_jw_key(sb, "body_type", 0);
+        _im_jw_name(sb, body_type_name(self.body_type));
+        _im_jw_key(sb, "position", 0);
+        _im_jw_vec3(sb, self.position);
+        _im_jw_key(sb, "rotation", 0);
+        _im_jw_f64_list(sb, &q, 4);
+        _im_jw_key(sb, "linear_velocity", 0);
+        _im_jw_vec3(sb, self.linear_velocity);
+        _im_jw_key(sb, "angular_velocity", 0);
+        _im_jw_vec3(sb, self.angular_velocity);
+        _im_jw_key(sb, "is_sleeping", 0);
+        _im_jw_bool(sb, self.is_sleeping);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a 3D `BodyState` document (every field required; `rotation` four numbers, `angular_velocity` three) into
+# *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+#must_use
+fn ImBodyState_from_json(buf, len, out: *ImBodyState): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 7);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var s: ImBodyState;
+    var w[8];
+    if (_im_jr_u64(_im_jr_at(o, f, 0, "handle"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.handle = load64(&w);
+    if (_im_jr_body_type(_im_jr_at(o, f, 1, "body_type"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.body_type = load64(&w);
+    var pos: ImVec3 = ImVec3_zero();
+    if (_im_jr_vec3(_im_jr_at(o, f, 2, "position"), &pos) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.position = pos;
+    var q[32];
+    if (_im_jr_f64s(_im_jr_at(o, f, 3, "rotation"), 4, &q) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var qx: f64 = load64(&q);
+    var qy: f64 = load64(&q + 8);
+    var qz: f64 = load64(&q + 16);
+    var qw: f64 = load64(&q + 24);
+    s.rotation = ImQuat_new(qx, qy, qz, qw);
+    var lv: ImVec3 = ImVec3_zero();
+    if (_im_jr_vec3(_im_jr_at(o, f, 4, "linear_velocity"), &lv) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.linear_velocity = lv;
+    var av: ImVec3 = ImVec3_zero();
+    if (_im_jr_vec3(_im_jr_at(o, f, 5, "angular_velocity"), &av) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.angular_velocity = av;
+    if (_im_jr_bool(_im_jr_at(o, f, 6, "is_sleeping"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.is_sleeping = load64(&w);
+    memcpy(out, &s, sizeof(ImBodyState));
+    return Ok(0);
+}

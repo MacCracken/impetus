@@ -1065,11 +1065,39 @@ fails when either drifts from `cyrius.cyml`.
   the committed tree had 44: test helpers and `main`s, three constructors in `src/`, and `ImCollider3d_from_desc`,
   whose comment part 3 separated from it by inserting `_im_b3_coll_shape` between them. The earlier parts read the
   audit's output and missed its exit code. All 44 now have one, and the audit exits 0.
-- **Not done: ADR 0008 #4.** The ADR gives the 3D `BodyState` a full quaternion and angular-velocity vector. Part 1
-  ported Rust's rotation about z, and that is unchanged here. The world only passes the state through, so #4 changes
-  `src/b3_state.cyr` and the shared `ImBodyState` alone. It pairs with M6's `BodySnapshot`.
+- **ADR 0008 #4** (the full 3D `BodyState`) was not part of this section. It came next, in §24.
 - **Result:** 3D **29,404 ok, 0 failed, 11 accepted (ADR 11: 5, ADR 0008: 6)** over 8 modules; 2D unchanged at
   **98,873 ok**. The same on x86_64 ELF, x86_64 PE and aarch64. Surface parity is 637 across 29 modules.
+
+## 24. ADR 0008 #4: the full 3D body state (2026-11-10)
+
+- **The type.** `ImBodyState` left the shared `src/types.cyr` for each profile's types file. The 2D one is Rust's.
+  The 3D one (`src/b3_types.cyr`) has `rotation: ImQuat` (x, y, z, w) and `angular_velocity: ImVec3`. Its JSON codec
+  went with it, from `src/json.cyr` to `src/b2_json.cyr` (unchanged) and the new `src/b3_json.cyr`, each after the
+  shared JSON module in its profile. The 3D document is serde's for the 2.0 struct, `"rotation":[x,y,z,w]` and
+  `"angular_velocity":[x,y,z]`. Rust 1.4.0's 3D document is refused.
+- **Get and set.** `get_body_state` copies the body's quaternion and angular velocity (no more `atan2`).
+  `set_body_state` stores them as given, then wakes the body and refreshes R·I⁻¹·Rᵀ. Rust's call with angle θ and spin ω
+  is the 2.0 call with `ImQuat_from_rotation_z(θ)` and (0, 0, ω), bit for bit. The ADR's amendment records the
+  choices: a type per profile, no normalizing on set, `BodyDesc` unchanged.
+- **`b3_state.tsv`** keeps its 414 scripts; 313 of them read or write a state. A get's outputs are now the body's
+  full state from the oracle's dump, 16 tokens with the quaternion and the angular-velocity vector. A set's inputs
+  are the state Rust stores for its angle and spin, `DQuat::from_rotation_z(θ)` and (0, 0, ω). The generator asserts,
+  after every set, that the dump holds that state bit for bit. Both compare by value, with no mapping. The scripts
+  still need 2 corrections, both from `add_body`'s `from_rotation_z`. A get no longer needs `atan2`, and a set no longer
+  needs `sin_cos`. **All 408 plain scripts are 0 ulp** (101,874 floats). Reverting the get to Rust's spin about z alone
+  fails 7. `validate.py`'s model reads and writes the same 16 tokens and no longer takes an `atan2`.
+- **Tests.** `tests/b3_state.tcyr` (34 assertions, +6):
+  - Rust's `set_body_state_teleports` with its angle as `ImQuat_from_rotation_z(1.0)`, reading the whole state back;
+  - an arbitrary orientation and spin read back exactly, the body woken, R·I⁻¹·Rᵀ for the new orientation, and a
+    frame integrating from the state set;
+  - the 3D JSON: an exact round trip, the document's text, and Rust 1.4.0's document refused.
+
+  `off_centre_box_rests_without_spin`, shared by both profiles, reads the rotation through a helper each runner
+  defines: the 2D angle, or the quaternion's whole angle in 3D. That is stricter than Rust's angle about z. The
+  body-state token helpers moved from `tests/parity_types.cyr` to each harness.
+- **Result:** 3D **29,404 ok, 0 failed, 11 accepted (ADR 11: 5, ADR 0008: 6)**; 2D unchanged at **98,873 ok**. The same
+  on x86_64 ELF, x86_64 PE and aarch64. Surface parity is 637 across 29 modules.
 
 ## How to reproduce
 

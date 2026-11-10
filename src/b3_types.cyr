@@ -11,6 +11,21 @@
 # field: cyrius 6.7.18 stores the field argument instead of the result in `s.f = g(s.e)` (filed upstream,
 # cyrius docs/development/issues/2026-11-09-field-store-of-struct-call-copies-a-field-argument.md).
 
+# ── the public body state ───────────────────────────────────────────────────────────
+
+# A body's public state in 3D: its full orientation and angular velocity (ADR 0008 #4; Rust 1.4.0's keeps a rotation
+# and a spin about z only). `rotation` is a unit quaternion, (x, y, z, w) as glam's `DQuat`. Mirrors `BodyState`
+# (src/b2_types.cyr has the 2D profile's). Its JSON is src/b3_json.cyr's.
+struct ImBodyState {
+    handle;
+    body_type;
+    position: ImVec3;
+    rotation: ImQuat;
+    linear_velocity: ImVec3;
+    angular_velocity: ImVec3;
+    is_sleeping;
+}
+
 # ── rigid bodies ────────────────────────────────────────────────────────────────────
 
 struct ImRigidBody3d {

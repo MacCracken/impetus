@@ -110,6 +110,35 @@ fn _par_atan2_poly(y, x): i64 {
     return f64_add(q, F64_PI);
 }
 
+# ── the 2D body state (flat::body_state's 11 tokens) ────────────────────────────────────
+
+fn _par_in_body_state(k): ImBodyState {
+    var s: ImBodyState;
+    s.handle = _par_in(k);
+    s.body_type = _par_in_enum(k + 1, "BodyType.", &body_type_name, 3);
+    s.position = _par_in_v3(k + 2);
+    var rot: f64 = _par_in(k + 5);
+    s.rotation = rot;
+    s.linear_velocity = _par_in_v3(k + 6);
+    var av: f64 = _par_in(k + 9);
+    s.angular_velocity = av;
+    s.is_sleeping = _par_in(k + 10);
+    return s;
+}
+
+fn _par_got_body_state(s: ImBodyState) {
+    var rot: f64 = s.rotation;
+    var av: f64 = s.angular_velocity;
+    _par_got_i(s.handle);
+    _par_got_enum("BodyType.", body_type_name(s.body_type));
+    _par_got_v3(s.position);
+    _par_got_f(rot);
+    _par_got_v3(s.linear_velocity);
+    _par_got_f(av);
+    _par_got_i(s.is_sleeping);
+    return 0;
+}
+
 # ── dispatch ────────────────────────────────────────────────────────────────────────
 # Each module's dispatcher fills the got list for one row. It returns 1 when it handled the
 # function, 0 when the function is pending (not ported), or -1 when the inputs are unusable (a

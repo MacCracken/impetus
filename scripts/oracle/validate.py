@@ -640,18 +640,6 @@ def _logged_pow(log):
     return f
 
 
-def _logged_atan2(log):
-    """MPFR's correctly rounded atan2(y, x), recording each call glibc rounds otherwise into `log`."""
-    def f(y, x):
-        want = MPFR.cr2("atan2", y, x)
-        got = _LIBM.atan2(y, x)
-        if not same(got, want):
-            log.append(f"atan2(f:{bits(y):016x}, f:{bits(x):016x}) glibc f:{bits(got):016x} "
-                       f"correctly rounded f:{bits(want):016x}")
-        return want
-    return f
-
-
 def corrections(module, rows):
     """(fn, inputs text, corrected outputs text, note) for every row of `module` whose outputs change
     when every exp, sin and cos result is correctly rounded."""
@@ -695,7 +683,7 @@ def corrections(module, rows):
                 out.append((fn, " ".join(ins), " ".join(toks), "oracle " + " ".join(outs) + "; " + "; ".join(seen)))
             continue
         elif module == "b3_state":
-            toks = _b3_state_row(ins, prim["sin"], prim["cos"], _logged_atan2(log))
+            toks = _b3_state_row(ins, prim["sin"], prim["cos"])
             if not _same_tokens(outs, toks):
                 seen = list(dict.fromkeys(log))
                 out.append((fn, " ".join(ins), " ".join(toks), "oracle (dump); " + "; ".join(seen)))
@@ -4805,8 +4793,9 @@ def check_b3_ray(rows):
 
 # ── b3_state: the 3D backend's state (M5 part 1) ────────────────────────────────────
 # state.rs on the 3D types: bodies with a quaternion and inertia tensors, the mass recompute over every collider on
-# each add or removal, joints with their reference rotation, and no neighbour waking. sin, cos and atan2 are
-# parameters: glibc's for the check, MPFR's for the corrected oracle.
+# each add or removal, joints with their reference rotation, and no neighbour waking. A state read or written is the
+# 2.0 one (ADR 0008 #4): the full quaternion and angular-velocity vector. sin and cos are parameters: glibc's for the
+# check, MPFR's for the corrected oracle.
 
 def _b3_inv_world(b):
     """RigidBody3d::compute_inv_inertia_world."""
@@ -4816,7 +4805,7 @@ def _b3_inv_world(b):
     return _m_mul(_m_mul(r, b["inv_inertia"]), _m_transpose(r))
 
 
-def _b3_state_row(ins, sin, cos, atan2):
+def _b3_state_row(ins, sin, cos):
     """The outputs of a 3D state script: each op's result, then the backend dump."""
     bodies, colls, joints = _Arena(), _Arena(), _Arena()
     lists = {}
@@ -4952,19 +4941,18 @@ def _b3_state_row(ins, sin, cos, atan2):
             if b is None:
                 out.append("E:BodyNotFound")
                 continue
-            q = b["rot"]
-            out += [_st_h(b["handle"]), b["type"]] + [_st_f(x) for x in (*b["pos"], atan2(q[2], q[3]) * 2.0,
-                                                                         *b["vel"], b["w"][2])]
+            # The 2.0 state (ADR 0008 #4): the full quaternion and angular-velocity vector.
+            out += [_st_h(b["handle"]), b["type"]] + [_st_f(x) for x in (*b["pos"], *b["rot"], *b["vel"], *b["w"])]
             out.append(f"i:{int(b['sleeping'])}")
         elif op == "SetBodyState":
             b = bodies.get(_st_word(ins[k]))
-            st = ins[k + 1:k + 12]
-            k += 12
+            st = ins[k + 1:k + 17]
+            k += 17
             if b is None:
                 out.append("E:BodyNotFound")
                 continue
-            b["pos"], b["rot"] = tuple(tok_f(t) for t in st[2:5]), rot_z(tok_f(st[5]))
-            b["vel"], b["w"] = tuple(tok_f(t) for t in st[6:9]), (0.0, 0.0, tok_f(st[9]))
+            b["pos"], b["rot"] = tuple(tok_f(t) for t in st[2:5]), tuple(tok_f(t) for t in st[5:9])
+            b["vel"], b["w"] = tuple(tok_f(t) for t in st[9:12]), tuple(tok_f(t) for t in st[12:15])
             wake(b)
             b["world"] = _b3_inv_world(b)
             out.append("i:0")
@@ -5013,12 +5001,12 @@ def _b3_state_row(ins, sin, cos, atan2):
 
 
 def check_b3_state(rows):
-    """Replays every 3D state script on the model, on glibc's sin, cos and atan2."""
+    """Replays every 3D state script on the model, on glibc's sin and cos."""
     for fn, cls, ins, outs, note in rows:
         if fn not in ("b3::state_script", "b3::state_script_orphan", "b3::state_script_unsupported"):
             fail(f"b3_state: unknown function {fn}")
             continue
-        want = _b3_state_row(ins, _glibc("sin"), _glibc("cos"), _LIBM.atan2)
+        want = _b3_state_row(ins, _glibc("sin"), _glibc("cos"))
         if not _same_tokens(outs, want):
             first = next((i for i, (a, b) in enumerate(zip(outs, want)) if a != b), min(len(outs), len(want)))
             fail(f"b3_state: {note[:120]}: the model differs at output {first}: "

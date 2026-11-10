@@ -6,6 +6,19 @@
 include "tests/lib_3d.cyr"
 include "tests/regression_cases.cyr"
 
+# A state's rotation angle, for tests/regression_cases.cyr: the whole angle of its quaternion, 2·atan2(|(x, y, z)|,
+# |w|). Rust 1.4.0's 3D state has only the angle about z (ADR 0008 #4), so this check is the stricter one.
+fn rot_angle(s: ImBodyState): f64 {
+    var x: f64 = s.rotation.x;
+    var y: f64 = s.rotation.y;
+    var z: f64 = s.rotation.z;
+    var w: f64 = s.rotation.w;
+    var vl: f64 = f64_sqrt(x * x + y * y + z * z);
+    var aw: f64 = f64_abs(w);
+    var a: f64 = _im_atan2(vl, aw);
+    return a * 2.0;
+}
+
 # substeps_are_honoured_in_3d: a ball (every layer and mask bit) after one step of a default world at `sub` sub-steps:
 # its y.
 fn fall(sub): f64 {

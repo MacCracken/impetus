@@ -57,3 +57,25 @@ Not in 2.0 (new physics, started after 2.0 with reference tests only): 3D island
   feature look the same. They follow 2.0.
 - **A Rust 2.0 first.** Rejected, as kimiya did: no consumer would use it, and it would delay the
   port for a release with a short life.
+
+## Amendment — #4 implemented (2026-11-10)
+
+How #4 lands, now that it is built (after M5, before M6):
+- **One name, two shapes.** `ImBodyState` is each profile's own type, as the world is. The 2D profile keeps Rust's
+  (`src/b2_types.cyr`: `rotation: f64`, `angular_velocity: f64`). The 3D profile's (`src/b3_types.cyr`) has
+  `rotation: ImQuat`, a unit quaternion (x, y, z, w) as glam's `DQuat`, and `angular_velocity: ImVec3`. The other
+  fields are shared. Rust's two features already give one `BodyState` per build, so a consumer that compiles against
+  one bundle sees one type.
+- **Get and set.** `get_body_state` copies the body's quaternion and angular velocity. `set_body_state` stores them as
+  given, then wakes the body and refreshes its world inverse inertia, as Rust does. It does not normalize the
+  quaternion: normalizing would change a unit quaternion's last bit. Rust 1.4.0's call with angle θ and spin ω is
+  the 2.0 call with `ImQuat_from_rotation_z(θ)` and (0, 0, ω), bit for bit.
+- **`BodyDesc` is unchanged.** It still builds a body turned about z, as in Rust. A body gets any other orientation
+  from `set_body_state` or from the dynamics.
+- **JSON.** The 3D document is what serde_json writes for the 2.0 struct: `"rotation":[x,y,z,w]` (glam's `DQuat`
+  order) and `"angular_velocity":[x,y,z]` (`src/b3_json.cyr`). Rust 1.4.0's 3D document, with a number in each, is
+  refused with `IM_ERR_DESERIALIZE`. The 2D document is unchanged. M6's `BodySnapshot` follows the same shapes.
+- **Golden comparison**, as the table says. `b3_state.tsv`'s gets carry the body's full state from the oracle's dump.
+  Its sets carry the state Rust stores for its angle and spin, which the generator checks against the dump after
+  each call. Both compare by value, with no mapping to count. Rust's 3D tests that read the angle use the
+  quaternion's whole angle, which is stricter than the angle about z.

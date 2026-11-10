@@ -7,6 +7,12 @@
 include "tests/lib_2d.cyr"
 include "tests/regression_cases.cyr"
 
+# A state's rotation angle, for tests/regression_cases.cyr: the 2D angle itself.
+fn rot_angle(s: ImBodyState): f64 {
+    var a: f64 = s.rotation;
+    return a;
+}
+
 # spring_joint_independent_of_iterations: a 1 kg ball on a soft spring of rest length 0 at x = 1, one
 # step of 0.01 s at `iters` velocity iterations: its x velocity.
 fn spring_run(iters): f64 {

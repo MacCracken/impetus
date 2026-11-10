@@ -395,37 +395,33 @@ impl ImPhysicsState3d {
         return self._bodies().len();
     }
 
-    # The body's public state into out, its rotation as 2·atan2(q.z, q.w) (correctly rounded, ADR 0011) and its
-    # angular velocity's z: Ok(0), or Err(IM_ERR_BODY_NOT_FOUND). Mirrors `get_body_state`.
+    # The body's public state into out, with its full orientation and angular velocity (ADR 0008 #4; Rust 1.4.0 returns
+    # 2·atan2(q.z, q.w) and the angular velocity's z): Ok(0), or Err(IM_ERR_BODY_NOT_FOUND). Mirrors `get_body_state`.
     fn get_body_state(self, handle, out: *ImBodyState): Result {
         var rb: *ImRigidBody3d = self._body(handle);
         if (rb == 0) { return Err(IM_ERR_BODY_NOT_FOUND); }
-        var qz: f64 = rb.rotation.z;
-        var qw: f64 = rb.rotation.w;
-        var a: f64 = _im_atan2(qz, qw);
-        var w: f64 = rb.angular_velocity.z;
         out.handle = rb.handle;
         out.body_type = rb.body_type;
         out.position = rb.position;
-        out.rotation = a * 2.0;
+        out.rotation = rb.rotation;
         out.linear_velocity = rb.linear_velocity;
-        out.angular_velocity = w;
+        out.angular_velocity = rb.angular_velocity;
         out.is_sleeping = rb.is_sleeping;
         return Ok(0);
     }
 
-    # Teleports the body to a state (position, rotation about z, linear velocity, spin about z; its type and sleep
-    # flag ignored), wakes it and refreshes its world inverse inertia: Ok(0), or Err(IM_ERR_BODY_NOT_FOUND). Mirrors
+    # Teleports the body to a state (position, orientation, linear and angular velocity; its type and sleep flag
+    # ignored), wakes it and refreshes its world inverse inertia: Ok(0), or Err(IM_ERR_BODY_NOT_FOUND). The orientation
+    # is stored as given, so it should be a unit quaternion, as glam assumes. Rust 1.4.0 takes a rotation and a spin
+    # about z, which is the state (`ImQuat_from_rotation_z(angle)`, (0, 0, spin)) here (ADR 0008 #4). Mirrors
     # `set_body_state`.
     fn set_body_state(self, handle, st: ImBodyState): Result {
         var rb: *ImRigidBody3d = self._body(handle);
         if (rb == 0) { return Err(IM_ERR_BODY_NOT_FOUND); }
-        var rot: f64 = st.rotation;
-        var w: f64 = st.angular_velocity;
         rb.position = st.position;
-        rb.rotation = ImQuat_from_rotation_z(rot);
+        rb.rotation = st.rotation;
         rb.linear_velocity = st.linear_velocity;
-        rb.angular_velocity = ImVec3_new(0.0, 0.0, w);
+        rb.angular_velocity = st.angular_velocity;
         _im_b3_wake(rb);
         rb.update_inertia_world();
         return Ok(0);

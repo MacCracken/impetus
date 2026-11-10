@@ -29,15 +29,8 @@ struct ImBodyDesc {
     gravity_scale: f64;
 }
 
-struct ImBodyState {
-    handle;
-    body_type;
-    position: ImVec3;
-    rotation: f64;
-    linear_velocity: ImVec3;
-    angular_velocity: f64;
-    is_sleeping;
-}
+# `ImBodyState`, a body's public state, is each profile's own: src/b2_types.cyr (a rotation angle and a spin about z)
+# and src/b3_types.cyr (a quaternion and an angular-velocity vector, ADR 0008 #4).
 
 # The Rust variant name of a body type (`"Dynamic"`), or "Unknown".
 #must_use

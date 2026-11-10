@@ -512,6 +512,20 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     `tests/parity_types.cyr`.
   - Surface parity is 637/637 across 29 modules, with the 3 snapshot functions pending M6.
   - **3D: 29,404 ok, 0 failed, 11 accepted (ADR 11: 5, ADR 0008: 6)**; 2D unchanged at **98,873 ok**.
+- **Cyrius port, ADR 0008 #4: the full 3D body state** (`docs/development/port-parity.md` §24; the ADR's amendment):
+  - The 3D profile's `ImBodyState` carries the full orientation and angular velocity: `rotation` is an `ImQuat`
+    (x, y, z, w) and `angular_velocity` an `ImVec3`. The 2D profile's is unchanged. Each profile defines its own
+    `ImBodyState` (`src/b2_types.cyr`, `src/b3_types.cyr`) and its JSON (`src/b2_json.cyr`, `src/b3_json.cyr`).
+  - `get_body_state` copies the body's quaternion and angular velocity; Rust 1.4.0 returns 2·atan2(q.z, q.w) and the
+    spin about z. `set_body_state` stores them as given (a unit quaternion is expected), wakes the body and refreshes
+    its world inverse inertia.
+  - The 3D JSON document writes `"rotation":[x,y,z,w]` and `"angular_velocity":[x,y,z]`. Rust 1.4.0's 3D document is
+    refused.
+  - **Migrating a 3D consumer:** where Rust's state had angle θ and spin ω, pass
+    `ImQuat_from_rotation_z(θ)` and `ImVec3_new(0.0, 0.0, ω)`. If only the angle about z is wanted, it is
+    2·atan2(q.z, q.w), as Rust computed it. `BodyDesc` is unchanged.
+  - `b3_state.tsv`'s gets and sets now compare the full state, from the oracle's dump, all 0 ulp.
+    `tests/b3_state.tcyr` has 34 assertions (+6: arbitrary orientations, the inertia refresh, the 3D JSON).
 
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
@@ -607,6 +621,9 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - `step_100_particles_with_floor` 338 ns → 2.85 µs (8.4×, 2D's is 4.3×). Its particles soon expire, so it times a
     frame with one static box, and 1.84 µs of that frame is the 3D broadphase's rebuild for the one box. Recorded as a
     finding.
+- **The full 3D body state against Rust** (ADR 0008 #4; quiet machine, Rust on its 3D build): `mutation/get_body_state`
+  11.5 → 40 ns, down from part 1's 338 ns (a copy, no `atan2`); `mutation/set_body_state` 26.9 → 379 ns, 304 ns of it
+  the R·I⁻¹·Rᵀ refresh.
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

@@ -75,11 +75,13 @@ modules = [
     "src/b2_world.cyr",
     "src/world.cyr",
     "src/json.cyr",
+    "src/b2_json.cyr",
 ]
 
 # The 3D profile (M4 on): the shared modules in [lib]'s order, glam's 3D math (src/math3.cyr, ADR 0012), then the
 # 3D backend; particle.cyr and json.cyr touch no backend. Each profile's world file (src/b2_world.cyr,
-# src/b3_world.cyr: the storage over its backend) comes before the shared src/world.cyr. tests/lib_3d.cyr mirrors
+# src/b3_world.cyr: the storage over its backend) comes before the shared src/world.cyr, and its JSON file
+# (src/b2_json.cyr, src/b3_json.cyr: `BodyState`, whose fields differ by profile) after src/json.cyr. tests/lib_3d.cyr mirrors
 # this list, and scripts/surface_parity.py fails when either profile's mirror drifts.
 [lib.3d]
 modules = [
@@ -112,4 +114,5 @@ modules = [
     "src/b3_world.cyr",
     "src/world.cyr",
     "src/json.cyr",
+    "src/b3_json.cyr",
 ]

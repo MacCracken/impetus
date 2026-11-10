@@ -138,8 +138,11 @@ impetus specifics:
   collider or joint for a missing body (ADR 0008 #1).
 - 3D state rows (`b3_state.tsv`, the 3D build only) are the same scripts on `PhysicsState3d`, with 3D shapes,
   positions, offsets and impulse points, and the backend dump of `src/dump3d.rs` (full quaternions, angular velocity
-  vectors and inertia tensors; no manifolds, which the 3D backend doesn't keep). Class C: `set_body_state` rotates
-  about z through `sin_cos`, and `get_body_state` returns 2·atan2(q.z, q.w). The arena, pair-list and tracker tokens
+  vectors and inertia tensors; no manifolds, which the 3D backend doesn't keep). A state read or written is the 2.0 3D
+  `BodyState` (ADR 0008 #4, 16 tokens with the quaternion and the angular-velocity vector): a get's is the body's full
+  state from the dump, and a set's is the state Rust stores for its angle and spin, `DQuat::from_rotation_z(θ)` and
+  (0, 0, ω), which the generator checks against the dump after the call. Class C: a body added turned about z goes
+  through `sin_cos`. The arena, pair-list and tracker tokens
   both dumps write are `src/dumpcore.rs`'s. `b3::state_script_orphan` scripts add a collider or joint for a missing
   body (ADR 0008 #1), and `b3::state_script_unsupported` ones a Revolute or Prismatic joint or a motor, which the 3D
   port refuses (ADR 0008 #5); no other script adds one.
@@ -255,8 +258,8 @@ Standard-library Python, run with `-I`. It never calls the oracle:
   every `b3_step` collider's mask is 0, and on MPFR's hypot writes `b3_contact.cr.tsv` (and `b3_step.cr.tsv`, none so
   far);
 - every `b3_state` script is replayed on a Python model of the 3D state (the arenas, the mass recompute, the joints'
-  reference rotation, forces and impulses through R·I⁻¹·Rᵀ, the state's rotation through glibc's atan2), rebuilding
-  every result and dump token; the same on MPFR's writes `b3_state.cr.tsv`;
+  reference rotation, forces and impulses through R·I⁻¹·Rᵀ, the full body state read and written, ADR 0008 #4),
+  rebuilding every result and dump token; the same on MPFR's writes `b3_state.cr.tsv`;
 - `src/constants_private.cyr` holds every library `const` of the ported modules, each equal to Python's parse of
   the Rust literal;
 - the corrected oracle and `src/crmath_data.cyr` are current (above).

@@ -7,6 +7,20 @@
 # min / max are Rust's (src/mathx.cyr). The constants are generated (src/constants_private.cyr,
 # `_IM_B2_*`). [f64; 2] fields are ImVec2.
 
+# ── the public body state ───────────────────────────────────────────────────────────
+
+# A body's public state in 2D: its rotation (radians) and its spin about z. Mirrors `BodyState` (src/b3_types.cyr has
+# the 3D profile's). Its JSON is src/b2_json.cyr's.
+struct ImBodyState {
+    handle;
+    body_type;
+    position: ImVec3;
+    rotation: f64;
+    linear_velocity: ImVec3;
+    angular_velocity: f64;
+    is_sleeping;
+}
+
 # ── rigid bodies ────────────────────────────────────────────────────────────────────
 
 struct ImRigidBody2d {

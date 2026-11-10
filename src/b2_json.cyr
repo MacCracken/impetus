@@ -1,0 +1,58 @@
+# b2_json.cyr — the 2D profile's JSON (ADR 0010): `BodyState`, whose fields differ by profile. It comes after the shared
+# src/json.cyr, whose writers and readers it uses; src/b3_json.cyr is the 3D counterpart.
+
+impl ImBodyState {
+    # Appends the state as serde_json writes a `BodyState`.
+    fn to_json(self, sb) {
+        var rot: f64 = self.rotation;
+        var av: f64 = self.angular_velocity;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "handle", 1);
+        _im_jw_u64(sb, self.handle);
+        _im_jw_key(sb, "body_type", 0);
+        _im_jw_name(sb, body_type_name(self.body_type));
+        _im_jw_key(sb, "position", 0);
+        _im_jw_vec3(sb, self.position);
+        _im_jw_key(sb, "rotation", 0);
+        im_fmt_f64_json(sb, rot);
+        _im_jw_key(sb, "linear_velocity", 0);
+        _im_jw_vec3(sb, self.linear_velocity);
+        _im_jw_key(sb, "angular_velocity", 0);
+        im_fmt_f64_json(sb, av);
+        _im_jw_key(sb, "is_sleeping", 0);
+        _im_jw_bool(sb, self.is_sleeping);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `BodyState` document (every field required) into *out: Ok(0), or Err(IM_ERR_DESERIALIZE).
+# Mirrors `serde_json::from_str::<BodyState>`.
+#must_use
+fn ImBodyState_from_json(buf, len, out: *ImBodyState): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 7);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var s: ImBodyState;
+    var w[8];
+    if (_im_jr_u64(_im_jr_at(o, f, 0, "handle"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.handle = load64(&w);
+    if (_im_jr_body_type(_im_jr_at(o, f, 1, "body_type"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.body_type = load64(&w);
+    var pos: ImVec3 = ImVec3_zero();
+    if (_im_jr_vec3(_im_jr_at(o, f, 2, "position"), &pos) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.position = pos;
+    if (_im_jr_f64(_im_jr_at(o, f, 3, "rotation"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var rot: f64 = load64(&w);
+    s.rotation = rot;
+    var lv: ImVec3 = ImVec3_zero();
+    if (_im_jr_vec3(_im_jr_at(o, f, 4, "linear_velocity"), &lv) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.linear_velocity = lv;
+    if (_im_jr_f64(_im_jr_at(o, f, 5, "angular_velocity"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var av: f64 = load64(&w);
+    s.angular_velocity = av;
+    if (_im_jr_bool(_im_jr_at(o, f, 6, "is_sleeping"), &w) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    s.is_sleeping = load64(&w);
+    memcpy(out, &s, sizeof(ImBodyState));
+    return Ok(0);
+}

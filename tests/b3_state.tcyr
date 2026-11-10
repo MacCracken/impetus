@@ -1,7 +1,8 @@
 # b3_state.tcyr — the ported Rust tests of rust-old/src/backend_3d/state.rs (M5 part 1): the state-level tests of
 # backend_3d/tests.rs that need no step (body counts, teleports, type changes, the mass recompute over colliders,
 # the parallel-axis theorem with a removal, the linear and the world-space angular impulse), plus Cyrius-only tests of
-# the ADR 0008 #1 refusals, removals, joints' reference rotation and a flat heap. The tests that step the state are in
+# the ADR 0008 #1 refusals, removals, joints' reference rotation, the full 3D state and its JSON (ADR 0008 #4) and a
+# flat heap. The tests that step the state are in
 # tests/b3_joints.tcyr (M5 part 2) and, with contacts, part 3.
 
 include "tests/lib_3d.cyr"
@@ -47,13 +48,14 @@ fn main() {
     var d2: ImColliderDesc = ball_desc(0.5, zero, 0, 0.0);
     var r2t, r2v = s2.add_collider(h2, d2);
     d2.shape.free();
+    # Rust's state has the angle 1.0 and the spin 0.5 about z: the 2.0 state of the same rotation (ADR 0008 #4).
     var ns: ImBodyState;
     ns.handle = h2;
     ns.body_type = IM_BODY_DYNAMIC;
     ns.position = v(10.0, 20.0, 30.0);
-    ns.rotation = 1.0;
+    ns.rotation = ImQuat_from_rotation_z(1.0);
     ns.linear_velocity = v(1.0, 2.0, 3.0);
-    ns.angular_velocity = 0.5;
+    ns.angular_velocity = v(0.0, 0.0, 0.5);
     ns.is_sleeping = 0;
     var t2, u2 = s2.set_body_state(h2, ns);
     var rb2: *ImRigidBody3d = s2._body(h2);
@@ -61,12 +63,10 @@ fn main() {
     assert_eq(near(rb2.position.x, 10.0, eps) + near(rb2.position.y, 20.0, eps) + near(rb2.position.z, 30.0, eps), 3,
       "moved");
     assert_eq(rb2.is_sleeping, 0, "awake");
-    # Cyrius-only: the state reads back through 2·atan2(q.z, q.w), correctly rounded.
+    # Cyrius-only: the state reads back as it was set, every word.
     var bs: ImBodyState;
     var t2b, u2b = s2.get_body_state(h2, &bs);
-    var rot: f64 = bs.rotation;
-    var w: f64 = bs.angular_velocity;
-    assert_eq(near(rot, 1.0, 0.000000000000001) + near(w, 0.5, eps), 2, "rotation and spin read back");
+    assert_eq(is_ok(t2b) == 1 && memeq(&bs, &ns, sizeof(ImBodyState)) == 1, 1, "the full state reads back");
     s2.free();
 
     test_group("set_body_state_not_found");
@@ -232,6 +232,89 @@ fn main() {
     var t11b, u11b = s11.remove_joint(jh);
     assert_eq(u11 == IM_ERR_COLLIDER_NOT_FOUND && u11b == IM_ERR_JOINT_NOT_FOUND, 1, "then not found");
     s11.free();
+
+    test_group("full_orientation_state");
+    # ADR 0008 #4: any orientation and angular velocity in, the same out; the world inverse inertia follows the new
+    # orientation; a sleeping body wakes; a frame integrates from the state set.
+    var os: ImPhysicsState3d = ImPhysicsState3d_new();
+    var oh = os.add_body(ImBodyDesc_default());
+    var oc: ImColliderDesc = ImColliderDesc_new(ImColliderShape_box(0.3, 0.6, 1.2));
+    var ort, orv = os.add_collider(oh, oc);
+    var orb: *ImRigidBody3d = os._body(oh);
+    orb.is_sleeping = 1;
+    var oqa: ImQuat = ImQuat_mul_quat(ImQuat_from_rotation_x(0.4), ImQuat_from_rotation_y(-1.1));
+    var oq: ImQuat = ImQuat_mul_quat(oqa, ImQuat_from_rotation_z(2.3));
+    var ofs: ImBodyState;
+    ofs.handle = oh;
+    ofs.body_type = IM_BODY_DYNAMIC;
+    ofs.position = v(1.0, -2.0, 0.5);
+    ofs.rotation = oq;
+    ofs.linear_velocity = v(0.25, 0.0, -1.0);
+    ofs.angular_velocity = v(1.5, -0.75, 3.0);
+    ofs.is_sleeping = 1;
+    var ot, ou = os.set_body_state(oh, ofs);
+    var ogs: ImBodyState;
+    var otb, oub = os.get_body_state(oh, &ogs);
+    ofs.is_sleeping = 0;
+    assert_eq(is_ok(ot) == 1 && is_ok(otb) == 1 && memeq(&ogs, &ofs, sizeof(ImBodyState)) == 1, 1,
+      "an arbitrary orientation and spin read back, awake");
+    var orm: ImMat3 = ImMat3_from_quat(oq);
+    var ormt: ImMat3 = ImMat3_transpose(orm);
+    var ori: ImMat3 = ImMat3_mul_mat3(orm, orb.inv_inertia);
+    var owant: ImMat3 = ImMat3_mul_mat3(ori, ormt);
+    var oiw: ImMat3 = orb.inv_inertia_world;
+    var odw = 0;
+    for (var oe = 0; oe < 9; oe = oe + 1) {
+        var ogv: f64 = load64(&oiw + oe * 8);
+        var owv: f64 = load64(&owant + oe * 8);
+        if (near(ogv, owv, 0.000000000001) == 0) { odw = 1; }
+    }
+    assert_eq(odw, 0, "the world inverse inertia is R·I⁻¹·Rᵀ for the new orientation");
+    var ogz: ImVec3 = ImVec3_zero();
+    os.step(ogz, 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0, 30.0, 1.0, IM_BROADPHASE_SPATIAL_HASH);
+    var ohs: ImBodyState;
+    var otc, ouc = os.get_body_state(oh, &ohs);
+    var omoved: f64 = ohs.position.x - 1.0;
+    var oqd: f64 = ohs.rotation.w - oq.w;
+    assert_eq(near(omoved, 0.25 / 60.0, 0.000000000001) == 1 && oqd != 0.0, 1, "a frame integrates from the state set");
+    os.free();
+
+    test_group("body_state_json_3d");
+    # The 3D document: the quaternion as [x,y,z,w] and the angular velocity as an array; a round trip is exact, and
+    # Rust 1.4.0's document (numbers for both) is refused.
+    var jsb3 = str_builder_new();
+    ogs.to_json(jsb3);
+    var js3 = str_builder_build(jsb3);
+    var back3: ImBodyState;
+    var tj3, vj3 = ImBodyState_from_json(str_data(js3), str_len(js3), &back3);
+    assert_eq(is_ok(tj3) == 1 && memeq(&back3, &ogs, sizeof(ImBodyState)) == 1, 1, "a round trip is exact");
+    var simple3: ImBodyState;
+    simple3.handle = 3;
+    simple3.body_type = IM_BODY_STATIC;
+    simple3.position = v(1.0, 2.0, 3.0);
+    simple3.rotation = ImQuat_identity();
+    simple3.linear_velocity = ImVec3_zero();
+    simple3.angular_velocity = v(0.0, 0.0, -0.5);
+    simple3.is_sleeping = 1;
+    var ssb3 = str_builder_new();
+    simple3.to_json(ssb3);
+    var stext3 = str_builder_build(ssb3);
+    # The expected text in two pieces (the lines would run past 120 characters).
+    var wa3 = "{\"handle\":3,\"body_type\":\"Static\",\"position\":[1.0,2.0,3.0],\"rotation\":[0.0,0.0,0.0,1.0],";
+    var wb3 = "\"linear_velocity\":[0.0,0.0,0.0],\"angular_velocity\":[0.0,0.0,-0.5],\"is_sleeping\":true}";
+    var la3 = strlen(wa3);
+    var lb3 = strlen(wb3);
+    var sd3 = str_data(stext3);
+    assert_eq(str_len(stext3) == la3 + lb3 && memeq(sd3, wa3, la3) == 1 && memeq(sd3 + la3, wb3, lb3) == 1, 1,
+      "the document serde_json would write");
+    var oa3 = "{\"handle\":3,\"body_type\":\"Static\",\"position\":[1.0,2.0,3.0],\"rotation\":1.0,";
+    var ob3 = "\"linear_velocity\":[0.0,0.0,0.0],\"angular_velocity\":0.5,\"is_sleeping\":true}";
+    var osb3 = str_builder_new();
+    str_builder_add_cstr(osb3, oa3);
+    str_builder_add_cstr(osb3, ob3);
+    var old143 = str_builder_build(osb3);
+    var to3, vo3 = ImBodyState_from_json(str_data(old143), str_len(old143), &back3);
+    assert_eq(is_ok(to3) == 0 && vo3 == IM_ERR_DESERIALIZE, 1, "Rust 1.4.0's 3D document refused");
 
     test_group("flat_heap_state");
     # After its first round, the same adds and removals reuse the arenas' and lists' storage.
