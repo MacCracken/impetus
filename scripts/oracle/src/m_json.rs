@@ -9,9 +9,10 @@
 
 use impetus::{
     BodyDesc, BodyHandle, BodyState, BodyType, BroadphaseKind, ColliderDesc, ColliderHandle,
-    ColliderShape, CollisionEvent, CombineRule, ContactData, ContactPoint, Force, Impulse,
-    JointDesc, JointMotor, JointType, PhysicsMaterial, PhysicsUnit, PointQuery, Quantity, RayHit,
-    SolverKind, Spring, Spring2d, Spring3d, Torque, WorldConfig,
+    ColliderShape, CollisionEvent, CombineRule, ContactData, ContactPoint, Force, ForceField,
+    Impulse, JointDesc, JointMotor, JointType, Particle, ParticleEmitter, PhysicsMaterial,
+    PhysicsUnit, PointQuery, Quantity, RayHit, SolverKind, Spring, Spring2d, Spring3d, SubEmitter,
+    Torque, WorldConfig,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -320,6 +321,7 @@ pub fn emit() -> Module {
     ]);
     read_rows::<Torque>(&mut m, "Torque", &docs, torque);
     emit_m1b(&mut m, &mut rng);
+    emit_particles(&mut m, &mut rng);
     m
 }
 
@@ -900,4 +902,241 @@ fn emit_m1b(m: &mut Module, rng: &mut Rng) {
     let mut docs = write_rows(m, "Spring3d", &s3, flat::spring3d);
     docs.push("[[0,0,1,1,1,0.01],[0,0,1,1,1,0.01],[0,0,1,1,1,0.01]]".to_string());
     read_rows::<Spring3d>(m, "Spring3d", &docs, flat::spring3d);
+}
+
+fn sub_emitter(x: &SubEmitter) -> Vec<Tok> {
+    vec![
+        Tok::I(i64::from(x.count)),
+        f(x.speed),
+        f(x.lifetime),
+        f(x.radius),
+        f(x.gravity_scale),
+        f(x.restitution),
+    ]
+}
+
+fn rand_sub(rng: &mut Rng) -> SubEmitter {
+    SubEmitter {
+        count: u32::try_from(rng.int(0, 40)).unwrap_or(0),
+        speed: rng.uniform(0.0, 10.0),
+        lifetime: rng.log_uniform(-2.0, 1.0),
+        radius: rng.uniform(0.0, 0.2),
+        gravity_scale: rng.uniform(-1.0, 2.0),
+        restitution: rng.uniform(0.0, 1.0),
+    }
+}
+
+/// An emitter read from a document, the only way to set its crate-private spawn accumulator.
+fn emitter_with_accumulator(acc: &str) -> ParticleEmitter {
+    let doc = format!(
+        r#"{{"handle":7,"position":[1,2,0],"velocity":[0,5,0],"velocity_spread":[1,0.5,0],"rate":60,"particle_lifetime":2,"particle_radius":0.05,"particle_restitution":0.3,"particle_gravity_scale":1,"particle_damping":0,"active":true,"accumulator":{acc}}}"#
+    );
+    serde_json::from_str(&doc).unwrap_or_else(|_| ParticleEmitter::new([0.0; 3], [0.0; 3], 1.0))
+}
+
+/// `particle.rs`'s types (M3d): ForceField, SubEmitter, Particle, ParticleEmitter.
+#[allow(clippy::too_many_lines)] // one block per type
+fn emit_particles(m: &mut Module, rng: &mut Rng) {
+    // ── ForceField ──
+    let mut fields = vec![
+        ForceField::Radial {
+            center: [0.0, 0.0, 0.0],
+            strength: 100.0,
+            falloff: 2.0,
+            radius: 0.0,
+        },
+        ForceField::Radial {
+            center: [1.5, -2.0, 0.25],
+            strength: -6.5,
+            falloff: 1.5,
+            radius: 4.0,
+        },
+        ForceField::Directional {
+            force: [3.0, 1.0, 0.0],
+            min: [-1.0, -1.0, -1.0],
+            max: [1.0, 1.0, 1.0],
+        },
+        ForceField::Radial {
+            center: [0.0, 0.0, 0.0],
+            strength: f64::NAN,
+            falloff: f64::INFINITY,
+            radius: 0.0,
+        },
+    ];
+    for _ in 0..8 {
+        fields.push(ForceField::Radial {
+            center: rand3(rng, -3.0, 3.0),
+            strength: rng.signed_log_uniform(-2.0, 3.0),
+            falloff: rng.uniform(0.0, 3.0),
+            radius: rng.uniform(0.0, 5.0),
+        });
+        fields.push(ForceField::Directional {
+            force: rand3(rng, -3.0, 3.0),
+            min: rand3(rng, -3.0, 0.0),
+            max: rand3(rng, 0.0, 3.0),
+        });
+    }
+    let mut docs = write_rows(m, "ForceField", &fields, flat::force_field);
+    docs.extend(
+        [
+            r#""Radial""#,
+            r#"{"Radial":null}"#,
+            r#"{"Radial":[[0,0,0],1,2,0]}"#,
+            r#"{"Directional":[[1,0,0],[-1,-1,-1],[1,1,1]]}"#,
+            r#"{"Radial":{"center":[0,0,0],"strength":1,"falloff":2}}"#,
+            r#"{"Radial":{"center":[0,0],"strength":1,"falloff":2,"radius":0}}"#,
+            r#"{"Radial":{"center":[0,0,0],"strength":1,"falloff":2,"radius":0,"extra":true}}"#,
+            r#"{"Vortex":{"center":[0,0,0]}}"#,
+            r#"{"Radial":{"center":[0,0,0],"strength":1,"falloff":2,"radius":0},"Directional":{"force":[0,0,0],"min":[0,0,0],"max":[0,0,0]}}"#,
+            r#"{"Directional":{"force":[0,0,0],"min":[0,0,0],"max":null}}"#,
+            r#""radial""#,
+            "[]",
+        ]
+        .iter()
+        .map(|d| (*d).to_string()),
+    );
+    read_rows::<ForceField>(m, "ForceField", &docs, flat::force_field);
+
+    // ── SubEmitter ──
+    let mut subs = vec![
+        SubEmitter {
+            count: 4,
+            speed: 3.0,
+            lifetime: 2.0,
+            radius: 0.02,
+            gravity_scale: 0.0,
+            restitution: 0.5,
+        },
+        SubEmitter {
+            count: u32::MAX,
+            speed: -1.0,
+            lifetime: 0.0,
+            radius: f64::NAN,
+            gravity_scale: 1.0,
+            restitution: 1.0,
+        },
+    ];
+    for _ in 0..8 {
+        subs.push(rand_sub(rng));
+    }
+    let mut docs = write_rows(m, "SubEmitter", &subs, sub_emitter);
+    docs.extend(
+        [
+            r#"{"count":4,"speed":3,"lifetime":2,"radius":0.02,"gravity_scale":0}"#,
+            r#"{"count":-1,"speed":3,"lifetime":2,"radius":0.02,"gravity_scale":0,"restitution":0.5}"#,
+            r#"{"count":4.0,"speed":3,"lifetime":2,"radius":0.02,"gravity_scale":0,"restitution":0.5}"#,
+            r#"{"count":4294967296,"speed":3,"lifetime":2,"radius":0.02,"gravity_scale":0,"restitution":0.5}"#,
+            r#"[6,1.5,0.5,0.04,0.5,0.6]"#,
+            r#"[6,1.5,0.5,0.04,0.5]"#,
+            r#"[6,1.5,0.5,0.04,0.5,0.6,7]"#,
+            r#"{"count":4,"speed":"3","lifetime":2,"radius":0.02,"gravity_scale":0,"restitution":0.5}"#,
+        ]
+        .iter()
+        .map(|d| (*d).to_string()),
+    );
+    read_rows::<SubEmitter>(m, "SubEmitter", &docs, sub_emitter);
+
+    // ── Particle ──
+    let mut particles = vec![
+        Particle::new([1.0, 2.0, 0.0], [3.0, 4.0, 0.0], 5.0),
+        Particle::new([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 3.0)
+            .with_radius(0.1)
+            .with_drag(0.5)
+            .with_restitution(0.8)
+            .with_gravity_scale(0.5)
+            .with_damping(0.1),
+        Particle::new([5.0, 5.0, 0.0], [0.0, 0.0, 0.0], 0.025).with_sub_emitter(SubEmitter {
+            count: 4,
+            speed: 3.0,
+            lifetime: 2.0,
+            radius: 0.02,
+            gravity_scale: 0.0,
+            restitution: 0.5,
+        }),
+        Particle::new([0.0, 0.0, 0.0], [f64::INFINITY, 0.0, 0.0], f64::NAN),
+    ];
+    for _ in 0..10 {
+        let mut p = Particle::new(
+            rand3(rng, -3.0, 3.0),
+            rand3(rng, -3.0, 3.0),
+            rng.log_uniform(-2.0, 2.0),
+        )
+        .with_radius(rng.uniform(0.0, 0.2))
+        .with_drag(rng.uniform(0.0, 2.0))
+        .with_restitution(rng.uniform(0.0, 1.0))
+        .with_gravity_scale(rng.uniform(-1.0, 2.0))
+        .with_damping(rng.uniform(0.0, 1.0));
+        p.handle = impetus::ParticleHandle(rand_handle(rng));
+        if rng.unit() < 0.4 {
+            p = p.with_sub_emitter(rand_sub(rng));
+        }
+        particles.push(p);
+    }
+    let mut docs = write_rows(m, "Particle", &particles, flat::particle);
+    docs.extend(
+        [
+            r#"{"handle":3,"position":[1,2,0],"velocity":[0,0,0],"lifetime":1,"radius":0.05,"drag":0,"restitution":0.3,"gravity_scale":1,"damping":0}"#,
+            r#"{"handle":3,"position":[1,2,0],"velocity":[0,0,0],"lifetime":1,"radius":0.05,"drag":0,"restitution":0.3,"gravity_scale":1,"damping":0,"on_death_emit":null}"#,
+            r#"{"handle":3,"position":[1,2,0],"velocity":[0,0,0],"lifetime":1,"radius":0.05,"drag":0,"restitution":0.3,"gravity_scale":1}"#,
+            r#"{"handle":-3,"position":[1,2,0],"velocity":[0,0,0],"lifetime":1,"radius":0.05,"drag":0,"restitution":0.3,"gravity_scale":1,"damping":0}"#,
+            r#"{"handle":3,"position":[1,2],"velocity":[0,0,0],"lifetime":1,"radius":0.05,"drag":0,"restitution":0.3,"gravity_scale":1,"damping":0}"#,
+            r#"{"handle":3,"position":[1,2,0],"velocity":[0,0,0],"lifetime":null,"radius":0.05,"drag":0,"restitution":0.3,"gravity_scale":1,"damping":0}"#,
+            r#"[3,[1,2,0],[0,0,0],1,0.05,0,0.3,1,0]"#,
+            r#"[3,[1,2,0],[0,0,0],1,0.05,0,0.3,1,0,null]"#,
+            r#"[3,[1,2,0],[0,0,0],1,0.05,0,0.3,1,0,[2,1,0.5,0.01,0,0.4]]"#,
+            r#"[3,[1,2,0],[0,0,0],1,0.05,0,0.3,1,0,null,5]"#,
+            r#"[3,[1,2,0],[0,0,0],1,0.05,0,0.3,1]"#,
+            r#"{"handle":3,"position":[1,2,0],"velocity":[0,0,0],"lifetime":1,"radius":0.05,"drag":0,"restitution":0.3,"gravity_scale":1,"damping":0,"on_death_emit":{"count":2}}"#,
+        ]
+        .iter()
+        .map(|d| (*d).to_string()),
+    );
+    read_rows::<Particle>(m, "Particle", &docs, flat::particle);
+
+    // ── ParticleEmitter ──
+    let mut emitters = vec![
+        ParticleEmitter::new([0.0, 0.0, 0.0], [0.0, 10.0, 0.0], 100.0),
+        ParticleEmitter::new([1.0, 2.0, 0.0], [3.0, 4.0, 0.0], 10.0)
+            .with_spread([1.0, 2.0, 0.0])
+            .with_lifetime(3.0)
+            .with_radius(0.2)
+            .with_gravity_scale(0.0)
+            .with_damping(0.5),
+        emitter_with_accumulator("0.3700000000000001"),
+        emitter_with_accumulator("1e-300"),
+        ParticleEmitter::new([0.0; 3], [0.0; 3], f64::INFINITY),
+    ];
+    let mut off = ParticleEmitter::new([0.0, 1.0, 0.0], [0.0, 1.0, 0.0], 30.0);
+    off.active = false;
+    emitters.push(off);
+    for _ in 0..8 {
+        let mut e = ParticleEmitter::new(
+            rand3(rng, -3.0, 3.0),
+            rand3(rng, -3.0, 3.0),
+            rng.log_uniform(-1.0, 3.0),
+        )
+        .with_spread(rand3(rng, -1.0, 1.0))
+        .with_lifetime(rng.log_uniform(-1.0, 1.0))
+        .with_radius(rng.uniform(0.0, 0.2))
+        .with_gravity_scale(rng.uniform(-1.0, 2.0))
+        .with_damping(rng.uniform(0.0, 1.0));
+        e.handle = impetus::EmitterHandle(rand_handle(rng));
+        e.active = rng.unit() < 0.8;
+        emitters.push(e);
+    }
+    let mut docs = write_rows(m, "ParticleEmitter", &emitters, flat::emitter);
+    docs.extend(
+        [
+            r#"{"handle":0,"position":[0,0,0],"velocity":[0,1,0],"velocity_spread":[0,0,0],"rate":5,"particle_lifetime":2,"particle_radius":0.05,"particle_restitution":0.3,"particle_gravity_scale":1,"particle_damping":0,"active":true}"#,
+            r#"{"handle":0,"position":[0,0,0],"velocity":[0,1,0],"velocity_spread":[0,0,0],"rate":5,"particle_lifetime":2,"particle_radius":0.05,"particle_restitution":0.3,"particle_gravity_scale":1,"particle_damping":0,"active":1,"accumulator":0}"#,
+            r#"{"handle":0,"position":[0,0,0],"velocity":[0,1,0],"velocity_spread":[0,0,0],"rate":null,"particle_lifetime":2,"particle_radius":0.05,"particle_restitution":0.3,"particle_gravity_scale":1,"particle_damping":0,"active":true,"accumulator":0}"#,
+            r#"[0,[0,0,0],[0,1,0],[0,0,0],5,2,0.05,0.3,1,0,false,0.25]"#,
+            r#"[0,[0,0,0],[0,1,0],[0,0,0],5,2,0.05,0.3,1,0,false]"#,
+            r#"[0,[0,0,0],[0,1,0],[0,0,0],5,2,0.05,0.3,1,0,false,0.25,1]"#,
+            r#"{"handle":0,"position":[0,0,0],"velocity":[0,1,0],"velocity_spread":[0,0],"rate":5,"particle_lifetime":2,"particle_radius":0.05,"particle_restitution":0.3,"particle_gravity_scale":1,"particle_damping":0,"active":true,"accumulator":0}"#,
+        ]
+        .iter()
+        .map(|d| (*d).to_string()),
+    );
+    read_rows::<ParticleEmitter>(m, "ParticleEmitter", &docs, flat::emitter);
 }

@@ -123,86 +123,6 @@ pub fn backend(d: &Backend2dDump) -> Vec<Tok> {
     t
 }
 
-fn v3(t: &mut Vec<Tok>, v: [f64; 3]) {
-    t.extend([f(v[0]), f(v[1]), f(v[2])]);
-}
-
-/// The tokens of a particle (handle, position, velocity, the six scalars, then `n:` or the
-/// sub-emitter's count and five scalars).
-pub fn particle(p: &impetus::Particle) -> Vec<Tok> {
-    let mut t = vec![handle(p.handle.0)];
-    v3(&mut t, p.position);
-    v3(&mut t, p.velocity);
-    t.extend([
-        f(p.lifetime),
-        f(p.radius),
-        f(p.drag),
-        f(p.restitution),
-        f(p.gravity_scale),
-        f(p.damping),
-    ]);
-    match &p.on_death_emit {
-        Some(s) => t.extend([
-            i(s.count),
-            f(s.speed),
-            f(s.lifetime),
-            f(s.radius),
-            f(s.gravity_scale),
-            f(s.restitution),
-        ]),
-        None => t.push(Tok::None),
-    }
-    t
-}
-
-/// The tokens of an emitter, its private spawn accumulator read through serde (which carries it).
-pub fn emitter(e: &impetus::ParticleEmitter) -> Vec<Tok> {
-    let acc = serde_json::to_value(e)
-        .ok()
-        .and_then(|v| v.get("accumulator").and_then(serde_json::Value::as_f64))
-        .unwrap_or(f64::NAN);
-    let mut t = vec![handle(e.handle.0)];
-    v3(&mut t, e.position);
-    v3(&mut t, e.velocity);
-    v3(&mut t, e.velocity_spread);
-    t.extend([
-        f(e.rate),
-        f(e.particle_lifetime),
-        f(e.particle_radius),
-        f(e.particle_restitution),
-        f(e.particle_gravity_scale),
-        f(e.particle_damping),
-        b(e.active),
-        f(acc),
-    ]);
-    t
-}
-
-/// The tokens of a force field: its variant, then its fields.
-pub fn force_field(x: &impetus::ForceField) -> Vec<Tok> {
-    let mut t = Vec::new();
-    match x {
-        impetus::ForceField::Radial {
-            center,
-            strength,
-            falloff,
-            radius,
-        } => {
-            t.push(Tok::E("ForceField", "Radial".to_string()));
-            v3(&mut t, *center);
-            t.extend([f(*strength), f(*falloff), f(*radius)]);
-        }
-        impetus::ForceField::Directional { force, min, max } => {
-            t.push(Tok::E("ForceField", "Directional".to_string()));
-            v3(&mut t, *force);
-            v3(&mut t, *min);
-            v3(&mut t, *max);
-        }
-        _ => t.push(Tok::E("ForceField", "Unknown".to_string())),
-    }
-    t
-}
-
 /// The world's own state before its backend: the particle and emitter counters, then the particles,
 /// emitters and force fields in storage order.
 pub fn world(d: &impetus::oracle::WorldDump) -> Vec<Tok> {
@@ -212,15 +132,15 @@ pub fn world(d: &impetus::oracle::WorldDump) -> Vec<Tok> {
     ];
     t.push(Tok::V(d.particles.len()));
     for p in &d.particles {
-        t.extend(particle(p));
+        t.extend(flat::particle(p));
     }
     t.push(Tok::V(d.emitters.len()));
     for e in &d.emitters {
-        t.extend(emitter(e));
+        t.extend(flat::emitter(e));
     }
     t.push(Tok::V(d.force_fields.len()));
     for x in &d.force_fields {
-        t.extend(force_field(x));
+        t.extend(flat::force_field(x));
     }
     t
 }

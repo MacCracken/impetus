@@ -310,13 +310,18 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     validates and refuses XPBD (#6).
   - The new `world_step.tsv` holds 198 world steps from dumps that include the particles, emitters
     and fields. All 0 ulp on three targets, and `validate.py` transcribes the world step.
-    **98,393 ok, 0 failed, 0 measured, 7 pending, 165 accepted.**
-  - 63 more Rust tests: `world.rs` (22), `particle.rs` (6), `tests/integration.rs` (9) and the 2D
+    **98,393 ok, 0 failed, 0 measured, 7 pending, 165 accepted** before particle JSON.
+  - 65 more Rust tests: `world.rs` (22), `particle.rs` (8), `tests/integration.rs` (9) and the 2D
     tests of `tests/regressions.rs` (26), in `tests/world.tcyr` and `tests/regressions.tcyr`.
   - Surface parity is 507/507 across 23 modules, with `snapshot`, `restore` and `try_restore`
     pending M6.
   - The world's constants are generated, the `R3_ALPHA` array as three globals.
-  - Particle JSON is not ported yet.
+  - **Particle JSON** (ADR 0010): `src/json.cyr` writes and reads `ForceField`, `SubEmitter`,
+    `Particle` and `ParticleEmitter` as serde_json does. That includes the emitter's private
+    `accumulator`, which serde carries, and `on_death_emit`'s default. `json.tsv` grows from 937
+    to 1,092 rows (sequence forms, bare variant names, missing and extra fields, a u32 out of range),
+    all on the first run. The two particle serde tests are ported.
+    **98,548 ok, 0 failed, 0 measured, 7 pending, 165 accepted.**
 
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and

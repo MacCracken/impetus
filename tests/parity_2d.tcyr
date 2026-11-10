@@ -1737,6 +1737,56 @@ fn _par_b2_step(fp, fl): i64 {
 # particles, emitters and force fields) and the backend dump; the port loads all three into an
 # ImPhysicsWorld, steps it, and writes them again with the frame's events.
 
+# A particle at token k (flat::particle's layout) into *p: the token after it.
+fn _par_in_particle(k, p: *ImParticle): i64 {
+    var q: ImParticle = ImParticle_new(_par_in_v3(k + 1), _par_in_v3(k + 4), _par_in_f(k + 7));
+    q.handle = _par_in(k);
+    q.radius = _par_in_f(k + 8);
+    q.drag = _par_in_f(k + 9);
+    q.restitution = _par_in_f(k + 10);
+    q.gravity_scale = _par_in_f(k + 11);
+    q.damping = _par_in_f(k + 12);
+    var next = k + 14;
+    if (_par_in_is_none(k + 13) == 0) {
+        q.has_on_death_emit = 1;
+        q.on_death_emit = ImSubEmitter_new(_par_in(k + 13), _par_in_f(k + 14), _par_in_f(k + 15), _par_in_f(k + 16),
+          _par_in_f(k + 17), _par_in_f(k + 18));
+        next = k + 19;
+    }
+    memcpy(p, &q, sizeof(ImParticle));
+    return next;
+}
+
+# An emitter at token k (flat::emitter's layout) into *e: the token after it.
+fn _par_in_emitter(k, e: *ImParticleEmitter): i64 {
+    var m: ImParticleEmitter = ImParticleEmitter_new(_par_in_v3(k + 1), _par_in_v3(k + 4), _par_in_f(k + 10));
+    m.handle = _par_in(k);
+    m.velocity_spread = _par_in_v3(k + 7);
+    m.particle_lifetime = _par_in_f(k + 11);
+    m.particle_radius = _par_in_f(k + 12);
+    m.particle_restitution = _par_in_f(k + 13);
+    m.particle_gravity_scale = _par_in_f(k + 14);
+    m.particle_damping = _par_in_f(k + 15);
+    m.active = _par_in(k + 16);
+    m.accumulator = _par_in_f(k + 17);
+    memcpy(e, &m, sizeof(ImParticleEmitter));
+    return k + 18;
+}
+
+# A force field at token k (flat::force_field's layout) into *f: the token after it.
+fn _par_in_force_field(k, f: *ImForceField): i64 {
+    var g: ImForceField;
+    var next = k + 10;
+    if (_par_in_enum_is(k, "ForceField.", "Radial") == 1) {
+        g = ImForceField_radial(_par_in_v3(k + 1), _par_in_f(k + 4), _par_in_f(k + 5), _par_in_f(k + 6));
+        next = k + 7;
+    } else {
+        g = ImForceField_directional(_par_in_v3(k + 1), _par_in_v3(k + 4), _par_in_v3(k + 7));
+    }
+    memcpy(f, &g, sizeof(ImForceField));
+    return next;
+}
+
 # The world's own state at token k into w (fresh): the token after it.
 fn _par_load_world(w: *ImPhysicsWorld, k0): i64 {
     var k = k0;
@@ -1747,54 +1797,100 @@ fn _par_load_world(w: *ImPhysicsWorld, k0): i64 {
     k = k + 1;
     var p: ImParticle;
     for (var i = 0; i < np; i = i + 1) {
-        p = ImParticle_new(_par_in_v3(k + 1), _par_in_v3(k + 4), _par_in_f(k + 7));
-        p.handle = _par_in(k);
-        p.radius = _par_in_f(k + 8);
-        p.drag = _par_in_f(k + 9);
-        p.restitution = _par_in_f(k + 10);
-        p.gravity_scale = _par_in_f(k + 11);
-        p.damping = _par_in_f(k + 12);
-        if (_par_in_is_none(k + 13) == 1) {
-            k = k + 14;
-        } else {
-            p.has_on_death_emit = 1;
-            p.on_death_emit = ImSubEmitter_new(_par_in(k + 13), _par_in_f(k + 14), _par_in_f(k + 15), _par_in_f(k + 16),
-              _par_in_f(k + 17), _par_in_f(k + 18));
-            k = k + 19;
-        }
+        k = _par_in_particle(k, &p);
         w.particles.push(&p);
     }
     var ne = _par_in(k);
     k = k + 1;
     var e: ImParticleEmitter;
     for (var j = 0; j < ne; j = j + 1) {
-        e = ImParticleEmitter_new(_par_in_v3(k + 1), _par_in_v3(k + 4), _par_in_f(k + 10));
-        e.handle = _par_in(k);
-        e.velocity_spread = _par_in_v3(k + 7);
-        e.particle_lifetime = _par_in_f(k + 11);
-        e.particle_radius = _par_in_f(k + 12);
-        e.particle_restitution = _par_in_f(k + 13);
-        e.particle_gravity_scale = _par_in_f(k + 14);
-        e.particle_damping = _par_in_f(k + 15);
-        e.active = _par_in(k + 16);
-        e.accumulator = _par_in_f(k + 17);
+        k = _par_in_emitter(k, &e);
         w.emitters.push(&e);
-        k = k + 18;
     }
     var nf = _par_in(k);
     k = k + 1;
     var f: ImForceField;
     for (var q = 0; q < nf; q = q + 1) {
-        if (_par_in_enum_is(k, "ForceField.", "Radial") == 1) {
-            f = ImForceField_radial(_par_in_v3(k + 1), _par_in_f(k + 4), _par_in_f(k + 5), _par_in_f(k + 6));
-            k = k + 7;
-        } else {
-            f = ImForceField_directional(_par_in_v3(k + 1), _par_in_v3(k + 4), _par_in_v3(k + 7));
-            k = k + 10;
-        }
+        k = _par_in_force_field(k, &f);
         w.force_fields.push(&f);
     }
     return k;
+}
+
+fn _par_got_sub_emitter(s: *ImSubEmitter) {
+    _par_got_i(s.count);
+    var sa: f64 = s.speed;
+    var sb: f64 = s.lifetime;
+    var sc: f64 = s.radius;
+    var sd: f64 = s.gravity_scale;
+    var se: f64 = s.restitution;
+    _par_got_f(sa);
+    _par_got_f(sb);
+    _par_got_f(sc);
+    _par_got_f(sd);
+    _par_got_f(se);
+    return 0;
+}
+
+fn _par_got_particle(p: *ImParticle) {
+    _par_got_i(p.handle);
+    _par_got_v3(p.position);
+    _par_got_v3(p.velocity);
+    var pa: f64 = p.lifetime;
+    var pb: f64 = p.radius;
+    var pc: f64 = p.drag;
+    var pd: f64 = p.restitution;
+    var pe: f64 = p.gravity_scale;
+    var pf: f64 = p.damping;
+    _par_got_f(pa);
+    _par_got_f(pb);
+    _par_got_f(pc);
+    _par_got_f(pd);
+    _par_got_f(pe);
+    _par_got_f(pf);
+    if (p.has_on_death_emit == 1) { _par_got_sub_emitter(p.on_death_emit); } else { _par_got_none(); }
+    return 0;
+}
+
+fn _par_got_emitter(e: *ImParticleEmitter) {
+    _par_got_i(e.handle);
+    _par_got_v3(e.position);
+    _par_got_v3(e.velocity);
+    _par_got_v3(e.velocity_spread);
+    var ea: f64 = e.rate;
+    var eb: f64 = e.particle_lifetime;
+    var ec: f64 = e.particle_radius;
+    var ed: f64 = e.particle_restitution;
+    var ee: f64 = e.particle_gravity_scale;
+    var ef: f64 = e.particle_damping;
+    var eg: f64 = e.accumulator;
+    _par_got_f(ea);
+    _par_got_f(eb);
+    _par_got_f(ec);
+    _par_got_f(ed);
+    _par_got_f(ee);
+    _par_got_f(ef);
+    _par_got_i(e.active);
+    _par_got_f(eg);
+    return 0;
+}
+
+fn _par_got_force_field(f: *ImForceField) {
+    _par_got_enum("ForceField.", force_field_kind_name(f.kind));
+    if (f.kind == IM_FORCE_FIELD_RADIAL) {
+        _par_got_v3(f.center);
+        var fa: f64 = f.strength;
+        var fb: f64 = f.falloff;
+        var fc: f64 = f.radius;
+        _par_got_f(fa);
+        _par_got_f(fb);
+        _par_got_f(fc);
+    } else {
+        _par_got_v3(f.force);
+        _par_got_v3(f.min);
+        _par_got_v3(f.max);
+    }
+    return 0;
 }
 
 fn _par_got_world(w: *ImPhysicsWorld) {
@@ -1802,79 +1898,12 @@ fn _par_got_world(w: *ImPhysicsWorld) {
     _par_got_i(w.next_particle_id);
     _par_got_i(w.next_emitter_id);
     _par_got_seq(w.particles.len);
-    for (var i = 0; i < w.particles.len; i = i + 1) {
-        var p: *ImParticle = _im_as_particle(w.particles.at(i));
-        _par_got_i(p.handle);
-        _par_got_v3(p.position);
-        _par_got_v3(p.velocity);
-        var pa: f64 = p.lifetime;
-        var pb: f64 = p.radius;
-        var pc: f64 = p.drag;
-        var pd: f64 = p.restitution;
-        var pe: f64 = p.gravity_scale;
-        var pf: f64 = p.damping;
-        _par_got_f(pa);
-        _par_got_f(pb);
-        _par_got_f(pc);
-        _par_got_f(pd);
-        _par_got_f(pe);
-        _par_got_f(pf);
-        if (p.has_on_death_emit == 1) {
-            _par_got_i(p.on_death_emit.count);
-            var sa: f64 = p.on_death_emit.speed;
-            var sb: f64 = p.on_death_emit.lifetime;
-            var sc: f64 = p.on_death_emit.radius;
-            var sd: f64 = p.on_death_emit.gravity_scale;
-            var se: f64 = p.on_death_emit.restitution;
-            _par_got_f(sa);
-            _par_got_f(sb);
-            _par_got_f(sc);
-            _par_got_f(sd);
-            _par_got_f(se);
-        } else {
-            _par_got_none();
-        }
-    }
+    for (var i = 0; i < w.particles.len; i = i + 1) { _par_got_particle(_im_as_particle(w.particles.at(i))); }
     _par_got_seq(w.emitters.len);
-    for (var j = 0; j < w.emitters.len; j = j + 1) {
-        var e: *ImParticleEmitter = _im_as_emitter(w.emitters.at(j));
-        _par_got_i(e.handle);
-        _par_got_v3(e.position);
-        _par_got_v3(e.velocity);
-        _par_got_v3(e.velocity_spread);
-        var ea: f64 = e.rate;
-        var eb: f64 = e.particle_lifetime;
-        var ec: f64 = e.particle_radius;
-        var ed: f64 = e.particle_restitution;
-        var ee: f64 = e.particle_gravity_scale;
-        var ef: f64 = e.particle_damping;
-        var eg: f64 = e.accumulator;
-        _par_got_f(ea);
-        _par_got_f(eb);
-        _par_got_f(ec);
-        _par_got_f(ed);
-        _par_got_f(ee);
-        _par_got_f(ef);
-        _par_got_i(e.active);
-        _par_got_f(eg);
-    }
+    for (var j = 0; j < w.emitters.len; j = j + 1) { _par_got_emitter(_im_as_emitter(w.emitters.at(j))); }
     _par_got_seq(w.force_fields.len);
     for (var q = 0; q < w.force_fields.len; q = q + 1) {
-        var f: *ImForceField = _im_as_force_field(w.force_fields.at(q));
-        _par_got_enum("ForceField.", force_field_kind_name(f.kind));
-        if (f.kind == IM_FORCE_FIELD_RADIAL) {
-            _par_got_v3(f.center);
-            var fa: f64 = f.strength;
-            var fb: f64 = f.falloff;
-            var fc: f64 = f.radius;
-            _par_got_f(fa);
-            _par_got_f(fb);
-            _par_got_f(fc);
-        } else {
-            _par_got_v3(f.force);
-            _par_got_v3(f.min);
-            _par_got_v3(f.max);
-        }
+        _par_got_force_field(_im_as_force_field(w.force_fields.at(q)));
     }
     _par_got_state(w.backend);
     return 0;
@@ -2039,6 +2068,22 @@ fn _par_json_write(fp, fl): i64 {
         s2.x = _par_in_spring(0);
         s2.y = _par_in_spring(6);
         s2.to_json(sb);
+    } elif (_par_eq(fp, fl, "serde_json::to_string::<ForceField>") == 1) {
+        var ff: ImForceField;
+        _par_in_force_field(0, &ff);
+        ff.to_json(sb);
+    } elif (_par_eq(fp, fl, "serde_json::to_string::<SubEmitter>") == 1) {
+        var se: ImSubEmitter = ImSubEmitter_new(_par_in(0), _par_in_f(1), _par_in_f(2), _par_in_f(3), _par_in_f(4),
+          _par_in_f(5));
+        se.to_json(sb);
+    } elif (_par_eq(fp, fl, "serde_json::to_string::<Particle>") == 1) {
+        var pt: ImParticle;
+        _par_in_particle(0, &pt);
+        pt.to_json(sb);
+    } elif (_par_eq(fp, fl, "serde_json::to_string::<ParticleEmitter>") == 1) {
+        var em: ImParticleEmitter;
+        _par_in_emitter(0, &em);
+        em.to_json(sb);
     } elif (_par_eq(fp, fl, "serde_json::to_string::<Spring3d>") == 1) {
         var s3: ImSpring3d;
         s3.x = _par_in_spring(0);
@@ -2133,6 +2178,35 @@ fn _par_json_read(fp, fl): i64 {
         return 1;
     }
     return _par_json_read_m1b(fp, fl, doc, n);
+}
+
+# The particle types' documents (M3d).
+fn _par_json_read_m3(fp, fl, doc, n): i64 {
+    if (_par_eq(fp, fl, "serde_json::from_str::<ForceField>") == 1) {
+        var ff: ImForceField;
+        var t1, v1 = ImForceField_from_json(doc, n, &ff);
+        if (is_err_result(t1) == 1) { _par_got_err(v1); } else { _par_got_force_field(&ff); }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "serde_json::from_str::<SubEmitter>") == 1) {
+        var se: ImSubEmitter;
+        var t2, v2 = ImSubEmitter_from_json(doc, n, &se);
+        if (is_err_result(t2) == 1) { _par_got_err(v2); } else { _par_got_sub_emitter(&se); }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "serde_json::from_str::<Particle>") == 1) {
+        var pt: ImParticle;
+        var t3, v3 = ImParticle_from_json(doc, n, &pt);
+        if (is_err_result(t3) == 1) { _par_got_err(v3); } else { _par_got_particle(&pt); }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "serde_json::from_str::<ParticleEmitter>") == 1) {
+        var em: ImParticleEmitter;
+        var t4, v4 = ImParticleEmitter_from_json(doc, n, &em);
+        if (is_err_result(t4) == 1) { _par_got_err(v4); } else { _par_got_emitter(&em); }
+        return 1;
+    }
+    return 0;
 }
 
 fn _par_json_read_m1b(fp, fl, doc, n): i64 {
@@ -2246,7 +2320,7 @@ fn _par_json_read_m1b(fp, fl, doc, n): i64 {
         }
         return 1;
     }
-    return 0;
+    return _par_json_read_m3(fp, fl, doc, n);
 }
 
 fn _par_json(fp, fl): i64 {

@@ -1,5 +1,5 @@
 # json.cyr — serde-compatible JSON (ADR 0010): the same documents the Rust crate's serde_json writes
-# and reads.
+# and reads, for every serializable type (M1's, and particle.rs's from M3).
 #
 # Writers append to a `str_builder`, fields in Rust declaration order, f64 through src/fmtf.cyr's
 # serde_json form, handles as unsigned decimals. Readers parse with bayan's value tree (never the
@@ -1689,5 +1689,330 @@ fn ImSpring3d_from_json(buf, len, out: *ImSpring3d): Result {
     s.y = y;
     s.z = z;
     memcpy(out, &s, sizeof(ImSpring3d));
+    return Ok(0);
+}
+
+# ── ForceField, SubEmitter, Particle, ParticleEmitter ───────────────────────────────
+
+impl ImForceField {
+    # Appends the field as serde_json writes a `ForceField`: externally tagged, both variants structs.
+    fn to_json(self, sb) {
+        _im_jw_variant(sb, force_field_kind_name(self.kind));
+        str_builder_putc(sb, 123);
+        if (self.kind == IM_FORCE_FIELD_RADIAL) {
+            var st: f64 = self.strength;
+            var fo: f64 = self.falloff;
+            var ra: f64 = self.radius;
+            _im_jw_key(sb, "center", 1);
+            _im_jw_vec3(sb, self.center);
+            _im_jw_key(sb, "strength", 0);
+            im_fmt_f64_json(sb, st);
+            _im_jw_key(sb, "falloff", 0);
+            im_fmt_f64_json(sb, fo);
+            _im_jw_key(sb, "radius", 0);
+            im_fmt_f64_json(sb, ra);
+        } else {
+            _im_jw_key(sb, "force", 1);
+            _im_jw_vec3(sb, self.force);
+            _im_jw_key(sb, "min", 0);
+            _im_jw_vec3(sb, self.min);
+            _im_jw_key(sb, "max", 0);
+            _im_jw_vec3(sb, self.max);
+        }
+        str_builder_putc(sb, 125);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads the `ForceField` node v into *out: 1, or 0 when malformed (a bare variant name included: both
+# variants carry fields).
+fn _im_jr_force_field(v, out: *ImForceField): i64 {
+    var kw[8];
+    var pw[8];
+    if (_im_jr_tagged(v, &force_field_kind_name, 2, &kw, &pw) == 0) { return 0; }
+    var k = load64(&kw);
+    var p = load64(&pw);
+    var a: ImVec3 = ImVec3_zero();
+    var b: ImVec3 = ImVec3_zero();
+    var c: ImVec3 = ImVec3_zero();
+    var f: ImForceField;
+    if (k == IM_FORCE_FIELD_RADIAL) {
+        var fr = _im_jr_form(p, 4);
+        if (fr == 0) { return 0; }
+        if (_im_jr_vec3(_im_jr_at(p, fr, 0, "center"), &a) == 0) { return 0; }
+        var w[24];
+        var names[24];
+        store64(&names, "strength");
+        store64(&names + 8, "falloff");
+        store64(&names + 16, "radius");
+        for (var i = 0; i < 3; i = i + 1) {
+            if (_im_jr_f64(_im_jr_at(p, fr, i + 1, load64(&names + i * 8)), &w + i * 8) == 0) { return 0; }
+        }
+        var st: f64 = load64(&w);
+        var fo: f64 = load64(&w + 8);
+        var ra: f64 = load64(&w + 16);
+        f = ImForceField_radial(a, st, fo, ra);
+    } else {
+        var fd = _im_jr_form(p, 3);
+        if (fd == 0) { return 0; }
+        if (_im_jr_vec3(_im_jr_at(p, fd, 0, "force"), &a) == 0) { return 0; }
+        if (_im_jr_vec3(_im_jr_at(p, fd, 1, "min"), &b) == 0) { return 0; }
+        if (_im_jr_vec3(_im_jr_at(p, fd, 2, "max"), &c) == 0) { return 0; }
+        f = ImForceField_directional(a, b, c);
+    }
+    memcpy(out, &f, sizeof(ImForceField));
+    return 1;
+}
+
+# Reads a `ForceField` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE). Mirrors
+# `serde_json::from_str::<ForceField>`.
+#must_use
+fn ImForceField_from_json(buf, len, out: *ImForceField): Result {
+    return _im_jr_result(_im_jr_force_field(_im_jr_parse(buf, len), out));
+}
+
+impl ImSubEmitter {
+    # Appends the sub-emitter as serde_json writes a `SubEmitter`.
+    fn to_json(self, sb) {
+        var sp: f64 = self.speed;
+        var lt: f64 = self.lifetime;
+        var ra: f64 = self.radius;
+        var gs: f64 = self.gravity_scale;
+        var re: f64 = self.restitution;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "count", 1);
+        str_builder_add_int(sb, self.count);
+        _im_jw_key(sb, "speed", 0);
+        im_fmt_f64_json(sb, sp);
+        _im_jw_key(sb, "lifetime", 0);
+        im_fmt_f64_json(sb, lt);
+        _im_jw_key(sb, "radius", 0);
+        im_fmt_f64_json(sb, ra);
+        _im_jw_key(sb, "gravity_scale", 0);
+        im_fmt_f64_json(sb, gs);
+        _im_jw_key(sb, "restitution", 0);
+        im_fmt_f64_json(sb, re);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads the `SubEmitter` node v (every field required; count a u32) into *out: 1, or 0.
+fn _im_jr_sub_emitter(v, out: *ImSubEmitter): i64 {
+    var f = _im_jr_form(v, 6);
+    if (f == 0) { return 0; }
+    var cw[8];
+    if (_im_jr_u32(_im_jr_at(v, f, 0, "count"), &cw) == 0) { return 0; }
+    var w[40];
+    var names[40];
+    store64(&names, "speed");
+    store64(&names + 8, "lifetime");
+    store64(&names + 16, "radius");
+    store64(&names + 24, "gravity_scale");
+    store64(&names + 32, "restitution");
+    for (var i = 0; i < 5; i = i + 1) {
+        if (_im_jr_f64(_im_jr_at(v, f, i + 1, load64(&names + i * 8)), &w + i * 8) == 0) { return 0; }
+    }
+    var sp: f64 = load64(&w);
+    var lt: f64 = load64(&w + 8);
+    var ra: f64 = load64(&w + 16);
+    var gs: f64 = load64(&w + 24);
+    var re: f64 = load64(&w + 32);
+    var s: ImSubEmitter = ImSubEmitter_new(load64(&cw), sp, lt, ra, gs, re);
+    memcpy(out, &s, sizeof(ImSubEmitter));
+    return 1;
+}
+
+# Reads a `SubEmitter` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE). Mirrors
+# `serde_json::from_str::<SubEmitter>`.
+#must_use
+fn ImSubEmitter_from_json(buf, len, out: *ImSubEmitter): Result {
+    return _im_jr_result(_im_jr_sub_emitter(_im_jr_parse(buf, len), out));
+}
+
+impl ImParticle {
+    # Appends the particle as serde_json writes a `Particle` (its handle a bare u64, `on_death_emit`
+    # null without one).
+    fn to_json(self, sb) {
+        var lt: f64 = self.lifetime;
+        var ra: f64 = self.radius;
+        var dr: f64 = self.drag;
+        var re: f64 = self.restitution;
+        var gs: f64 = self.gravity_scale;
+        var dm: f64 = self.damping;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "handle", 1);
+        _im_jw_u64(sb, self.handle);
+        _im_jw_key(sb, "position", 0);
+        _im_jw_vec3(sb, self.position);
+        _im_jw_key(sb, "velocity", 0);
+        _im_jw_vec3(sb, self.velocity);
+        _im_jw_key(sb, "lifetime", 0);
+        im_fmt_f64_json(sb, lt);
+        _im_jw_key(sb, "radius", 0);
+        im_fmt_f64_json(sb, ra);
+        _im_jw_key(sb, "drag", 0);
+        im_fmt_f64_json(sb, dr);
+        _im_jw_key(sb, "restitution", 0);
+        im_fmt_f64_json(sb, re);
+        _im_jw_key(sb, "gravity_scale", 0);
+        im_fmt_f64_json(sb, gs);
+        _im_jw_key(sb, "damping", 0);
+        im_fmt_f64_json(sb, dm);
+        _im_jw_key(sb, "on_death_emit", 0);
+        if (self.has_on_death_emit == 1) {
+            self.on_death_emit.to_json(sb);
+        } else {
+            str_builder_add_cstr(sb, "null");
+        }
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `Particle` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE). Every field is required but
+# `on_death_emit`, which may be absent or null (serde's default). Mirrors
+# `serde_json::from_str::<Particle>`.
+#must_use
+fn ImParticle_from_json(buf, len, out: *ImParticle): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 10);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var hw[8];
+    if (_im_jr_u64(_im_jr_at(o, f, 0, "handle"), &hw) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var pos: ImVec3 = ImVec3_zero();
+    var vel: ImVec3 = ImVec3_zero();
+    if (_im_jr_vec3(_im_jr_at(o, f, 1, "position"), &pos) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_vec3(_im_jr_at(o, f, 2, "velocity"), &vel) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var w[48];
+    var names[48];
+    store64(&names, "lifetime");
+    store64(&names + 8, "radius");
+    store64(&names + 16, "drag");
+    store64(&names + 24, "restitution");
+    store64(&names + 32, "gravity_scale");
+    store64(&names + 40, "damping");
+    for (var i = 0; i < 6; i = i + 1) {
+        if (_im_jr_f64(_im_jr_at(o, f, i + 3, load64(&names + i * 8)), &w + i * 8) == 0) {
+            return Err(IM_ERR_DESERIALIZE);
+        }
+    }
+    var life: f64 = load64(&w);
+    var p: ImParticle = ImParticle_new(pos, vel, life);
+    p.handle = load64(&hw);
+    var ra: f64 = load64(&w + 8);
+    var dr: f64 = load64(&w + 16);
+    var re: f64 = load64(&w + 24);
+    var gs: f64 = load64(&w + 32);
+    var dm: f64 = load64(&w + 40);
+    # The fields as stored (Rust's derive sets them directly: no `with_radius` clamp).
+    p.radius = ra;
+    p.drag = dr;
+    p.restitution = re;
+    p.gravity_scale = gs;
+    p.damping = dm;
+    var sub: ImSubEmitter = ImSubEmitter_new(0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    var r = _im_jr_opt_def(_im_jr_at(o, f, 9, "on_death_emit"), &_im_jr_sub_emitter, &sub);
+    if (r == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (r == 1) {
+        p.has_on_death_emit = 1;
+        p.on_death_emit = sub;
+    }
+    memcpy(out, &p, sizeof(ImParticle));
+    return Ok(0);
+}
+
+impl ImParticleEmitter {
+    # Appends the emitter as serde_json writes a `ParticleEmitter`, its spawn accumulator included.
+    fn to_json(self, sb) {
+        var rt: f64 = self.rate;
+        var lt: f64 = self.particle_lifetime;
+        var ra: f64 = self.particle_radius;
+        var re: f64 = self.particle_restitution;
+        var gs: f64 = self.particle_gravity_scale;
+        var dm: f64 = self.particle_damping;
+        var ac: f64 = self.accumulator;
+        str_builder_putc(sb, 123);
+        _im_jw_key(sb, "handle", 1);
+        _im_jw_u64(sb, self.handle);
+        _im_jw_key(sb, "position", 0);
+        _im_jw_vec3(sb, self.position);
+        _im_jw_key(sb, "velocity", 0);
+        _im_jw_vec3(sb, self.velocity);
+        _im_jw_key(sb, "velocity_spread", 0);
+        _im_jw_vec3(sb, self.velocity_spread);
+        _im_jw_key(sb, "rate", 0);
+        im_fmt_f64_json(sb, rt);
+        _im_jw_key(sb, "particle_lifetime", 0);
+        im_fmt_f64_json(sb, lt);
+        _im_jw_key(sb, "particle_radius", 0);
+        im_fmt_f64_json(sb, ra);
+        _im_jw_key(sb, "particle_restitution", 0);
+        im_fmt_f64_json(sb, re);
+        _im_jw_key(sb, "particle_gravity_scale", 0);
+        im_fmt_f64_json(sb, gs);
+        _im_jw_key(sb, "particle_damping", 0);
+        im_fmt_f64_json(sb, dm);
+        _im_jw_key(sb, "active", 0);
+        _im_jw_bool(sb, self.active);
+        _im_jw_key(sb, "accumulator", 0);
+        im_fmt_f64_json(sb, ac);
+        str_builder_putc(sb, 125);
+        return 0;
+    }
+}
+
+# Reads a `ParticleEmitter` document into *out: Ok(0), or Err(IM_ERR_DESERIALIZE). Every field is
+# required, the accumulator too (Rust serializes its private field with no default). Mirrors
+# `serde_json::from_str::<ParticleEmitter>`.
+#must_use
+fn ImParticleEmitter_from_json(buf, len, out: *ImParticleEmitter): Result {
+    var o = _im_jr_parse(buf, len);
+    var f = _im_jr_form(o, 12);
+    if (f == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var hw[8];
+    if (_im_jr_u64(_im_jr_at(o, f, 0, "handle"), &hw) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var pos: ImVec3 = ImVec3_zero();
+    var vel: ImVec3 = ImVec3_zero();
+    var spr: ImVec3 = ImVec3_zero();
+    if (_im_jr_vec3(_im_jr_at(o, f, 1, "position"), &pos) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_vec3(_im_jr_at(o, f, 2, "velocity"), &vel) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    if (_im_jr_vec3(_im_jr_at(o, f, 3, "velocity_spread"), &spr) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var w[48];
+    var names[48];
+    store64(&names, "rate");
+    store64(&names + 8, "particle_lifetime");
+    store64(&names + 16, "particle_radius");
+    store64(&names + 24, "particle_restitution");
+    store64(&names + 32, "particle_gravity_scale");
+    store64(&names + 40, "particle_damping");
+    for (var i = 0; i < 6; i = i + 1) {
+        if (_im_jr_f64(_im_jr_at(o, f, i + 4, load64(&names + i * 8)), &w + i * 8) == 0) {
+            return Err(IM_ERR_DESERIALIZE);
+        }
+    }
+    var aw[8];
+    if (_im_jr_bool(_im_jr_at(o, f, 10, "active"), &aw) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var cw[8];
+    if (_im_jr_f64(_im_jr_at(o, f, 11, "accumulator"), &cw) == 0) { return Err(IM_ERR_DESERIALIZE); }
+    var rate: f64 = load64(&w);
+    var e: ImParticleEmitter = ImParticleEmitter_new(pos, vel, rate);
+    e.handle = load64(&hw);
+    e.velocity_spread = spr;
+    var lt: f64 = load64(&w + 8);
+    var ra: f64 = load64(&w + 16);
+    var re: f64 = load64(&w + 24);
+    var gs: f64 = load64(&w + 32);
+    var dm: f64 = load64(&w + 40);
+    var ac: f64 = load64(&cw);
+    e.particle_lifetime = lt;
+    e.particle_radius = ra;
+    e.particle_restitution = re;
+    e.particle_gravity_scale = gs;
+    e.particle_damping = dm;
+    e.active = load64(&aw);
+    e.accumulator = ac;
+    memcpy(out, &e, sizeof(ImParticleEmitter));
     return Ok(0);
 }

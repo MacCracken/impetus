@@ -1,7 +1,7 @@
 # world.tcyr — the world and its particles (M3d): the Rust tests of rust-old/src/world.rs (22; the four
-# xpbd_* tests are not ported, ADR 0008 #6) and of rust-old/src/particle.rs (6; its two serde tests wait
-# for particle JSON), plus Cyrius-only tests of try_new's refusals, the spawn cap, emitter removal, the
-# config view and a flat heap.
+# xpbd_* tests are not ported, ADR 0008 #6) and of rust-old/src/particle.rs (8, its two serde round trips
+# through src/json.cyr), plus Cyrius-only tests of try_new's refusals, the spawn cap, emitter removal, the
+# config view, a flat heap and the force-field and sub-emitter JSON.
 
 include "tests/lib_2d.cyr"
 
@@ -12,6 +12,15 @@ fn near(got: f64, want: f64, eps: f64): i64 {
     var d: f64 = f64_abs(got - want);
     if (d < eps) { return 1; }
     return 0;
+}
+
+# 1 when the words at a and b, n bytes, are equal (Rust's derived PartialEq on these all-f64 records,
+# which holds for the round trips here: no NaN).
+fn same_words(a, b, n): i64 {
+    for (var i = 0; i < n; i = i + 8) {
+        if (load64(a + i) != load64(b + i)) { return 0; }
+    }
+    return 1;
 }
 
 # A config with gravity (gx, gy).
@@ -334,6 +343,23 @@ fn main() {
     var egs: f64 = eb.particle_gravity_scale;
     var edm: f64 = eb.particle_damping;
     assert_eq(esy == 2.0 && elf == 3.0 && erd == 0.2 && egs == 0.0 && edm == 0.5, 1, "set");
+    test_group("particle_serde");
+    var sp1: ImParticle = ImParticle_new(ImVec3_new(1.0, 2.0, 0.0), ImVec3_new(3.0, 4.0, 0.0), 5.0);
+    var jsb = str_builder_new();
+    sp1.to_json(jsb);
+    var js1 = str_builder_build(jsb);
+    var sp2: ImParticle = ImParticle_new(z, z, 0.0);
+    var tj1, vj1 = ImParticle_from_json(str_data(js1), str_len(js1), &sp2);
+    assert_eq(is_ok(tj1) == 1 && same_words(&sp1, &sp2, sizeof(ImParticle)) == 1, 1, "a particle reads back equal");
+    test_group("emitter_serde");
+    var se1: ImParticleEmitter = ImParticleEmitter_new(ImVec3_new(1.0, 2.0, 0.0), ImVec3_new(3.0, 4.0, 0.0), 10.0);
+    var esb = str_builder_new();
+    se1.to_json(esb);
+    var es1 = str_builder_build(esb);
+    var se2: ImParticleEmitter = ImParticleEmitter_new(z, z, 0.0);
+    var tj2, vj2 = ImParticleEmitter_from_json(str_data(es1), str_len(es1), &se2);
+    var esame = same_words(&se1, &se2, sizeof(ImParticleEmitter));
+    assert_eq(is_ok(tj2) == 1 && esame == 1, 1, "an emitter reads back equal");
     test_group("particle_handle_eq");
     assert_eq(1 == 1 && 1 != 2, 1, "handles are words");
 
@@ -378,6 +404,39 @@ fn main() {
     var fs2, fn2 = w.force_fields();
     assert_eq(fn2, 0, "fields cleared");
     w.free();
+
+    test_group("particle_json_kinds");
+    # A sub-emitter and both field kinds round trip; a bare variant name or a missing field is refused.
+    var sp3: ImParticle = ImParticle_new(ImVec3_new(5.0, 5.0, 0.0), z, 0.025);
+    sp3.with_sub_emitter(ImSubEmitter_new(4, 3.0, 2.0, 0.02, 0.0, 0.5));
+    sp3.handle = 41;
+    var jsb3 = str_builder_new();
+    sp3.to_json(jsb3);
+    var js3 = str_builder_build(jsb3);
+    var sp4: ImParticle = ImParticle_new(z, z, 0.0);
+    var tj3, vj3 = ImParticle_from_json(str_data(js3), str_len(js3), &sp4);
+    assert_eq(is_ok(tj3) == 1 && same_words(&sp3, &sp4, sizeof(ImParticle)) == 1, 1, "with a sub-emitter");
+    var fr1: ImForceField = ImForceField_radial(ImVec3_new(1.0, 2.0, 0.0), -3.0, 1.5, 4.0);
+    var fd1: ImForceField = ImForceField_directional(ImVec3_new(1.0, 0.0, 0.0), ImVec3_new(-1.0, -1.0, -1.0),
+      ImVec3_new(1.0, 1.0, 1.0));
+    var fsb = str_builder_new();
+    fr1.to_json(fsb);
+    var fj1 = str_builder_build(fsb);
+    var fr2: ImForceField = ImForceField_radial(z, 0.0, 0.0, 0.0);
+    var tj4, vj4 = ImForceField_from_json(str_data(fj1), str_len(fj1), &fr2);
+    var fsb2 = str_builder_new();
+    fd1.to_json(fsb2);
+    var fj2 = str_builder_build(fsb2);
+    var fd2: ImForceField = ImForceField_radial(z, 0.0, 0.0, 0.0);
+    var tj5, vj5 = ImForceField_from_json(str_data(fj2), str_len(fj2), &fd2);
+    assert_eq(is_ok(tj4) == 1 && is_ok(tj5) == 1 && same_words(&fr1, &fr2, sizeof(ImForceField)) == 1
+      && same_words(&fd1, &fd2, sizeof(ImForceField)) == 1, 1, "both field kinds");
+    var bare = "\"Radial\"";
+    var tj6, vj6 = ImForceField_from_json(bare, strlen(bare), &fd2);
+    var part = "{\"count\":4,\"speed\":3}";
+    var sub2: ImSubEmitter = ImSubEmitter_new(0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    var tj7, vj7 = ImSubEmitter_from_json(part, strlen(part), &sub2);
+    assert_eq(is_ok(tj6) == 0 && vj6 == IM_ERR_DESERIALIZE && is_ok(tj7) == 0, 1, "refused");
 
     test_group("flat_heap_with_particles");
     # An emitter at steady state over a floor: after warm-up the particle storage is reused.

@@ -595,7 +595,7 @@ fails when either drifts from `cyrius.cyml`.
     then the particles: emitter spawns with the R3 spread and the 10,000 cap, gravity, fields, drag, damping,
     collisions with balls, boxes, capsules and segments, sub-emitters, and removal of the dead.
   - The API follows Rust's with ADR 0008's changes (#1, #6). Slices come back as (address, count). Snapshots wait for
-    M6, and particle JSON for a later part.
+    M6. Particle JSON came last (below).
   - `FIELD_SOFTENING`, `MAX_SPAWNS_PER_EMITTER_STEP` and the `R3_ALPHA` array are generated (`t_private.rs` now reads
     multi-line array constants).
 - **`world_step.tsv`**, 198 rows: the config, the world's own state (counters, particles, emitters with their spawn
@@ -618,12 +618,20 @@ fails when either drifts from `cyrius.cyml`.
 - **The transcription.** `validate.py` now transcribes the world step: the backend frame, then the particles on
   glibc's sin, cos and pow. It reproduces all 198 rows bit for bit. MPFR changes none of them, so there is no
   `world_step.cr.tsv`.
-- **Rust tests.** All 22 of `world.rs` are ported (its four XPBD tests excepted), 6 of `particle.rs` (its two serde
-  tests wait for particle JSON), 9 of `tests/integration.rs`, and 26 of `tests/regressions.rs` (the 2D ones; the three
+- **Rust tests.** All 22 of `world.rs` are ported (its four XPBD tests excepted), all 8 of `particle.rs`, 9 of
+  `tests/integration.rs`, and 26 of `tests/regressions.rs` (the 2D ones; the three
   snapshot tests wait for M6). That makes `tests/world.tcyr` (50 assertions, with Cyrius-only checks of `try_new`, the
   spawn cap, emitter removal and a flat heap) and `tests/regressions.tcyr` (44).
-- **Result, every target:** 18 modules, 0 failing; **98,393 ok, 0 failed, 0 measured, 7 pending, 165 accepted**
-  (ADR 0011: 70). The ELF and PE digests are equal (their `powf` digest is new). On aarch64 only the native shadows
+- **Particle JSON**, the last piece of M3. `src/json.cyr` writes and reads `ForceField` (externally tagged, both
+  variants with fields), `SubEmitter`, `Particle` (`on_death_emit` defaults to None) and `ParticleEmitter`, its private
+  `accumulator` required, as serde derives it.
+  - `json.tsv` grows 937 → 1,092 rows: 70 written values and 85 documents read back. The documents include the
+    sequence form at every length, a bare variant name, two keys, a missing or extra field, a u32 out of range or
+    written as a float, and a `null` for an f64.
+  - All 155 pass on the first run, writes byte for byte. The two particle serde tests are ported (`world.tcyr`, 55
+    assertions).
+- **Result, every target:** 18 modules, 0 failing; **98,548 ok, 0 failed, 0 measured, 7 pending, 165 accepted**
+  (ADR 0011: 70). Before particle JSON it was 98,393 ok. The ELF and PE digests are equal (their `powf` digest is new). On aarch64 only the native shadows
   differ.
 
 ## How to reproduce
