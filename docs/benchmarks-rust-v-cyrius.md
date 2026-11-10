@@ -544,3 +544,19 @@ x86_64 ELF, quiet machine. Rust's rows are criterion on the 3D build (`cargo ben
   quaternion. Both then refresh R·I⁻¹·Rᵀ: a quaternion-to-matrix conversion and two 3×3 products. A one-off probe
   timed the port's refresh alone at 304 ns of the 379. Its chain of by-value struct calls is the cost, as in M4's math
   rows. Recorded, not acted on.
+
+## M6 part 1: snapshots at the struct (2026-11-10)
+
+x86_64 ELF, quiet machine. Cyrius only: Rust's `snapshot/*` rows serialize to bitcode bytes, and the port's bytes come
+with part 2. These rows run Rust's scenes at the struct (ADR 0013): a capture into an `ImWorldSnapshot` and its
+`free`, and a restore into a fresh world and its `free`.
+
+| Bench | Body | Cyrius |
+|---|---|---|
+| `snapshot/capture_empty (struct)` | an empty world (Rust's `serialize_empty` scene) | 1.39 µs |
+| `snapshot/capture_100_bodies (struct)` | 100 balls in rows of 10 (Rust's `serialize_100_bodies` scene) | 208 µs |
+| `snapshot/restore_100_bodies (struct)` | those 100 restored into a fresh world (Rust's `roundtrip_100_bodies` scene) | 234 µs |
+
+About 2 µs a body each way. Each body copies its record (224 B), its collider's record (320 B) with the shape, and
+allocates its collider list; how the 2 µs splits between them is not profiled yet. Part 2 sets Rust's byte rows beside
+these.

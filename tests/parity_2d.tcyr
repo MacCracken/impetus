@@ -159,7 +159,10 @@ fn _par_constants(fp, fl): i64 {
         _par_got_i(IM_MAX_ITERATIONS);
         return 1;
     }
-    if (_par_eq(np, nl, "world::PhysicsWorld::MAX_SNAPSHOT_INDEX") == 1) { return 0; }
+    if (_par_eq(np, nl, "world::PhysicsWorld::MAX_SNAPSHOT_INDEX") == 1) {
+        _par_got_i(IM_MAX_SNAPSHOT_INDEX);
+        return 1;
+    }
     return 0 - 1;
 }
 

@@ -3,10 +3,8 @@
 //! impetus 1.4.0 has three public scalar consts, all `u32` limits. `ALL` lists every one, and
 //! `complete` proves the list against `rust-old/src`; `tests/golden/constants.tsv` pins every
 //! value (`m_constants.rs`).
-//! - **Config limits** (`Home::Constants`) are generated here: `WorldConfig::validate` checks
-//!   them from M1.
-//! - **The snapshot index cap** (`Home::Module("M6")`) is generated with the snapshot module;
-//!   its golden row is *pending* in the harness until then.
+//! All three are generated here: the config limits, which `WorldConfig::validate` checks from M1, and the snapshot
+//! index cap, which `restore` checks (M6).
 //!
 //! Private constants (solver thresholds, the broadphase margin, the emitter spawn cap, …) are
 //! not public API. They are extracted from the Rust source and proven against the oracle's
@@ -18,15 +16,6 @@ use crate::cyr::{doc_comment, header};
 use std::fmt::Write as _;
 use std::path::Path;
 
-/// Where a constant is generated.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Home {
-    /// `src/constants.cyr` (this generator).
-    Constants,
-    /// With its module, at the named (later) milestone.
-    Module(&'static str),
-}
-
 /// One public const of the oracle.
 pub struct Constant {
     /// `config::WorldConfig::MAX_SUB_STEPS`, the golden row's input.
@@ -37,7 +26,6 @@ pub struct Constant {
     file: &'static str,
     item: &'static str,
     pub value: i64,
-    pub home: Home,
 }
 
 /// Every public const of impetus 1.4.0, in source order.
@@ -49,7 +37,6 @@ pub fn all() -> Vec<Constant> {
             file: "config.rs",
             item: "pub const MAX_SUB_STEPS",
             value: i64::from(impetus::WorldConfig::MAX_SUB_STEPS),
-            home: Home::Constants,
         },
         Constant {
             path: "config::WorldConfig::MAX_ITERATIONS",
@@ -57,7 +44,6 @@ pub fn all() -> Vec<Constant> {
             file: "config.rs",
             item: "pub const MAX_ITERATIONS",
             value: i64::from(impetus::WorldConfig::MAX_ITERATIONS),
-            home: Home::Constants,
         },
         Constant {
             path: "world::PhysicsWorld::MAX_SNAPSHOT_INDEX",
@@ -65,7 +51,6 @@ pub fn all() -> Vec<Constant> {
             file: "world.rs",
             item: "pub const MAX_SNAPSHOT_INDEX",
             value: i64::from(impetus::PhysicsWorld::MAX_SNAPSHOT_INDEX),
-            home: Home::Module("M6"),
         },
     ]
 }
@@ -129,12 +114,10 @@ pub fn emit(root: &Path, provenance: &str) -> Result<String, String> {
         &[
             "Every public constant of the Rust crate; t_constants.rs proves the list complete\n\
              against rust-old/src, and tests/golden/constants.tsv pins each value.",
-            "The snapshot index cap (PhysicsWorld::MAX_SNAPSHOT_INDEX) is generated with the\n\
-             snapshot module (M6). Private constants are extracted and proven at the milestone\n\
-             whose module uses them.",
+            "Private constants are extracted and proven at the milestone whose module uses them.",
         ],
     );
-    for c in all().iter().filter(|c| c.home == Home::Constants) {
+    for c in &all() {
         let file = root.join("rust-old/src").join(c.file);
         let src = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
         out.push_str(&doc_comment(&src, c.item)?);

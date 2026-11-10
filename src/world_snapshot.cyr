@@ -1,0 +1,102 @@
+# world_snapshot.cyr — `snapshot` and `restore` (ADR 0013), and the world's half of a snapshot: the config, the id
+# counters, the particles, emitters and force fields. Shared by both profiles, after the profile's snapshot file
+# (src/b2_snapshot.cyr), whose `ImWorldSnapshot` and backend half it completes.
+#
+# `restore` is the one fallible restore of ADR 0008 #2 (Rust's `try_restore`; 1.4.0's `restore` that ignored errors is
+# gone). It checks the whole snapshot first, builds a fresh world from it, and only then replaces the world, so on any
+# error the world is unchanged.
+
+impl ImWorldSnapshot {
+    # Captures world w: 1, or 0 when there is no memory (what was captured stays owned by the snapshot).
+    fn _capture(self, w: *ImPhysicsWorld): i64 {
+        self.config = w.config;
+        self.next_particle_id = w.next_particle_id;
+        self.next_emitter_id = w.next_emitter_id;
+        if (_im_snap_copy_records(self.particles, w.particles) == 0) { return 0; }
+        if (_im_snap_copy_records(self.emitters, w.emitters) == 0) { return 0; }
+        if (_im_snap_copy_records(self.force_fields, w.force_fields) == 0) { return 0; }
+        return self._capture_backend(w.backend);
+    }
+
+    # Ok(0) when the snapshot can be restored: the config passes `validate` (else its error, IM_ERR_INVALID_CONFIG or,
+    # for XPBD, IM_ERR_UNSUPPORTED), and the world's records and the backend half are well formed (else
+    # Err(IM_ERR_DESERIALIZE)). Mirrors `validate_snapshot`, whose checks it extends (ADR 0013).
+    fn validate(self): Result {
+        var cfg: ImWorldConfig = self.config;
+        var t, v = cfg.validate();
+        if (is_ok(t) == 0) { return Err(v); }
+        if (self.particles.size != sizeof(ImParticle) || self.emitters.size != sizeof(ImParticleEmitter)) {
+            return Err(IM_ERR_DESERIALIZE);
+        }
+        if (self.force_fields.size != sizeof(ImForceField)) { return Err(IM_ERR_DESERIALIZE); }
+        for (var i = 0; i < self.particles.len; i = i + 1) {
+            var p: *ImParticle = _im_as_particle(self.particles.at(i));
+            if (_im_snap_flag(p.has_on_death_emit) == 0) { return Err(IM_ERR_DESERIALIZE); }
+            var n = p.on_death_emit.count;
+            if (p.has_on_death_emit == 1 && (n < 0 || n > 0xFFFFFFFF)) { return Err(IM_ERR_DESERIALIZE); }
+        }
+        for (var e = 0; e < self.emitters.len; e = e + 1) {
+            var em: *ImParticleEmitter = _im_as_emitter(self.emitters.at(e));
+            if (_im_snap_flag(em.active) == 0) { return Err(IM_ERR_DESERIALIZE); }
+        }
+        for (var f = 0; f < self.force_fields.len; f = f + 1) {
+            var ff: *ImForceField = _im_as_force_field(self.force_fields.at(f));
+            if (ff.kind != IM_FORCE_FIELD_RADIAL && ff.kind != IM_FORCE_FIELD_DIRECTIONAL) {
+                return Err(IM_ERR_DESERIALIZE);
+            }
+        }
+        if (self._validate_backend() == 0) { return Err(IM_ERR_DESERIALIZE); }
+        return Ok(0);
+    }
+
+    # Loads the snapshot into the fresh world w (built over its config): 1, or 0 when there is no memory. Assumes
+    # `validate`.
+    fn _load(self, w: *ImPhysicsWorld): i64 {
+        w.next_particle_id = self.next_particle_id;
+        w.next_emitter_id = self.next_emitter_id;
+        if (_im_snap_copy_records(w.particles, self.particles) == 0) { return 0; }
+        if (_im_snap_copy_records(w.emitters, self.emitters) == 0) { return 0; }
+        if (_im_snap_copy_records(w.force_fields, self.force_fields) == 0) { return 0; }
+        return self._load_backend(w.backend);
+    }
+
+    # Releases everything the snapshot owns.
+    fn free(self) {
+        self.particles.free();
+        self.emitters.free();
+        self.force_fields.free();
+        self._free_backend();
+        return 0;
+    }
+}
+
+impl ImPhysicsWorld {
+    # The world's whole state into out, overwriting it (free a snapshot it held first): Ok(0), or Err(IM_ERR_SERIALIZE)
+    # when there is no memory. The snapshot owns copies; the world is untouched. Mirrors `snapshot` (ADR 0013).
+    fn snapshot(self, out: *ImWorldSnapshot): Result {
+        var s: ImWorldSnapshot = ImWorldSnapshot_new();
+        if (s._capture(self) == 0) {
+            s.free();
+            return Err(IM_ERR_SERIALIZE);
+        }
+        memcpy(out, &s, sizeof(ImWorldSnapshot));
+        return Ok(0);
+    }
+
+    # Replaces the world with the snapshot's: its config, bodies, colliders, joints, contacts, particles, emitters and
+    # force fields, its arenas' slots (so the next handles are the original's) and the last step's events. Ok(0), or the
+    # error `validate` gives, or Err(IM_ERR_DESERIALIZE) when there is no memory; on any error the world is unchanged.
+    # The snapshot is only read. Mirrors `try_restore` (ADR 0008 #2).
+    fn restore(self, snap: *ImWorldSnapshot): Result {
+        var t, v = snap.validate();
+        if (is_ok(t) == 0) { return Err(v); }
+        var nw: ImPhysicsWorld = ImPhysicsWorld_new(snap.config);
+        if (snap._load(&nw) == 0) {
+            nw.free();
+            return Err(IM_ERR_DESERIALIZE);
+        }
+        self.free();
+        memcpy(self, &nw, sizeof(ImPhysicsWorld));
+        return Ok(0);
+    }
+}

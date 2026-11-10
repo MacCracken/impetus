@@ -76,9 +76,7 @@ fn im_error_message(code): i64 {
 # Every public constant of the Rust crate; t_constants.rs proves the list complete
 # against rust-old/src, and tests/golden/constants.tsv pins each value.
 #
-# The snapshot index cap (PhysicsWorld::MAX_SNAPSHOT_INDEX) is generated with the
-# snapshot module (M6). Private constants are extracted and proven at the milestone
-# whose module uses them.
+# Private constants are extracted and proven at the milestone whose module uses them.
 
 # Largest accepted `sub_steps`.
 # Rust: impetus::config::WorldConfig::MAX_SUB_STEPS
@@ -87,6 +85,12 @@ const IM_MAX_SUB_STEPS = 4096;
 # Largest accepted `velocity_iterations` / `position_iterations`.
 # Rust: impetus::config::WorldConfig::MAX_ITERATIONS
 const IM_MAX_ITERATIONS = 10000;
+
+# Largest arena index (body, collider or joint slot) accepted from a
+# snapshot. Restoring allocates every slot up to the largest index, so
+# this bounds the memory an untrusted snapshot can request.
+# Rust: impetus::world::PhysicsWorld::MAX_SNAPSHOT_INDEX
+const IM_MAX_SNAPSHOT_INDEX = 1048576;
 
 # --- constants_private.cyr ---
 
@@ -14872,4 +14876,735 @@ fn ImBodyState_from_json(buf, len, out: *ImBodyState): Result {
     s.is_sleeping = load64(&w);
     memcpy(out, &s, sizeof(ImBodyState));
     return Ok(0);
+}
+
+# --- snapshot.cyr ---
+
+# snapshot.cyr — the snapshot pieces both profiles share (ADR 0013): an arena's slots and free list, the contact
+# tracker's pair lists and last events, and record-list copies. Each piece captures its part of a live world, checks
+# itself, and loads into a fresh one. A profile's `ImWorldSnapshot`, with its backend records, comes next
+# (src/b2_snapshot.cyr; the 3D one arrives with M6 part 4), and src/world_snapshot.cyr after it: `snapshot`,
+# `restore` and the checks that span the pieces.
+
+# ── record and pair lists ───────────────────────────────────────────────────────────
+
+# Copies src's records into dst (emptied first; both of one record size): 1, or 0 when there is no memory.
+fn _im_snap_copy_records(dst: *ImRecordList, src: *ImRecordList): i64 {
+    dst.len = 0;
+    if (src.len == 0) { return 1; }
+    if (dst.reserve(src.len) == 0) { return 0; }
+    memcpy(dst.data, src.data, src.len * src.size);
+    dst.len = src.len;
+    return 1;
+}
+
+# Copies src's pairs into dst (emptied first): 1, or 0 when there is no memory.
+fn _im_snap_copy_pairs(dst: *ImPairList, src: *ImPairList): i64 {
+    dst.len = 0;
+    if (src.len == 0) { return 1; }
+    if (dst.reserve(src.len) == 0) { return 0; }
+    memcpy(dst.data, src.data, src.len * 16);
+    dst.len = src.len;
+    return 1;
+}
+
+# 1 when the pairs are in strictly ascending (unsigned) order, as the tracker and the manifold store keep them.
+#must_use
+fn _im_snap_pairs_ascending(p: *ImPairList): i64 {
+    for (var i = 1; i < p.len; i = i + 1) {
+        if (_im_pair_cmp(p.first(i - 1), p.second(i - 1), p.first(i), p.second(i)) >= 0) { return 0; }
+    }
+    return 1;
+}
+
+# 1 when x is 0 or 1.
+#must_use
+fn _im_snap_flag(x): i64 {
+    if (x == 0 || x == 1) { return 1; }
+    return 0;
+}
+
+# ── shapes, materials, joint types ──────────────────────────────────────────────────
+
+# A copy of shape s with arrays of its own into *out: 1, or 0 when there is no memory (then nothing stays allocated).
+fn _im_snap_clone_shape(s: *ImColliderShape, out: *ImColliderShape): i64 {
+    var c: ImColliderShape = s.clone();
+    var lost = 0;
+    if (s.point_count > 0 && c.points == 0) { lost = 1; }
+    if (s.vertex_count > 0 && c.vertices == 0) { lost = 1; }
+    if (s.index_count > 0 && c.indices == 0) { lost = 1; }
+    if (s.height_count > 0 && c.heights == 0) { lost = 1; }
+    if (lost == 1) {
+        c.free();
+        return 0;
+    }
+    memcpy(out, &c, sizeof(ImColliderShape));
+    return 1;
+}
+
+# 1 when shape s is well formed: a known kind, no negative array count, an array behind every nonzero count, and a
+# mesh's indices inside its vertices. Its sizes are not checked, as Rust checks none.
+#must_use
+fn _im_snap_shape_ok(s: *ImColliderShape): i64 {
+    if (s.kind < IM_SHAPE_BOX || s.kind > IM_SHAPE_SEGMENT) { return 0; }
+    if (s.point_count < 0 || s.vertex_count < 0 || s.index_count < 0 || s.height_count < 0) { return 0; }
+    if ((s.point_count > 0 && s.points == 0) || (s.vertex_count > 0 && s.vertices == 0)) { return 0; }
+    if ((s.index_count > 0 && s.indices == 0) || (s.height_count > 0 && s.heights == 0)) { return 0; }
+    for (var i = 0; i < s.index_count * 3; i = i + 1) {
+        var v = load64(s.indices + i * 8);
+        if (v < 0 || v >= s.vertex_count) { return 0; }
+    }
+    return 1;
+}
+
+# 1 when the material's flag and combine rules are in range.
+#must_use
+fn _im_snap_material_ok(m: *ImPhysicsMaterial): i64 {
+    if (_im_snap_flag(m.has_static_friction) == 0) { return 0; }
+    if (m.friction_combine < IM_COMBINE_MIN || m.friction_combine > IM_COMBINE_MAX) { return 0; }
+    if (m.restitution_combine < IM_COMBINE_MIN || m.restitution_combine > IM_COMBINE_MAX) { return 0; }
+    return 1;
+}
+
+# 1 when the joint type's kind and limits flag are in range.
+#must_use
+fn _im_snap_joint_type_ok(j: *ImJointType): i64 {
+    if (j.kind < IM_JOINT_FIXED || j.kind > IM_JOINT_MOUSE) { return 0; }
+    return _im_snap_flag(j.has_limits);
+}
+
+# ── arenas ──────────────────────────────────────────────────────────────────────────
+
+# One arena slot: occupied (0 or 1), its generation (below 2^32) and the next free slot (-1 for none). The arena's
+# own three metadata words, in that order.
+struct ImSlotSnapshot { occupied; generation; next_free; }
+
+# An arena's slots (ImSlotSnapshot records, slot order), its free-list head (-1 for none) and whether the free list
+# awaits a rebuild (after `insert_at`). With these an arena hands out the same handles as the original.
+struct ImArenaSnapshot { slots: ImRecordList; free_head; free_list_stale; }
+
+# An empty arena snapshot.
+#must_use
+fn ImArenaSnapshot_new(): ImArenaSnapshot {
+    var s: ImArenaSnapshot;
+    s.slots = ImRecordList_new(sizeof(ImSlotSnapshot));
+    s.free_head = 0 - 1;
+    s.free_list_stale = 0;
+    return s;
+}
+
+#must_use
+fn _im_as_slot(p): *ImSlotSnapshot { return p; }
+
+impl ImArenaSnapshot {
+    # Captures arena a's slots and free list: 1, or 0 when there is no memory.
+    fn capture(self, a: *ImArena): i64 {
+        self.slots.len = 0;
+        if (a.count > 0) {
+            if (self.slots.reserve(a.count) == 0) { return 0; }
+            memcpy(self.slots.data, a.meta, a.count * sizeof(ImSlotSnapshot));
+        }
+        self.slots.len = a.count;
+        self.free_head = a.free_head;
+        self.free_list_stale = a.free_list_stale;
+        return 1;
+    }
+
+    # The slot record at index i.
+    #must_use
+    fn slot(self, i): *ImSlotSnapshot { return _im_as_slot(self.slots.at(i)); }
+
+    # 1 when h names an occupied slot at that slot's generation.
+    #must_use
+    fn live(self, h): i64 {
+        var i = _im_handle_index(h);
+        if (i >= self.slots.len) { return 0; }
+        var s: *ImSlotSnapshot = self.slot(i);
+        if (s.occupied != 1 || _im_arena_handle(i, s.generation) != h) { return 0; }
+        return 1;
+    }
+
+    # The number of occupied slots.
+    #must_use
+    fn occupied(self): i64 {
+        var n = 0;
+        for (var i = 0; i < self.slots.len; i = i + 1) {
+            var s: *ImSlotSnapshot = self.slot(i);
+            if (s.occupied == 1) { n = n + 1; }
+        }
+        return n;
+    }
+
+    # 1 when the slots could be an arena's: at most IM_MAX_SNAPSHOT_INDEX + 1 of them, each occupied 0 or 1 with a
+    # generation below 2^32 and a next free slot in range or -1, the head in range or -1, and (unless the list awaits a
+    # rebuild) a free list that visits free slots only, each at most once. Mirrors `validate_snapshot`'s index cap.
+    #must_use
+    fn validate(self): i64 {
+        var n = self.slots.len;
+        if (self.slots.size != sizeof(ImSlotSnapshot) || n < 0 || n > IM_MAX_SNAPSHOT_INDEX + 1) { return 0; }
+        for (var i = 0; i < n; i = i + 1) {
+            var s: *ImSlotSnapshot = self.slot(i);
+            if (_im_snap_flag(s.occupied) == 0) { return 0; }
+            if (s.generation < 0 || s.generation > 0xFFFFFFFF) { return 0; }
+            if (s.next_free < 0 - 1 || s.next_free >= n) { return 0; }
+        }
+        if (self.free_head < 0 - 1 || self.free_head >= n) { return 0; }
+        if (_im_snap_flag(self.free_list_stale) == 0) { return 0; }
+        if (self.free_list_stale == 0) {
+            var at = self.free_head;
+            var steps = 0;
+            while (at >= 0) {
+                var f: *ImSlotSnapshot = self.slot(at);
+                if (f.occupied != 0 || steps >= n) { return 0; }
+                steps = steps + 1;
+                at = f.next_free;
+            }
+        }
+        return 1;
+    }
+
+    # Writes the slots and free list into the fresh arena a, whose records the caller fills: 1, or 0 when there is no
+    # memory.
+    fn load(self, a: *ImArena): i64 {
+        var n = self.slots.len;
+        if (a._reserve(n) == 0) { return 0; }
+        if (n > 0) { memcpy(a.meta, self.slots.data, n * sizeof(ImSlotSnapshot)); }
+        a.count = n;
+        a.len = self.occupied();
+        a.free_head = self.free_head;
+        a.free_list_stale = self.free_list_stale;
+        return 1;
+    }
+
+    # Releases the slot list.
+    fn free(self) {
+        self.slots.free();
+        return 0;
+    }
+}
+
+# ── the contact tracker ─────────────────────────────────────────────────────────────
+
+# The contact tracker's state between frames: the pairs touching at the end of the last frame (`prev`), the frame's
+# so far (`current`), those seen in any sub-step (`seen`), whether a sub-step recorded (`recorded`), and the last
+# frame's events (ImCollisionEvent records), which `collision_events` returns.
+struct ImTrackerSnapshot {
+    prev: ImPairList;
+    current: ImPairList;
+    seen: ImPairList;
+    recorded;
+    events: ImRecordList;
+}
+
+# An empty tracker snapshot.
+#must_use
+fn ImTrackerSnapshot_new(): ImTrackerSnapshot {
+    var s: ImTrackerSnapshot;
+    s.prev = ImPairList_new();
+    s.current = ImPairList_new();
+    s.seen = ImPairList_new();
+    s.recorded = 0;
+    s.events = ImRecordList_new(sizeof(ImCollisionEvent));
+    return s;
+}
+
+#must_use
+fn _im_as_event(p): *ImCollisionEvent { return p; }
+
+impl ImTrackerSnapshot {
+    # Captures tracker t: 1, or 0 when there is no memory.
+    fn capture(self, t: *ImContactTracker): i64 {
+        if (_im_snap_copy_pairs(self.prev, t.prev) == 0) { return 0; }
+        if (_im_snap_copy_pairs(self.current, t.current) == 0) { return 0; }
+        if (_im_snap_copy_pairs(self.seen, t.seen) == 0) { return 0; }
+        self.recorded = t.recorded;
+        self.events.len = 0;
+        if (t.event_count > 0) {
+            if (self.events.reserve(t.event_count) == 0) { return 0; }
+            memcpy(self.events.data, t.events, t.event_count * sizeof(ImCollisionEvent));
+        }
+        self.events.len = t.event_count;
+        return 1;
+    }
+
+    # 1 when the pair lists are strictly ascending, the flag is 0 or 1 and every event's kind is one of the three.
+    #must_use
+    fn validate(self): i64 {
+        if (self.events.size != sizeof(ImCollisionEvent)) { return 0; }
+        if (_im_snap_pairs_ascending(self.prev) == 0 || _im_snap_pairs_ascending(self.current) == 0) { return 0; }
+        if (_im_snap_pairs_ascending(self.seen) == 0 || _im_snap_flag(self.recorded) == 0) { return 0; }
+        for (var i = 0; i < self.events.len; i = i + 1) {
+            var e: *ImCollisionEvent = _im_as_event(self.events.at(i));
+            if (e.kind < IM_EVENT_STARTED || e.kind > IM_EVENT_ONGOING) { return 0; }
+        }
+        return 1;
+    }
+
+    # Writes the state into the fresh tracker t: 1, or 0 when there is no memory.
+    fn load(self, t: *ImContactTracker): i64 {
+        if (_im_snap_copy_pairs(t.prev, self.prev) == 0) { return 0; }
+        if (_im_snap_copy_pairs(t.current, self.current) == 0) { return 0; }
+        if (_im_snap_copy_pairs(t.seen, self.seen) == 0) { return 0; }
+        t.recorded = self.recorded;
+        var n = self.events.len;
+        if (n > 0) {
+            var e = fl_alloc(n * sizeof(ImCollisionEvent));
+            if (e == 0) { return 0; }
+            memcpy(e, self.events.data, n * sizeof(ImCollisionEvent));
+            t.events = e;
+            t.event_cap = n;
+        }
+        t.event_count = n;
+        return 1;
+    }
+
+    # Releases the lists.
+    fn free(self) {
+        self.prev.free();
+        self.current.free();
+        self.seen.free();
+        self.events.free();
+        return 0;
+    }
+}
+
+# --- b2_snapshot.cyr ---
+
+# b2_snapshot.cyr — the 2D profile's snapshot (ADR 0013): `ImWorldSnapshot` over the 2D backend's own records, and its
+# backend half: capture from a state, the checks, and the load into a fresh one. src/world_snapshot.cyr, after this
+# file, holds `snapshot`, `restore` and the world's half; src/snapshot.cyr, before it, the arena and tracker pieces.
+#
+# The records are the backend's (ImRigidBody2d, ImCollider2d, ImJoint2d, ImContactManifold), field for field, so a
+# snapshot holds what the oracle's dump holds. A snapshot owns its copies: each collider's shape arrays, each
+# manifold's points, each body's collider list; `free` releases them.
+
+# A body and its collider handles, in attachment order. Rust's `BodySnapshot` (a `BodyDesc` and the kinematic state);
+# here the whole body record.
+struct ImBodySnapshot {
+    body: ImRigidBody2d;
+    colliders: ImWordList;
+}
+
+# A joint record and its handle. Rust's `JointSnapshot` (a `JointDesc`); here the whole record, its reference angle
+# included.
+struct ImJointSnapshot {
+    handle;
+    joint: ImJoint2d;
+}
+
+# A 2D world's whole state (ADR 0013). `bodies` are ImBodySnapshot records, `colliders` ImCollider2d (Rust's
+# `ColliderSnapshot`) and `joints` ImJointSnapshot, each in its arena's slot order; `particles`, `emitters` and
+# `force_fields` the world's records; the three arenas' slots and free lists; the contact manifolds (ImContactManifold
+# records in key order, each owning its points); the contact tracker. Mirrors Rust's `WorldSnapshot`, which holds the
+# first eight fields' worth (less the arenas, force fields, manifolds and tracker).
+struct ImWorldSnapshot {
+    config: ImWorldConfig;
+    next_particle_id;
+    next_emitter_id;
+    bodies: ImRecordList;
+    colliders: ImRecordList;
+    joints: ImRecordList;
+    particles: ImRecordList;
+    emitters: ImRecordList;
+    force_fields: ImRecordList;
+    body_arena: ImArenaSnapshot;
+    collider_arena: ImArenaSnapshot;
+    joint_arena: ImArenaSnapshot;
+    manifolds: ImRecordList;
+    tracker: ImTrackerSnapshot;
+}
+
+#must_use
+fn _im_as_body_snap(p): *ImBodySnapshot { return p; }
+#must_use
+fn _im_as_joint_snap(p): *ImJointSnapshot { return p; }
+
+# The collider list of the ImBodySnapshot record at r (Cyrius takes no field addresses: the word after the body).
+#must_use
+fn _im_b2_snap_list(r): *ImWordList { return r + sizeof(ImRigidBody2d); }
+
+# An empty snapshot (the default config).
+#must_use
+fn ImWorldSnapshot_new(): ImWorldSnapshot {
+    var s: ImWorldSnapshot;
+    s.config = ImWorldConfig_default();
+    s.next_particle_id = 0;
+    s.next_emitter_id = 0;
+    s.bodies = ImRecordList_new(sizeof(ImBodySnapshot));
+    s.colliders = ImRecordList_new(sizeof(ImCollider2d));
+    s.joints = ImRecordList_new(sizeof(ImJointSnapshot));
+    s.particles = ImRecordList_new(sizeof(ImParticle));
+    s.emitters = ImRecordList_new(sizeof(ImParticleEmitter));
+    s.force_fields = ImRecordList_new(sizeof(ImForceField));
+    s.body_arena = ImArenaSnapshot_new();
+    s.collider_arena = ImArenaSnapshot_new();
+    s.joint_arena = ImArenaSnapshot_new();
+    s.manifolds = ImRecordList_new(sizeof(ImContactManifold));
+    s.tracker = ImTrackerSnapshot_new();
+    return s;
+}
+
+impl ImWorldSnapshot {
+    # Captures the state's arenas, records, collider lists, manifolds and tracker: 1, or 0 when there is no memory
+    # (what was captured stays owned by the snapshot, for `free`).
+    fn _capture_backend(self, st: *ImPhysicsState2d): i64 {
+        var ba: *ImArena = st._bodies();
+        var ca: *ImArena = st._colliders();
+        var ja: *ImArena = st._joints();
+        if (self.body_arena.capture(ba) == 0) { return 0; }
+        if (self.collider_arena.capture(ca) == 0) { return 0; }
+        if (self.joint_arena.capture(ja) == 0) { return 0; }
+        if (self.bodies.reserve(ba.len()) == 0) { return 0; }
+        var empty: ImWordList = ImWordList_new();
+        for (var s = 0; s < ba.slot_count(); s = s + 1) {
+            var bh = ba.slot_handle(s);
+            if (bh != 0 - 1) {
+                var r = self.bodies.at(self.bodies.len);
+                memcpy(r, ba.get(bh), sizeof(ImRigidBody2d));
+                var dl: *ImWordList = _im_b2_snap_list(r);
+                memcpy(dl, &empty, sizeof(ImWordList));
+                self.bodies.len = self.bodies.len + 1;
+                var sl: *ImWordList = st._list(_im_handle_index(bh));
+                if (sl == 0) { return 0; }
+                if (dl.reserve(sl.len) == 0) { return 0; }
+                for (var q = 0; q < sl.len; q = q + 1) { dl.push(sl.at(q)); }
+            }
+        }
+        if (self.colliders.reserve(ca.len()) == 0) { return 0; }
+        var sh: ImColliderShape;
+        for (var c = 0; c < ca.slot_count(); c = c + 1) {
+            var ch = ca.slot_handle(c);
+            if (ch != 0 - 1) {
+                var src: *ImCollider2d = _im_b2_as_coll(ca.get(ch));
+                if (_im_snap_clone_shape(src.shape, &sh) == 0) { return 0; }
+                var cr: *ImCollider2d = _im_b2_as_coll(self.colliders.at(self.colliders.len));
+                memcpy(cr, src, sizeof(ImCollider2d));
+                cr.shape = sh;
+                self.colliders.len = self.colliders.len + 1;
+            }
+        }
+        if (self.joints.reserve(ja.len()) == 0) { return 0; }
+        for (var j = 0; j < ja.slot_count(); j = j + 1) {
+            var jh = ja.slot_handle(j);
+            if (jh != 0 - 1) {
+                var jr = self.joints.at(self.joints.len);
+                store64(jr, jh);
+                memcpy(jr + 8, ja.get(jh), sizeof(ImJoint2d));
+                self.joints.len = self.joints.len + 1;
+            }
+        }
+        var nm = st.manifolds.count();
+        if (self.manifolds.reserve(nm) == 0) { return 0; }
+        for (var m = 0; m < nm; m = m + 1) {
+            var mf: *ImContactManifold = _im_b2_as_manifold(st.manifolds.at(m));
+            var pts = 0;
+            var pbytes = mf.point_count * sizeof(ImManifoldPoint);
+            if (pbytes > 0) {
+                pts = fl_alloc(pbytes);
+                if (pts == 0) { return 0; }
+                memcpy(pts, mf.points, pbytes);
+            }
+            var mr: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(self.manifolds.len));
+            memcpy(mr, mf, sizeof(ImContactManifold));
+            mr.points = pts;
+            self.manifolds.len = self.manifolds.len + 1;
+        }
+        return self.tracker.capture(st.contact_tracker);
+    }
+
+    # 1 when the backend half is consistent: the arenas well formed; one body, collider and joint record per occupied
+    # slot of its arena, each at its slot's handle; enums and flags in range; each collider on a live body and on that
+    # body's list exactly once; each joint's bodies live (a Mouse joint's second body needn't be); each manifold on two
+    # live colliders, its bodies theirs, the smaller handle first, in strictly ascending key order with at most two
+    # points; the tracker's lists sorted. 0 otherwise, or when there is no memory for the check.
+    #must_use
+    fn _validate_backend(self): i64 {
+        if (self.bodies.size != sizeof(ImBodySnapshot) || self.colliders.size != sizeof(ImCollider2d)) { return 0; }
+        if (self.joints.size != sizeof(ImJointSnapshot)) { return 0; }
+        if (self.manifolds.size != sizeof(ImContactManifold)) { return 0; }
+        if (self.body_arena.validate() == 0 || self.collider_arena.validate() == 0) { return 0; }
+        if (self.joint_arena.validate() == 0 || self.tracker.validate() == 0) { return 0; }
+        if (self.bodies.len != self.body_arena.occupied()) { return 0; }
+        if (self.colliders.len != self.collider_arena.occupied()) { return 0; }
+        if (self.joints.len != self.joint_arena.occupied()) { return 0; }
+        # seen: one word per collider slot, the index + 1 of its record (0: none yet), then a listed flag per record.
+        var nslots = self.collider_arena.slots.len;
+        var seen = fl_alloc(nslots * 8 + self.colliders.len * 8 + 8);
+        if (seen == 0) { return 0; }
+        var ok = self._validate_records(seen, nslots);
+        fl_free(seen);
+        return ok;
+    }
+
+    # The record checks of `_validate_backend`, with seen: nslots + colliders.len zeroed words.
+    #must_use
+    fn _validate_records(self, seen, nslots): i64 {
+        for (var z = 0; z < nslots + self.colliders.len; z = z + 1) { store64(seen + z * 8, 0); }
+        var listed = seen + nslots * 8;
+        # Bodies: live handles in ascending slot order, so one per occupied slot.
+        for (var i = 0; i < self.bodies.len; i = i + 1) {
+            var b: *ImBodySnapshot = _im_as_body_snap(self.bodies.at(i));
+            var bh = b.body.handle;
+            if (self.body_arena.live(bh) == 0) { return 0; }
+            if (i > 0) {
+                var pb: *ImBodySnapshot = _im_as_body_snap(self.bodies.at(i - 1));
+                if (_im_handle_index(pb.body.handle) >= _im_handle_index(bh)) { return 0; }
+            }
+            if (b.body.body_type < IM_BODY_STATIC || b.body.body_type > IM_BODY_KINEMATIC) { return 0; }
+            if (_im_snap_flag(b.body.fixed_rotation) == 0 || _im_snap_flag(b.body.is_sleeping) == 0) { return 0; }
+        }
+        # Colliders: distinct live handles in slot order, on live bodies, well formed.
+        for (var c = 0; c < self.colliders.len; c = c + 1) {
+            var cp: *ImCollider2d = _im_b2_as_coll(self.colliders.at(c));
+            if (self.collider_arena.live(cp.handle) == 0 || self.body_arena.live(cp.body) == 0) { return 0; }
+            var ci = _im_handle_index(cp.handle);
+            if (load64(seen + ci * 8) != 0) { return 0; }
+            store64(seen + ci * 8, c + 1);
+            if (_im_snap_flag(cp.is_sensor) == 0 || _im_snap_flag(cp.has_mass) == 0) { return 0; }
+            if (_im_snap_shape_ok(cp.shape) == 0 || _im_snap_material_ok(cp.material) == 0) { return 0; }
+        }
+        # Lists: each entry a live collider of that body, each collider listed once.
+        var total = 0;
+        for (var k = 0; k < self.bodies.len; k = k + 1) {
+            var r = self.bodies.at(k);
+            var kb: *ImBodySnapshot = _im_as_body_snap(r);
+            var l: *ImWordList = _im_b2_snap_list(r);
+            if (l.len < 0 || (l.len > 0 && l.data == 0)) { return 0; }
+            for (var q = 0; q < l.len; q = q + 1) {
+                var lh = l.at(q);
+                if (self.collider_arena.live(lh) == 0) { return 0; }
+                var rec = load64(seen + _im_handle_index(lh) * 8) - 1;
+                var lc: *ImCollider2d = _im_b2_as_coll(self.colliders.at(rec));
+                if (lc.body != kb.body.handle || load64(listed + rec * 8) != 0) { return 0; }
+                store64(listed + rec * 8, 1);
+                total = total + 1;
+            }
+        }
+        if (total != self.colliders.len) { return 0; }
+        # Joints: distinct live handles in slot order, their bodies live.
+        for (var j = 0; j < self.joints.len; j = j + 1) {
+            var js: *ImJointSnapshot = _im_as_joint_snap(self.joints.at(j));
+            if (self.joint_arena.live(js.handle) == 0) { return 0; }
+            if (j > 0) {
+                var pj: *ImJointSnapshot = _im_as_joint_snap(self.joints.at(j - 1));
+                if (_im_handle_index(pj.handle) >= _im_handle_index(js.handle)) { return 0; }
+            }
+            if (_im_snap_joint_type_ok(js.joint.joint_type) == 0) { return 0; }
+            if (self.body_arena.live(js.joint.body_a) == 0) { return 0; }
+            if (js.joint.joint_type.kind != IM_JOINT_MOUSE && self.body_arena.live(js.joint.body_b) == 0) { return 0; }
+            if (_im_snap_flag(js.joint.has_motor) == 0 || _im_snap_flag(js.joint.has_break_force) == 0) { return 0; }
+        }
+        # Manifolds: on live colliders and their bodies, keyed in strictly ascending order.
+        for (var m = 0; m < self.manifolds.len; m = m + 1) {
+            var mf: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(m));
+            if (self.collider_arena.live(mf.collider_a) == 0 || self.collider_arena.live(mf.collider_b) == 0) {
+                return 0;
+            }
+            if (_im_ult(mf.collider_b, mf.collider_a) == 1) { return 0; }
+            if (m > 0) {
+                var pm: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(m - 1));
+                if (_im_pair_cmp(pm.collider_a, pm.collider_b, mf.collider_a, mf.collider_b) >= 0) { return 0; }
+            }
+            var ra = load64(seen + _im_handle_index(mf.collider_a) * 8) - 1;
+            var rb = load64(seen + _im_handle_index(mf.collider_b) * 8) - 1;
+            var ma: *ImCollider2d = _im_b2_as_coll(self.colliders.at(ra));
+            var mb: *ImCollider2d = _im_b2_as_coll(self.colliders.at(rb));
+            if (mf.body_a != ma.body || mf.body_b != mb.body) { return 0; }
+            if (mf.point_count < 0 || mf.point_count > 2 || (mf.point_count > 0 && mf.points == 0)) { return 0; }
+        }
+        return 1;
+    }
+
+    # Loads the backend half into the fresh state st: 1, or 0 when there is no memory (st then holds what was loaded,
+    # for its `free`). Assumes `_validate_backend`.
+    fn _load_backend(self, st: *ImPhysicsState2d): i64 {
+        var ba: *ImArena = st._bodies();
+        var ca: *ImArena = st._colliders();
+        var ja: *ImArena = st._joints();
+        if (self.body_arena.load(ba) == 0) { return 0; }
+        for (var i = 0; i < self.bodies.len; i = i + 1) {
+            var r = self.bodies.at(i);
+            var b: *ImBodySnapshot = _im_as_body_snap(r);
+            var bi = _im_handle_index(b.body.handle);
+            memcpy(ba.values + bi * ba.elem_size, r, sizeof(ImRigidBody2d));
+            var src: *ImWordList = _im_b2_snap_list(r);
+            var dst: *ImWordList = st._list(bi);
+            if (dst == 0 || dst.reserve(src.len) == 0) { return 0; }
+            for (var q = 0; q < src.len; q = q + 1) { dst.push(src.at(q)); }
+        }
+        # A collider slot holds no shape arrays until its copy is in, so a failure leaves nothing to double-free.
+        if (self.collider_arena.load(ca) == 0) { return 0; }
+        var sh: ImColliderShape;
+        for (var c = 0; c < self.colliders.len; c = c + 1) {
+            var cp: *ImCollider2d = _im_b2_as_coll(self.colliders.at(c));
+            var ci = _im_handle_index(cp.handle);
+            var slot: *ImCollider2d = _im_b2_as_coll(ca.values + ci * ca.elem_size);
+            memcpy(slot, cp, sizeof(ImCollider2d));
+            var blank: ImColliderShape = _im_shape(cp.shape.kind);
+            slot.shape = blank;
+        }
+        for (var c2 = 0; c2 < self.colliders.len; c2 = c2 + 1) {
+            var cq: *ImCollider2d = _im_b2_as_coll(self.colliders.at(c2));
+            if (_im_snap_clone_shape(cq.shape, &sh) == 0) { return 0; }
+            var s2: *ImCollider2d = _im_b2_as_coll(ca.values + _im_handle_index(cq.handle) * ca.elem_size);
+            s2.shape = sh;
+        }
+        if (self.joint_arena.load(ja) == 0) { return 0; }
+        for (var j = 0; j < self.joints.len; j = j + 1) {
+            var jr = self.joints.at(j);
+            var ji = _im_handle_index(load64(jr));
+            memcpy(ja.values + ji * ja.elem_size, jr + 8, sizeof(ImJoint2d));
+        }
+        var nm = self.manifolds.len;
+        if (nm > 0) {
+            st.manifolds.data = fl_alloc(nm * sizeof(ImContactManifold));
+            if (st.manifolds.data == 0) { return 0; }
+            st.manifolds.cap = nm;
+        }
+        for (var m = 0; m < nm; m = m + 1) {
+            var mf: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(m));
+            var pts = 0;
+            var pbytes = mf.point_count * sizeof(ImManifoldPoint);
+            if (pbytes > 0) {
+                pts = fl_alloc(pbytes);
+                if (pts == 0) { return 0; }
+                memcpy(pts, mf.points, pbytes);
+            }
+            var dm: *ImContactManifold = _im_b2_as_manifold(st.manifolds.at(m));
+            memcpy(dm, mf, sizeof(ImContactManifold));
+            dm.points = pts;
+            st.manifolds.len = m + 1;
+        }
+        return self.tracker.load(st.contact_tracker);
+    }
+
+    # Releases the backend half: the collider lists, shapes, manifold points, arenas and tracker.
+    fn _free_backend(self) {
+        for (var i = 0; i < self.bodies.len; i = i + 1) {
+            var bl: *ImWordList = _im_b2_snap_list(self.bodies.at(i));
+            bl.free();
+        }
+        self.bodies.free();
+        for (var c = 0; c < self.colliders.len; c = c + 1) {
+            var cp: *ImCollider2d = _im_b2_as_coll(self.colliders.at(c));
+            cp.shape.free();
+        }
+        self.colliders.free();
+        self.joints.free();
+        for (var m = 0; m < self.manifolds.len; m = m + 1) {
+            var mf: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(m));
+            if (mf.points != 0) { fl_free(mf.points); }
+        }
+        self.manifolds.free();
+        self.body_arena.free();
+        self.collider_arena.free();
+        self.joint_arena.free();
+        self.tracker.free();
+        return 0;
+    }
+}
+
+# --- world_snapshot.cyr ---
+
+# world_snapshot.cyr — `snapshot` and `restore` (ADR 0013), and the world's half of a snapshot: the config, the id
+# counters, the particles, emitters and force fields. Shared by both profiles, after the profile's snapshot file
+# (src/b2_snapshot.cyr), whose `ImWorldSnapshot` and backend half it completes.
+#
+# `restore` is the one fallible restore of ADR 0008 #2 (Rust's `try_restore`; 1.4.0's `restore` that ignored errors is
+# gone). It checks the whole snapshot first, builds a fresh world from it, and only then replaces the world, so on any
+# error the world is unchanged.
+
+impl ImWorldSnapshot {
+    # Captures world w: 1, or 0 when there is no memory (what was captured stays owned by the snapshot).
+    fn _capture(self, w: *ImPhysicsWorld): i64 {
+        self.config = w.config;
+        self.next_particle_id = w.next_particle_id;
+        self.next_emitter_id = w.next_emitter_id;
+        if (_im_snap_copy_records(self.particles, w.particles) == 0) { return 0; }
+        if (_im_snap_copy_records(self.emitters, w.emitters) == 0) { return 0; }
+        if (_im_snap_copy_records(self.force_fields, w.force_fields) == 0) { return 0; }
+        return self._capture_backend(w.backend);
+    }
+
+    # Ok(0) when the snapshot can be restored: the config passes `validate` (else its error, IM_ERR_INVALID_CONFIG or,
+    # for XPBD, IM_ERR_UNSUPPORTED), and the world's records and the backend half are well formed (else
+    # Err(IM_ERR_DESERIALIZE)). Mirrors `validate_snapshot`, whose checks it extends (ADR 0013).
+    fn validate(self): Result {
+        var cfg: ImWorldConfig = self.config;
+        var t, v = cfg.validate();
+        if (is_ok(t) == 0) { return Err(v); }
+        if (self.particles.size != sizeof(ImParticle) || self.emitters.size != sizeof(ImParticleEmitter)) {
+            return Err(IM_ERR_DESERIALIZE);
+        }
+        if (self.force_fields.size != sizeof(ImForceField)) { return Err(IM_ERR_DESERIALIZE); }
+        for (var i = 0; i < self.particles.len; i = i + 1) {
+            var p: *ImParticle = _im_as_particle(self.particles.at(i));
+            if (_im_snap_flag(p.has_on_death_emit) == 0) { return Err(IM_ERR_DESERIALIZE); }
+            var n = p.on_death_emit.count;
+            if (p.has_on_death_emit == 1 && (n < 0 || n > 0xFFFFFFFF)) { return Err(IM_ERR_DESERIALIZE); }
+        }
+        for (var e = 0; e < self.emitters.len; e = e + 1) {
+            var em: *ImParticleEmitter = _im_as_emitter(self.emitters.at(e));
+            if (_im_snap_flag(em.active) == 0) { return Err(IM_ERR_DESERIALIZE); }
+        }
+        for (var f = 0; f < self.force_fields.len; f = f + 1) {
+            var ff: *ImForceField = _im_as_force_field(self.force_fields.at(f));
+            if (ff.kind != IM_FORCE_FIELD_RADIAL && ff.kind != IM_FORCE_FIELD_DIRECTIONAL) {
+                return Err(IM_ERR_DESERIALIZE);
+            }
+        }
+        if (self._validate_backend() == 0) { return Err(IM_ERR_DESERIALIZE); }
+        return Ok(0);
+    }
+
+    # Loads the snapshot into the fresh world w (built over its config): 1, or 0 when there is no memory. Assumes
+    # `validate`.
+    fn _load(self, w: *ImPhysicsWorld): i64 {
+        w.next_particle_id = self.next_particle_id;
+        w.next_emitter_id = self.next_emitter_id;
+        if (_im_snap_copy_records(w.particles, self.particles) == 0) { return 0; }
+        if (_im_snap_copy_records(w.emitters, self.emitters) == 0) { return 0; }
+        if (_im_snap_copy_records(w.force_fields, self.force_fields) == 0) { return 0; }
+        return self._load_backend(w.backend);
+    }
+
+    # Releases everything the snapshot owns.
+    fn free(self) {
+        self.particles.free();
+        self.emitters.free();
+        self.force_fields.free();
+        self._free_backend();
+        return 0;
+    }
+}
+
+impl ImPhysicsWorld {
+    # The world's whole state into out, overwriting it (free a snapshot it held first): Ok(0), or Err(IM_ERR_SERIALIZE)
+    # when there is no memory. The snapshot owns copies; the world is untouched. Mirrors `snapshot` (ADR 0013).
+    fn snapshot(self, out: *ImWorldSnapshot): Result {
+        var s: ImWorldSnapshot = ImWorldSnapshot_new();
+        if (s._capture(self) == 0) {
+            s.free();
+            return Err(IM_ERR_SERIALIZE);
+        }
+        memcpy(out, &s, sizeof(ImWorldSnapshot));
+        return Ok(0);
+    }
+
+    # Replaces the world with the snapshot's: its config, bodies, colliders, joints, contacts, particles, emitters and
+    # force fields, its arenas' slots (so the next handles are the original's) and the last step's events. Ok(0), or the
+    # error `validate` gives, or Err(IM_ERR_DESERIALIZE) when there is no memory; on any error the world is unchanged.
+    # The snapshot is only read. Mirrors `try_restore` (ADR 0008 #2).
+    fn restore(self, snap: *ImWorldSnapshot): Result {
+        var t, v = snap.validate();
+        if (is_ok(t) == 0) { return Err(v); }
+        var nw: ImPhysicsWorld = ImPhysicsWorld_new(snap.config);
+        if (snap._load(&nw) == 0) {
+            nw.free();
+            return Err(IM_ERR_DESERIALIZE);
+        }
+        self.free();
+        memcpy(self, &nw, sizeof(ImPhysicsWorld));
+        return Ok(0);
+    }
 }

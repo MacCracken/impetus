@@ -35,11 +35,11 @@ MODULES = [
     "aabb_tree", "spatial_hash", "backend_2d/types", "backend_2d/narrowphase",
     "backend_2d/raycast", "backend_2d/state", "backend_2d/joints", "backend_2d/solver",
     "particle", "world", "backend_3d/types", "backend_3d/narrowphase", "backend_3d/raycast",
-    "backend_3d/state", "backend_3d/joints", "backend_3d/solver",
+    "backend_3d/state", "backend_3d/joints", "backend_3d/solver", "serialize",
 ]
 PENDING_MODULES = {
     "backend_2d/tests": "M3",
-    "backend_3d/tests": "M5", "serialize": "M6",
+    "backend_3d/tests": "M5",
 }
 DEFERRED_MODULES = {"bridge": "until a Cyrius consumer exists (port plan §3.2)"}
 NOT_APPLICABLE_MODULES = {
@@ -64,6 +64,8 @@ ENUM_PREFIX = {
 }
 # Rust function -> the Cyrius function that provides it, where the naming rules give another name.
 FN_RENAMES = {
+    # ADR 0008 #2: one fallible restore, Rust's try_restore under restore's name.
+    "PhysicsWorld::try_restore": "ImPhysicsWorld::restore",
     # A handle is a bare word (src/arena.cyr), so ArenaHandle's methods are private word helpers.
     "ArenaHandle::new": "_im_arena_handle",
     "ArenaHandle::index": "_im_handle_index",
@@ -108,16 +110,24 @@ FIELD_RENAMES = {
     ("Joint3d", "break_force"): ["has_break_force", "break_force"],
     # A Vec is its records' address and their count.
     ("ContactManifold", "points"): ["points", "point_count"],
+    # ADR 0013: a 2.0 snapshot holds the backend's own records. A BodySnapshot is the whole body record (`body`)
+    # with its collider list; a JointSnapshot is the handle and the whole joint record (`joint`).
+    ("BodySnapshot", "handle"): ["body"],
+    ("BodySnapshot", "desc"): ["body"],
+    ("BodySnapshot", "position"): ["body"],
+    ("BodySnapshot", "rotation"): ["body"],
+    ("BodySnapshot", "linear_velocity"): ["body"],
+    ("BodySnapshot", "angular_velocity"): ["body"],
+    ("JointSnapshot", "desc"): ["joint"],
 }
 # The Cyrius prefix of a module's crate-internal constants (scripts/oracle/src/t_private.rs).
 PRIVATE_PREFIX = {"backend_2d/types": "_IM_B2_", "backend_3d/types": "_IM_B3_", "backend_3d/narrowphase": "_IM_B3_",
                   "backend_3d/solver": "_IM_B3_"}
-PENDING_CONSTS = {"MAX_SNAPSHOT_INDEX": "M6, with the snapshot module"}
+PENDING_CONSTS = {}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
 PENDING_FNS = {
-    "PhysicsWorld::snapshot": "M6, with the snapshot module",
-    "PhysicsWorld::restore": "M6 (ADR 0008 #2: one fallible restore)",
-    "PhysicsWorld::try_restore": "M6 (ADR 0008 #2: one fallible restore)",
+    "serialize_world": "M6 part 2, the binary form (ADR 0013)",
+    "deserialize_world": "M6 part 2, the binary form (ADR 0013)",
 }
 EXCEPTIONS = {
     "units::impl Display for Quantity": "`impl ImQuantity { fn fmt(self, sb) }`: src/fmtf.cyr's "
@@ -143,6 +153,13 @@ EXCEPTIONS = {
                                           "a pair key (src/contact_tracker.cyr)",
     "backend_2d/narrowphase::type Contact2": "a contact is a five-word record (normal, depth, point; "
                                              "_IM_B2_CONTACT bytes) in a caller's buffer",
+    # ADR 0013: the backend's collider record is the 2.0 collider snapshot, every field of it.
+    "serialize::ColliderSnapshot": "the backend's collider record (ImCollider2d, ImCollider3d) is the collider "
+                                   "snapshot (ADR 0013)",
+    "serialize::ColliderSnapshot::handle": "ImCollider2d / ImCollider3d `handle` (ADR 0013)",
+    "serialize::ColliderSnapshot::body": "ImCollider2d / ImCollider3d `body` (ADR 0013)",
+    "serialize::ColliderSnapshot::desc": "the collider record's shape, offset, material, is_sensor, mass, "
+                                         "collision_layer and collision_mask (ADR 0013)",
 }
 
 

@@ -1,0 +1,481 @@
+# snapshot.tcyr — 2D snapshots (M6 part 1, ADR 0013): `snapshot` and `restore` on the struct. Rust's snapshot tests go
+# through bytes and arrive with part 2; here are the struct-level ones: `restore_rejects_huge_handle_index` and
+# `restore_replaces_force_fields` (one of the two `#[ignore]`d in Rust), and Cyrius-only tests of an exact round trip,
+# step-equivalence (a restored world steps to the same bits, with the same events and next handles) in scenes with
+# contacts, joints, sleep, removals, forces, particles and sub-steps, every refusal leaving the world unchanged, and a
+# flat heap.
+
+include "tests/lib_2d.cyr"
+
+# ── comparing snapshots, bit for bit ────────────────────────────────────────────────
+
+# 1 when the n bytes at a and b are equal (n may be 0).
+fn same_bytes(a, b, n): i64 {
+    if (n == 0) { return 1; }
+    return memeq(a, b, n);
+}
+
+# 1 when two record lists hold the same records.
+fn same_records(a: *ImRecordList, b: *ImRecordList): i64 {
+    if (a.len != b.len || a.size != b.size) { return 0; }
+    return same_bytes(a.data, b.data, a.len * a.size);
+}
+
+# 1 when two pair lists hold the same pairs.
+fn same_pairs(a: *ImPairList, b: *ImPairList): i64 {
+    if (a.len != b.len) { return 0; }
+    return same_bytes(a.data, b.data, a.len * 16);
+}
+
+# 1 when two arena snapshots are the same.
+fn same_arena(a: *ImArenaSnapshot, b: *ImArenaSnapshot): i64 {
+    if (a.free_head != b.free_head || a.free_list_stale != b.free_list_stale) { return 0; }
+    return same_records(a.slots, b.slots);
+}
+
+# 1 when the shapes at a and b (untyped: offsets in bytes) are the same, their arrays by content. The layout:
+# kind, half_extents, radius, half_height (bytes 0–47), then four (array, count) pairs (48–111), then scale, a, b.
+fn same_shape(a, b): i64 {
+    if (load64(a) != load64(b) || same_bytes(a + 8, b + 8, 40) == 0) { return 0; }
+    var widths[32];
+    store64(&widths, 24);
+    store64(&widths + 8, 24);
+    store64(&widths + 16, 24);
+    store64(&widths + 24, 8);
+    for (var k = 0; k < 4; k = k + 1) {
+        var at = 48 + k * 16;
+        var n = load64(a + at + 8);
+        if (n != load64(b + at + 8)) { return 0; }
+        if (same_bytes(load64(a + at), load64(b + at), n * load64(&widths + k * 8)) == 0) { return 0; }
+    }
+    return same_bytes(a + 112, b + 112, sizeof(ImColliderShape) - 112);
+}
+
+# 1 when two snapshots hold the same state: every record bit for bit, arrays by content.
+fn snap_eq(a: *ImWorldSnapshot, b: *ImWorldSnapshot): i64 {
+    if (same_bytes(a, b, sizeof(ImWorldConfig) + 16) == 0) { return 0; }
+    if (same_records(a.particles, b.particles) == 0 || same_records(a.emitters, b.emitters) == 0) { return 0; }
+    if (same_records(a.force_fields, b.force_fields) == 0) { return 0; }
+    if (same_arena(a.body_arena, b.body_arena) == 0) { return 0; }
+    if (same_arena(a.collider_arena, b.collider_arena) == 0) { return 0; }
+    if (same_arena(a.joint_arena, b.joint_arena) == 0 || same_records(a.joints, b.joints) == 0) { return 0; }
+    if (a.bodies.len != b.bodies.len || a.colliders.len != b.colliders.len) { return 0; }
+    for (var i = 0; i < a.bodies.len; i = i + 1) {
+        var ra = a.bodies.at(i);
+        var rb = b.bodies.at(i);
+        if (same_bytes(ra, rb, sizeof(ImRigidBody2d)) == 0) { return 0; }
+        var la: *ImWordList = _im_b2_snap_list(ra);
+        var lb: *ImWordList = _im_b2_snap_list(rb);
+        if (la.len != lb.len || same_bytes(la.data, lb.data, la.len * 8) == 0) { return 0; }
+    }
+    for (var c = 0; c < a.colliders.len; c = c + 1) {
+        var ca = a.colliders.at(c);
+        var cb = b.colliders.at(c);
+        if (same_bytes(ca, cb, 16) == 0 || same_shape(ca + 16, cb + 16) == 0) { return 0; }
+        var after = 16 + sizeof(ImColliderShape);
+        if (same_bytes(ca + after, cb + after, sizeof(ImCollider2d) - after) == 0) { return 0; }
+    }
+    if (a.manifolds.len != b.manifolds.len) { return 0; }
+    for (var m = 0; m < a.manifolds.len; m = m + 1) {
+        # collider_a, collider_b, body_a, body_b, normal (bytes 0–47), points, point_count, rolling_impulse.
+        var ma = a.manifolds.at(m);
+        var mb = b.manifolds.at(m);
+        var npts = load64(ma + 56);
+        if (same_bytes(ma, mb, 48) == 0 || npts != load64(mb + 56) || load64(ma + 64) != load64(mb + 64)) { return 0; }
+        if (same_bytes(load64(ma + 48), load64(mb + 48), npts * sizeof(ImManifoldPoint)) == 0) { return 0; }
+    }
+    if (same_pairs(a.tracker.prev, b.tracker.prev) == 0 || same_pairs(a.tracker.current, b.tracker.current) == 0) {
+        return 0;
+    }
+    if (same_pairs(a.tracker.seen, b.tracker.seen) == 0 || a.tracker.recorded != b.tracker.recorded) { return 0; }
+    return same_records(a.tracker.events, b.tracker.events);
+}
+
+# 1 when worlds a and b hold the same state.
+fn same_world(a: *ImPhysicsWorld, b: *ImPhysicsWorld): i64 {
+    var sa: ImWorldSnapshot = ImWorldSnapshot_new();
+    var sb: ImWorldSnapshot = ImWorldSnapshot_new();
+    var ta, va = a.snapshot(&sa);
+    var tb, vb = b.snapshot(&sb);
+    var r = 0;
+    if (is_ok(ta) == 1 && is_ok(tb) == 1) { r = snap_eq(&sa, &sb); }
+    sa.free();
+    sb.free();
+    return r;
+}
+
+# ── scenes ──────────────────────────────────────────────────────────────────────────
+
+# A body of type t at (x, y) turned rot, with one collider of shape s and material m: its handle.
+fn body(w: *ImPhysicsWorld, t, x: f64, y: f64, rot: f64, s: ImColliderShape, m: ImPhysicsMaterial): i64 {
+    var d: ImBodyDesc = ImBodyDesc_default();
+    d.body_type = t;
+    d.position = ImVec3_new(x, y, 0.0);
+    d.rotation = rot;
+    var h = w.add_body(d);
+    var cd: ImColliderDesc = ImColliderDesc_new(s);
+    cd.material = m;
+    var tc, c = w.add_collider(h, cd);
+    return h;
+}
+
+# A joint of type jt between a and b, anchored at la and lb.
+fn joint(w: *ImPhysicsWorld, a, b, jt: ImJointType, lax: f64, lay: f64, lbx: f64, lby: f64): i64 {
+    var d: ImJointDesc = ImJointDesc_new(a, b, jt, ImVec2_new(lax, lay), ImVec2_new(lbx, lby));
+    var t, h = w.add_joint(d);
+    return h;
+}
+
+# Scene k into w: 0 a ball on a floor (Rust's step_exact_determinism), 1 a stack of five boxes with a ball thrown at it,
+# 2 every joint type with motors, limits, breaking and damping, 3 particles, emitters, fields and sub-emitters over a
+# floor, 4 removals (a free list with holes) and a sensor.
+fn scene(w: *ImPhysicsWorld, k) {
+    var dm: ImPhysicsMaterial = ImPhysicsMaterial_default();
+    var floor = body(w, IM_BODY_STATIC, 0.0, 0.0, 0.0, ImColliderShape_box(50.0, 0.5, 0.0), ImPhysicsMaterial_wood());
+    if (k == 0) {
+        var ball = body(w, IM_BODY_DYNAMIC, 3.0, 15.0, 0.0, ImColliderShape_ball(0.5), ImPhysicsMaterial_rubber());
+        var bs: ImBodyState;
+        w.get_body_state(ball, &bs);
+        bs.linear_velocity = ImVec3_new(1.0, 0.0, 0.0);
+        w.set_body_state(ball, bs);
+    } elif (k == 1) {
+        for (var i = 0; i < 5; i = i + 1) {
+            var y: f64 = 1.0 + f64_from(i);
+            body(w, IM_BODY_DYNAMIC, 0.0, y, 0.0, ImColliderShape_box(0.5, 0.5, 0.0), dm);
+        }
+        var shot = body(w, IM_BODY_DYNAMIC, -6.0, 3.0, 0.0, ImColliderShape_ball(0.4), dm);
+        w.apply_impulse(shot, ImImpulse_new(6.0, 1.0, 0.0));
+    } elif (k == 2) {
+        var a = body(w, IM_BODY_STATIC, 0.0, 6.0, 0.0, ImColliderShape_ball(0.1), dm);
+        var b1 = body(w, IM_BODY_DYNAMIC, 1.0, 6.0, 0.3, ImColliderShape_box(0.4, 0.1, 0.0), dm);
+        var b2 = body(w, IM_BODY_DYNAMIC, 2.0, 6.0, 0.0, ImColliderShape_capsule(0.3, 0.1), dm);
+        var b3 = body(w, IM_BODY_DYNAMIC, 3.0, 5.5, 0.0, ImColliderShape_ball(0.2), dm);
+        var b4 = body(w, IM_BODY_DYNAMIC, -2.0, 5.0, 0.0, ImColliderShape_box(0.3, 0.3, 0.0), dm);
+        var b5 = body(w, IM_BODY_DYNAMIC, -3.0, 4.0, 0.0, ImColliderShape_ball(0.25), dm);
+        var rev: ImJointDesc = ImJointDesc_new(a, b1, ImJointType_revolute(ImVec2_new(0.0, 0.0), 1, -0.5, 0.8),
+          ImVec2_new(0.0, 0.0), ImVec2_new(-1.0, 0.0));
+        rev.has_motor = 1;
+        rev.motor = ImJointMotor_new(1.5, 20.0);
+        w.add_joint(rev);
+        joint(w, b1, b2, ImJointType_distance(1.0), 0.4, 0.0, -0.3, 0.0);
+        joint(w, b2, b3, ImJointType_spring(0.6, 40.0, 1.0), 0.0, 0.3, 0.0, 0.0);
+        var br: ImJointDesc = ImJointDesc_new(a, b4, ImJointType_rope(2.5), ImVec2_new(0.0, 0.0), ImVec2_new(0.0, 0.0));
+        br.has_break_force = 1;
+        br.break_force = 30.0;
+        br.damping = 0.5;
+        w.add_joint(br);
+        joint(w, b4, b5, ImJointType_prismatic(ImVec2_new(1.0, 0.2), 1, -0.5, 0.5), 0.0, 0.0, 0.0, 0.0);
+        joint(w, b5, b5, ImJointType_mouse(ImVec3_new(-1.0, 3.0, 0.0), 80.0, 5.0, 500.0), 0.0, 0.0, 0.0, 0.0);
+        joint(w, floor, b3, ImJointType_wheel(ImVec2_new(0.0, 1.0), 25.0, 1.0), 3.0, 0.5, 0.0, 0.0);
+        joint(w, b1, b4, ImJointType_fixed(), 0.0, 0.0, 0.0, 0.0);
+    } elif (k == 3) {
+        body(w, IM_BODY_STATIC, 2.0, 2.0, 0.4, ImColliderShape_capsule(0.8, 0.2), dm);
+        var e: ImParticleEmitter = ImParticleEmitter_new(ImVec3_new(0.0, 3.0, 0.0), ImVec3_new(0.5, 2.0, 0.0), 47.0);
+        e.with_spread(ImVec3_new(1.5, 1.0, 0.0)).with_lifetime(1.2).with_radius(0.05).with_damping(0.3);
+        w.add_emitter(e);
+        w.add_force_field(ImForceField_radial(ImVec3_new(1.0, 1.0, 0.0), 3.0, 1.5, 4.0));
+        w.add_force_field(ImForceField_directional(ImVec3_new(2.0, 0.0, 0.0), ImVec3_new(-1.0, 0.0, -1.0),
+            ImVec3_new(1.0, 2.0, 1.0)));
+        for (var p = 0; p < 6; p = p + 1) {
+            var px: f64 = f64_from(p) - 2.5;
+            var q: ImParticle = ImParticle_new(ImVec3_new(px, 2.0, 0.0), ImVec3_new(0.0, 1.0, 0.0), 0.1 + 0.05 * px);
+            q.with_radius(0.04).with_drag(0.2).with_sub_emitter(ImSubEmitter_new(3, 2.0, 0.4, 0.03, 0.5, 0.6));
+            w.spawn_particle(q);
+        }
+    } else {
+        var hs[64];
+        for (var r = 0; r < 6; r = r + 1) {
+            var rx: f64 = f64_from(r) * 1.5 - 4.0;
+            store64(&hs + r * 8, body(w, IM_BODY_DYNAMIC, rx, 2.0, 0.0, ImColliderShape_ball(0.4), dm));
+        }
+        w.remove_body(load64(&hs + 8));
+        w.remove_body(load64(&hs + 32));
+        var sd: ImColliderDesc = ImColliderDesc_new(ImColliderShape_box(1.0, 1.0, 0.0));
+        sd.is_sensor = 1;
+        var ts, sc = w.add_collider(floor, sd);
+    }
+    return 0;
+}
+
+# Builds scene k in two worlds over cfg, steps the first `before` frames (a force on body 1 every frame when push is
+# 1), restores its snapshot into the second (which held another scene), then steps both `after` frames the same way:
+# 1 when the restored world matches bit for bit at the restore and every frame after, events included, and both hand
+# out the same next handles.
+fn lockstep(k, cfg: ImWorldConfig, before, after, push): i64 {
+    var a: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    var b: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    scene(&a, k);
+    scene(&b, (k + 1) % 5);
+    var bh = _im_arena_handle(1, 0);
+    var f: ImForce = ImForce_new(3.0, 4.0, 0.0);
+    for (var i = 0; i < before; i = i + 1) {
+        if (push == 1) { a.apply_force(bh, f); }
+        a.step();
+    }
+    var s: ImWorldSnapshot = ImWorldSnapshot_new();
+    var ok = 1;
+    var t1, v1 = a.snapshot(&s);
+    var t2, v2 = b.restore(&s);
+    s.free();
+    if (is_ok(t1) == 0 || is_ok(t2) == 0 || same_world(&a, &b) == 0) { ok = 0; }
+    for (var j = 0; j < after && ok == 1; j = j + 1) {
+        if (push == 1) {
+            a.apply_force(bh, f);
+            b.apply_force(bh, f);
+        }
+        a.step();
+        b.step();
+        var ea, na = a.collision_events();
+        var eb, nb = b.collision_events();
+        if (na != nb || same_bytes(ea, eb, na * sizeof(ImCollisionEvent)) == 0) { ok = 0; }
+        if ((j % 25) == 24 && same_world(&a, &b) == 0) { ok = 0; }
+    }
+    if (ok == 1 && same_world(&a, &b) == 0) { ok = 0; }
+    var na1 = a.add_body(ImBodyDesc_default());
+    var nb1 = b.add_body(ImBodyDesc_default());
+    var tc1, nc1 = a.add_collider(na1, ImColliderDesc_new(ImColliderShape_ball(0.1)));
+    var tc2, nc2 = b.add_collider(nb1, ImColliderDesc_new(ImColliderShape_ball(0.1)));
+    if (na1 != nb1 || nc1 != nc2) { ok = 0; }
+    a.free();
+    b.free();
+    return ok;
+}
+
+# Restores snapshot s into a world holding scene 1 after 20 frames: 1 when it is refused with code `want` and the
+# world is unchanged.
+fn refused(s: *ImWorldSnapshot, want): i64 {
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    scene(&w, 1);
+    for (var i = 0; i < 20; i = i + 1) { w.step(); }
+    var before: ImWorldSnapshot = ImWorldSnapshot_new();
+    w.snapshot(&before);
+    var t, v = w.restore(s);
+    var after: ImWorldSnapshot = ImWorldSnapshot_new();
+    w.snapshot(&after);
+    var r = 0;
+    if (is_ok(t) == 0 && v == want && snap_eq(&before, &after) == 1) { r = 1; }
+    before.free();
+    after.free();
+    w.free();
+    return r;
+}
+
+# A fresh snapshot of scene k after n frames into *out.
+fn take(k, n, out: *ImWorldSnapshot) {
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    scene(&w, k);
+    for (var i = 0; i < n; i = i + 1) { w.step(); }
+    w.snapshot(out);
+    w.free();
+    return 0;
+}
+
+# Runs the snapshot tests.
+fn main() {
+    alloc_init();
+    var cfg: ImWorldConfig = ImWorldConfig_default();
+
+    # ── regressions.rs, struct-level ──
+    test_group("restore_rejects_huge_handle_index");
+    var w1: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    w1.add_body(ImBodyDesc_default());
+    var snap: ImWorldSnapshot = ImWorldSnapshot_new();
+    w1.snapshot(&snap);
+    var b0: *ImBodySnapshot = _im_as_body_snap(snap.bodies.at(0));
+    b0.body.handle = 0xFFFFFFF0;
+    var w2: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    var th, vh = w2.restore(&snap);
+    assert_eq(is_ok(th) == 0 && w2.body_count() == 0, 1, "a huge handle index refused; the world unchanged");
+    snap.free();
+    w1.free();
+    w1 = ImPhysicsWorld_new(cfg);
+    var bb = w1.add_body(ImBodyDesc_default());
+    var tbc, cbc = w1.add_collider(bb, ImColliderDesc_new(ImColliderShape_ball(0.5)));
+    var dup: ImWorldSnapshot = ImWorldSnapshot_new();
+    w1.snapshot(&dup);
+    var c0: *ImCollider2d = _im_b2_as_coll(dup.colliders.at(0));
+    var cc: ImCollider2d;
+    memcpy(&cc, c0, sizeof(ImCollider2d));
+    var ccs: ImColliderShape = c0.shape.clone();
+    cc.shape = ccs;
+    dup.colliders.push(&cc);
+    var td, vd = w2.restore(&dup);
+    assert_eq(is_ok(td), 0, "a duplicated collider refused");
+    dup.free();
+    var orphan: ImWorldSnapshot = ImWorldSnapshot_new();
+    w1.snapshot(&orphan);
+    var oc: *ImCollider2d = _im_b2_as_coll(orphan.colliders.at(0));
+    oc.body = 99;
+    var to, vo = w2.restore(&orphan);
+    assert_eq(is_ok(to), 0, "a collider on a missing body refused");
+    orphan.free();
+    var good: ImWorldSnapshot = ImWorldSnapshot_new();
+    w1.snapshot(&good);
+    var tg, vg = w2.restore(&good);
+    assert_eq(is_ok(tg) == 1 && w2.body_count() == 1, 1, "the valid snapshot restored");
+    good.free();
+    w1.free();
+    w2.free();
+
+    test_group("restore_replaces_force_fields");
+    var f1: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    f1.add_force_field(ImForceField_directional(ImVec3_new(1.0, 0.0, 0.0), ImVec3_new(-1.0, -1.0, -1.0),
+        ImVec3_new(1.0, 1.0, 1.0)));
+    var f2: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    f2.add_force_field(ImForceField_radial(ImVec3_zero(), 1.0, 2.0, 1.0));
+    var fs: ImWorldSnapshot = ImWorldSnapshot_new();
+    f1.snapshot(&fs);
+    var tf, vf = f2.restore(&fs);
+    fs.free();
+    var fa, fn1 = f1.force_fields();
+    var fb, fn2 = f2.force_fields();
+    assert_eq(is_ok(tf) == 1 && fn1 == 1 && fn2 == 1 && memeq(fa, fb, sizeof(ImForceField)) == 1, 1,
+      "the force fields are the snapshot's");
+    f1.free();
+    f2.free();
+
+    # ── Cyrius-only ──
+    test_group("round_trip_is_exact");
+    var rt = 1;
+    for (var k = 0; k < 5; k = k + 1) {
+        var src: ImWorldSnapshot = ImWorldSnapshot_new();
+        take(k, 40, &src);
+        var rw: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+        var tr, vr = rw.restore(&src);
+        var back: ImWorldSnapshot = ImWorldSnapshot_new();
+        rw.snapshot(&back);
+        if (is_ok(tr) == 0 || snap_eq(&src, &back) == 0) { rt = 0; }
+        src.free();
+        back.free();
+        rw.free();
+    }
+    assert_eq(rt, 1, "snapshot, restore, snapshot: the same state in every scene");
+
+    test_group("step_equivalence");
+    # Rust's step_exact_determinism (50 frames, then 100), at the struct.
+    assert_eq(lockstep(0, cfg, 50, 100, 0), 1, "a ball on a floor, 50 + 100 frames");
+    assert_eq(lockstep(1, cfg, 30, 150, 0), 1, "a stack hit by a ball: manifolds and warm starts carried");
+    assert_eq(lockstep(1, cfg, 200, 60, 0), 1, "the stack asleep");
+    assert_eq(lockstep(2, cfg, 25, 120, 1), 1, "every joint type, a rope that breaks, a force every frame");
+    assert_eq(lockstep(3, cfg, 17, 90, 0), 1, "particles, emitters mid-interval, fields, sub-emitters");
+    assert_eq(lockstep(4, cfg, 10, 60, 0), 1, "removed bodies (the free list) and a sensor");
+    var c4: ImWorldConfig = ImWorldConfig_default();
+    c4.sub_steps = 4;
+    c4.broadphase = IM_BROADPHASE_AABB_TREE;
+    assert_eq(lockstep(1, c4, 30, 60, 1), 1, "four sub-steps on the AABB tree, a force applied before the snapshot");
+    assert_eq(lockstep(2, cfg, 0, 30, 0), 1, "a snapshot before the first step");
+
+    test_group("refusals_leave_the_world_unchanged");
+    var s1: ImWorldSnapshot = ImWorldSnapshot_new();
+    take(1, 30, &s1);
+    var ts1: f64 = s1.config.timestep;
+    s1.config.timestep = 0.0 - 1.0;
+    assert_eq(refused(&s1, IM_ERR_INVALID_CONFIG), 1, "an invalid config (IM_ERR_INVALID_CONFIG)");
+    s1.config.timestep = ts1;
+    s1.config.solver = IM_SOLVER_XPBD;
+    assert_eq(refused(&s1, IM_ERR_UNSUPPORTED), 1, "XPBD (IM_ERR_UNSUPPORTED, ADR 0008 #6)");
+    s1.config.solver = IM_SOLVER_SEQUENTIAL_IMPULSE;
+    var b1: *ImBodySnapshot = _im_as_body_snap(s1.bodies.at(2));
+    var t0 = b1.body.body_type;
+    b1.body.body_type = 7;
+    assert_eq(refused(&s1, IM_ERR_DESERIALIZE), 1, "a body type out of range");
+    b1.body.body_type = t0;
+    var l1: *ImWordList = _im_b2_snap_list(s1.bodies.at(2));
+    var lw = l1.pop();
+    assert_eq(refused(&s1, IM_ERR_DESERIALIZE), 1, "a collider missing from its body's list");
+    l1.push(lw);
+    l1.push(lw);
+    assert_eq(refused(&s1, IM_ERR_DESERIALIZE), 1, "a collider listed twice");
+    l1.pop();
+    var sl: *ImSlotSnapshot = s1.body_arena.slot(1);
+    sl.generation = sl.generation + 1;
+    assert_eq(refused(&s1, IM_ERR_DESERIALIZE), 1, "a body handle at a stale generation");
+    sl.generation = sl.generation - 1;
+    assert_eq(s1.manifolds.len > 0, 1, "(the stack has manifolds)");
+    var mf: *ImContactManifold = _im_b2_as_manifold(s1.manifolds.at(0));
+    var np = mf.point_count;
+    mf.point_count = 3;
+    assert_eq(refused(&s1, IM_ERR_DESERIALIZE), 1, "a manifold with three points");
+    mf.point_count = np;
+    var mca = mf.collider_a;
+    mf.collider_a = mf.collider_b;
+    mf.collider_b = mca;
+    assert_eq(refused(&s1, IM_ERR_DESERIALIZE), 1, "a manifold keyed larger handle first");
+    mf.collider_b = mf.collider_a;
+    mf.collider_a = mca;
+    s1.tracker.prev.push(0, 0);
+    assert_eq(refused(&s1, IM_ERR_DESERIALIZE), 1, "a tracker list out of order");
+    s1.tracker.prev.len = s1.tracker.prev.len - 1;
+    var ok1: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    var tk, vk = ok1.restore(&s1);
+    assert_eq(is_ok(tk), 1, "each edit undone: the snapshot restores");
+    ok1.free();
+    s1.free();
+    var s2: ImWorldSnapshot = ImWorldSnapshot_new();
+    take(4, 5, &s2);
+    var fh = s2.body_arena.free_head;
+    var hs: *ImSlotSnapshot = s2.body_arena.slot(fh);
+    var hn = hs.next_free;
+    hs.next_free = fh;
+    assert_eq(refused(&s2, IM_ERR_DESERIALIZE), 1, "a free list that loops");
+    hs.next_free = hn;
+    hs.next_free = 0;
+    assert_eq(refused(&s2, IM_ERR_DESERIALIZE), 1, "a free list through an occupied slot");
+    hs.next_free = hn;
+    var big: ImSlotSnapshot;
+    big.occupied = 0;
+    big.generation = 0;
+    big.next_free = 0 - 1;
+    while (s2.body_arena.slots.len <= IM_MAX_SNAPSHOT_INDEX + 1) { s2.body_arena.slots.push(&big); }
+    assert_eq(refused(&s2, IM_ERR_DESERIALIZE), 1, "more than IM_MAX_SNAPSHOT_INDEX + 1 slots");
+    s2.free();
+    var s3: ImWorldSnapshot = ImWorldSnapshot_new();
+    take(2, 5, &s3);
+    var j3: *ImJointSnapshot = _im_as_joint_snap(s3.joints.at(1));
+    var jb = j3.joint.body_b;
+    j3.joint.body_b = _im_arena_handle(40, 0);
+    assert_eq(refused(&s3, IM_ERR_DESERIALIZE), 1, "a joint on a missing body");
+    j3.joint.body_b = jb;
+    var mouse = 0 - 1;
+    for (var mj = 0; mj < s3.joints.len; mj = mj + 1) {
+        var jm: *ImJointSnapshot = _im_as_joint_snap(s3.joints.at(mj));
+        if (jm.joint.joint_type.kind == IM_JOINT_MOUSE) { mouse = mj; }
+    }
+    var jmo: *ImJointSnapshot = _im_as_joint_snap(s3.joints.at(mouse));
+    jmo.joint.body_b = _im_arena_handle(40, 0);
+    var mw: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    var tm, vm = mw.restore(&s3);
+    assert_eq(is_ok(tm), 1, "a Mouse joint's second body may be missing");
+    mw.free();
+    s3.free();
+
+    test_group("flat_heap_snapshots");
+    # Snapshot and restore, round and round: after warm-up the heap stays put.
+    var hw: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    scene(&hw, 3);
+    var hr: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    for (var warm = 0; warm < 30; warm = warm + 1) {
+        hw.step();
+        var hs1: ImWorldSnapshot = ImWorldSnapshot_new();
+        hw.snapshot(&hs1);
+        hr.restore(&hs1);
+        hs1.free();
+    }
+    var arena0 = _fl_arena;
+    var pos0 = _fl_arena_pos;
+    for (var rnd = 0; rnd < 60; rnd = rnd + 1) {
+        var hs2: ImWorldSnapshot = ImWorldSnapshot_new();
+        hw.snapshot(&hs2);
+        hr.restore(&hs2);
+        hs2.free();
+    }
+    assert_eq(_fl_arena == arena0 && _fl_arena_pos == pos0, 1, "no growth");
+    hw.free();
+    hr.free();
+
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

@@ -527,6 +527,33 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - `b3_state.tsv`'s gets and sets now compare the full state, from the oracle's dump, all 0 ulp.
     `tests/b3_state.tcyr` has 34 assertions (+6: arbitrary orientations, the inertia refresh, the 3D JSON).
 
+- **Cyrius port, M6 part 1: 2D snapshots, the struct and `restore`** ([ADR 0013](docs/adr/0013-complete-snapshots.md);
+  `docs/development/port-parity.md` §25):
+  - `ImWorldSnapshot` holds a 2D world's whole state: the config and id counters, particles, emitters and force fields,
+    each arena's slots and free list, every body, collider and joint record (the backend's own types), each body's
+    collider list, the contact manifolds with their warm-start impulses, the contact tracker and the last events.
+    Rust 1.4.0's `WorldSnapshot` has no force fields, manifolds, sleep timers, mass properties, accumulators, arena
+    metadata or tracker.
+  - `world.snapshot(out)` fills one. `world.restore(snap)` checks it, builds a fresh world and swaps it in. On any
+    error the world is unchanged: the config's own error, or `IM_ERR_DESERIALIZE`. Rust's `restore` and
+    `try_restore` are one fallible `restore` (ADR 0008 #2). A restored world steps to the same bits as the original,
+    with the same events and next handles.
+  - The checks extend Rust's `validate_snapshot`: the index cap, slot words and free lists, one record per occupied
+    slot at its generation, colliders on live bodies and on their lists once, joints' bodies, manifold keys and point
+    counts, sorted tracker lists, enums and flags.
+  - `IM_MAX_SNAPSHOT_INDEX` (2^20) is generated; its golden row, pending since M1, now replays (2D: 98,874 ok, 6
+    pending).
+  - `tests/snapshot.tcyr` has 31 assertions:
+    - Rust's `restore_rejects_huge_handle_index`, and `restore_replaces_force_fields` (`#[ignore]`d in Rust), at
+      the struct;
+    - exact round trips in five scenes, and step-equivalence in eight runs over contacts, sleep, every joint type,
+      breaking, particles, removals, sub-steps and the AABB tree;
+    - 13 refusals, each leaving the world unchanged, and a flat heap.
+
+    Dropping the warm starts, the free-list order or the tracker on restore each fails 5–6 of them.
+  - Surface parity is 662 across 30 modules: Rust's `serialize` module joins, with its snapshot records mapped onto
+    ADR 0013's and `serialize_world` / `deserialize_world` pending part 2.
+
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
   sin_cos from 3.3 µs to 187 ns (the polyfills: 48–64 and 75–83 ns).
@@ -624,6 +651,9 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
 - **The full 3D body state against Rust** (ADR 0008 #4; quiet machine, Rust on its 3D build): `mutation/get_body_state`
   11.5 → 40 ns, down from part 1's 338 ns (a copy, no `atan2`); `mutation/set_body_state` 26.9 → 379 ns, 304 ns of it
   the R·I⁻¹·Rᵀ refresh.
+- **Snapshots, first numbers** (Cyrius only, the struct; Rust's `snapshot/*` rows go through bytes, part 2): on Rust's
+  scenes a capture of an empty world takes 1.39 µs, of 100 balls 208 µs, and a restore of those 100 into a fresh world
+  234 µs. Not profiled yet.
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

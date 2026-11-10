@@ -33,5 +33,6 @@ Decisions about impetus — what we chose, the context, and the consequences we 
 | [0010](0010-serde-compatible-json.md) | Serde-compatible JSON codecs on bayan, with a shortest-digit float printer | Accepted |
 | [0011](0011-correctly-rounded-exp-sin-cos.md) | Correctly rounded exp, sin and cos, gated exactly against a corrected oracle (amended: hypot, pow, atan2) | Accepted |
 | [0012](0012-impetus-owned-3d-math-stopgap.md) | Impetus-owned 3D math and GJK/EPA until hisab's allocation can be scoped | Accepted |
+| [0013](0013-complete-snapshots.md) | Complete snapshots: an inspectable struct, a checksummed binary form and JSON | Accepted |
 
 0001–0006 were written for the Rust crate (three-digit numbers until the port).

@@ -1,0 +1,333 @@
+# b2_snapshot.cyr — the 2D profile's snapshot (ADR 0013): `ImWorldSnapshot` over the 2D backend's own records, and its
+# backend half: capture from a state, the checks, and the load into a fresh one. src/world_snapshot.cyr, after this
+# file, holds `snapshot`, `restore` and the world's half; src/snapshot.cyr, before it, the arena and tracker pieces.
+#
+# The records are the backend's (ImRigidBody2d, ImCollider2d, ImJoint2d, ImContactManifold), field for field, so a
+# snapshot holds what the oracle's dump holds. A snapshot owns its copies: each collider's shape arrays, each
+# manifold's points, each body's collider list; `free` releases them.
+
+# A body and its collider handles, in attachment order. Rust's `BodySnapshot` (a `BodyDesc` and the kinematic state);
+# here the whole body record.
+struct ImBodySnapshot {
+    body: ImRigidBody2d;
+    colliders: ImWordList;
+}
+
+# A joint record and its handle. Rust's `JointSnapshot` (a `JointDesc`); here the whole record, its reference angle
+# included.
+struct ImJointSnapshot {
+    handle;
+    joint: ImJoint2d;
+}
+
+# A 2D world's whole state (ADR 0013). `bodies` are ImBodySnapshot records, `colliders` ImCollider2d (Rust's
+# `ColliderSnapshot`) and `joints` ImJointSnapshot, each in its arena's slot order; `particles`, `emitters` and
+# `force_fields` the world's records; the three arenas' slots and free lists; the contact manifolds (ImContactManifold
+# records in key order, each owning its points); the contact tracker. Mirrors Rust's `WorldSnapshot`, which holds the
+# first eight fields' worth (less the arenas, force fields, manifolds and tracker).
+struct ImWorldSnapshot {
+    config: ImWorldConfig;
+    next_particle_id;
+    next_emitter_id;
+    bodies: ImRecordList;
+    colliders: ImRecordList;
+    joints: ImRecordList;
+    particles: ImRecordList;
+    emitters: ImRecordList;
+    force_fields: ImRecordList;
+    body_arena: ImArenaSnapshot;
+    collider_arena: ImArenaSnapshot;
+    joint_arena: ImArenaSnapshot;
+    manifolds: ImRecordList;
+    tracker: ImTrackerSnapshot;
+}
+
+#must_use
+fn _im_as_body_snap(p): *ImBodySnapshot { return p; }
+#must_use
+fn _im_as_joint_snap(p): *ImJointSnapshot { return p; }
+
+# The collider list of the ImBodySnapshot record at r (Cyrius takes no field addresses: the word after the body).
+#must_use
+fn _im_b2_snap_list(r): *ImWordList { return r + sizeof(ImRigidBody2d); }
+
+# An empty snapshot (the default config).
+#must_use
+fn ImWorldSnapshot_new(): ImWorldSnapshot {
+    var s: ImWorldSnapshot;
+    s.config = ImWorldConfig_default();
+    s.next_particle_id = 0;
+    s.next_emitter_id = 0;
+    s.bodies = ImRecordList_new(sizeof(ImBodySnapshot));
+    s.colliders = ImRecordList_new(sizeof(ImCollider2d));
+    s.joints = ImRecordList_new(sizeof(ImJointSnapshot));
+    s.particles = ImRecordList_new(sizeof(ImParticle));
+    s.emitters = ImRecordList_new(sizeof(ImParticleEmitter));
+    s.force_fields = ImRecordList_new(sizeof(ImForceField));
+    s.body_arena = ImArenaSnapshot_new();
+    s.collider_arena = ImArenaSnapshot_new();
+    s.joint_arena = ImArenaSnapshot_new();
+    s.manifolds = ImRecordList_new(sizeof(ImContactManifold));
+    s.tracker = ImTrackerSnapshot_new();
+    return s;
+}
+
+impl ImWorldSnapshot {
+    # Captures the state's arenas, records, collider lists, manifolds and tracker: 1, or 0 when there is no memory
+    # (what was captured stays owned by the snapshot, for `free`).
+    fn _capture_backend(self, st: *ImPhysicsState2d): i64 {
+        var ba: *ImArena = st._bodies();
+        var ca: *ImArena = st._colliders();
+        var ja: *ImArena = st._joints();
+        if (self.body_arena.capture(ba) == 0) { return 0; }
+        if (self.collider_arena.capture(ca) == 0) { return 0; }
+        if (self.joint_arena.capture(ja) == 0) { return 0; }
+        if (self.bodies.reserve(ba.len()) == 0) { return 0; }
+        var empty: ImWordList = ImWordList_new();
+        for (var s = 0; s < ba.slot_count(); s = s + 1) {
+            var bh = ba.slot_handle(s);
+            if (bh != 0 - 1) {
+                var r = self.bodies.at(self.bodies.len);
+                memcpy(r, ba.get(bh), sizeof(ImRigidBody2d));
+                var dl: *ImWordList = _im_b2_snap_list(r);
+                memcpy(dl, &empty, sizeof(ImWordList));
+                self.bodies.len = self.bodies.len + 1;
+                var sl: *ImWordList = st._list(_im_handle_index(bh));
+                if (sl == 0) { return 0; }
+                if (dl.reserve(sl.len) == 0) { return 0; }
+                for (var q = 0; q < sl.len; q = q + 1) { dl.push(sl.at(q)); }
+            }
+        }
+        if (self.colliders.reserve(ca.len()) == 0) { return 0; }
+        var sh: ImColliderShape;
+        for (var c = 0; c < ca.slot_count(); c = c + 1) {
+            var ch = ca.slot_handle(c);
+            if (ch != 0 - 1) {
+                var src: *ImCollider2d = _im_b2_as_coll(ca.get(ch));
+                if (_im_snap_clone_shape(src.shape, &sh) == 0) { return 0; }
+                var cr: *ImCollider2d = _im_b2_as_coll(self.colliders.at(self.colliders.len));
+                memcpy(cr, src, sizeof(ImCollider2d));
+                cr.shape = sh;
+                self.colliders.len = self.colliders.len + 1;
+            }
+        }
+        if (self.joints.reserve(ja.len()) == 0) { return 0; }
+        for (var j = 0; j < ja.slot_count(); j = j + 1) {
+            var jh = ja.slot_handle(j);
+            if (jh != 0 - 1) {
+                var jr = self.joints.at(self.joints.len);
+                store64(jr, jh);
+                memcpy(jr + 8, ja.get(jh), sizeof(ImJoint2d));
+                self.joints.len = self.joints.len + 1;
+            }
+        }
+        var nm = st.manifolds.count();
+        if (self.manifolds.reserve(nm) == 0) { return 0; }
+        for (var m = 0; m < nm; m = m + 1) {
+            var mf: *ImContactManifold = _im_b2_as_manifold(st.manifolds.at(m));
+            var pts = 0;
+            var pbytes = mf.point_count * sizeof(ImManifoldPoint);
+            if (pbytes > 0) {
+                pts = fl_alloc(pbytes);
+                if (pts == 0) { return 0; }
+                memcpy(pts, mf.points, pbytes);
+            }
+            var mr: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(self.manifolds.len));
+            memcpy(mr, mf, sizeof(ImContactManifold));
+            mr.points = pts;
+            self.manifolds.len = self.manifolds.len + 1;
+        }
+        return self.tracker.capture(st.contact_tracker);
+    }
+
+    # 1 when the backend half is consistent: the arenas well formed; one body, collider and joint record per occupied
+    # slot of its arena, each at its slot's handle; enums and flags in range; each collider on a live body and on that
+    # body's list exactly once; each joint's bodies live (a Mouse joint's second body needn't be); each manifold on two
+    # live colliders, its bodies theirs, the smaller handle first, in strictly ascending key order with at most two
+    # points; the tracker's lists sorted. 0 otherwise, or when there is no memory for the check.
+    #must_use
+    fn _validate_backend(self): i64 {
+        if (self.bodies.size != sizeof(ImBodySnapshot) || self.colliders.size != sizeof(ImCollider2d)) { return 0; }
+        if (self.joints.size != sizeof(ImJointSnapshot)) { return 0; }
+        if (self.manifolds.size != sizeof(ImContactManifold)) { return 0; }
+        if (self.body_arena.validate() == 0 || self.collider_arena.validate() == 0) { return 0; }
+        if (self.joint_arena.validate() == 0 || self.tracker.validate() == 0) { return 0; }
+        if (self.bodies.len != self.body_arena.occupied()) { return 0; }
+        if (self.colliders.len != self.collider_arena.occupied()) { return 0; }
+        if (self.joints.len != self.joint_arena.occupied()) { return 0; }
+        # seen: one word per collider slot, the index + 1 of its record (0: none yet), then a listed flag per record.
+        var nslots = self.collider_arena.slots.len;
+        var seen = fl_alloc(nslots * 8 + self.colliders.len * 8 + 8);
+        if (seen == 0) { return 0; }
+        var ok = self._validate_records(seen, nslots);
+        fl_free(seen);
+        return ok;
+    }
+
+    # The record checks of `_validate_backend`, with seen: nslots + colliders.len zeroed words.
+    #must_use
+    fn _validate_records(self, seen, nslots): i64 {
+        for (var z = 0; z < nslots + self.colliders.len; z = z + 1) { store64(seen + z * 8, 0); }
+        var listed = seen + nslots * 8;
+        # Bodies: live handles in ascending slot order, so one per occupied slot.
+        for (var i = 0; i < self.bodies.len; i = i + 1) {
+            var b: *ImBodySnapshot = _im_as_body_snap(self.bodies.at(i));
+            var bh = b.body.handle;
+            if (self.body_arena.live(bh) == 0) { return 0; }
+            if (i > 0) {
+                var pb: *ImBodySnapshot = _im_as_body_snap(self.bodies.at(i - 1));
+                if (_im_handle_index(pb.body.handle) >= _im_handle_index(bh)) { return 0; }
+            }
+            if (b.body.body_type < IM_BODY_STATIC || b.body.body_type > IM_BODY_KINEMATIC) { return 0; }
+            if (_im_snap_flag(b.body.fixed_rotation) == 0 || _im_snap_flag(b.body.is_sleeping) == 0) { return 0; }
+        }
+        # Colliders: distinct live handles in slot order, on live bodies, well formed.
+        for (var c = 0; c < self.colliders.len; c = c + 1) {
+            var cp: *ImCollider2d = _im_b2_as_coll(self.colliders.at(c));
+            if (self.collider_arena.live(cp.handle) == 0 || self.body_arena.live(cp.body) == 0) { return 0; }
+            var ci = _im_handle_index(cp.handle);
+            if (load64(seen + ci * 8) != 0) { return 0; }
+            store64(seen + ci * 8, c + 1);
+            if (_im_snap_flag(cp.is_sensor) == 0 || _im_snap_flag(cp.has_mass) == 0) { return 0; }
+            if (_im_snap_shape_ok(cp.shape) == 0 || _im_snap_material_ok(cp.material) == 0) { return 0; }
+        }
+        # Lists: each entry a live collider of that body, each collider listed once.
+        var total = 0;
+        for (var k = 0; k < self.bodies.len; k = k + 1) {
+            var r = self.bodies.at(k);
+            var kb: *ImBodySnapshot = _im_as_body_snap(r);
+            var l: *ImWordList = _im_b2_snap_list(r);
+            if (l.len < 0 || (l.len > 0 && l.data == 0)) { return 0; }
+            for (var q = 0; q < l.len; q = q + 1) {
+                var lh = l.at(q);
+                if (self.collider_arena.live(lh) == 0) { return 0; }
+                var rec = load64(seen + _im_handle_index(lh) * 8) - 1;
+                var lc: *ImCollider2d = _im_b2_as_coll(self.colliders.at(rec));
+                if (lc.body != kb.body.handle || load64(listed + rec * 8) != 0) { return 0; }
+                store64(listed + rec * 8, 1);
+                total = total + 1;
+            }
+        }
+        if (total != self.colliders.len) { return 0; }
+        # Joints: distinct live handles in slot order, their bodies live.
+        for (var j = 0; j < self.joints.len; j = j + 1) {
+            var js: *ImJointSnapshot = _im_as_joint_snap(self.joints.at(j));
+            if (self.joint_arena.live(js.handle) == 0) { return 0; }
+            if (j > 0) {
+                var pj: *ImJointSnapshot = _im_as_joint_snap(self.joints.at(j - 1));
+                if (_im_handle_index(pj.handle) >= _im_handle_index(js.handle)) { return 0; }
+            }
+            if (_im_snap_joint_type_ok(js.joint.joint_type) == 0) { return 0; }
+            if (self.body_arena.live(js.joint.body_a) == 0) { return 0; }
+            if (js.joint.joint_type.kind != IM_JOINT_MOUSE && self.body_arena.live(js.joint.body_b) == 0) { return 0; }
+            if (_im_snap_flag(js.joint.has_motor) == 0 || _im_snap_flag(js.joint.has_break_force) == 0) { return 0; }
+        }
+        # Manifolds: on live colliders and their bodies, keyed in strictly ascending order.
+        for (var m = 0; m < self.manifolds.len; m = m + 1) {
+            var mf: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(m));
+            if (self.collider_arena.live(mf.collider_a) == 0 || self.collider_arena.live(mf.collider_b) == 0) {
+                return 0;
+            }
+            if (_im_ult(mf.collider_b, mf.collider_a) == 1) { return 0; }
+            if (m > 0) {
+                var pm: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(m - 1));
+                if (_im_pair_cmp(pm.collider_a, pm.collider_b, mf.collider_a, mf.collider_b) >= 0) { return 0; }
+            }
+            var ra = load64(seen + _im_handle_index(mf.collider_a) * 8) - 1;
+            var rb = load64(seen + _im_handle_index(mf.collider_b) * 8) - 1;
+            var ma: *ImCollider2d = _im_b2_as_coll(self.colliders.at(ra));
+            var mb: *ImCollider2d = _im_b2_as_coll(self.colliders.at(rb));
+            if (mf.body_a != ma.body || mf.body_b != mb.body) { return 0; }
+            if (mf.point_count < 0 || mf.point_count > 2 || (mf.point_count > 0 && mf.points == 0)) { return 0; }
+        }
+        return 1;
+    }
+
+    # Loads the backend half into the fresh state st: 1, or 0 when there is no memory (st then holds what was loaded,
+    # for its `free`). Assumes `_validate_backend`.
+    fn _load_backend(self, st: *ImPhysicsState2d): i64 {
+        var ba: *ImArena = st._bodies();
+        var ca: *ImArena = st._colliders();
+        var ja: *ImArena = st._joints();
+        if (self.body_arena.load(ba) == 0) { return 0; }
+        for (var i = 0; i < self.bodies.len; i = i + 1) {
+            var r = self.bodies.at(i);
+            var b: *ImBodySnapshot = _im_as_body_snap(r);
+            var bi = _im_handle_index(b.body.handle);
+            memcpy(ba.values + bi * ba.elem_size, r, sizeof(ImRigidBody2d));
+            var src: *ImWordList = _im_b2_snap_list(r);
+            var dst: *ImWordList = st._list(bi);
+            if (dst == 0 || dst.reserve(src.len) == 0) { return 0; }
+            for (var q = 0; q < src.len; q = q + 1) { dst.push(src.at(q)); }
+        }
+        # A collider slot holds no shape arrays until its copy is in, so a failure leaves nothing to double-free.
+        if (self.collider_arena.load(ca) == 0) { return 0; }
+        var sh: ImColliderShape;
+        for (var c = 0; c < self.colliders.len; c = c + 1) {
+            var cp: *ImCollider2d = _im_b2_as_coll(self.colliders.at(c));
+            var ci = _im_handle_index(cp.handle);
+            var slot: *ImCollider2d = _im_b2_as_coll(ca.values + ci * ca.elem_size);
+            memcpy(slot, cp, sizeof(ImCollider2d));
+            var blank: ImColliderShape = _im_shape(cp.shape.kind);
+            slot.shape = blank;
+        }
+        for (var c2 = 0; c2 < self.colliders.len; c2 = c2 + 1) {
+            var cq: *ImCollider2d = _im_b2_as_coll(self.colliders.at(c2));
+            if (_im_snap_clone_shape(cq.shape, &sh) == 0) { return 0; }
+            var s2: *ImCollider2d = _im_b2_as_coll(ca.values + _im_handle_index(cq.handle) * ca.elem_size);
+            s2.shape = sh;
+        }
+        if (self.joint_arena.load(ja) == 0) { return 0; }
+        for (var j = 0; j < self.joints.len; j = j + 1) {
+            var jr = self.joints.at(j);
+            var ji = _im_handle_index(load64(jr));
+            memcpy(ja.values + ji * ja.elem_size, jr + 8, sizeof(ImJoint2d));
+        }
+        var nm = self.manifolds.len;
+        if (nm > 0) {
+            st.manifolds.data = fl_alloc(nm * sizeof(ImContactManifold));
+            if (st.manifolds.data == 0) { return 0; }
+            st.manifolds.cap = nm;
+        }
+        for (var m = 0; m < nm; m = m + 1) {
+            var mf: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(m));
+            var pts = 0;
+            var pbytes = mf.point_count * sizeof(ImManifoldPoint);
+            if (pbytes > 0) {
+                pts = fl_alloc(pbytes);
+                if (pts == 0) { return 0; }
+                memcpy(pts, mf.points, pbytes);
+            }
+            var dm: *ImContactManifold = _im_b2_as_manifold(st.manifolds.at(m));
+            memcpy(dm, mf, sizeof(ImContactManifold));
+            dm.points = pts;
+            st.manifolds.len = m + 1;
+        }
+        return self.tracker.load(st.contact_tracker);
+    }
+
+    # Releases the backend half: the collider lists, shapes, manifold points, arenas and tracker.
+    fn _free_backend(self) {
+        for (var i = 0; i < self.bodies.len; i = i + 1) {
+            var bl: *ImWordList = _im_b2_snap_list(self.bodies.at(i));
+            bl.free();
+        }
+        self.bodies.free();
+        for (var c = 0; c < self.colliders.len; c = c + 1) {
+            var cp: *ImCollider2d = _im_b2_as_coll(self.colliders.at(c));
+            cp.shape.free();
+        }
+        self.colliders.free();
+        self.joints.free();
+        for (var m = 0; m < self.manifolds.len; m = m + 1) {
+            var mf: *ImContactManifold = _im_b2_as_manifold(self.manifolds.at(m));
+            if (mf.points != 0) { fl_free(mf.points); }
+        }
+        self.manifolds.free();
+        self.body_arena.free();
+        self.collider_arena.free();
+        self.joint_arena.free();
+        self.tracker.free();
+        return 0;
+    }
+}

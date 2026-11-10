@@ -6,9 +6,7 @@
 # Every public constant of the Rust crate; t_constants.rs proves the list complete
 # against rust-old/src, and tests/golden/constants.tsv pins each value.
 #
-# The snapshot index cap (PhysicsWorld::MAX_SNAPSHOT_INDEX) is generated with the
-# snapshot module (M6). Private constants are extracted and proven at the milestone
-# whose module uses them.
+# Private constants are extracted and proven at the milestone whose module uses them.
 
 # Largest accepted `sub_steps`.
 # Rust: impetus::config::WorldConfig::MAX_SUB_STEPS
@@ -17,3 +15,9 @@ const IM_MAX_SUB_STEPS = 4096;
 # Largest accepted `velocity_iterations` / `position_iterations`.
 # Rust: impetus::config::WorldConfig::MAX_ITERATIONS
 const IM_MAX_ITERATIONS = 10000;
+
+# Largest arena index (body, collider or joint slot) accepted from a
+# snapshot. Restoring allocates every slot up to the largest index, so
+# this bounds the memory an untrusted snapshot can request.
+# Rust: impetus::world::PhysicsWorld::MAX_SNAPSHOT_INDEX
+const IM_MAX_SNAPSHOT_INDEX = 1048576;

@@ -76,6 +76,9 @@ modules = [
     "src/world.cyr",
     "src/json.cyr",
     "src/b2_json.cyr",
+    "src/snapshot.cyr",
+    "src/b2_snapshot.cyr",
+    "src/world_snapshot.cyr",
 ]
 
 # The 3D profile (M4 on): the shared modules in [lib]'s order, glam's 3D math (src/math3.cyr, ADR 0012), then the
@@ -115,4 +118,5 @@ modules = [
     "src/world.cyr",
     "src/json.cyr",
     "src/b3_json.cyr",
+    "src/snapshot.cyr",
 ]

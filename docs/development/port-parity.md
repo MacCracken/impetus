@@ -1099,6 +1099,50 @@ fails when either drifts from `cyrius.cyml`.
 - **Result:** 3D **29,404 ok, 0 failed, 11 accepted (ADR 11: 5, ADR 0008: 6)**; 2D unchanged at **98,873 ok**. The same
   on x86_64 ELF, x86_64 PE and aarch64. Surface parity is 637 across 29 modules.
 
+## 25. M6a: 2D snapshots, the struct and `restore` (2026-11-10, ADR 0013)
+
+- **No oracle.** Rust 1.4.0's snapshot is incomplete and its bytes are bitcode, so a 2.0 snapshot has nothing to
+  compare against (port plan §2 item 5). It is checked three ways: by round trip (snapshot, restore, snapshot again:
+  the same state), by step-equivalence (a restored world steps to the original's bits), and by refusal tests. The
+  content needs no separate proof of completeness: it is what the oracle's dump holds, and every step corpus row
+  loads exactly that into a fresh world and reaches Rust's bits.
+- **The modules.**
+  - `src/snapshot.cyr` holds the pieces both profiles share: an arena's slots and free list (`ImArenaSnapshot`), the
+    tracker's lists and last events (`ImTrackerSnapshot`), checked shape copies, and the shape, material and
+    joint-type checks.
+  - `src/b2_snapshot.cyr` holds the 2D `ImWorldSnapshot` over the backend's own records: `ImBodySnapshot` (the body
+    record and its collider list), the collider record, `ImJointSnapshot` (handle and record) and the manifold
+    record with its points. It also holds the backend half of capture, checks and load.
+  - `src/world_snapshot.cyr` holds the world's half and the public `snapshot` and `restore`. `restore` checks
+    everything, builds a fresh world beside the old one and only then swaps it in.
+
+  The order in `[lib]`: JSON, then `snapshot.cyr`, the profile's file, `world_snapshot.cyr`. The 3D profile has
+  `snapshot.cyr` alone until part 4.
+- **The constant.** `IM_MAX_SNAPSHOT_INDEX` (Rust's `MAX_SNAPSHOT_INDEX`, 2^20) is generated with the config limits.
+  Its `constants.tsv` row, pending since M1, now replays: 2D **98,874 ok, 6 pending** (S3 3, S4 3).
+- **Tests** (`tests/snapshot.tcyr`, 31 assertions). A comparison follows every owned array, so two snapshots are equal
+  only bit for bit.
+  - Rust's `restore_rejects_huge_handle_index` (a huge index, a duplicated collider, an orphan collider), and
+    `restore_replaces_force_fields`, one of Rust's two `#[ignore]`d tests, at the struct. Rust's byte-level tests come
+    with part 2.
+  - Round trips in five scenes: a ball on a floor, a stack hit by a ball, every joint type with a motor, limits, a
+    breaking rope and damping, particles with emitters, fields and sub-emitters, and removals with a sensor.
+  - Step-equivalence in eight runs. Snapshot after k frames, restore into a world that held another scene, then step
+    both. The checks are the state every 25 frames and at the end, the events every frame, and the next body and
+    collider handles. The runs cover Rust's `step_exact_determinism` (50 + 100 frames), the stack in contact and
+    asleep, the joints under a force every frame, mid-interval emitters, the free list, four sub-steps on the AABB
+    tree with a force applied before the snapshot, and a snapshot before the first step.
+  - 13 refusals: an invalid config, XPBD, an enum out of range, a list missing or doubling a collider, a stale
+    generation, a three-point manifold, a manifold keyed larger handle first, a tracker list out of order, a free list
+    that loops or passes an occupied slot, too many slots, and a joint on a missing body. Each leaves the world it was
+    restored into bit for bit unchanged; a Mouse joint's missing second body is accepted, as Rust's check allows.
+  - A flat heap over 60 snapshot-and-restore rounds.
+- **Mutations.** Zeroing the manifolds' normal impulses on load fails 5 checks, rebuilding the free list instead of
+  carrying it fails 6, and skipping the tracker fails 5.
+- **Result:** 2D **98,874 ok, 0 failed, 6 pending, 166 accepted**; 3D **29,404 ok, 0 failed**; the same on x86_64
+  ELF, x86_64 PE and aarch64, where `tests/snapshot.tcyr` also passes. Surface parity is 662 across 30 modules:
+  `serialize` joins, with `serialize_world` and `deserialize_world` pending part 2.
+
 ## How to reproduce
 
 ```sh
