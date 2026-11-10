@@ -607,6 +607,25 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     - 13 refusals of edited 3D records;
     - a pin and a JSON edit.
 
+- **Cyrius port, M6 part 5: the fuzz targets, the capture profiled, M6 closed** (`docs/development/port-parity.md` §29):
+  - Rust's two fuzz targets run as seeded loops on both profiles: `tests/fuzz_cases.cyr`, driven by
+    `tests/impetus.fcyr` (2D) and the new `tests/impetus_3d.fcyr` (3D) under `cyrius fuzz`. An LCG with edge-weighted
+    words stands in for libFuzzer, and an optional argument multiplies the counts (`args` joins `[test]`'s stdlib).
+    The checks:
+    - `fuzz_contacts`: two balls from arbitrary bytes, decoded as Rust decodes them, step to finite positions and
+      velocities;
+    - `fuzz_serialize`: mutated and random snapshot bytes. A refused input leaves the world unchanged, and a restored
+      world steps and serializes again. Mutated config documents that `try_new` accepts step;
+    - a Cyrius-only target: mutated snapshot JSON. A restored world steps and serializes again.
+
+    The default run takes about 2.5 s a profile and a scale-20 soak passed. Four faults put in the library each fail the
+    default run, under `--bounds` and `--poison` as well.
+  - The capture now skips the shape clone for a ball, box, capsule or segment, since the record copy has already
+    copied that shape whole (`_im_snap_shape_plain`). A hull, mesh or heightfield still clones its arrays.
+  - The shared `array_shapes_owned` group adds what no snapshot test held: shapes that own arrays, copied at new
+    addresses into the snapshot and again into the restored world, each copy outliving the other. `snapshot.tcyr`
+    has 62 assertions and `b3_snapshot.tcyr` 63 (the shared cases 34). Skipping every clone fails the group.
+
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
   sin_cos from 3.3 µs to 187 ns (the polyfills: 48–64 and 75–83 ns).
@@ -714,6 +733,14 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   in 3.70 ms, about 0.8 µs per shortest-form float (29 a ball); the binary form is 8–10× faster.
 - **3D snapshots against Rust** (quiet machine, Rust's bitcode on its 3D build): `snapshot/serialize_empty` 1.23 →
   2.13 µs, `serialize_100_bodies` 13.7 → 396 µs, `roundtrip_100_bodies` 37.2 → 478 µs. A 3D body record is 496 B.
+- **Snapshots, profiled** (M6 part 5; quiet machine): a probe split the 2D capture of Rust's 100 balls (205 µs). The
+  body and collider records through the byte-loop `memcpy` took 87 µs (12 µs as 8-byte copies, S5). The shape clones
+  took 63 µs, the arena slots 7 µs and the collider lists 4 µs. Skipping the clone for shapes without arrays cuts the
+  struct capture from 210 to 145 µs (−31%) and the restore from 235 to 166 µs (−29%). Against Rust:
+  - 2D: `serialize_100_bodies` 283 → 221 µs (19× → 15×), `roundtrip_100_bodies` 359 → 286 µs (11× → 8.5×);
+  - 3D: `serialize_100_bodies` 390 → 330 µs (29× → 24×), `roundtrip_100_bodies` 481 → 416 µs (13× → 11×).
+
+  The JSON rows are unchanged within noise.
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

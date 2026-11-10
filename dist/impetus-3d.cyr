@@ -14531,6 +14531,15 @@ fn _im_snap_clone_shape(s: *ImColliderShape, out: *ImColliderShape): i64 {
     return 1;
 }
 
+# 1 when shape s owns no arrays (every count and pointer 0): copying its record is then the whole copy, and `clone`
+# would only repeat it. Capture and load skip the clone for such a shape (ball, box, capsule, segment).
+#must_use
+fn _im_snap_shape_plain(s: *ImColliderShape): i64 {
+    if (s.points != 0 || s.vertices != 0 || s.indices != 0 || s.heights != 0) { return 0; }
+    if (s.point_count != 0 || s.vertex_count != 0 || s.index_count != 0 || s.height_count != 0) { return 0; }
+    return 1;
+}
+
 # 1 when shape s is well formed: a known kind, no negative array count, an array behind every nonzero count, and a
 # mesh's indices inside its vertices. Its sizes are not checked, as Rust checks none.
 #must_use
@@ -15811,10 +15820,13 @@ impl ImWorldSnapshot {
             var ch = ca.slot_handle(c);
             if (ch != 0 - 1) {
                 var src: *ImCollider3d = _im_b3_as_coll(ca.get(ch));
-                if (_im_snap_clone_shape(src.shape, &sh) == 0) { return 0; }
+                var plain = _im_snap_shape_plain(src.shape);
+                if (plain == 0) {
+                    if (_im_snap_clone_shape(src.shape, &sh) == 0) { return 0; }
+                }
                 var cr: *ImCollider3d = _im_b3_as_coll(self.colliders.at(self.colliders.len));
                 memcpy(cr, src, sizeof(ImCollider3d));
-                cr.shape = sh;
+                if (plain == 0) { cr.shape = sh; }
                 self.colliders.len = self.colliders.len + 1;
             }
         }
@@ -15940,14 +15952,18 @@ impl ImWorldSnapshot {
             var cp: *ImCollider3d = _im_b3_as_coll(self.colliders.at(c));
             var slot: *ImCollider3d = _im_b3_as_coll(ca.values + _im_handle_index(cp.handle) * ca.elem_size);
             memcpy(slot, cp, sizeof(ImCollider3d));
-            var blank: ImColliderShape = _im_shape(cp.shape.kind);
-            slot.shape = blank;
+            if (_im_snap_shape_plain(cp.shape) == 0) {
+                var blank: ImColliderShape = _im_shape(cp.shape.kind);
+                slot.shape = blank;
+            }
         }
         for (var c2 = 0; c2 < self.colliders.len; c2 = c2 + 1) {
             var cq: *ImCollider3d = _im_b3_as_coll(self.colliders.at(c2));
-            if (_im_snap_clone_shape(cq.shape, &sh) == 0) { return 0; }
-            var s2: *ImCollider3d = _im_b3_as_coll(ca.values + _im_handle_index(cq.handle) * ca.elem_size);
-            s2.shape = sh;
+            if (_im_snap_shape_plain(cq.shape) == 0) {
+                if (_im_snap_clone_shape(cq.shape, &sh) == 0) { return 0; }
+                var s2: *ImCollider3d = _im_b3_as_coll(ca.values + _im_handle_index(cq.handle) * ca.elem_size);
+                s2.shape = sh;
+            }
         }
         if (self.joint_arena.load(ja) == 0) { return 0; }
         for (var j = 0; j < self.joints.len; j = j + 1) {

@@ -1,0 +1,452 @@
+# fuzz_cases.cyr — rust-old/fuzz's two targets, ported as self-driving loops (M6 part 5), for both profiles: a seeded
+# generator stands in for libFuzzer, and each input's invariant is checked on the spot. tests/impetus.fcyr runs them on
+# the 2D profile and tests/impetus_3d.fcyr on the 3D one; each includes its profile's module list first. `cyrius fuzz`
+# runs both; a harness takes an optional multiplier of its iteration counts.
+#
+# Invariants:
+#   - fuzz_contacts: two balls built from arbitrary bytes (Rust's decoding: finite values clamped to ±1000, radii to
+#     [0.01, 100]) step three frames to finite positions and velocities.
+#   - fuzz_serialize, bytes: no byte sequence crashes `deserialize_world`. Every input it accepts gives a world that
+#     steps three frames and serializes again. Every input it refuses leaves the world it was given unchanged. The
+#     inputs are random bytes, and snapshots of seed worlds with words replaced, flipped, cut, repeated or spliced,
+#     half of them behind a resealed header so the payload is read.
+#   - fuzz_serialize, config: a config document that `ImPhysicsWorld_try_new` accepts steps.
+#   - Cyrius-only, the snapshot's JSON form: no mutated document crashes `ImWorldSnapshot_from_json` or `restore`, and
+#     an accepted one steps and serializes.
+
+var _fz = 20261110;
+
+# The next pseudo-random word (an LCG, Knuth's MMIX constants).
+fn fz_rand(): i64 {
+    _fz = _fz * 6364136223846793005 + 1442695040888963407;
+    return (_fz >> 11) & 0x1FFFFFFFFFFFFF;
+}
+
+# A pseudo-random integer in [0, m).
+fn fz_u(m): i64 { return fz_rand() % m; }
+
+# Reports a broken invariant and stops.
+fn fz_fail(target, iter, msg) {
+    print("FUZZ FAIL: ", 11);
+    print(target, strlen(target));
+    print(" iteration ", 11);
+    print_num(iter);
+    print(": ", 2);
+    println(msg);
+    sys_exit_group(1);
+    return 0;
+}
+
+# A word worth trying as an f64: random bits, or one of the edges (0, -0, ±1, ±huge, ±tiny, NaN, ±inf).
+fn fz_word(): i64 {
+    var k = fz_u(16);
+    if (k == 0) { return 0; }
+    if (k == 1) { return 0x8000000000000000; }
+    if (k == 2) { return 0x3FF0000000000000; }
+    if (k == 3) { return 0xBFF0000000000000; }
+    if (k == 4) { return 0x7FEFFFFFFFFFFFFF; }
+    if (k == 5) { return 1; }
+    if (k == 6) { return 0x7FF8000000000000; }
+    if (k == 7) { return 0x7FF0000000000000; }
+    if (k == 8) { return 0xFFF0000000000000; }
+    if (k == 9) { return 0x4059000000000000 + fz_u(1000000000); }
+    return fz_rand() ^ (fz_rand() << 11);
+}
+
+# ── fuzz_contacts ───────────────────────────────────────────────────────────────────
+
+# The f64 at byte offset `at` of data, as Rust's target reads it: a finite value clamped to [-1000, 1000], else 0.
+fn fz_f(data, at): f64 {
+    var x: f64 = load64(data + at);
+    var zero: f64 = 0.0;
+    if (_im_is_finite(x) == 0) { return zero; }
+    return _im_clamp(x, -1000.0, 1000.0);
+}
+
+# A radius from the f64 at `at`: |x| raised to 0.01 and capped at 100, as Rust's `abs().max(0.01).min(100.0)`.
+fn fz_radius(data, at): f64 {
+    var x: f64 = fz_f(data, at);
+    var a: f64 = f64_abs(x);
+    var lo: f64 = _im_max(a, 0.01);
+    return _im_min(lo, 100.0);
+}
+
+# 1 when every component of v is finite.
+fn fz_finite3(v: ImVec3): i64 {
+    var x: f64 = v.x;
+    var y: f64 = v.y;
+    var z: f64 = v.z;
+    if (_im_is_finite(x) == 0 || _im_is_finite(y) == 0 || _im_is_finite(z) == 0) { return 0; }
+    return 1;
+}
+
+# Rust's fuzz_contacts on the len bytes at data: two balls (the second radius 1 when len < 48), zero gravity, three
+# frames, then finite positions and velocities. 1, or 0 when the invariant breaks. Inputs under 40 bytes are skipped.
+fn fuzz_contacts(data, len): i64 {
+    if (len < 40) { return 1; }
+    var x1: f64 = fz_f(data, 0);
+    var y1: f64 = fz_f(data, 8);
+    var r1: f64 = fz_radius(data, 16);
+    var x2: f64 = fz_f(data, 24);
+    var y2: f64 = fz_f(data, 32);
+    var r2: f64 = 1.0;
+    if (len >= 48) { r2 = fz_radius(data, 40); }
+    var cfg: ImWorldConfig = ImWorldConfig_default();
+    cfg.gravity = ImVec3_zero();
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    var da: ImBodyDesc = ImBodyDesc_default();
+    da.position = ImVec3_new(x1, y1, 0.0);
+    var a = w.add_body(da);
+    var ta, ca = w.add_collider(a, ImColliderDesc_new(ImColliderShape_ball(r1)));
+    var db: ImBodyDesc = ImBodyDesc_default();
+    db.position = ImVec3_new(x2, y2, 0.0);
+    var b = w.add_body(db);
+    var tb, cb = w.add_collider(b, ImColliderDesc_new(ImColliderShape_ball(r2)));
+    for (var s = 0; s < 3; s = s + 1) { w.step(); }
+    var ok = 1;
+    var st: ImBodyState;
+    var t1, v1 = w.get_body_state(a, &st);
+    if (is_ok(t1) == 1 && (fz_finite3(st.position) == 0 || fz_finite3(st.linear_velocity) == 0)) { ok = 0; }
+    var t2, v2 = w.get_body_state(b, &st);
+    if (is_ok(t2) == 1 && (fz_finite3(st.position) == 0 || fz_finite3(st.linear_velocity) == 0)) { ok = 0; }
+    w.free();
+    return ok;
+}
+
+# ── fuzz_serialize ──────────────────────────────────────────────────────────────────
+
+# Seed world k into w: 0 empty, 1 a ball on a floor after 30 frames, 2 a stack of three boxes in contact, 3 a spring
+# pair, 4 particles with an emitter and a field, 5 bodies removed (a free list).
+fn fz_seed(w: *ImPhysicsWorld, k) {
+    if (k == 0) { return 0; }
+    var fd: ImBodyDesc = ImBodyDesc_default();
+    fd.body_type = IM_BODY_STATIC;
+    var floor = w.add_body(fd);
+    var tf, cf = w.add_collider(floor, ImColliderDesc_new(ImColliderShape_box(20.0, 0.5, 20.0)));
+    if (k == 1 || k == 2) {
+        var n = 1;
+        if (k == 2) { n = 3; }
+        for (var i = 0; i < n; i = i + 1) {
+            var d: ImBodyDesc = ImBodyDesc_default();
+            d.position = ImVec3_new(0.2 * f64_from(i), 1.0 + f64_from(i), 0.0);
+            var h = w.add_body(d);
+            var shape: ImColliderShape = ImColliderShape_ball(0.5);
+            if (k == 2) { shape = ImColliderShape_box(0.5, 0.5, 0.5); }
+            var tc, c = w.add_collider(h, ImColliderDesc_new(shape));
+        }
+    } elif (k == 3) {
+        var d1: ImBodyDesc = ImBodyDesc_default();
+        d1.position = ImVec3_new(-1.0, 3.0, 0.0);
+        var h1 = w.add_body(d1);
+        var d2: ImBodyDesc = ImBodyDesc_default();
+        d2.position = ImVec3_new(1.0, 3.0, 0.0);
+        var h2 = w.add_body(d2);
+        var t1, c1 = w.add_collider(h1, ImColliderDesc_new(ImColliderShape_ball(0.3)));
+        var t2, c2 = w.add_collider(h2, ImColliderDesc_new(ImColliderShape_capsule(0.3, 0.2)));
+        var z2: ImVec2 = ImVec2_new(0.0, 0.0);
+        var tj, j = w.add_joint(ImJointDesc_new(h1, h2, ImJointType_spring(1.0, 30.0, 1.0), z2, z2));
+    } elif (k == 4) {
+        var e: ImParticleEmitter = ImParticleEmitter_new(ImVec3_new(0.0, 2.0, 0.0), ImVec3_new(0.0, 1.0, 0.0), 60.0);
+        e.with_spread(ImVec3_new(1.0, 1.0, 1.0)).with_radius(0.05);
+        w.add_emitter(e);
+        w.add_force_field(ImForceField_radial(ImVec3_new(0.0, 1.0, 0.0), 2.0, 1.5, 3.0));
+        w.spawn_particle(ImParticle_new(ImVec3_new(0.5, 1.0, 0.0), ImVec3_zero(), 2.0));
+    } else {
+        var hs[48];
+        for (var r = 0; r < 5; r = r + 1) {
+            var dr: ImBodyDesc = ImBodyDesc_default();
+            dr.position = ImVec3_new(f64_from(r), 2.0, 0.0);
+            store64(&hs + r * 8, w.add_body(dr));
+        }
+        w.remove_body(load64(&hs + 8));
+        w.remove_body(load64(&hs + 24));
+    }
+    for (var s = 0; s < 30; s = s + 1) { w.step(); }
+    return 0;
+}
+
+# The bytes of seed world k into *out.
+fn fz_seed_bytes(k, out: *ImWordList) {
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    fz_seed(&w, k);
+    serialize_world(&w, out);
+    w.free();
+    return 0;
+}
+
+# A mutated copy of the n words at src, at most cap words, into dst: its length in words. Words are replaced, flipped,
+# nudged, cut, repeated or spliced from elsewhere in the input.
+fn fz_mutate_words(src, n, dst, cap): i64 {
+    var m = n;
+    memcpy(dst, src, n * 8);
+    var edits = 1 + fz_u(4);
+    for (var e = 0; e < edits && m > 0; e = e + 1) {
+        var at = fz_u(m);
+        var k = fz_u(7);
+        if (k == 0) { store64(dst + at * 8, fz_word()); }
+        if (k == 1) { store64(dst + at * 8, load64(dst + at * 8) ^ (1 << fz_u(64))); }
+        if (k == 2) { store64(dst + at * 8, load64(dst + at * 8) + 1 - 2 * fz_u(2)); }
+        if (k == 3) { m = at; }
+        if (k == 4 && m < cap) {
+            store64(dst + m * 8, load64(dst + at * 8));
+            m = m + 1;
+        }
+        if (k == 5) { store64(dst + at * 8, load64(dst + fz_u(m) * 8)); }
+        if (k == 6) { store64(dst + at * 8, fz_u(64)); }
+    }
+    return m;
+}
+
+# Rewrites the header's payload length and checksum of the m words at b (when there is a header).
+fn fz_reseal(b, m) {
+    if (m < _IM_SNAP_HEADER) { return 0; }
+    store64(b + 24, m - _IM_SNAP_HEADER);
+    store64(b + 32, _im_snap_checksum(b + 40, m - _IM_SNAP_HEADER));
+    return 0;
+}
+
+# Rust's fuzz_serialize (bytes) on the len bytes at data, given to a world restored from base (seed world 2's bytes):
+# 0 when the contract breaks, 1 for a refusal that left the world unchanged, 2 for a restore after which the world
+# stepped three frames and serialized again.
+fn fuzz_bytes(data, len, base: *ImWordList): i64 {
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    var tb, vb = deserialize_world(&w, base.data, base.len * 8);
+    if (is_ok(tb) == 0) { return 0; }
+    var t, v = deserialize_world(&w, data, len);
+    var ok = 1;
+    var after: ImWordList = ImWordList_new();
+    if (is_ok(t) == 0) {
+        serialize_world(&w, &after);
+        if (base.len != after.len || memeq(base.data, after.data, base.len * 8) == 0) { ok = 0; }
+    } else {
+        for (var s = 0; s < 3; s = s + 1) { w.step(); }
+        var ta, va = serialize_world(&w, &after);
+        ok = 2;
+        if (is_ok(ta) == 0) { ok = 0; }
+    }
+    after.free();
+    w.free();
+    return ok;
+}
+
+# The JSON text of the default config, mutated: bytes replaced, deleted or inserted, or a value swapped for an edge
+# number. Into the buffer buf of capacity cap: the text's length.
+fn fz_config_text(buf, cap): i64 {
+    var c: ImWorldConfig = ImWorldConfig_default();
+    var sb = str_builder_new();
+    c.to_json(sb);
+    var s = str_builder_build(sb);
+    var n = str_len(s);
+    memcpy(buf, str_data(s), n);
+    var edits = 1 + fz_u(3);
+    for (var e = 0; e < edits && n > 0; e = e + 1) {
+        var at = fz_u(n);
+        var k = fz_u(4);
+        if (k == 0) { store8(buf + at, load8(buf + at) ^ (1 << fz_u(8))); }
+        if (k == 1) {
+            for (var d = at; d + 1 < n; d = d + 1) { store8(buf + d, load8(buf + d + 1)); }
+            n = n - 1;
+        }
+        if (k == 2 && n + 8 < cap) {
+            var lit = "1e308";
+            var which = fz_u(5);
+            if (which == 1) { lit = "-0.0"; }
+            if (which == 2) { lit = "4097"; }
+            if (which == 3) { lit = "\"Xpbd\""; }
+            if (which == 4) { lit = "null"; }
+            var ll = strlen(lit);
+            var d2 = n - 1;
+            while (d2 >= at) {
+                store8(buf + d2 + ll, load8(buf + d2));
+                d2 = d2 - 1;
+            }
+            memcpy(buf + at, lit, ll);
+            n = n + ll;
+        }
+        if (k == 3) { store8(buf + at, 32 + fz_u(95)); }
+    }
+    return n;
+}
+
+# Rust's fuzz_serialize (config) on the text at buf: a config it reads that try_new accepts steps one frame. 1 when
+# try_new accepted it (and the world stepped), else 0.
+fn fuzz_config(buf, n): i64 {
+    var c: ImWorldConfig = ImWorldConfig_default();
+    var t, v = ImWorldConfig_from_json(buf, n, &c);
+    if (is_ok(t) == 0) { return 0; }
+    var w: ImPhysicsWorld;
+    var tw, vw = ImPhysicsWorld_try_new(c, &w);
+    if (is_ok(tw) == 0) { return 0; }
+    w.step();
+    w.free();
+    return 1;
+}
+
+# Restores read by fuzz_snapshot_json that the world accepted.
+var _fz_json_restored = 0;
+
+# Cyrius-only: the snapshot's JSON form, mutated, into a world holding seed world 3: 1 when the contract holds
+# (refused, or accepted, stepping and serializing).
+fn fuzz_snapshot_json(buf, n): i64 {
+    var s: ImWorldSnapshot = ImWorldSnapshot_new();
+    var t, v = ImWorldSnapshot_from_json(buf, n, &s);
+    if (is_ok(t) == 0) { return 1; }
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    fz_seed(&w, 3);
+    var tr, vr = w.restore(&s);
+    s.free();
+    var ok = 1;
+    if (is_ok(tr) == 1) {
+        _fz_json_restored = _fz_json_restored + 1;
+        for (var k = 0; k < 3; k = k + 1) { w.step(); }
+        var out: ImWordList = ImWordList_new();
+        var to, vo = serialize_world(&w, &out);
+        if (is_ok(to) == 0) { ok = 0; }
+        out.free();
+    }
+    w.free();
+    return ok;
+}
+
+# ── the driver ──────────────────────────────────────────────────────────────────────
+
+# Runs every target `scale` times its base count of iterations; prints a summary line per target.
+fn fuzz_cases(scale) {
+    # fuzz_contacts: 40 to 55 bytes of edge-weighted words.
+    var buf = fl_alloc(1 << 16);
+    var nc = 3000 * scale;
+    for (var i = 0; i < nc; i = i + 1) {
+        var len = 40 + fz_u(16);
+        for (var b = 0; b < 7; b = b + 1) { store64(buf + b * 8, fz_word()); }
+        if (fuzz_contacts(buf, len) == 0) { fz_fail("fuzz_contacts", i, "a non-finite position or velocity"); }
+    }
+    print("fuzz_contacts: ", 15);
+    print_num(nc);
+    println(" inputs, positions and velocities finite");
+    # fuzz_serialize, bytes: the six seed snapshots (built once), mutated with half resealed, and random words behind a
+    # valid header.
+    var sdat[48];
+    var slen[48];
+    for (var sk = 0; sk < 6; sk = sk + 1) {
+        var sl: ImWordList = ImWordList_new();
+        fz_seed_bytes(sk, &sl);
+        store64(&sdat + sk * 8, sl.data);
+        store64(&slen + sk * 8, sl.len);
+    }
+    var base: ImWordList = ImWordList_new();
+    base.data = load64(&sdat + 16);
+    base.len = load64(&slen + 16);
+    var copy = fl_alloc(1 << 20);
+    var nb = 6000 * scale;
+    var read = 0;
+    var restored = 0;
+    for (var i2 = 0; i2 < nb; i2 = i2 + 1) {
+        var m = 0;
+        if (fz_u(8) == 0) {
+            m = 5 + fz_u(40);
+            for (var r = 0; r < m; r = r + 1) { store64(copy + r * 8, fz_word()); }
+            store64(copy, _IM_SNAP_MAGIC);
+            store64(copy + 8, _IM_SNAP_VERSION);
+            store64(copy + 16, _IM_SNAP_PROFILE);
+            fz_reseal(copy, m);
+        } else {
+            var pick = fz_u(6);
+            m = fz_mutate_words(load64(&sdat + pick * 8), load64(&slen + pick * 8), copy, (1 << 17) - 1);
+            if (fz_u(2) == 0) { fz_reseal(copy, m); }
+        }
+        var bytes = m * 8;
+        if (fz_u(16) == 0 && bytes > 0) { bytes = bytes - 1 - fz_u(7); }
+        var chk: ImWorldSnapshot = ImWorldSnapshot_new();
+        var tchk, vchk = ImWorldSnapshot_from_bytes(copy, bytes, &chk);
+        if (is_ok(tchk) == 1) {
+            read = read + 1;
+            chk.free();
+        }
+        var got = fuzz_bytes(copy, bytes, &base);
+        if (got == 0) { fz_fail("fuzz_serialize", i2, "a refusal changed the world, or a restored one failed"); }
+        if (got == 2) { restored = restored + 1; }
+    }
+    for (var sf = 0; sf < 6; sf = sf + 1) { fl_free(load64(&sdat + sf * 8)); }
+    print("fuzz_serialize (bytes): ", 24);
+    print_num(nb);
+    print(" inputs, ", 9);
+    print_num(read);
+    print(" read, ", 7);
+    print_num(restored);
+    println(" restored; every refusal left the world unchanged, every restored world stepped and serialized");
+    # fuzz_serialize, config documents.
+    var nj = 1500 * scale;
+    var stepped = 0;
+    for (var i3 = 0; i3 < nj; i3 = i3 + 1) {
+        var n = fz_config_text(buf, 1 << 16);
+        stepped = stepped + fuzz_config(buf, n);
+    }
+    print("fuzz_serialize (config): ", 25);
+    print_num(nj);
+    print(" documents, ", 12);
+    print_num(stepped);
+    println(" built a world that stepped; none crashed");
+    # The snapshot's JSON form, mutated byte-wise.
+    var nsj = 150 * scale;
+    var jw: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    fz_seed(&jw, 2);
+    var js: ImWorldSnapshot = ImWorldSnapshot_new();
+    jw.snapshot(&js);
+    var jsb = str_builder_new();
+    var tj, vj = js.to_json(jsb);
+    var jt = str_builder_build(jsb);
+    js.free();
+    jw.free();
+    var jn = str_len(jt);
+    var jbuf = fl_alloc(jn + 64);
+    for (var i4 = 0; i4 < nsj; i4 = i4 + 1) {
+        memcpy(jbuf, str_data(jt), jn);
+        # Half the edits rewrite a digit (the next one at or after a random place), so many documents still parse and
+        # reach restore's checks; the rest flip a bit or write a printable byte anywhere.
+        var edits = 1 + fz_u(3);
+        for (var e = 0; e < edits; e = e + 1) {
+            var at = fz_u(jn);
+            var k = fz_u(4);
+            if (k == 0) { store8(jbuf + at, load8(jbuf + at) ^ (1 << fz_u(8))); }
+            if (k == 1) { store8(jbuf + at, 32 + fz_u(95)); }
+            if (k >= 2) {
+                while (at < jn && (load8(jbuf + at) < 48 || load8(jbuf + at) > 57)) { at = at + 1; }
+                if (at < jn) { store8(jbuf + at, 48 + fz_u(10)); }
+            }
+        }
+        if (fuzz_snapshot_json(jbuf, jn) == 0) {
+            fz_fail("snapshot JSON", i4, "an accepted document failed to step or serialize");
+        }
+    }
+    print("snapshot JSON: ", 15);
+    print_num(nsj);
+    print(" documents, ", 12);
+    print_num(_fz_json_restored);
+    println(" restored, stepped and serialized; none crashed");
+    fl_free(jbuf);
+    fl_free(copy);
+    fl_free(buf);
+    return 0;
+}
+
+# The scale given on the command line (a positive integer), or 1.
+fn fz_scale(): i64 {
+    if (argc() < 2) { return 1; }
+    var arg = argv(1);
+    var n = 0;
+    var i = 0;
+    while (load8(arg + i) != 0) {
+        var d = load8(arg + i);
+        if (d < 48 || d > 57 || i >= 6) {
+            println("usage: <harness> [scale, 1-999999]");
+            sys_exit_group(2);
+        }
+        n = n * 10 + d - 48;
+        i = i + 1;
+    }
+    if (n <= 0) {
+        println("usage: <harness> [scale, 1-999999]");
+        sys_exit_group(2);
+    }
+    return n;
+}

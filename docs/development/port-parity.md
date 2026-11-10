@@ -1237,6 +1237,58 @@ fails when either drifts from `cyrius.cyml`.
 - **Result:** 2D **98,874 ok, 0 failed, 6 pending**; 3D **29,404 ok**; the same on x86_64 ELF, x86_64 PE and aarch64,
   where both snapshot test files also pass with their pins. Surface parity is 662 across 30 modules.
 
+## 29. M6e: the fuzz targets, the capture profiled, M6 closed (2026-11-10)
+
+- **The fuzz targets.** Rust's two libFuzzer targets become seeded loops in `tests/fuzz_cases.cyr`. They run on each
+  profile under `cyrius fuzz`, from `tests/impetus.fcyr` (2D) and `tests/impetus_3d.fcyr` (3D). An LCG stands in for
+  libFuzzer, with words weighted toward edge values: 0, −0, ±1, ±max, the smallest subnormal, NaN and ±∞. A harness
+  takes an optional multiplier of its counts; build it with `cyrius build` to pass one. The default run takes about
+  2.5 s a profile, compile included.
+  - `fuzz_contacts`, 3,000 inputs of 40–55 bytes, decoded as Rust decodes them (finite values clamped to ±1000, else 0;
+    radii to [0.01, 100]). Two balls in zero gravity step three frames to finite positions and velocities.
+  - `fuzz_serialize` on bytes, 6,000 inputs to `deserialize_world` on a world restored from a seed. The inputs are
+    the six seed worlds' snapshots with words replaced, flipped, nudged, cut, repeated or copied (half of them behind
+    a resealed header, so the payload is read), random words behind a valid header, and cut lengths. A refused
+    input must leave the world's bytes unchanged. A restored world must step three frames and serialize. Rust's
+    target checks only that nothing panics and that an accepted input steps.
+  - `fuzz_serialize` on config, 1,500 mutated config documents (bit flips, deletions, edge literals). Any that
+    `ImPhysicsWorld_try_new` accepts steps one frame.
+  - Cyrius-only: 150 mutated snapshot JSON documents. Half the edits rewrite a digit, so many still parse. Any that
+    `restore` accepts steps and serializes.
+- **Reach.**
+  - Of the default run's 6,000 byte inputs, about 790 (2D) and 880 (3D) read as snapshots; 550 and 680 restore.
+  - About 280 configs build a world, and about 40 snapshot documents restore.
+  - A scale-20 soak, 213,000 inputs a profile (24 s for both), passed.
+- **Teeth.** Each of these faults in the library fails the default run:
+  - `restore` writing a world counter before it validates, so a refusal changes the world;
+  - a collider list's entries left unchecked, in 2D and in 3D, where a corrupt handle is read out of bounds and the
+    harness segfaults. The 2D fault first needed scale 10, so the byte target now restores its seed from cached bytes
+    instead of stepping it again: 10× the inputs in less time;
+  - the circle-circle contact's coincident-centre guard removed, so the normal is NaN.
+
+  Both harnesses also pass under `--bounds` and `--poison`. `args` joins `[test]`'s stdlib for the multiplier.
+- **The capture profiled.** A probe split the 2D capture of Rust's 100-ball scene (205 µs):
+
+  | Piece | Time |
+  |---|---|
+  | Body and collider records through the byte-loop `memcpy` | 87 µs (12 µs as 8-byte copies, S5) |
+  | Shape clones | 63 µs |
+  | Arena slots | 7 µs |
+  | Collider lists | 4 µs |
+
+  A ball, box, capsule or segment owns no arrays. The record copy had already copied its shape whole, and its clone
+  copied the shape's 184 bytes two or three more times. Capture and load now skip the clone for such a shape
+  (`_im_snap_shape_plain`: every array count and pointer 0); a hull, mesh or heightfield clones as before. The
+  struct capture drops from 210 to 145 µs and the restore from 235 to 166 µs (`docs/benchmarks-rust-v-cyrius.md`).
+- **A gap closed.** No snapshot test held a shape that owns arrays, so forcing every shape down the skip passed both
+  snapshot tests. The shared `array_shapes_owned` group (4 assertions a profile) now covers it. A hull, a mesh and a
+  heightfield each have every array copied to a new address in the snapshot, and again in the restored world. Each
+  copy outlives the other with the freed memory written over. Skipping every clone fails the group: on capture with
+  10 failures, and on load with a segfault after two.
+- **Result:** unchanged. 2D **98,874 ok, 0 failed, 6 pending**; 3D **29,404 ok**; the same on x86_64 ELF, x86_64 PE
+  and aarch64, where both snapshot test files pass with their pins. `snapshot.tcyr` has 62 assertions,
+  `b3_snapshot.tcyr` 63, and the shared cases 34. Surface parity is 662 across 30 modules. M6 is closed.
+
 ## How to reproduce
 
 ```sh

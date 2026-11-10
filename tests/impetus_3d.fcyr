@@ -1,0 +1,20 @@
+# impetus.fcyr — the 3D fuzz harness (M6 part 5): rust-old/fuzz's two targets on the 3D profile, through
+# tests/fuzz_cases.cyr (its header lists the invariants). An optional argument multiplies the iteration counts.
+# `cyrius fuzz` passes none, so a longer run builds the harness (`cyrius build <this file> <out>`) and runs it with one.
+# `cyrius build` adds no `[test]` stdlib, hence lib/args.cyr by name here as well as in that list.
+
+include "lib/args.cyr"
+include "tests/lib_3d.cyr"
+include "tests/fuzz_cases.cyr"
+
+# Runs the harness.
+fn main() {
+    alloc_init();
+    args_init();
+    fuzz_cases(fz_scale());
+    println("fuzz: ok");
+    return 0;
+}
+
+var r = main();
+sys_exit_group(r);

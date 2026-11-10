@@ -609,3 +609,36 @@ medians, bitcode). Cyrius writes ADR 0013's binary form for the 3D world into a 
 The 3D body record is 496 B against 2D's 224 B: the full orientation, the angular-velocity vector and three inertia
 tensors. Rust's 3D snapshot writes the body's descriptor and the angle and spin about z only. The 2D rows' reading
 holds (§M6 part 2): the struct capture dominates and is not profiled yet.
+
+## M6 part 5: the capture profiled (2026-11-10)
+
+x86_64 ELF, quiet machine. A temporary probe split the 2D struct capture of Rust's 100-ball scene (205 µs that run):
+
+| Piece | Time |
+|---|---|
+| 100 body records (224 B) and collider records (320 B) through the stdlib's byte-loop `memcpy` | 87 µs |
+| the same as 8-byte word copies (S5) | 12 µs |
+| 100 shape clones | 63 µs |
+| the body and collider arenas' slots (byte loop) | 7 µs |
+| 100 collider lists (reserve, push, free) | 4 µs |
+| freeing the snapshot | 12 µs |
+
+A ball owns no arrays. The collider's record copy had already copied its shape whole, and the clone copied the shape's
+184 bytes two or three more times: in `clone`, out of it, and into the record. Capture and load now skip the clone for a
+shape whose array counts and pointers are all 0. Before and after, on the same quiet machine:
+
+| Bench | Rust | Before | After | Change | Ratio after |
+|---|---|---|---|---|---|
+| `snapshot/capture_100_bodies (struct)` | — | 209.7 µs | 144.8 µs | −31% | — |
+| `snapshot/restore_100_bodies (struct)` | — | 234.7 µs | 165.6 µs | −29% | — |
+| `snapshot/serialize_100_bodies` | 14.5 µs | 282.8 µs | 220.7 µs | −22% | 15× |
+| `snapshot/roundtrip_100_bodies` | 33.6 µs | 359.3 µs | 286.0 µs | −20% | 8.5× |
+| `b3/snapshot/serialize_100_bodies` | 13.7 µs | 389.9 µs | 329.7 µs | −15% | 24× |
+| `b3/snapshot/roundtrip_100_bodies` | 37.2 µs | 481.1 µs | 415.5 µs | −14% | 11× |
+
+The empty-world and JSON rows are unchanged within noise (`to_json_100_bodies` 2.30 → 2.31 ms,
+`json_roundtrip_100_bodies` 3.75 → 3.63 ms; formatting dominates them).
+
+Of the 145 µs capture that remains, 87 µs is the byte-loop copies: S5 upstream, whose numbers now include this row.
+Speed is measured, not gated, so the port keeps the stdlib's `memcpy`.
+

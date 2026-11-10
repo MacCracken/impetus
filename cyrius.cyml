@@ -33,9 +33,10 @@ git = "https://github.com/MacCracken/hisab.git"
 tag = "3.4.1"
 modules = ["dist/hisab.cyr"]
 
-# Test / bench / fuzz compiles only. overflow: tests/ulp.cyr's saturating `-|` (ulp distance).
+# Test / bench / fuzz compiles only. overflow: tests/ulp.cyr's saturating `-|` (ulp distance); args: the fuzz
+# harnesses' optional iteration multiplier.
 [test]
-stdlib = ["assert", "bench", "overflow"]
+stdlib = ["assert", "bench", "overflow", "args"]
 
 # `[lib]` is the bundle `cyrius distlib` writes to dist/impetus.cyr: the 2D default, as the Rust
 # crate's default feature. [lib.3d] (M4) lists the same shared modules in the same order and adds

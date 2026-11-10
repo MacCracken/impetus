@@ -213,6 +213,103 @@ fn edit(j, old, new): i64 {
     return j;
 }
 
+# The f64 words of the n values at v (an array of f64 literals) into a fresh freelist buffer.
+fn f64s(v, n): i64 {
+    var p = fl_alloc(n * 8);
+    for (var i = 0; i < n; i = i + 1) { store64(p + i * 8, load64(v + i * 8)); }
+    return p;
+}
+
+# The array-owning shapes in w, on static bodies kept apart (so no pair of them is ever tested), beside a ball dropped
+# on a floor: a convex hull at x 10, a triangle mesh at 20 and a heightfield at 30.
+fn array_scene(w: *ImPhysicsWorld) {
+    var dm: ImPhysicsMaterial = ImPhysicsMaterial_default();
+    var fd: ImBodyDesc = ImBodyDesc_default();
+    fd.body_type = IM_BODY_STATIC;
+    var floor = w.add_body(fd);
+    var tf, cf = w.add_collider(floor, ImColliderDesc_new(ImColliderShape_box(5.0, 0.5, 5.0)));
+    rust_ball(w, IM_BODY_DYNAMIC, 0.0, 2.0, 0.5, dm);
+    var hv[96];
+    var c0: f64 = 0.0;
+    var c1: f64 = 1.0;
+    var c2: f64 = -1.0;
+    var c3: f64 = 0.5;
+    store64(&hv, c2); store64(&hv + 8, c2); store64(&hv + 16, c0);
+    store64(&hv + 24, c1); store64(&hv + 32, c2); store64(&hv + 40, c0);
+    store64(&hv + 48, c1); store64(&hv + 56, c1); store64(&hv + 64, c3);
+    store64(&hv + 72, c2); store64(&hv + 80, c1); store64(&hv + 88, c3);
+    var ix[48];
+    store64(&ix, 0); store64(&ix + 8, 1); store64(&ix + 16, 2);
+    store64(&ix + 24, 0); store64(&ix + 32, 2); store64(&ix + 40, 3);
+    var pts = f64s(&hv, 12);
+    var hull: ImColliderShape = ImColliderShape_convex_hull(pts, 4);
+    var mesh: ImColliderShape = ImColliderShape_tri_mesh(pts, 4, &ix, 2);
+    var field: ImColliderShape = ImColliderShape_heightfield(pts, 5, ImVec3_new(0.5, 2.0, 1.0));
+    fl_free(pts);
+    for (var k = 0; k < 3; k = k + 1) {
+        var d: ImBodyDesc = ImBodyDesc_default();
+        d.body_type = IM_BODY_STATIC;
+        d.position = ImVec3_new(10.0 + 10.0 * f64_from(k), 5.0, 0.0);
+        var h = w.add_body(d);
+        var sh: ImColliderShape = hull;
+        if (k == 1) { sh = mesh; }
+        if (k == 2) { sh = field; }
+        var tc, c = w.add_collider(h, ImColliderDesc_new(sh));
+    }
+    hull.free();
+    mesh.free();
+    field.free();
+    return 0;
+}
+
+# 1 when every array of every collider shape in snapshot s is a copy of the matching collider's in world w: the same
+# count, the same words, and a different address. A shape sits 16 bytes into a collider record, its four (array, count)
+# pairs 48 bytes into the shape; points, vertices and index triples are 24 bytes a unit, heights 8.
+fn arrays_apart(w: *ImPhysicsWorld, s: *ImWorldSnapshot): i64 {
+    var ca: *ImArena = w.backend._colliders();
+    var owned = 0;
+    for (var c = 0; c < s.colliders.len; c = c + 1) {
+        var sr = s.colliders.at(c) + 16;
+        var wr = ca.get(load64(s.colliders.at(c)));
+        if (wr == 0) { return 0; }
+        wr = wr + 16;
+        for (var k = 0; k < 4; k = k + 1) {
+            var at = 48 + k * 16;
+            var n = load64(sr + at + 8);
+            var width = 24;
+            if (k == 3) { width = 8; }
+            if (n != load64(wr + at + 8)) { return 0; }
+            if (n > 0) {
+                var pa = load64(sr + at);
+                var pb = load64(wr + at);
+                if (pa == 0 || pb == 0 || pa == pb || same_bytes(pa, pb, n * width) == 0) { return 0; }
+                owned = owned + 1;
+            }
+        }
+    }
+    return owned;
+}
+
+# Fills freed memory with junk: 4 blocks of every size from 8 to 512 bytes taken from the freelist, written with a
+# pattern, and kept until `unscribble`. A pointer into a freed array then reads junk, not the old values.
+fn scribble(keep: *ImWordList) {
+    for (var sz = 8; sz <= 512; sz = sz + 8) {
+        for (var r = 0; r < 4; r = r + 1) {
+            var p = fl_alloc(sz);
+            for (var o = 0; o < sz; o = o + 8) { store64(p + o, 0x5A5A5A5A5A5A5A5A); }
+            keep.push(p);
+        }
+    }
+    return 0;
+}
+
+# Frees what `scribble` kept.
+fn unscribble(keep: *ImWordList) {
+    for (var i = 0; i < keep.len; i = i + 1) { fl_free(keep.at(i)); }
+    keep.free();
+    return 0;
+}
+
 # Runs the shared snapshot tests.
 fn snapshot_cases() {
     var cfg: ImWorldConfig = ImWorldConfig_default();
@@ -610,6 +707,42 @@ fn snapshot_cases() {
     jnb.free();
     jns.free();
     jn.free();
+
+    test_group("array_shapes_owned");
+    # A convex hull, a triangle mesh and a heightfield own arrays. A snapshot holds copies of its own and a restored
+    # world copies again, so either outlives the other, even with the freed memory written over. (A ball, box, capsule
+    # or segment owns none: its record copy is the whole copy, and capture and load skip the clone.)
+    var aw: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    array_scene(&aw);
+    for (var af = 0; af < 5; af = af + 1) { aw.step(); }
+    var abytes: ImWordList = ImWordList_new();
+    world_bytes(&aw, &abytes);
+    var asn: ImWorldSnapshot = ImWorldSnapshot_new();
+    var tas, vas = aw.snapshot(&asn);
+    assert_eq(is_ok(tas) == 1 && arrays_apart(&aw, &asn) == 4, 1, "the snapshot's four arrays are copies");
+    aw.free();
+    var junk1: ImWordList = ImWordList_new();
+    scribble(&junk1);
+    var ar: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    var tar, varr = ar.restore(&asn);
+    assert_eq(is_ok(tar) == 1 && arrays_apart(&ar, &asn) == 4, 1, "the restored world's are copies again");
+    var ab2: ImWordList = ImWordList_new();
+    world_bytes(&ar, &ab2);
+    assert_eq(ab2.len == abytes.len && same_bytes(ab2.data, abytes.data, abytes.len * 8) == 1, 1,
+      "the snapshot outlives its world");
+    asn.free();
+    var junk2: ImWordList = ImWordList_new();
+    scribble(&junk2);
+    var ab3: ImWordList = ImWordList_new();
+    world_bytes(&ar, &ab3);
+    assert_eq(ab3.len == abytes.len && same_bytes(ab3.data, abytes.data, abytes.len * 8) == 1, 1,
+      "the restored world outlives its snapshot");
+    unscribble(&junk1);
+    unscribble(&junk2);
+    abytes.free();
+    ab2.free();
+    ab3.free();
+    ar.free();
 
     test_group("flat_heap_snapshots");
     # Snapshot and restore, round and round: after warm-up the heap stays put.

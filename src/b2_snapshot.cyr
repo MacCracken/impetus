@@ -114,10 +114,13 @@ impl ImWorldSnapshot {
             var ch = ca.slot_handle(c);
             if (ch != 0 - 1) {
                 var src: *ImCollider2d = _im_b2_as_coll(ca.get(ch));
-                if (_im_snap_clone_shape(src.shape, &sh) == 0) { return 0; }
+                var plain = _im_snap_shape_plain(src.shape);
+                if (plain == 0) {
+                    if (_im_snap_clone_shape(src.shape, &sh) == 0) { return 0; }
+                }
                 var cr: *ImCollider2d = _im_b2_as_coll(self.colliders.at(self.colliders.len));
                 memcpy(cr, src, sizeof(ImCollider2d));
-                cr.shape = sh;
+                if (plain == 0) { cr.shape = sh; }
                 self.colliders.len = self.colliders.len + 1;
             }
         }
@@ -278,14 +281,18 @@ impl ImWorldSnapshot {
             var ci = _im_handle_index(cp.handle);
             var slot: *ImCollider2d = _im_b2_as_coll(ca.values + ci * ca.elem_size);
             memcpy(slot, cp, sizeof(ImCollider2d));
-            var blank: ImColliderShape = _im_shape(cp.shape.kind);
-            slot.shape = blank;
+            if (_im_snap_shape_plain(cp.shape) == 0) {
+                var blank: ImColliderShape = _im_shape(cp.shape.kind);
+                slot.shape = blank;
+            }
         }
         for (var c2 = 0; c2 < self.colliders.len; c2 = c2 + 1) {
             var cq: *ImCollider2d = _im_b2_as_coll(self.colliders.at(c2));
-            if (_im_snap_clone_shape(cq.shape, &sh) == 0) { return 0; }
-            var s2: *ImCollider2d = _im_b2_as_coll(ca.values + _im_handle_index(cq.handle) * ca.elem_size);
-            s2.shape = sh;
+            if (_im_snap_shape_plain(cq.shape) == 0) {
+                if (_im_snap_clone_shape(cq.shape, &sh) == 0) { return 0; }
+                var s2: *ImCollider2d = _im_b2_as_coll(ca.values + _im_handle_index(cq.handle) * ca.elem_size);
+                s2.shape = sh;
+            }
         }
         if (self.joint_arena.load(ja) == 0) { return 0; }
         for (var j = 0; j < self.joints.len; j = j + 1) {

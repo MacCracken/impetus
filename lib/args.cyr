@@ -1,0 +1,209 @@
+# args.cyr — command-line argument access
+# Usage: include "lib/args.cyr"
+# Must call args_init() as the FIRST thing in your program.
+#
+# On Linux x86_64 at entry:
+#   [rsp]    = argc
+#   [rsp+8]  = argv[0] (program name pointer)
+#   [rsp+16] = argv[1] (first arg pointer)
+#   ...
+#
+# macOS arm64: Mach-O entry prologue stashes argc/argv in x28 before
+# enum/gvar inits clobber x0/x1; args_macos.cyr reads from there
+# (XNU has no /procfs). See CHANGELOG [5.5.17].
+
+# Convert ONE UTF-16LE NUL-terminated wide string at `w` into UTF-8 in
+# `dst` (≤ cap bytes), NUL-terminated; returns the total bytes written
+# INCLUDING the trailing NUL. Surrogate pairs (U+10000+) decode to 4-byte
+# UTF-8. Pure (no syscall), target-agnostic, so it is unit-testable on any
+# host (tests/tcyr/platform/args_win_utf8.tcyr); dead on Linux/macOS (DCE-stubbed).
+#
+# v6.0.69 §3: lib/args_win.cyr now splits the command line with the real
+# shell32!CommandLineToArgvW (correct \\"-quote semantics) and converts
+# each returned wide arg through here — so a non-ASCII (Unicode) install
+# path no longer corrupts. Replaces the v6.0.54 ASCII-only tokenizer
+# (`_args_tokenize_utf16`, low-byte-kept / '?'-mapped). See CHANGELOG [6.0.69].
+fn _args_w2u8(w, dst, cap) {
+    var i = 0;
+    var o = 0;
+    var lo = 0;
+    var hi = 0;
+    var cu = 0;
+    var cp = 0;
+    var lo2 = 0;
+    var hi2 = 0;
+    var cu2 = 0;
+    var done = 0;
+    while (done == 0) {
+        lo = load8(w + i);
+        hi = load8(w + i + 1);
+        cu = lo | (hi << 8);
+        if (cu == 0) {
+            done = 1;
+        } else {
+            cp = cu;
+            i = i + 2;
+            # High surrogate (0xD800-0xDBFF) + low surrogate (0xDC00-0xDFFF)
+            # → one U+10000+ code point. A lone surrogate falls through and
+            # is encoded as its 3-byte form (best effort).
+            if (cu >= 0xD800) {
+                if (cu <= 0xDBFF) {
+                    lo2 = load8(w + i);
+                    hi2 = load8(w + i + 1);
+                    cu2 = lo2 | (hi2 << 8);
+                    if (cu2 >= 0xDC00) {
+                        if (cu2 <= 0xDFFF) {
+                            cp = 0x10000 + ((cu - 0xD800) << 10) + (cu2 - 0xDC00);
+                            i = i + 2;
+                        }
+                    }
+                }
+            }
+            # Room for up to 4 UTF-8 bytes + the final NUL.
+            if (o + 5 < cap) {
+                if (cp < 0x80) {
+                    store8(dst + o, cp);
+                    o = o + 1;
+                } elif (cp < 0x800) {
+                    store8(dst + o, 0xC0 | (cp >> 6));
+                    store8(dst + o + 1, 0x80 | (cp & 0x3F));
+                    o = o + 2;
+                } elif (cp < 0x10000) {
+                    store8(dst + o, 0xE0 | (cp >> 12));
+                    store8(dst + o + 1, 0x80 | ((cp >> 6) & 0x3F));
+                    store8(dst + o + 2, 0x80 | (cp & 0x3F));
+                    o = o + 3;
+                } else {
+                    store8(dst + o, 0xF0 | (cp >> 18));
+                    store8(dst + o + 1, 0x80 | ((cp >> 12) & 0x3F));
+                    store8(dst + o + 2, 0x80 | ((cp >> 6) & 0x3F));
+                    store8(dst + o + 3, 0x80 | (cp & 0x3F));
+                    o = o + 4;
+                }
+            }
+        }
+    }
+    store8(dst + o, 0);   # NUL-terminate this arg
+    o = o + 1;
+    return o;
+}
+
+#ifdef CYRIUS_TARGET_MACOS
+include "lib/args_macos.cyr"
+#endif
+
+#ifdef CYRIUS_TARGET_WIN
+include "lib/args_win.cyr"
+#endif
+
+#ifdef CYRIUS_TARGET_AGNOS
+# 6.6.9: the agnos peer's _agnos_getenv calls strlen / alloc / memcpy, and on agnos this
+# arm was the only thing included, so `include "lib/args.cyr"` alone compiled with three
+# undefined functions there (and cleanly on Linux, whose arm below brings alloc). The one module
+# that regressed per target. CHANGELOG [6.6.9]
+include "lib/alloc.cyr"
+include "lib/string.cyr"
+include "lib/args_agnos.cyr"
+#endif
+
+#ifdef CYRIUS_TARGET_LINUX
+include "lib/syscalls.cyr"
+include "lib/alloc.cyr"
+
+var _args_base = 0;
+var _args_len = 0;
+
+# Copy `n` bytes from `src` to `dst` (non-overlapping): qwords, then the byte tail. A private
+# loop rather than lib/string.cyr's memcpy, so `include "lib/args.cyr"` brings no string names.
+fn _args_copy(dst, src, n) {
+    var i = 0;
+    while (i + 8 <= n) {
+        store64(dst + i, load64(src + i));
+        i = i + 8;
+    }
+    while (i < n) {
+        store8(dst + i, load8(src + i));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Read `fd` to EOF into a heap buffer of `cap` bytes that doubles whenever it fills, then publish
+# it as the argument blob. Returns the byte count, or a negative errno: the read's own, or -12
+# (ENOMEM) when a buffer cannot be allocated. On failure nothing is published — argc() never
+# describes a prefix. The loop is the fix: one read of a fixed buffer returned the first
+# 2,097,152 bytes of a longer command line with no error. CHANGELOG [6.7.12]
+fn _args_read_all(fd, cap) {
+    var buf = alloc(cap);
+    if (buf == 0) { return 0 - 12; }
+    var n = 0;
+    var r = 1;
+    var nb = 0;
+    while (r > 0) {
+        if (n == cap) {
+            nb = alloc(cap * 2);
+            if (nb == 0) { return 0 - 12; }
+            _args_copy(nb, buf, n);
+            buf = nb;
+            cap = cap * 2;
+        }
+        r = sys_read(fd, buf + n, cap - n);
+        if (r < 0) { return r; }
+        n = n + r;
+    }
+    _args_base = buf;
+    _args_len = n;
+    return n;
+}
+
+# Initialize argument access by reading /proc/self/cmdline (the kernel's NUL-joined copy of
+# argv). Returns the bytes read, or a negative errno when the command line cannot be read (D7): the open's or the read's
+# -errno, or -12 when the buffer cannot be allocated — never 0 for a failure, since 0 is what
+# macOS answers on success. Reads to EOF: Linux's ARG_MAX is not 2 MiB but RLIMIT_STACK / 4 (up
+# to 6 MiB), which an unprivileged `ulimit -s` raises. The 2 MiB first buffer is heap-backed (a
+# 4 KB stack buffer truncated silently, CHANGELOG [5.9.5]); alloc() lazy-inits the heap, so this
+# can run first thing. The sys_* wrappers, not raw numbers: x86's open / read numbers are other
+# calls on aarch64 (CHANGELOG [6.0.9]). CHANGELOG [6.7.12]
+fn args_init() {
+    var fd = sys_open("/proc/self/cmdline", 0, 0);
+    if (fd < 0) { return fd; }
+    var n = _args_read_all(fd, 2097152);
+    sys_close(fd);
+    return n;
+}
+
+# Return the number of command-line arguments.
+# /proc/self/cmdline is exactly n bytes, each arg terminated by \0
+# (including empty args, which are a bare \0). Count = \0 bytes in [0,n).
+fn argc() {
+    var base = _args_base;
+    if (base == 0) { return 0; }
+    var n = _args_len;
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while (i < n) {
+        if (load8(base + i) == 0) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+# Return pointer to the nth command-line argument string
+fn argv(n) {
+    # Return pointer to nth null-terminated string
+    var base = _args_base;
+    if (base == 0) { return 0; }
+    var blen = _args_len;
+    var count: i64 = 0;
+    var i: i64 = 0;
+    if (n == 0) { return base; }
+    while (i < blen) {
+        if (load8(base + i) == 0) {
+            count = count + 1;
+            if (count == n) { return base + i + 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+#endif

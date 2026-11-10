@@ -89,10 +89,10 @@ Make impetus the obvious choice for anyone writing a game or sim in Rust.
 
 Each item needs a public-API or snapshot-format change, so it waits for a major release.
 
-- [ ] **Complete snapshots** — force fields, contact manifolds and warm-start impulses, sleep state, and arena slot generations + free-list order, so a restored world steps bit-identically and allocates the same handles (regression tests `restore_replaces_force_fields`, `restore_preserves_handle_allocation` are `#[ignore]`d until then). Bitcode is not self-describing, so this changes the format.
-- [ ] **3D orientation in `BodyState` / `BodySnapshot`** — full quaternion and angular velocity; today 3D get/set/snapshot keep only rotation about Z
+- [x] **Complete snapshots** (the Cyrius port, M6, [ADR 0013](../adr/0013-complete-snapshots.md)) — force fields, contact manifolds and warm-start impulses, sleep state, and arena slot generations + free-list order, so a restored world steps bit-identically and allocates the same handles (regression tests `restore_replaces_force_fields`, `restore_preserves_handle_allocation` are `#[ignore]`d until then). Bitcode is not self-describing, so this changes the format.
+- [x] **3D orientation in `BodyState` / `BodySnapshot`** (the Cyrius port, ADR 0008 #4 and M6) — full quaternion and angular velocity; today 3D get/set/snapshot keep only rotation about Z
 - [ ] **Fallible `add_collider` / `add_joint`** — return `Result` instead of storing orphans for missing bodies; validate shapes (negative extents) and materials
-- [ ] **Remove deprecated `PhysicsWorld::restore`** in favour of `try_restore`
+- [x] **Remove deprecated `PhysicsWorld::restore`** in favour of `try_restore` (the Cyrius port: one fallible `restore`, ADR 0008 #2)
 - [ ] **Consistent joint frames** — prismatic/wheel axis in body A's frame in 3D as in 2D
 - [ ] **3D islands** — island-atomic sleep, sleeping bodies as infinite mass in the solver, waking neighbours on removal (2D does all three)
 - [ ] **Cross-platform determinism** — `sin_cos`, `atan2` and `powf` come from the platform libm, so results are only bit-identical on the same platform
