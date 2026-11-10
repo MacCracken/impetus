@@ -1,0 +1,525 @@
+# math3.cyr — glam 0.29.3's f64 3D math, transcribed by value (ADR 0012).
+#
+# The Rust crate's 3D backend computes on glam's `DVec3`, `DQuat` and `DMat3`, which Rust hisab 1.4.0 re-exports
+# (scalar f64 code: glam's `std` and `serde` features only, so `math::sqrt` is IEEE and `math::sin_cos` is std's
+# `(sin, cos)`). Each function here is one glam method, with glam's operation order, read from the registry source of
+# the exact version the oracle links (`glam-0.29.3/src/f64/`). Rust never fuses a multiply-add and neither does
+# Cyrius, so the 3D arithmetic matches Rust bit for bit; tests/golden/b3_math.tsv pins it. `sin_cos` is crmath's
+# correctly rounded pair (ADR 0011). glam's `glam_assert!`s are compiled out in the oracle, so none is checked here.
+#
+# Impetus-owned until hisab's calls can be scoped (S1 in cyrius, or H9 in hisab); hisab's `hvec3_*`, `hquat_*` and
+# `m3_*` then replace these one path at a time. A struct passed by value is copied on entry, so a chain of small helper
+# calls costs several times the arithmetic (port-parity.md §4.2): the composite operations (rotation, the matrix
+# products, the inverse, the determinant) read the components into f64 locals and keep glam's operation order, and a
+# hot loop may do the same.
+#
+# `+` and `−` dispatch to `ImVec3_add` / `ImVec3_sub` and `ImMat3_add` / `ImMat3_sub`. No `*` or `/` overload is
+# defined: glam's `*` means a scale, an element-wise product, a rotation or a matrix product by operand type, and
+# Cyrius dispatches an operator by its left operand only, so each has its own name.
+
+# A quaternion, glam's (x, y, z, w) with w the scalar part.
+struct ImQuat { x: f64; y: f64; z: f64; w: f64; }
+
+# A 3×3 matrix by columns: glam's x_axis, y_axis and z_axis.
+struct ImMat3 { x: ImVec3; y: ImVec3; z: ImVec3; }
+
+# ── ImVec3 ──────────────────────────────────────────────────────────────────────────
+
+# (s, s, s). `DVec3::splat`.
+#must_use
+fn ImVec3_splat(s: f64): ImVec3 {
+    var v: ImVec3;
+    v.x = s;
+    v.y = s;
+    v.z = s;
+    return v;
+}
+
+# a + b. `DVec3 + DVec3`.
+#must_use
+fn ImVec3_add(a: ImVec3, b: ImVec3): ImVec3 {
+    var v: ImVec3;
+    v.x = a.x + b.x;
+    v.y = a.y + b.y;
+    v.z = a.z + b.z;
+    return v;
+}
+
+# a − b. `DVec3 − DVec3`.
+#must_use
+fn ImVec3_sub(a: ImVec3, b: ImVec3): ImVec3 {
+    var v: ImVec3;
+    v.x = a.x - b.x;
+    v.y = a.y - b.y;
+    v.z = a.z - b.z;
+    return v;
+}
+
+# −a. `-DVec3`.
+#must_use
+fn ImVec3_neg(a: ImVec3): ImVec3 {
+    var v: ImVec3;
+    v.x = -a.x;
+    v.y = -a.y;
+    v.z = -a.z;
+    return v;
+}
+
+# a · s. `DVec3 * f64`.
+#must_use
+fn ImVec3_scale(a: ImVec3, s: f64): ImVec3 {
+    var v: ImVec3;
+    v.x = a.x * s;
+    v.y = a.y * s;
+    v.z = a.z * s;
+    return v;
+}
+
+# a / s. `DVec3 / f64`.
+#must_use
+fn ImVec3_div_scalar(a: ImVec3, s: f64): ImVec3 {
+    var v: ImVec3;
+    v.x = a.x / s;
+    v.y = a.y / s;
+    v.z = a.z / s;
+    return v;
+}
+
+# The element-wise product. `DVec3 * DVec3`.
+#must_use
+fn ImVec3_mul_elem(a: ImVec3, b: ImVec3): ImVec3 {
+    var v: ImVec3;
+    v.x = a.x * b.x;
+    v.y = a.y * b.y;
+    v.z = a.z * b.z;
+    return v;
+}
+
+# (a.x·b.x + a.y·b.y) + a.z·b.z. `DVec3::dot`.
+#must_use
+fn ImVec3_dot(a: ImVec3, b: ImVec3): f64 {
+    var d: f64 = a.x * b.x + a.y * b.y + a.z * b.z;
+    return d;
+}
+
+# a × b, each component as glam writes it. `DVec3::cross`.
+#must_use
+fn ImVec3_cross(a: ImVec3, b: ImVec3): ImVec3 {
+    var v: ImVec3;
+    v.x = a.y * b.z - b.y * a.z;
+    v.y = a.z * b.x - b.z * a.x;
+    v.z = a.x * b.y - b.x * a.y;
+    return v;
+}
+
+# a · a. `DVec3::length_squared`.
+#must_use
+fn ImVec3_length_squared(a: ImVec3): f64 {
+    var d: f64 = ImVec3_dot(a, a);
+    return d;
+}
+
+# √(a · a). `DVec3::length`.
+#must_use
+fn ImVec3_length(a: ImVec3): f64 {
+    var d: f64 = ImVec3_dot(a, a);
+    var r: f64 = f64_sqrt(d);
+    return r;
+}
+
+# 1 / |a|. `DVec3::length_recip`.
+#must_use
+fn ImVec3_length_recip(a: ImVec3): f64 {
+    var l: f64 = ImVec3_length(a);
+    var r: f64 = 1.0 / l;
+    return r;
+}
+
+# a · (1 / |a|): non-finite for a zero, infinite or NaN vector, as glam's (whose assert is compiled out).
+# `DVec3::normalize`.
+#must_use
+fn ImVec3_normalize(a: ImVec3): ImVec3 {
+    var rcp: f64 = ImVec3_length_recip(a);
+    return ImVec3_scale(a, rcp);
+}
+
+# 1 with a's direction in *out, or 0 (out untouched) when 1 / |a| is not finite and positive. `DVec3::try_normalize`.
+#must_use
+fn ImVec3_try_normalize(a: ImVec3, out: *ImVec3): i64 {
+    var rcp: f64 = ImVec3_length_recip(a);
+    if (_im_is_finite(rcp) == 1 && rcp > 0.0) {
+        out.x = a.x * rcp;
+        out.y = a.y * rcp;
+        out.z = a.z * rcp;
+        return 1;
+    }
+    return 0;
+}
+
+# a's direction, or `fallback` when 1 / |a| is not finite and positive. `DVec3::normalize_or`.
+#must_use
+fn ImVec3_normalize_or(a: ImVec3, fallback: ImVec3): ImVec3 {
+    var rcp: f64 = ImVec3_length_recip(a);
+    if (_im_is_finite(rcp) == 1 && rcp > 0.0) { return ImVec3_scale(a, rcp); }
+    return fallback;
+}
+
+# a's direction, or zero. `DVec3::normalize_or_zero`.
+#must_use
+fn ImVec3_normalize_or_zero(a: ImVec3): ImVec3 {
+    return ImVec3_normalize_or(a, ImVec3_zero());
+}
+
+# The element-wise |a|. `DVec3::abs`.
+#must_use
+fn ImVec3_abs(a: ImVec3): ImVec3 {
+    var v: ImVec3;
+    v.x = f64_abs(a.x);
+    v.y = f64_abs(a.y);
+    v.z = f64_abs(a.z);
+    return v;
+}
+
+# The element-wise `f64::min`. `DVec3::min`.
+#must_use
+fn ImVec3_min(a: ImVec3, b: ImVec3): ImVec3 {
+    var v: ImVec3;
+    v.x = _im_min(a.x, b.x);
+    v.y = _im_min(a.y, b.y);
+    v.z = _im_min(a.z, b.z);
+    return v;
+}
+
+# The element-wise `f64::max`. `DVec3::max`.
+#must_use
+fn ImVec3_max(a: ImVec3, b: ImVec3): ImVec3 {
+    var v: ImVec3;
+    v.x = _im_max(a.x, b.x);
+    v.y = _im_max(a.y, b.y);
+    v.z = _im_max(a.z, b.z);
+    return v;
+}
+
+# 1 when every component is finite. `DVec3::is_finite`.
+#must_use
+fn ImVec3_is_finite(a: ImVec3): i64 {
+    if (_im_is_finite(a.x) == 1 && _im_is_finite(a.y) == 1 && _im_is_finite(a.z) == 1) { return 1; }
+    return 0;
+}
+
+# A vector orthogonal to a, not normalized: (−z, 0, x) when |x| > |y|, else (0, z, −y).
+# `DVec3::any_orthogonal_vector`.
+#must_use
+fn ImVec3_any_orthogonal_vector(a: ImVec3): ImVec3 {
+    var v: ImVec3;
+    var ax: f64 = f64_abs(a.x);
+    var ay: f64 = f64_abs(a.y);
+    if (ax > ay) {
+        v.x = -a.z;
+        v.y = 0.0;
+        v.z = a.x;
+        return v;
+    }
+    v.x = 0.0;
+    v.y = a.z;
+    v.z = -a.y;
+    return v;
+}
+
+# Two vectors that with the unit vector a make an orthonormal basis, written to *b and *c (Duff et al., the Pixar
+# construction glam cites). `DVec3::any_orthonormal_pair`.
+fn ImVec3_any_orthonormal_pair(a: ImVec3, b: *ImVec3, c: *ImVec3) {
+    var sign: f64 = _im_signum(a.z);
+    var den: f64 = sign + a.z;
+    var k: f64 = -1.0 / den;
+    var m: f64 = a.x * a.y * k;
+    var nsign: f64 = -sign;
+    b.x = 1.0 + sign * a.x * a.x * k;
+    b.y = sign * m;
+    b.z = nsign * a.x;
+    c.x = m;
+    c.y = sign + a.y * a.y * k;
+    c.z = -a.y;
+    return 0;
+}
+
+# ── ImQuat ──────────────────────────────────────────────────────────────────────────
+
+# (x, y, z, w). `DQuat::from_xyzw`.
+#must_use
+fn ImQuat_new(x: f64, y: f64, z: f64, w: f64): ImQuat {
+    var q: ImQuat;
+    q.x = x;
+    q.y = y;
+    q.z = z;
+    q.w = w;
+    return q;
+}
+
+# (0, 0, 0, 1). `DQuat::IDENTITY`.
+#must_use
+fn ImQuat_identity(): ImQuat {
+    return ImQuat_new(0.0, 0.0, 0.0, 1.0);
+}
+
+# A rotation of `angle` radians about x: (sin(angle/2), 0, 0, cos(angle/2)). `DQuat::from_rotation_x`.
+#must_use
+fn ImQuat_from_rotation_x(angle: f64): ImQuat {
+    var sv, cv = _im_sin_cos(angle * 0.5);
+    var s: f64 = sv;
+    var c: f64 = cv;
+    return ImQuat_new(s, 0.0, 0.0, c);
+}
+
+# A rotation of `angle` radians about y. `DQuat::from_rotation_y`.
+#must_use
+fn ImQuat_from_rotation_y(angle: f64): ImQuat {
+    var sv, cv = _im_sin_cos(angle * 0.5);
+    var s: f64 = sv;
+    var c: f64 = cv;
+    return ImQuat_new(0.0, s, 0.0, c);
+}
+
+# A rotation of `angle` radians about z. `DQuat::from_rotation_z`.
+#must_use
+fn ImQuat_from_rotation_z(angle: f64): ImQuat {
+    var sv, cv = _im_sin_cos(angle * 0.5);
+    var s: f64 = sv;
+    var c: f64 = cv;
+    return ImQuat_new(0.0, 0.0, s, c);
+}
+
+# (−x, −y, −z, w). `DQuat::conjugate`, and `DQuat::inverse` (glam assumes a unit quaternion).
+#must_use
+fn ImQuat_conjugate(q: ImQuat): ImQuat {
+    return ImQuat_new(-q.x, -q.y, -q.z, q.w);
+}
+
+# The inverse of a unit quaternion: its conjugate. `DQuat::inverse`.
+#must_use
+fn ImQuat_inverse(q: ImQuat): ImQuat {
+    return ImQuat_conjugate(q);
+}
+
+# ((x·x + y·y) + z·z) + w·w, as `DVec4::dot`. `DQuat::length_squared`.
+#must_use
+fn ImQuat_length_squared(q: ImQuat): f64 {
+    var d: f64 = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+    return d;
+}
+
+# q · (1 / |q|), through `DVec4::normalize`. `DQuat::normalize`.
+#must_use
+fn ImQuat_normalize(q: ImQuat): ImQuat {
+    var d: f64 = ImQuat_length_squared(q);
+    var l: f64 = f64_sqrt(d);
+    var rcp: f64 = 1.0 / l;
+    return ImQuat_new(q.x * rcp, q.y * rcp, q.z * rcp, q.w * rcp);
+}
+
+# 1 when every component is finite. `DQuat::is_finite`.
+#must_use
+fn ImQuat_is_finite(q: ImQuat): i64 {
+    if (_im_is_finite(q.x) == 0 || _im_is_finite(q.y) == 0) { return 0; }
+    if (_im_is_finite(q.z) == 0 || _im_is_finite(q.w) == 0) { return 0; }
+    return 1;
+}
+
+# The Hamilton product a·b, each component in glam's order. `DQuat * DQuat` (`DQuat::mul_quat`).
+#must_use
+fn ImQuat_mul_quat(a: ImQuat, b: ImQuat): ImQuat {
+    var q: ImQuat;
+    q.x = a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y;
+    q.y = a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x;
+    q.z = a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w;
+    q.w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z;
+    return q;
+}
+
+# v rotated by the unit quaternion q: v·(w² − b·b) + b·(2(v·b)) + (b × v)·2w with b = (x, y, z), per component
+# ((v·k0) + (b·k1)) + (c·k2) as glam chains its mul and add. `DQuat * DVec3` (`DQuat::mul_vec3`).
+#must_use
+fn ImQuat_mul_vec3(q: ImQuat, v: ImVec3): ImVec3 {
+    var bx: f64 = q.x;
+    var by: f64 = q.y;
+    var bz: f64 = q.z;
+    var w: f64 = q.w;
+    var vx: f64 = v.x;
+    var vy: f64 = v.y;
+    var vz: f64 = v.z;
+    var b2: f64 = bx * bx + by * by + bz * bz;
+    var k0: f64 = w * w - b2;
+    var vb: f64 = vx * bx + vy * by + vz * bz;
+    var k1: f64 = vb * 2.0;
+    var k2: f64 = w * 2.0;
+    var cx: f64 = by * vz - vy * bz;
+    var cy: f64 = bz * vx - vz * bx;
+    var cz: f64 = bx * vy - vx * by;
+    var r: ImVec3;
+    r.x = vx * k0 + bx * k1 + cx * k2;
+    r.y = vy * k0 + by * k1 + cy * k2;
+    r.z = vz * k0 + bz * k1 + cz * k2;
+    return r;
+}
+
+# ── ImMat3 ──────────────────────────────────────────────────────────────────────────
+
+# The matrix with columns x, y and z. `DMat3::from_cols`.
+#must_use
+fn ImMat3_from_cols(x: ImVec3, y: ImVec3, z: ImVec3): ImMat3 {
+    var m: ImMat3;
+    m.x = x;
+    m.y = y;
+    m.z = z;
+    return m;
+}
+
+# The zero matrix. `DMat3::ZERO`.
+#must_use
+fn ImMat3_zero(): ImMat3 {
+    var z: ImVec3 = ImVec3_zero();
+    return ImMat3_from_cols(z, z, z);
+}
+
+# diag(d.x, d.y, d.z). `DMat3::from_diagonal`.
+#must_use
+fn ImMat3_from_diagonal(d: ImVec3): ImMat3 {
+    return ImMat3_from_cols(ImVec3_new(d.x, 0.0, 0.0), ImVec3_new(0.0, d.y, 0.0), ImVec3_new(0.0, 0.0, d.z));
+}
+
+# The identity. `DMat3::IDENTITY`.
+#must_use
+fn ImMat3_identity(): ImMat3 {
+    return ImMat3_from_diagonal(ImVec3_splat(1.0));
+}
+
+# The rotation matrix of the unit quaternion q, as glam builds it from x2 = x + x, etc. `DMat3::from_quat`.
+#must_use
+fn ImMat3_from_quat(q: ImQuat): ImMat3 {
+    var x2: f64 = q.x + q.x;
+    var y2: f64 = q.y + q.y;
+    var z2: f64 = q.z + q.z;
+    var xx: f64 = q.x * x2;
+    var xy: f64 = q.x * y2;
+    var xz: f64 = q.x * z2;
+    var yy: f64 = q.y * y2;
+    var yz: f64 = q.y * z2;
+    var zz: f64 = q.z * z2;
+    var wx: f64 = q.w * x2;
+    var wy: f64 = q.w * y2;
+    var wz: f64 = q.w * z2;
+    var cx: ImVec3 = ImVec3_new(1.0 - (yy + zz), xy + wz, xz - wy);
+    var cy: ImVec3 = ImVec3_new(xy - wz, 1.0 - (xx + zz), yz + wx);
+    var cz: ImVec3 = ImVec3_new(xz + wy, yz - wx, 1.0 - (xx + yy));
+    return ImMat3_from_cols(cx, cy, cz);
+}
+
+# Mᵀ. `DMat3::transpose`.
+#must_use
+fn ImMat3_transpose(m: ImMat3): ImMat3 {
+    var cx: ImVec3 = ImVec3_new(m.x.x, m.y.x, m.z.x);
+    var cy: ImVec3 = ImVec3_new(m.x.y, m.y.y, m.z.y);
+    var cz: ImVec3 = ImVec3_new(m.x.z, m.y.z, m.z.z);
+    return ImMat3_from_cols(cx, cy, cz);
+}
+
+# z · (x × y) over the columns: glam's cross, then its dot. `DMat3::determinant`.
+#must_use
+fn ImMat3_determinant(m: ImMat3): f64 {
+    var cx: f64 = m.x.y * m.y.z - m.y.y * m.x.z;
+    var cy: f64 = m.x.z * m.y.x - m.y.z * m.x.x;
+    var cz: f64 = m.x.x * m.y.y - m.y.x * m.x.y;
+    var d: f64 = m.z.x * cx + m.z.y * cy + m.z.z * cz;
+    return d;
+}
+
+# M⁻¹ by the adjugate, as glam: t0 = y × z, t1 = z × x, t2 = x × y, det = z · t2, then (t0, t1, t2)·(1 / det)
+# transposed. A singular M gives infinities or NaN (glam's assert is compiled out). `DMat3::inverse`.
+#must_use
+fn ImMat3_inverse(m: ImMat3): ImMat3 {
+    var xx: f64 = m.x.x;
+    var xy: f64 = m.x.y;
+    var xz: f64 = m.x.z;
+    var yx: f64 = m.y.x;
+    var yy: f64 = m.y.y;
+    var yz: f64 = m.y.z;
+    var zx: f64 = m.z.x;
+    var zy: f64 = m.z.y;
+    var zz: f64 = m.z.z;
+    var t0x: f64 = yy * zz - zy * yz;
+    var t0y: f64 = yz * zx - zz * yx;
+    var t0z: f64 = yx * zy - zx * yy;
+    var t1x: f64 = zy * xz - xy * zz;
+    var t1y: f64 = zz * xx - xz * zx;
+    var t1z: f64 = zx * xy - xx * zy;
+    var t2x: f64 = xy * yz - yy * xz;
+    var t2y: f64 = xz * yx - yz * xx;
+    var t2z: f64 = xx * yy - yx * xy;
+    var det: f64 = zx * t2x + zy * t2y + zz * t2z;
+    var inv: f64 = 1.0 / det;
+    var r: ImMat3;
+    r.x.x = t0x * inv;
+    r.x.y = t1x * inv;
+    r.x.z = t2x * inv;
+    r.y.x = t0y * inv;
+    r.y.y = t1y * inv;
+    r.y.z = t2y * inv;
+    r.z.x = t0z * inv;
+    r.z.y = t1z * inv;
+    r.z.z = t2z * inv;
+    return r;
+}
+
+# (x·vx + y·vy) + z·vz over the columns of the matrix at m: glam's mul_vec3 (res = x·vx; res += y·vy; res += z·vz),
+# read through a pointer so the matrix isn't copied.
+#must_use
+fn _im_m3_apply(m: *ImMat3, vx: f64, vy: f64, vz: f64): ImVec3 {
+    var r: ImVec3;
+    r.x = m.x.x * vx + m.y.x * vy + m.z.x * vz;
+    r.y = m.x.y * vx + m.y.y * vy + m.z.y * vz;
+    r.z = m.x.z * vx + m.y.z * vy + m.z.z * vz;
+    return r;
+}
+
+# M·v. `DMat3 * DVec3` (`DMat3::mul_vec3`).
+#must_use
+fn ImMat3_mul_vec3(m: ImMat3, v: ImVec3): ImVec3 {
+    return _im_m3_apply(&m, v.x, v.y, v.z);
+}
+
+# A·B, column by column. `DMat3 * DMat3` (`DMat3::mul_mat3`).
+#must_use
+fn ImMat3_mul_mat3(a: ImMat3, b: ImMat3): ImMat3 {
+    var r: ImMat3;
+    var cx: ImVec3 = _im_m3_apply(&a, b.x.x, b.x.y, b.x.z);
+    var cy: ImVec3 = _im_m3_apply(&a, b.y.x, b.y.y, b.y.z);
+    var cz: ImVec3 = _im_m3_apply(&a, b.z.x, b.z.y, b.z.z);
+    r.x = cx;
+    r.y = cy;
+    r.z = cz;
+    return r;
+}
+
+# A + B. `DMat3 + DMat3` (`DMat3::add_mat3`).
+#must_use
+fn ImMat3_add(a: ImMat3, b: ImMat3): ImMat3 {
+    return ImMat3_from_cols(ImVec3_add(a.x, b.x), ImVec3_add(a.y, b.y), ImVec3_add(a.z, b.z));
+}
+
+# A − B. `DMat3 − DMat3` (`DMat3::sub_mat3`).
+#must_use
+fn ImMat3_sub(a: ImMat3, b: ImMat3): ImMat3 {
+    return ImMat3_from_cols(ImVec3_sub(a.x, b.x), ImVec3_sub(a.y, b.y), ImVec3_sub(a.z, b.z));
+}
+
+# A · s. `DMat3 * f64` (`DMat3::mul_scalar`).
+#must_use
+fn ImMat3_mul_scalar(a: ImMat3, s: f64): ImMat3 {
+    return ImMat3_from_cols(ImVec3_scale(a.x, s), ImVec3_scale(a.y, s), ImVec3_scale(a.z, s));
+}
+
+# −A. `-DMat3`.
+#must_use
+fn ImMat3_neg(a: ImMat3): ImMat3 {
+    return ImMat3_from_cols(ImVec3_neg(a.x), ImVec3_neg(a.y), ImVec3_neg(a.z));
+}

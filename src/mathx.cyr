@@ -64,6 +64,18 @@ fn _im_clamp(x: f64, lo: f64, hi: f64): f64 {
     return r;
 }
 
+# 1.0 with x's sign (−0 gives −1.0), or Rust's `f64::NAN` (the positive quiet NaN, whatever x's NaN bits) for a NaN
+# x. Mirrors `f64::signum`.
+#must_use
+fn _im_signum(x: f64): f64 {
+    if (x != x) {
+        var n: f64 = _im_cr_from_word(0x7ff8000000000000);
+        return n;
+    }
+    if (_im_bits(x) < 0) { return -1.0; }
+    return 1.0;
+}
+
 # Degrees to radians: one multiply by the folded π/180. Mirrors `f64::to_radians`.
 #must_use
 fn _im_to_radians(x: f64): f64 {

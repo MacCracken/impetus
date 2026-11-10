@@ -1,0 +1,594 @@
+# b3_types.cyr — the 3D backend's internal types (port of rust-old/src/backend_3d/types.rs): rigid bodies and their
+# integration (the implicit gyroscopic step included), colliders with their world AABBs and mass properties, the
+# parallel-axis shift, joints, AABBs and contacts.
+#
+# The vector, quaternion and matrix arithmetic is glam's, transcribed by value in src/math3.cyr (ADR 0012), and every
+# expression keeps Rust's operation order, so the mass properties are + − × ÷ √ only and the rotations add only
+# crmath's correctly rounded sin_cos (ADR 0011): golden rows at 0 ulp. f64 min / max are Rust's (src/mathx.cyr). The
+# constants are generated (src/constants_private.cyr, `_IM_B3_*`).
+#
+# A struct-returning call whose arguments read a struct-typed field is bound to a local before it is stored into a
+# field: cyrius 6.7.18 stores the field argument instead of the result in `s.f = g(s.e)` (filed upstream,
+# cyrius docs/development/issues/2026-11-09-field-store-of-struct-call-copies-a-field-argument.md).
+
+# ── rigid bodies ────────────────────────────────────────────────────────────────────
+
+struct ImRigidBody3d {
+    handle;
+    body_type;
+    position: ImVec3;
+    rotation: ImQuat;
+    linear_velocity: ImVec3;
+    angular_velocity: ImVec3;
+    linear_damping: f64;
+    angular_damping: f64;
+    fixed_rotation;
+    gravity_scale: f64;
+    force_accumulator: ImVec3;
+    torque_accumulator: ImVec3;
+    mass: f64;
+    inv_mass: f64;
+    inertia: ImMat3;
+    inv_inertia: ImMat3;
+    inv_inertia_world: ImMat3;
+    pseudo_velocity: ImVec3;
+    pseudo_angular_velocity: ImVec3;
+    is_sleeping;
+    sleep_timer: f64;
+}
+
+# A body from its descriptor: rotated by `rotation` about z, spinning at `angular_velocity` about z, with no mass until
+# colliders are added and gravity scale 1 unless given. Mirrors `RigidBody3d::from_desc`.
+#must_use
+fn ImRigidBody3d_from_desc(handle, desc: ImBodyDesc): ImRigidBody3d {
+    var b: ImRigidBody3d;
+    var rot: f64 = desc.rotation;
+    var av: f64 = desc.angular_velocity;
+    var ld: f64 = desc.linear_damping;
+    var ad: f64 = desc.angular_damping;
+    var gs: f64 = 1.0;
+    if (desc.has_gravity_scale == 1) { gs = desc.gravity_scale; }
+    b.handle = handle;
+    b.body_type = desc.body_type;
+    b.position = desc.position;
+    b.rotation = ImQuat_from_rotation_z(rot);
+    b.linear_velocity = desc.linear_velocity;
+    b.angular_velocity = ImVec3_new(0.0, 0.0, av);
+    b.linear_damping = ld;
+    b.angular_damping = ad;
+    b.fixed_rotation = desc.fixed_rotation;
+    b.gravity_scale = gs;
+    b.force_accumulator = ImVec3_zero();
+    b.torque_accumulator = ImVec3_zero();
+    b.mass = 0.0;
+    b.inv_mass = 0.0;
+    b.inertia = ImMat3_zero();
+    b.inv_inertia = ImMat3_zero();
+    b.inv_inertia_world = ImMat3_zero();
+    b.pseudo_velocity = ImVec3_zero();
+    b.pseudo_angular_velocity = ImVec3_zero();
+    b.is_sleeping = 0;
+    b.sleep_timer = 0.0;
+    return b;
+}
+
+impl ImRigidBody3d {
+    # 1 for a dynamic body.
+    #must_use
+    fn is_dynamic(self): i64 {
+        if (self.body_type == IM_BODY_DYNAMIC) { return 1; }
+        return 0;
+    }
+
+    # 1 for a static body.
+    #must_use
+    fn is_static(self): i64 {
+        if (self.body_type == IM_BODY_STATIC) { return 1; }
+        return 0;
+    }
+
+    # The world-space inverse inertia R·I⁻¹·Rᵀ for the current rotation; zero unless the body is dynamic and free to
+    # rotate. Mirrors `compute_inv_inertia_world`.
+    #must_use
+    fn compute_inv_inertia_world(self): ImMat3 {
+        if (self.is_dynamic() == 0 || self.fixed_rotation == 1) { return ImMat3_zero(); }
+        var r: ImMat3 = ImMat3_from_quat(self.rotation);
+        var ri: ImMat3 = ImMat3_mul_mat3(r, self.inv_inertia);
+        return ImMat3_mul_mat3(ri, ImMat3_transpose(r));
+    }
+
+    # Refreshes the cached inv_inertia_world. Mirrors `update_inertia_world`.
+    fn update_inertia_world(self) {
+        self.inv_inertia_world = self.compute_inv_inertia_world();
+        return 0;
+    }
+
+    # One velocity step: gravity and the accumulated force; the gyroscopic step and the accumulated torque in the body
+    # frame, where the inertia is constant; damping; then the speed cap. Static, kinematic, massless and sleeping
+    # bodies are left alone. Mirrors `integrate_velocities`.
+    fn integrate_velocities(self, gravity: ImVec3, dt: f64, max_velocity: f64) {
+        var im: f64 = self.inv_mass;
+        if (self.is_dynamic() == 0 || im == 0.0) { return 0; }
+        if (self.is_sleeping == 1) { return 0; }
+        var gs: f64 = self.gravity_scale;
+        self.linear_velocity = self.linear_velocity + ImVec3_scale(gravity, gs * dt);
+        self.linear_velocity = self.linear_velocity + ImVec3_scale(self.force_accumulator, im * dt);
+        if (self.fixed_rotation == 0) {
+            var q_inv: ImQuat = ImQuat_inverse(self.rotation);
+            var w0: ImVec3 = ImQuat_mul_vec3(q_inv, self.angular_velocity);
+            var w_body: ImVec3 = _im_b3_gyroscopic_step(self.inertia, w0, dt);
+            var tau_body: ImVec3 = ImQuat_mul_vec3(q_inv, self.torque_accumulator);
+            var dw: ImVec3 = ImVec3_scale(ImMat3_mul_vec3(self.inv_inertia, tau_body), dt);
+            var w1: ImVec3 = ImQuat_mul_vec3(self.rotation, w_body + dw);
+            self.angular_velocity = w1;
+        }
+        var ld: f64 = self.linear_damping;
+        var ad: f64 = self.angular_damping;
+        var damp: f64 = 1.0 / (1.0 + dt * ld);
+        var lv: ImVec3 = ImVec3_scale(self.linear_velocity, damp);
+        self.linear_velocity = lv;
+        var adamp: f64 = 1.0 / (1.0 + dt * ad);
+        var av: ImVec3 = ImVec3_scale(self.angular_velocity, adamp);
+        self.angular_velocity = av;
+        var speed_sq: f64 = ImVec3_dot(self.linear_velocity, self.linear_velocity);
+        if (speed_sq > max_velocity * max_velocity) {
+            var sp: f64 = f64_sqrt(speed_sq);
+            var scale: f64 = max_velocity / sp;
+            var cv: ImVec3 = ImVec3_scale(self.linear_velocity, scale);
+            self.linear_velocity = cv;
+        }
+        return 0;
+    }
+
+    # One position step with the velocity plus the split-impulse pseudo-velocity: the position, then the rotation by
+    # q += ½(ω, 0)·q and a renormalisation. Clears the pseudo-velocities and refreshes inv_inertia_world. Static and
+    # sleeping bodies, and massless dynamic ones, are left alone. Mirrors `integrate_positions`.
+    fn integrate_positions(self, dt: f64) {
+        if (self.is_static() == 1 || self.is_sleeping == 1) { return 0; }
+        var im: f64 = self.inv_mass;
+        if (self.is_dynamic() == 1 && im == 0.0) { return 0; }
+        var total: ImVec3 = self.linear_velocity + self.pseudo_velocity;
+        self.position = self.position + ImVec3_scale(total, dt);
+        if (self.fixed_rotation == 0) {
+            var w: ImVec3 = self.angular_velocity + self.pseudo_angular_velocity;
+            var half_dt: f64 = dt * 0.5;
+            var wq: ImQuat = ImQuat_new(w.x * half_dt, w.y * half_dt, w.z * half_dt, 0.0);
+            var dq: ImQuat = ImQuat_mul_quat(wq, self.rotation);
+            var r: ImQuat = self.rotation;
+            var sum: ImQuat = ImQuat_new(r.x + dq.x, r.y + dq.y, r.z + dq.z, r.w + dq.w);
+            self.rotation = ImQuat_normalize(sum);
+        }
+        self.pseudo_velocity = ImVec3_zero();
+        self.pseudo_angular_velocity = ImVec3_zero();
+        self.update_inertia_world();
+        return 0;
+    }
+
+    # Zeroes the accumulated force and torque. Mirrors `clear_forces`.
+    fn clear_forces(self) {
+        self.force_accumulator = ImVec3_zero();
+        self.torque_accumulator = ImVec3_zero();
+        return 0;
+    }
+}
+
+# The skew-symmetric cross-product matrix: skew(v)·x = v × x. Mirrors `skew`.
+#must_use
+fn _im_b3_skew(v: ImVec3): ImMat3 {
+    var cx: ImVec3 = ImVec3_new(0.0, v.z, -v.y);
+    var cy: ImVec3 = ImVec3_new(-v.z, 0.0, v.x);
+    var cz: ImVec3 = ImVec3_new(v.y, -v.x, 0.0);
+    return ImMat3_from_cols(cx, cy, cz);
+}
+
+# The body-frame angular velocity w advanced over dt by the gyroscopic term I·ẇ = −w × (I·w): one Newton step of the
+# implicit (backward Euler) update, rescaled onto the pre-step rotational kinetic energy, since the term is workless.
+# w unchanged when the Jacobian is singular or the result is not finite. Mirrors `gyroscopic_step`.
+#must_use
+fn _im_b3_gyroscopic_step(inertia: ImMat3, w: ImVec3, dt: f64): ImVec3 {
+    var iw: ImVec3 = ImMat3_mul_vec3(inertia, w);
+    var f: ImVec3 = ImVec3_scale(ImVec3_cross(w, iw), dt);
+    var sk: ImMat3 = ImMat3_mul_mat3(_im_b3_skew(w), inertia) - _im_b3_skew(iw);
+    var jac: ImMat3 = inertia + ImMat3_mul_scalar(sk, dt);
+    var det: f64 = ImMat3_determinant(jac);
+    var adet: f64 = f64_abs(det);
+    if (_im_is_finite(det) == 0 || adet <= _IM_B3_EPSILON_SQ) { return w; }
+    var w2: ImVec3 = w - ImMat3_mul_vec3(ImMat3_inverse(jac), f);
+    var e1: f64 = ImVec3_dot(w, iw);
+    var e2: f64 = ImVec3_dot(w2, ImMat3_mul_vec3(inertia, w2));
+    if (ImVec3_is_finite(w2) == 0 || _im_is_finite(e2) == 0) { return w; }
+    if (e2 > _IM_B3_EPSILON_SQ && e1 >= 0.0) {
+        var q: f64 = e1 / e2;
+        var s: f64 = f64_sqrt(q);
+        return ImVec3_scale(w2, s);
+    }
+    return w2;
+}
+
+# ── AABBs ───────────────────────────────────────────────────────────────────────────
+
+struct ImAabb3d { min: ImVec3; max: ImVec3; }
+
+# The AABB [lo, hi].
+#must_use
+fn ImAabb3d_new(lo: ImVec3, hi: ImVec3): ImAabb3d {
+    var a: ImAabb3d;
+    a.min = lo;
+    a.max = hi;
+    return a;
+}
+
+impl ImAabb3d {
+    # 1 when the boxes overlap or touch on every axis. Mirrors `Aabb3d::overlaps`.
+    #must_use
+    fn overlaps(self, o: *ImAabb3d): i64 {
+        if (self.min.x <= o.max.x && self.max.x >= o.min.x && self.min.y <= o.max.y && self.max.y >= o.min.y
+          && self.min.z <= o.max.z && self.max.z >= o.min.z) {
+            return 1;
+        }
+        return 0;
+    }
+}
+
+# ── colliders ───────────────────────────────────────────────────────────────────────
+
+struct ImCollider3d {
+    handle;
+    body;
+    shape: ImColliderShape;
+    offset: ImVec3;
+    material: ImPhysicsMaterial;
+    is_sensor;
+    has_mass;
+    mass: f64;
+    collision_layer;
+    collision_mask;
+}
+
+# A collider of `body` from its descriptor, with a copy of its shape (freed by `free`). Mirrors `Collider3d::from_desc`.
+#must_use
+fn ImCollider3d_from_desc(handle, body, desc: ImColliderDesc): ImCollider3d {
+    var c: ImCollider3d;
+    var m: f64 = desc.mass;
+    c.handle = handle;
+    c.body = body;
+    c.shape = desc.shape.clone();
+    c.offset = desc.offset;
+    c.material = desc.material;
+    c.is_sensor = desc.is_sensor;
+    c.has_mass = desc.has_mass;
+    c.mass = m;
+    c.collision_layer = desc.collision_layer;
+    c.collision_mask = desc.collision_mask;
+    return c;
+}
+
+# The point (x, y, z) at p as a vector (a hull point or mesh vertex: three f64 words).
+#must_use
+fn _im_b3_point(p): ImVec3 {
+    var x: f64 = load64(p);
+    var y: f64 = load64(p + 8);
+    var z: f64 = load64(p + 16);
+    return ImVec3_new(x, y, z);
+}
+
+# The AABB of the n points at pts into *out: 1, or 0 for no points. Mirrors `Collider3d::points_aabb`.
+fn _im_b3_points_aabb(pts, n, out: *ImAabb3d): i64 {
+    var zero: f64 = 0.0;
+    var inf: f64 = 1.0 / zero;
+    var lo: ImVec3 = ImVec3_splat(inf);
+    var hi: ImVec3 = ImVec3_splat(-inf);
+    for (var j = 0; j < n; j = j + 1) {
+        var v: ImVec3 = _im_b3_point(pts + j * 24);
+        lo = ImVec3_min(lo, v);
+        hi = ImVec3_max(hi, v);
+    }
+    if (lo.x <= hi.x) {
+        out.min = lo;
+        out.max = hi;
+        return 1;
+    }
+    return 0;
+}
+
+# The world-space corner c of a box: wp + rot·c, folded into the running bounds.
+fn _im_b3_aabb_fold(a: *ImAabb3d, wp: ImVec3, rot: ImQuat, c: ImVec3) {
+    var wc: ImVec3 = wp + ImQuat_mul_vec3(rot, c);
+    var lo: ImVec3 = ImVec3_min(a.min, wc);
+    var hi: ImVec3 = ImVec3_max(a.max, wc);
+    a.min = lo;
+    a.max = hi;
+    return 0;
+}
+
+impl ImCollider3d {
+    # The world AABB at body position `p`, rotation `rot`: exact for a ball and a segment, the rotated corners of a
+    # box, the rotated points of a hull or mesh (the collider's position when it has none), and an axis-aligned box
+    # for a heightfield. Mirrors `Collider3d::world_aabb`.
+    #must_use
+    fn world_aabb(self, p: ImVec3, rot: ImQuat): ImAabb3d {
+        var wp: ImVec3 = p + ImQuat_mul_vec3(rot, self.offset);
+        var k = self.shape.kind;
+        if (k == IM_SHAPE_BALL) {
+            var rr: f64 = self.shape.radius;
+            var r: ImVec3 = ImVec3_splat(rr);
+            return ImAabb3d_new(wp - r, wp + r);
+        }
+        var zero: f64 = 0.0;
+        var inf: f64 = 1.0 / zero;
+        var ninf: f64 = -inf;
+        if (k == IM_SHAPE_BOX) {
+            var hx: f64 = self.shape.half_extents.x;
+            var hy: f64 = self.shape.half_extents.y;
+            var hz: f64 = self.shape.half_extents.z;
+            var bx: ImAabb3d = ImAabb3d_new(ImVec3_splat(inf), ImVec3_splat(ninf));
+            _im_b3_aabb_fold(&bx, wp, rot, ImVec3_new(-hx, -hy, -hz));
+            _im_b3_aabb_fold(&bx, wp, rot, ImVec3_new(hx, -hy, -hz));
+            _im_b3_aabb_fold(&bx, wp, rot, ImVec3_new(-hx, hy, -hz));
+            _im_b3_aabb_fold(&bx, wp, rot, ImVec3_new(hx, hy, -hz));
+            _im_b3_aabb_fold(&bx, wp, rot, ImVec3_new(-hx, -hy, hz));
+            _im_b3_aabb_fold(&bx, wp, rot, ImVec3_new(hx, -hy, hz));
+            _im_b3_aabb_fold(&bx, wp, rot, ImVec3_new(-hx, hy, hz));
+            _im_b3_aabb_fold(&bx, wp, rot, ImVec3_new(hx, hy, hz));
+            return bx;
+        }
+        if (k == IM_SHAPE_CAPSULE) {
+            var hh: f64 = self.shape.half_height;
+            var cr: f64 = self.shape.radius;
+            var axis: ImVec3 = ImVec3_abs(ImQuat_mul_vec3(rot, ImVec3_new(0.0, hh, 0.0)));
+            var cv: ImVec3 = ImVec3_splat(cr);
+            return ImAabb3d_new(wp - axis - cv, wp + axis + cv);
+        }
+        if (k == IM_SHAPE_SEGMENT) {
+            var wa: ImVec3 = wp + ImQuat_mul_vec3(rot, self.shape.a);
+            var wb: ImVec3 = wp + ImQuat_mul_vec3(rot, self.shape.b);
+            return ImAabb3d_new(ImVec3_min(wa, wb), ImVec3_max(wa, wb));
+        }
+        if (k == IM_SHAPE_HEIGHTFIELD) {
+            var n = self.shape.height_count;
+            var cells = n;
+            if (cells < 1) { cells = 1; }
+            var sx: f64 = self.shape.scale.x;
+            var sy: f64 = self.shape.scale.y;
+            var sz: f64 = self.shape.scale.z;
+            var cf: f64 = f64_from(cells - 1);
+            var w: f64 = sx * cf;
+            var hmin: f64 = inf;
+            var hmax: f64 = ninf;
+            for (var i = 0; i < n; i = i + 1) {
+                var h: f64 = load64(self.shape.heights + i * 8);
+                hmin = _im_min(hmin, h);
+                hmax = _im_max(hmax, h);
+            }
+            var lo: ImVec3 = ImVec3_new(wp.x, wp.y + hmin * sy, wp.z);
+            var hi: ImVec3 = ImVec3_new(wp.x + w, wp.y + hmax * sy, wp.z + sz);
+            return ImAabb3d_new(lo, hi);
+        }
+        # ConvexHull points or TriMesh vertices: the rotated, translated extremes.
+        var pts = self.shape.points;
+        var np = self.shape.point_count;
+        if (k == IM_SHAPE_TRI_MESH) {
+            pts = self.shape.vertices;
+            np = self.shape.vertex_count;
+        }
+        var ab: ImAabb3d = ImAabb3d_new(ImVec3_splat(inf), ImVec3_splat(ninf));
+        for (var j = 0; j < np; j = j + 1) {
+            _im_b3_aabb_fold(&ab, wp, rot, _im_b3_point(pts + j * 24));
+        }
+        if (ab.min.x > ab.max.x) { return ImAabb3d_new(wp, wp); }
+        return ab;
+    }
+
+    # The local AABB of a hull or mesh with a volume above EPSILON into *out: 1, else 0 (any other shape, no points,
+    # or a flat point set). Mirrors `Collider3d::solid_points_aabb`.
+    fn _solid_points_aabb(self, out: *ImAabb3d): i64 {
+        var k = self.shape.kind;
+        var got = 0;
+        if (k == IM_SHAPE_CONVEX_HULL) { got = _im_b3_points_aabb(self.shape.points, self.shape.point_count, out); }
+        if (k == IM_SHAPE_TRI_MESH) { got = _im_b3_points_aabb(self.shape.vertices, self.shape.vertex_count, out); }
+        if (got == 0) { return 0; }
+        var size: ImVec3 = out.max - out.min;
+        var vol: f64 = size.x * size.y * size.z;
+        if (vol > _IM_B3_EPSILON) { return 1; }
+        return 0;
+    }
+
+    # The centre of mass relative to the collider origin: zero for the symmetric primitives, the AABB centre for a
+    # solid hull or mesh. Mirrors `Collider3d::local_centroid`.
+    #must_use
+    fn local_centroid(self): ImVec3 {
+        var ab: ImAabb3d = ImAabb3d_new(ImVec3_zero(), ImVec3_zero());
+        if (self._solid_points_aabb(&ab) == 0) { return ImVec3_zero(); }
+        return ImVec3_scale(ab.min + ab.max, 0.5);
+    }
+
+    # The collider mass: the explicit mass, else volume · density, at least MIN_MASS. A hull or mesh uses its points'
+    # AABB volume (1 m³ when flat); a segment and a heightfield 1 m³. Mirrors `Collider3d::compute_mass`.
+    #must_use
+    fn compute_mass(self): f64 {
+        if (self.has_mass == 1) {
+            var em: f64 = self.mass;
+            var mm: f64 = _im_max(em, _IM_B3_MIN_MASS);
+            return mm;
+        }
+        var k = self.shape.kind;
+        var ball: f64 = 4.0 / 3.0;
+        var vol: f64 = 1.0;
+        if (k == IM_SHAPE_BALL) {
+            var r: f64 = self.shape.radius;
+            var r3: f64 = _im_powi3(r);
+            vol = ball * _IM_PI * r3;
+        } elif (k == IM_SHAPE_BOX) {
+            var hx: f64 = self.shape.half_extents.x;
+            var hy: f64 = self.shape.half_extents.y;
+            var hz: f64 = self.shape.half_extents.z;
+            vol = 8.0 * hx * hy * hz;
+        } elif (k == IM_SHAPE_CAPSULE) {
+            var hh: f64 = self.shape.half_height;
+            var cr: f64 = self.shape.radius;
+            var c3: f64 = _im_powi3(cr);
+            vol = _IM_PI * cr * cr * 2.0 * hh + ball * _IM_PI * c3;
+        } elif (k == IM_SHAPE_CONVEX_HULL || k == IM_SHAPE_TRI_MESH) {
+            var ab: ImAabb3d = ImAabb3d_new(ImVec3_zero(), ImVec3_zero());
+            if (self._solid_points_aabb(&ab) == 1) {
+                var s: ImVec3 = ab.max - ab.min;
+                vol = s.x * s.y * s.z;
+            }
+        }
+        var den: f64 = self.material.density;
+        var vm: f64 = vol * den;
+        var m: f64 = _im_max(vm, _IM_B3_MIN_MASS);
+        return m;
+    }
+
+    # The inertia tensor about the shape's own centre of mass (local_centroid), in collider axes: diagonal, each entry
+    # at least MIN_INERTIA. A ball's 2/5·m·r²; a box's solid-box tensor; a capsule's cylinder plus two hemispheres
+    # (axis along y); a solid hull or mesh its AABB's solid box; anything else m on the diagonal. Mirrors
+    # `Collider3d::compute_inertia`.
+    #must_use
+    fn compute_inertia(self, mass: f64): ImMat3 {
+        var k = self.shape.kind;
+        var d: ImVec3 = ImVec3_splat(mass);
+        if (k == IM_SHAPE_BALL) {
+            var r: f64 = self.shape.radius;
+            var i: f64 = 0.4 * mass * r * r;
+            d = ImVec3_splat(i);
+        } elif (k == IM_SHAPE_BOX) {
+            var hx: f64 = self.shape.half_extents.x;
+            var hy: f64 = self.shape.half_extents.y;
+            var hz: f64 = self.shape.half_extents.z;
+            d = _im_b3_solid_box(mass, 2.0 * hx, 2.0 * hy, 2.0 * hz);
+        } elif (k == IM_SHAPE_CAPSULE) {
+            var cr: f64 = self.shape.radius;
+            var hh: f64 = self.shape.half_height;
+            var r2: f64 = cr * cr;
+            var h: f64 = 2.0 * hh;
+            var ball: f64 = 4.0 / 3.0;
+            var cyl_vol: f64 = _IM_PI * r2 * h;
+            var hemis_vol: f64 = ball * _IM_PI * r2 * cr;
+            var total_vol: f64 = cyl_vol + hemis_vol;
+            var m_cyl: f64 = 0.0;
+            var m_hemis: f64 = mass;
+            if (total_vol > 0.0) {
+                var fr: f64 = cyl_vol / total_vol;
+                m_cyl = mass * fr;
+                m_hemis = mass * (1.0 - fr);
+            }
+            var i_axis: f64 = m_cyl * r2 / 2.0 + m_hemis * 2.0 * r2 / 5.0;
+            var i_perp: f64 = m_cyl * (h * h / 12.0 + r2 / 4.0)
+            + m_hemis * (2.0 * r2 / 5.0 + h * h / 4.0 + 3.0 * h * cr / 8.0);
+            d = ImVec3_new(i_perp, i_axis, i_perp);
+        } elif (k == IM_SHAPE_CONVEX_HULL || k == IM_SHAPE_TRI_MESH) {
+            var ab: ImAabb3d = ImAabb3d_new(ImVec3_zero(), ImVec3_zero());
+            if (self._solid_points_aabb(&ab) == 1) {
+                var s: ImVec3 = ab.max - ab.min;
+                d = _im_b3_solid_box(mass, s.x, s.y, s.z);
+            }
+        }
+        var floor: ImVec3 = ImVec3_splat(_IM_B3_MIN_INERTIA);
+        return ImMat3_from_diagonal(ImVec3_max(d, floor));
+    }
+
+    # Releases the collider's shape arrays.
+    fn free(self) {
+        self.shape.free();
+        return 0;
+    }
+}
+
+# The diagonal of a solid box w × h × d of mass m: m(h² + d²)/12, m(w² + d²)/12, m(w² + h²)/12. The `solid_box` closure
+# of `Collider3d::compute_inertia`.
+#must_use
+fn _im_b3_solid_box(m: f64, w: f64, h: f64, d: f64): ImVec3 {
+    var ix: f64 = m * (h * h + d * d) / 12.0;
+    var iy: f64 = m * (w * w + d * d) / 12.0;
+    var iz: f64 = m * (w * w + h * h) / 12.0;
+    return ImVec3_new(ix, iy, iz);
+}
+
+# The parallel-axis shift of an inertia tensor by displacement d for mass m: m(|d|²E − d dᵀ). Mirrors `parallel_axis`.
+#must_use
+fn _im_b3_parallel_axis(m: f64, d: ImVec3): ImMat3 {
+    var dd: f64 = ImVec3_dot(d, d);
+    var diag: ImMat3 = ImMat3_from_diagonal(ImVec3_splat(m * dd));
+    var outer: ImMat3 = ImMat3_from_cols(ImVec3_scale(d, m * d.x), ImVec3_scale(d, m * d.y), ImVec3_scale(d, m * d.z));
+    return diag - outer;
+}
+
+# ── mass properties (state.rs's `recompute_mass_properties`, in three steps) ─────────
+# The body's mass and inertia fields are the running sums: reset them, add each of its colliders in attachment order,
+# then finish, which settles the inverses and the world inverse inertia. The 3D state (M5) runs the loop.
+
+# Zeroes body b's mass and inertia sums.
+fn _im_b3_mass_reset(b: *ImRigidBody3d) {
+    b.mass = 0.0;
+    b.inertia = ImMat3_zero();
+    return 0;
+}
+
+# Adds collider c's mass, and its inertia shifted to the body origin by the parallel-axis theorem (its offset plus its
+# centroid), to body b's sums.
+fn _im_b3_mass_add(b: *ImRigidBody3d, c: *ImCollider3d) {
+    var cm: f64 = c.compute_mass();
+    var bm: f64 = b.mass;
+    b.mass = bm + cm;
+    var ci: ImMat3 = c.compute_inertia(cm);
+    var pa: ImMat3 = _im_b3_parallel_axis(cm, c.offset + c.local_centroid());
+    b.inertia = b.inertia + (ci + pa);
+    return 0;
+}
+
+# Settles body b's mass properties from its sums: a static or kinematic body gets zero mass and inertia, and a dynamic
+# body without positive mass keeps its sums with zero inverses. Otherwise inv_mass = 1/mass, and inv_inertia the
+# inverse unless rotation is fixed or the determinant is not finite and positive. Then inv_inertia_world.
+fn _im_b3_mass_finish(b: *ImRigidBody3d) {
+    var mass: f64 = b.mass;
+    if (b.is_dynamic() == 0 || mass <= 0.0) {
+        if (b.is_dynamic() == 0) {
+            b.mass = 0.0;
+            b.inertia = ImMat3_zero();
+        }
+        b.inv_mass = 0.0;
+        b.inv_inertia = ImMat3_zero();
+    } else {
+        var im: f64 = 1.0 / mass;
+        b.inv_mass = im;
+        var det: f64 = ImMat3_determinant(b.inertia);
+        if (b.fixed_rotation == 1 || _im_is_finite(det) == 0 || det <= 0.0) {
+            b.inv_inertia = ImMat3_zero();
+        } else {
+            var inv: ImMat3 = ImMat3_inverse(b.inertia);
+            b.inv_inertia = inv;
+        }
+    }
+    b.update_inertia_world();
+    return 0;
+}
+
+# ── joints and contacts ─────────────────────────────────────────────────────────────
+
+# `reference_rotation` is q_a⁻¹·q_b when the joint was made: a Fixed joint holds the bodies at it. The motor is kept for
+# snapshots only (3D joint motors are refused, port plan §3.3 #5).
+struct ImJoint3d {
+    body_a;
+    body_b;
+    joint_type: ImJointType;
+    local_anchor_a: ImVec3;
+    local_anchor_b: ImVec3;
+    reference_rotation: ImQuat;
+    has_motor;
+    motor: ImJointMotor;
+    damping: f64;
+    has_break_force;
+    break_force: f64;
+}
+
+struct ImContact3d {
+    collider_a;
+    collider_b;
+    body_a;
+    body_b;
+    normal: ImVec3;
+    depth: f64;
+    point: ImVec3;
+}

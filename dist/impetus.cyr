@@ -173,6 +173,32 @@ var _IM_B2_WARM_START_FACTOR: f64 = 0.95;
 
 # FALLBACK is not carried: the (1, [0, 0], 1) tuple local to `shape_props`, written in place in src/b2_types.cyr.
 
+# ── rust-old/src/backend_3d/types.rs ──
+
+# General-purpose geometry epsilon for zero-length checks.
+# Rust: `EPSILON: f64 = 1e-10`
+var _IM_B3_EPSILON: f64 = 0.0000000001;
+
+# Squared epsilon for distance-squared checks.
+# Rust: `EPSILON_SQ: f64 = 1e-20`
+var _IM_B3_EPSILON_SQ: f64 = 0.00000000000000000001;
+
+# Bodies with both linear and angular speed below this are candidates for sleep.
+# Rust: `SLEEP_VELOCITY_THRESHOLD_3D: f64 = 0.01`
+var _IM_B3_SLEEP_VELOCITY_THRESHOLD_3D: f64 = 0.01;
+
+# How many seconds of low motion before a body is put to sleep.
+# Rust: `SLEEP_TIME_THRESHOLD_3D: f64 = 0.5`
+var _IM_B3_SLEEP_TIME_THRESHOLD_3D: f64 = 0.5;
+
+# Minimum mass to avoid division by zero for dynamic bodies.
+# Rust: `MIN_MASS: f64 = 1e-6`
+var _IM_B3_MIN_MASS: f64 = 0.000001;
+
+# Minimum inertia to avoid division by zero.
+# Rust: `MIN_INERTIA: f64 = 1e-10`
+var _IM_B3_MIN_INERTIA: f64 = 0.0000000001;
+
 # ── rust-old/src/world.rs ──
 
 # MAX_SNAPSHOT_INDEX is not carried: the snapshot code's public cap on restored handle indices, carried with M6.
@@ -2469,6 +2495,18 @@ fn _im_clamp(x: f64, lo: f64, hi: f64): f64 {
     if (r < lo) { r = lo; }
     if (r > hi) { r = hi; }
     return r;
+}
+
+# 1.0 with x's sign (−0 gives −1.0), or Rust's `f64::NAN` (the positive quiet NaN, whatever x's NaN bits) for a NaN
+# x. Mirrors `f64::signum`.
+#must_use
+fn _im_signum(x: f64): f64 {
+    if (x != x) {
+        var n: f64 = _im_cr_from_word(0x7ff8000000000000);
+        return n;
+    }
+    if (_im_bits(x) < 0) { return -1.0; }
+    return 1.0;
 }
 
 # Degrees to radians: one multiply by the folded π/180. Mirrors `f64::to_radians`.

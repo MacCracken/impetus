@@ -634,6 +634,82 @@ fails when either drifts from `cyrius.cyml`.
   (ADR 0011: 70). Before particle JSON it was 98,393 ok. The ELF and PE digests are equal (their `powf` digest is new). On aarch64 only the native shadows
   differ.
 
+## 17. M4a: glam's 3D math and the 3D backend's types (2026-11-09, ADR 0012)
+
+- **The decision** (ADR 0012). The 3D step path can't call hisab until its allocations can be scoped (§4.1). The
+  maintainer chose the stopgap over waiting: impetus transcribes glam's math and ports its own GJK/EPA, gated as the
+  2D backend is (classes A–C, 0 ulp against the corrected oracle). H9 is filed in hisab
+  (`hisab/docs/development/issues/2026-11-09-allocator-scoped-calls.md`). Its repro exits 1 while 7 of 7 calls leak,
+  the same numbers as §4.1.
+- **`src/math3.cyr`.** These are glam 0.29.3's `DVec3`, `DQuat` and `DMat3` operations as the 3D backend calls them,
+  read from the registry source of the version the oracle links. hisab 1.4.0 enables only `std` and `serde`, so all
+  of it is scalar f64 code. Every formula keeps glam's order: the cross product's operand order, `mul_vec3`'s chained
+  adds, the inverse by adjugate then transpose, `DVec4`'s dot for a quaternion's length. `+` and `−` are overloaded.
+  There is no `*` overload: glam's `*` means four different operations by operand type, and Cyrius dispatches on the
+  left operand only.
+- **`b3_math.tsv`**, 7,087 rows from the `b3` build. It drives glam through hisab 1.4.0's re-export, which is now an
+  optional dependency of that build and was already in its lock.
+  - The inputs are edge vectors (±0, axes, subnormal, overflowing squares, ±∞, NaN), seeded ones, unit vectors for
+    `any_orthonormal_pair`, angles from 0 to 1e300, unit and non-unit quaternions, and dense, rotation, diagonal,
+    singular and non-finite matrices.
+  - Class A for one IEEE operation per output, B for compositions, and C for the three rotations built on `sin_cos`.
+  - **All 0 ulp on three targets** with one digest (`0xe3ab711457c42b4d`). `validate.py` recomputes every row from
+    glam's formulas. MPFR corrects none, so there is no `b3_math.cr.tsv`.
+- **`f64::signum`** (glam's `any_orthonormal_pair`): `_im_signum` returns Rust's own positive NaN for a NaN of
+  either sign. That adds 326 `math.tsv` rows (19,491), all exact.
+- **`src/b3_types.cyr`**, a transcription of `backend_3d/types.rs` on math3:
+  - bodies, with `from_desc`'s z rotation, R·I⁻¹·Rᵀ, both integrations, and the gyroscopic step (one Newton step of
+    backward Euler, projected onto the pre-step energy);
+  - colliders, with world AABBs for every shape, mass and inertia (capsule as cylinder plus hemispheres, hull and
+    mesh by their points' AABB);
+  - the parallel-axis shift.
+
+  `recompute_mass_properties` is three steps (reset, add each collider, finish) for M5's state to loop. The six
+  private constants are generated as `_IM_B3_*`.
+- **`b3_body.tsv`**, 234 rows. Each builds a 3D world, adds a body from a full descriptor and its colliders through
+  the public API, and reads the dump: 60 outputs, every stored field but the handle. The rows cover:
+  - every shape alone, including a zero radius, a flat box, a flat hull (the 1 m³ fallback), one point and none;
+  - densities from 0 to 1,000 and explicit masses (0, −1, 1e12);
+  - offsets, several colliders, and a symmetric set;
+  - static and kinematic bodies, fixed rotation, rotations from −0 to 10;
+  - 150 seeded bodies.
+
+  Class C. All 0 ulp on three targets, and `validate.py` recomputes all of them.
+- **A compiler defect, found by these rows.** On the first run 202 of the 234 bodies failed, each with its inverse
+  inertia equal to its inertia.
+  - cyrius 6.7.18 compiles `s.f = g(.., t.e, ..)` to store `t.e` itself when `g` returns a struct and `t.e` is a
+    struct-typed field, at any depth of the arguments. Every struct size is affected.
+  - A local destination, `var t: T = g(..)`, an f64-field argument, a method on a field and the operator form are
+    all correct.
+  - Workaround: bind the call to a local, then store it (7 sites in `b3_types.cyr`).
+  - `scripts/surface_parity.py` resolves argument types and fails on any new site; the 2D code has none.
+  - Filed as `cyrius/docs/development/issues/2026-11-09-field-store-of-struct-call-copies-a-field-argument.md`, with
+    a repro that exits 1 on 7 wrong forms.
+- **Performance, within the work loop.** Each helper call copies its by-value struct arguments, so `ImQuat_mul_vec3`
+  as a chain of nine helpers cost 128 ns. The composite operations now read components into f64 locals in glam's
+  order:
+  - rotation 41 ns, against hisab's allocating `hquat_rotate_vec3` at 51 ns;
+  - 3×3 product 86 ns, against `m3_mul` at 89 ns;
+  - inverse 50 ns.
+
+  The digest and every row are unchanged. `docs/benchmarks-rust-v-cyrius.md` has the rows.
+- **Rust tests.** `tests/b3_types.tcyr` (23 assertions) ports the type-level tests of `backend_3d/tests.rs`:
+  - quaternion identity and z rotation, the sphere, box and hull masses, the capsule tensor;
+  - accumulation over colliders, the parallel-axis theorem with its off-diagonal term, and removal as a recompute
+    over none;
+  - gyroscopic precession, and its absence for a symmetric body.
+
+  It adds a free spin integrated for 600 steps (energy never grows, |L| holds; the Rust test steps the state, M5),
+  the AABB rule, and a flat heap (global and freelist) across the math, integration, AABBs and mass.
+- **The 3D profile.** `[lib.3d]`: the shared modules, `math3`, `b3_types`, then `particle` and `json`, which touch no
+  backend. `distlib` writes `dist/impetus-3d.cyr`. `tests/lib_3d.cyr` mirrors the list, and `surface_parity.py` now
+  fails if either mirror drifts. The descriptor token helpers moved to `tests/parity_types.cyr`, shared by both
+  harnesses.
+- **Still unpinned by golden rows:** `integrate_velocities`, `integrate_positions` and the gyroscopic step (M5's
+  single steps), and `world_aabb` (M4's 3D queries and M5's broadphase). The reference tests above exercise them.
+- **Result, every target:** 3D **7,321 ok, 0 failed** (2 modules); 2D **98,874 ok, 0 failed, 0 measured, 7 pending,
+  165 accepted** (18 modules). The digests are equal on ELF, PE and aarch64, except the 2D native shadows, as before.
+
 ## How to reproduce
 
 ```sh
@@ -643,6 +719,8 @@ python3 -I scripts/oracle/validate.py . --write   # regenerates them (needs libm
 cyrius test tests/parity_2d.tcyr                  # x86_64 ELF
 cyrius test --win tests/parity_2d.tcyr            # x86_64 PE, needs wine
 cyrius test --aarch64 tests/parity_2d.tcyr        # aarch64, needs qemu-aarch64
+cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml --no-default-features --features b3 -- --check
+cyrius test tests/parity_3d.tcyr                  # the b3_* modules; also --win and --aarch64
 cyrius run scripts/probes/p1_memory.cyr           # §4.1
 cyrius bench scripts/probes/p2_vectors.bcyr       # §4.2
 ```

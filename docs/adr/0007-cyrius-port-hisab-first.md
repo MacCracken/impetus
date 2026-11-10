@@ -110,3 +110,7 @@ redirects `alloc` to a caller's arena (request S1, port plan §8), or allocator-
 - Every hisab use on the step path that this ADR names (3D quaternion and matrix ops, GJK/EPA, BVH,
   `detect_islands`) moves behind that request. Where the port plan lists them as "use", read "use
   once S1/H9 lands".
+
+**M4 decision (2026-11-09).** The maintainer chose the stopgap: [ADR 0012](0012-impetus-owned-3d-math-stopgap.md)
+transcribes glam's 3D math by value and ports impetus's own GJK/EPA, gated at classes A–C. H9 is filed in hisab
+(`hisab/docs/development/issues/2026-11-09-allocator-scoped-calls.md`) alongside S1.

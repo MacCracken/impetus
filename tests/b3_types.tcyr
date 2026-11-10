@@ -1,0 +1,284 @@
+# b3_types.tcyr — the ported Rust tests of rust-old/src/backend_3d/types.rs (M4): the quaternion, mass, inertia and
+# gyroscopic tests of backend_3d/tests.rs that touch the types alone, the parallel-axis tests with the state's mass
+# recompute run as src/b3_types.cyr's three steps, and Cyrius-only tests: a free spin integrated directly (the Rust
+# test steps the state, M5), the AABB overlap rule, and a flat heap across the 3D math, integration and mass code.
+
+include "tests/lib_3d.cyr"
+
+# 1 when |got − want| < eps.
+fn near(got: f64, want: f64, eps: f64): i64 {
+    var d: f64 = f64_abs(got - want);
+    if (d < eps) { return 1; }
+    return 0;
+}
+
+# A collider of `shape` at `offset` on body 0 with the default material (density 1), or the explicit mass `m` when
+# has_m is 1. The collider holds its own copy of the shape's arrays; the caller frees both.
+fn coll(shape: ImColliderShape, offset: ImVec3, has_m, m: f64): ImCollider3d {
+    var d: ImColliderDesc = ImColliderDesc_new(shape);
+    d.offset = offset;
+    d.has_mass = has_m;
+    d.mass = m;
+    return ImCollider3d_from_desc(0, 0, d);
+}
+
+# The eight corners ±h of a cube as hull points (freelist words; the shape copies them).
+fn cube_hull(h: f64): ImColliderShape {
+    var w = fl_alloc(8 * 24);
+    for (var k = 0; k < 8; k = k + 1) {
+        var x: f64 = h;
+        var y: f64 = h;
+        var z: f64 = h;
+        if ((k & 1) == 0) { x = -h; }
+        if ((k & 2) == 0) { y = -h; }
+        if ((k & 4) == 0) { z = -h; }
+        store64(w + k * 24, _im_bits(x));
+        store64(w + k * 24 + 8, _im_bits(y));
+        store64(w + k * 24 + 16, _im_bits(z));
+    }
+    var s: ImColliderShape = ImColliderShape_convex_hull(w, 8);
+    fl_free(w);
+    return s;
+}
+
+# A dynamic body at the origin from the default descriptor.
+fn body(): ImRigidBody3d {
+    return ImRigidBody3d_from_desc(0, ImBodyDesc_default());
+}
+
+# The rotational kinetic energy ½ω·(R I Rᵀ)ω and |L| of a body, as the Rust test's `spin_energy_and_momentum`.
+fn spin(b: *ImRigidBody3d) {
+    var r: ImMat3 = ImMat3_from_quat(b.rotation);
+    var iw: ImMat3 = ImMat3_mul_mat3(ImMat3_mul_mat3(r, b.inertia), ImMat3_transpose(r));
+    var l: ImVec3 = ImMat3_mul_vec3(iw, b.angular_velocity);
+    var d: f64 = ImVec3_dot(b.angular_velocity, l);
+    var e: f64 = 0.5 * d;
+    var lm: f64 = ImVec3_length(l);
+    return (e, lm);
+}
+
+fn main() {
+    alloc_init();
+    var eps: f64 = 0.0000000001;
+    var pi: f64 = _IM_PI;
+    var zero: ImVec3 = ImVec3_zero();
+
+    test_group("quaternion_identity_rotation");
+    var r0: ImVec3 = ImQuat_mul_vec3(ImQuat_identity(), ImVec3_new(1.0, 0.0, 0.0));
+    assert_eq(near(r0.x, 1.0, eps) + near(r0.y, 0.0, eps) + near(r0.z, 0.0, eps), 3, "x stays x");
+
+    test_group("quaternion_z_rotation");
+    var r1: ImVec3 = ImQuat_mul_vec3(ImQuat_from_rotation_z(pi / 2.0), ImVec3_new(1.0, 0.0, 0.0));
+    assert_eq(near(r1.x, 0.0, eps) + near(r1.y, 1.0, eps) + near(r1.z, 0.0, eps), 3, "x turns to y");
+
+    test_group("sphere_mass_3d");
+    var c1: ImCollider3d = coll(ImColliderShape_ball(1.0), zero, 0, 0.0);
+    var m1: f64 = c1.compute_mass();
+    var k43: f64 = 4.0 / 3.0;
+    assert_eq(near(m1, k43 * pi, eps), 1, "4/3 π");
+    c1.free();
+
+    test_group("box_mass_3d");
+    var c2: ImCollider3d = coll(ImColliderShape_box(1.0, 1.0, 1.0), zero, 0, 0.0);
+    var m2: f64 = c2.compute_mass();
+    assert_eq(near(m2, 8.0, eps), 1, "8");
+    c2.free();
+
+    test_group("hull_mass_scales_with_size");
+    var h05: ImColliderShape = cube_hull(0.5);
+    var h10: ImColliderShape = cube_hull(1.0);
+    var c3: ImCollider3d = coll(h05, zero, 0, 0.0);
+    var c4: ImCollider3d = coll(h10, zero, 0, 0.0);
+    var m3: f64 = c3.compute_mass();
+    var m4: f64 = c4.compute_mass();
+    assert_eq(near(m3, 1.0, eps) + near(m4, 8.0, eps), 2, "1 and 8");
+    c3.free();
+    c4.free();
+    h05.free();
+    h10.free();
+
+    test_group("capsule_inertia_matches_standard_tensor");
+    var cr: f64 = 0.5;
+    var chh: f64 = 1.0;
+    var c5: ImCollider3d = coll(ImColliderShape_capsule(chh, cr), zero, 0, 0.0);
+    var m5: f64 = c5.compute_mass();
+    var i5: ImMat3 = c5.compute_inertia(m5);
+    var ch: f64 = 2.0 * chh;
+    var r3: f64 = _im_powi3(cr);
+    var v_cyl: f64 = pi * cr * cr * ch;
+    var v_hem: f64 = 4.0 / 3.0 * pi * r3;
+    var m_cyl: f64 = m5 * v_cyl / (v_cyl + v_hem);
+    var m_hem: f64 = m5 * v_hem / (v_cyl + v_hem);
+    var i_axis: f64 = m_cyl * cr * cr / 2.0 + m_hem * 2.0 * cr * cr / 5.0;
+    var i_perp: f64 = m_cyl * (ch * ch / 12.0 + cr * cr / 4.0)
+    + m_hem * (2.0 * cr * cr / 5.0 + ch * ch / 4.0 + 3.0 * ch * cr / 8.0);
+    var tol: f64 = 0.000000001;
+    assert_eq(near(i5.y.y, i_axis, tol), 1, "axis");
+    assert_eq(near(i5.x.x, i_perp, tol) + near(i5.z.z, i_perp, tol), 2, "perpendicular");
+    c5.free();
+
+    test_group("multiple_colliders_accumulate_mass_3d");
+    var b6: ImRigidBody3d = body();
+    var c6: ImCollider3d = coll(ImColliderShape_ball(1.0), zero, 0, 0.0);
+    var c7: ImCollider3d = coll(ImColliderShape_ball(1.0), ImVec3_new(2.0, 0.0, 0.0), 0, 0.0);
+    _im_b3_mass_reset(&b6);
+    _im_b3_mass_add(&b6, &c6);
+    _im_b3_mass_finish(&b6);
+    var first: f64 = b6.mass;
+    _im_b3_mass_reset(&b6);
+    _im_b3_mass_add(&b6, &c6);
+    _im_b3_mass_add(&b6, &c7);
+    _im_b3_mass_finish(&b6);
+    var both: f64 = b6.mass;
+    assert_eq(near(both, 2.0 * first, eps), 1, "twice the mass");
+    c6.free();
+    c7.free();
+
+    test_group("offset_colliders_use_parallel_axis_theorem");
+    var b8: ImRigidBody3d = body();
+    var c8: ImCollider3d = coll(ImColliderShape_ball(1.0), ImVec3_new(-2.0, 0.0, 0.0), 1, 1.0);
+    var c9: ImCollider3d = coll(ImColliderShape_ball(1.0), ImVec3_new(2.0, 0.0, 0.0), 1, 1.0);
+    _im_b3_mass_reset(&b8);
+    _im_b3_mass_add(&b8, &c8);
+    _im_b3_mass_add(&b8, &c9);
+    _im_b3_mass_finish(&b8);
+    var i_own: f64 = 0.4;
+    assert_eq(near(b8.inertia.x.x, 2.0 * i_own, eps), 1, "about the line of centres");
+    assert_eq(near(b8.inertia.y.y, 2.0 * (i_own + 4.0), eps) + near(b8.inertia.z.z, 2.0 * (i_own + 4.0), eps), 2,
+      "across it");
+    c8.free();
+    c9.free();
+    var b9: ImRigidBody3d = body();
+    var c10: ImCollider3d = coll(ImColliderShape_ball(1.0), ImVec3_new(1.0, 1.0, 0.0), 1, 1.0);
+    _im_b3_mass_reset(&b9);
+    _im_b3_mass_add(&b9, &c10);
+    _im_b3_mass_finish(&b9);
+    assert_eq(near(b9.inertia.x.y, -1.0, eps), 1, "off-diagonal −m·dx·dy");
+    assert_eq(near(b9.inertia.z.z, 0.4 + 2.0, eps), 1, "zz");
+    # Removing the collider recomputes over none: mass and inverses zero.
+    _im_b3_mass_reset(&b9);
+    _im_b3_mass_finish(&b9);
+    var m9: f64 = b9.mass;
+    var im9: f64 = b9.inv_mass;
+    assert_eq(m9 == 0.0 && im9 == 0.0, 1, "no colliders, no mass");
+    c10.free();
+
+    test_group("static_and_fixed_rotation_mass");
+    var bd: ImBodyDesc = ImBodyDesc_default();
+    bd.body_type = IM_BODY_STATIC;
+    var b10: ImRigidBody3d = ImRigidBody3d_from_desc(0, bd);
+    var c11: ImCollider3d = coll(ImColliderShape_ball(0.5), zero, 0, 0.0);
+    _im_b3_mass_reset(&b10);
+    _im_b3_mass_add(&b10, &c11);
+    _im_b3_mass_finish(&b10);
+    var sm: f64 = b10.mass;
+    var sim: f64 = b10.inv_mass;
+    var sw: f64 = b10.inv_inertia_world.x.x;
+    assert_eq(sm == 0.0 && sim == 0.0 && sw == 0.0, 1, "a static body has none");
+    var fd: ImBodyDesc = ImBodyDesc_default();
+    fd.fixed_rotation = 1;
+    var b11: ImRigidBody3d = ImRigidBody3d_from_desc(0, fd);
+    _im_b3_mass_reset(&b11);
+    _im_b3_mass_add(&b11, &c11);
+    _im_b3_mass_finish(&b11);
+    var fi: f64 = b11.inv_inertia.x.x;
+    var fm: f64 = b11.inv_mass;
+    assert_eq(fi == 0.0 && fm > 0.0, 1, "fixed rotation: no inverse inertia, an inverse mass");
+    c11.free();
+
+    test_group("gyroscopic_torque_precession");
+    var g1: ImRigidBody3d = body();
+    g1.mass = 1.0;
+    g1.inv_mass = 1.0;
+    g1.inertia = ImMat3_from_diagonal(ImVec3_new(1.0, 2.0, 3.0));
+    g1.inv_inertia = ImMat3_from_diagonal(ImVec3_new(1.0, 0.5, 1.0 / 3.0));
+    g1.angular_velocity = ImVec3_new(10.0, 5.0, 0.0);
+    var before_z: f64 = g1.angular_velocity.z;
+    g1.integrate_velocities(zero, 1.0 / 60.0, 100.0);
+    var dz: f64 = g1.angular_velocity.z - before_z;
+    var adz: f64 = f64_abs(dz);
+    assert_eq(adz > 0.01, 1, "cross-axis change");
+
+    test_group("gyroscopic_torque_symmetric_no_precession");
+    var g2: ImRigidBody3d = body();
+    g2.mass = 1.0;
+    g2.inv_mass = 1.0;
+    g2.inertia = ImMat3_from_diagonal(ImVec3_splat(2.0));
+    g2.inv_inertia = ImMat3_from_diagonal(ImVec3_splat(0.5));
+    g2.angular_velocity = ImVec3_new(10.0, 0.0, 0.0);
+    var w_before: ImVec3 = g2.angular_velocity;
+    g2.integrate_velocities(zero, 1.0 / 60.0, 100.0);
+    var wd: ImVec3 = g2.angular_velocity - w_before;
+    var dl: f64 = ImVec3_length(wd);
+    assert_eq(dl < 0.01, 1, "negligible");
+
+    test_group("free_spinning_body_does_not_gain_energy");
+    # The Rust test's body and spin, integrated directly: velocities then positions at 1/60 s, 600 steps.
+    var sd: ImBodyDesc = ImBodyDesc_default();
+    sd.rotation = 0.7;
+    var fs: ImRigidBody3d = ImRigidBody3d_from_desc(0, sd);
+    var c12: ImCollider3d = coll(ImColliderShape_box(1.0, 0.5, 0.25), zero, 0, 0.0);
+    _im_b3_mass_reset(&fs);
+    _im_b3_mass_add(&fs, &c12);
+    _im_b3_mass_finish(&fs);
+    c12.free();
+    var qa: ImQuat = ImQuat_mul_quat(ImQuat_from_rotation_x(0.3), ImQuat_from_rotation_y(0.7));
+    var qr: ImQuat = ImQuat_mul_quat(qa, ImQuat_from_rotation_z(-0.4));
+    fs.rotation = qr;
+    var w0: ImVec3 = ImQuat_mul_vec3(qr, ImVec3_new(0.2, 8.0, 0.3));
+    fs.angular_velocity = w0;
+    fs.update_inertia_world();
+    var ev0, lv0 = spin(&fs);
+    var e0: f64 = ev0;
+    var l0: f64 = lv0;
+    var grew = 0;
+    var cap: f64 = e0 * (1.0 + 0.000000001);
+    for (var s = 0; s < 600; s = s + 1) {
+        fs.integrate_velocities(zero, 1.0 / 60.0, 100.0);
+        fs.integrate_positions(1.0 / 60.0);
+        var evs, lvs = spin(&fs);
+        var es: f64 = evs;
+        if (es > cap) { grew = grew + 1; }
+    }
+    var ev1, lv1 = spin(&fs);
+    var e1: f64 = ev1;
+    var l1: f64 = lv1;
+    var drift: f64 = f64_abs(l1 - l0);
+    assert_eq(grew, 0, "energy never grows");
+    assert_eq(e1 > 0.5 * e0, 1, "energy does not collapse");
+    assert_eq(drift < 0.1 * l0, 1, "|L| holds");
+
+    test_group("aabb_overlaps_touching");
+    var a1: ImAabb3d = ImAabb3d_new(zero, ImVec3_splat(1.0));
+    var a2: ImAabb3d = ImAabb3d_new(ImVec3_new(1.0, 0.5, 0.5), ImVec3_splat(2.0));
+    var a3: ImAabb3d = ImAabb3d_new(ImVec3_new(1.5, 0.0, 0.0), ImVec3_splat(2.0));
+    var a4: ImAabb3d = ImAabb3d_new(ImVec3_new(0.0, 0.0, 1.0000001), ImVec3_splat(2.0));
+    assert_eq(a1.overlaps(&a2), 1, "touching faces overlap");
+    assert_eq(a1.overlaps(&a3) + a1.overlaps(&a4), 0, "separated on x, on z");
+
+    test_group("flat_heap_3d");
+    # Value math, integration, world AABBs and the mass recompute allocate nothing on either heap.
+    var fb: ImRigidBody3d = body();
+    var fc: ImCollider3d = coll(ImColliderShape_capsule(0.5, 0.25), ImVec3_new(0.5, 0.0, 0.0), 0, 0.0);
+    var heap0 = alloc_used();
+    var arena0 = _fl_arena;
+    var pos0 = _fl_arena_pos;
+    for (var s2 = 0; s2 < 1000; s2 = s2 + 1) {
+        _im_b3_mass_reset(&fb);
+        _im_b3_mass_add(&fb, &fc);
+        _im_b3_mass_finish(&fb);
+        fb.angular_velocity = ImVec3_new(1.0, 2.0, 3.0);
+        fb.integrate_velocities(ImVec3_new(0.0, -9.81, 0.0), 1.0 / 60.0, 100.0);
+        fb.integrate_positions(1.0 / 60.0);
+        var ab: ImAabb3d = fc.world_aabb(fb.position, fb.rotation);
+        var inv: ImMat3 = ImMat3_inverse(fb.inertia);
+    }
+    assert_eq(alloc_used() == heap0 && _fl_arena == arena0 && _fl_arena_pos == pos0, 1, "no growth");
+    fc.free();
+
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

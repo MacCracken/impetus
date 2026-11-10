@@ -161,6 +161,12 @@ pub fn emit() -> Module {
     xs.extend(sweep(0x5159, 200, 0.0, 1e4));
     unary(&mut m, "f64::sqrt", Class::A, f64::sqrt, &xs);
     unary(&mut m, "f64::abs", Class::A, f64::abs, &wide(0xab5, 100));
+    // signum (glam's `any_orthonormal_pair`, M4): ±0, ±∞, the subnormals either side of 0, a NaN of
+    // each sign (both give Rust's positive `f64::NAN`), then random values.
+    let mut sg = specials();
+    sg.extend([-f64::from_bits(1), f64::from_bits(0xfff8_0000_0000_0000)]);
+    sg.extend(wide(0x5165, 40));
+    unary(&mut m, "f64::signum", Class::A, f64::signum, &sg);
 
     // floor / ceil: impetus's spatial hash takes floor/ceil of coordinate / cell size. Ties
     // and the doubles either side of an integer, then sweeps.

@@ -1,0 +1,152 @@
+# impetus 3D benchmarks — the 3D profile's rows (M4 on). Rust's simulation.rs times the 3D backend only through the
+# world, so these are Cyrius-only rows until the 3D world steps (M5); they are recorded in
+# docs/benchmarks-rust-v-cyrius.md. Same pattern as tests/impetus.bcyr: bench_new -> bench_batch_start -> tight loop ->
+# bench_batch_stop -> bench_report.
+#
+# M4 part 1: glam's value math (src/math3.cyr) beside hisab's allocating calls for the same operation (ADR 0012's
+# trade), the gyroscopic step, body integration, the mass recompute and a world AABB.
+
+include "tests/lib_3d.cyr"
+
+var N = 1000000;
+var g_sink = 0;
+
+# A unit quaternion off every axis.
+fn quat(): ImQuat {
+    var a: ImQuat = ImQuat_mul_quat(ImQuat_from_rotation_x(0.3), ImQuat_from_rotation_y(0.7));
+    return ImQuat_mul_quat(a, ImQuat_from_rotation_z(-0.4));
+}
+
+# Value math against hisab's allocating forms (24 B or 72 B of global heap per hisab call, never returned).
+fn bench_math3() {
+    var q: ImQuat = quat();
+    var v: ImVec3 = ImVec3_new(1.0, 2.0, 3.0);
+    var b = bench_new("b3/math_quat_mul_vec3");
+    bench_batch_start(b);
+    for (var i = 0; i < N; i = i + 1) {
+        var r: ImVec3 = ImQuat_mul_vec3(q, v);
+        g_sink = _im_bits(r.x);
+    }
+    bench_batch_stop(b, N);
+    bench_report(b);
+
+    var hq = hquat_new(q.x, q.y, q.z, q.w);
+    var hv = hvec3_new(1.0, 2.0, 3.0);
+    var n2 = 100000;
+    var bh = bench_new("b3/hisab_hquat_rotate_vec3 (allocates)");
+    bench_batch_start(bh);
+    for (var i2 = 0; i2 < n2; i2 = i2 + 1) { g_sink = hquat_rotate_vec3(hq, hv); }
+    bench_batch_stop(bh, n2);
+    bench_report(bh);
+
+    var m: ImMat3 = ImMat3_from_quat(q);
+    var bm = bench_new("b3/math_mat3_mul_mat3");
+    bench_batch_start(bm);
+    for (var i3 = 0; i3 < N; i3 = i3 + 1) {
+        var p: ImMat3 = ImMat3_mul_mat3(m, m);
+        g_sink = _im_bits(p.x.x);
+    }
+    bench_batch_stop(bm, N);
+    bench_report(bm);
+
+    var j: ImMat3 = ImMat3_from_diagonal(ImVec3_new(1.0, 2.0, 3.0));
+    var bi = bench_new("b3/math_mat3_inverse");
+    bench_batch_start(bi);
+    for (var i4 = 0; i4 < N; i4 = i4 + 1) {
+        var inv: ImMat3 = ImMat3_inverse(j);
+        g_sink = _im_bits(inv.x.x);
+    }
+    bench_batch_stop(bi, N);
+    bench_report(bi);
+
+    var hm = m3_from_quat(hq);
+    var bhm = bench_new("b3/hisab_m3_mul (allocates)");
+    bench_batch_start(bhm);
+    for (var i5 = 0; i5 < n2; i5 = i5 + 1) { g_sink = m3_mul(hm, hm); }
+    bench_batch_stop(bhm, n2);
+    bench_report(bhm);
+    return 0;
+}
+
+# A dynamic body with a box collider, its mass set, spinning off-axis.
+fn spinning_box(): ImRigidBody3d {
+    var b: ImRigidBody3d = ImRigidBody3d_from_desc(0, ImBodyDesc_default());
+    var c: ImCollider3d = ImCollider3d_from_desc(0, 0, ImColliderDesc_new(ImColliderShape_box(1.0, 0.5, 0.25)));
+    _im_b3_mass_reset(&b);
+    _im_b3_mass_add(&b, &c);
+    _im_b3_mass_finish(&b);
+    c.free();
+    b.rotation = quat();
+    b.angular_velocity = ImVec3_new(0.2, 8.0, 0.3);
+    b.torque_accumulator = ImVec3_new(0.1, 0.0, -0.2);
+    b.update_inertia_world();
+    return b;
+}
+
+fn bench_body() {
+    var b: ImRigidBody3d = spinning_box();
+    var w: ImVec3 = ImVec3_new(0.2, 8.0, 0.3);
+    var n = 100000;
+    var bg = bench_new("b3/gyroscopic_step");
+    bench_batch_start(bg);
+    for (var i = 0; i < n; i = i + 1) {
+        var r: ImVec3 = _im_b3_gyroscopic_step(b.inertia, w, 1.0 / 60.0);
+        g_sink = _im_bits(r.x);
+    }
+    bench_batch_stop(bg, n);
+    bench_report(bg);
+
+    var g: ImVec3 = ImVec3_new(0.0, -9.81, 0.0);
+    var bv = bench_new("b3/integrate_velocities");
+    bench_batch_start(bv);
+    for (var i2 = 0; i2 < n; i2 = i2 + 1) { b.integrate_velocities(g, 1.0 / 60.0, 100.0); }
+    bench_batch_stop(bv, n);
+    bench_report(bv);
+
+    var bp = bench_new("b3/integrate_positions");
+    bench_batch_start(bp);
+    for (var i3 = 0; i3 < n; i3 = i3 + 1) { b.integrate_positions(1.0 / 60.0); }
+    bench_batch_stop(bp, n);
+    bench_report(bp);
+    return 0;
+}
+
+fn bench_mass_and_aabb() {
+    var b: ImRigidBody3d = spinning_box();
+    var c: ImCollider3d = ImCollider3d_from_desc(0, 0, ImColliderDesc_new(ImColliderShape_box(1.0, 0.5, 0.25)));
+    c.offset = ImVec3_new(0.5, -0.25, 1.0);
+    var n = 100000;
+    var bm = bench_new("b3/body_mass_box_offset");
+    bench_batch_start(bm);
+    for (var i = 0; i < n; i = i + 1) {
+        _im_b3_mass_reset(&b);
+        _im_b3_mass_add(&b, &c);
+        _im_b3_mass_finish(&b);
+    }
+    bench_batch_stop(bm, n);
+    bench_report(bm);
+
+    var p: ImVec3 = ImVec3_new(1.0, 2.0, 3.0);
+    var q: ImQuat = quat();
+    var ba = bench_new("b3/world_aabb_box_rotated");
+    bench_batch_start(ba);
+    for (var i2 = 0; i2 < n; i2 = i2 + 1) {
+        var ab: ImAabb3d = c.world_aabb(p, q);
+        g_sink = _im_bits(ab.min.x);
+    }
+    bench_batch_stop(ba, n);
+    bench_report(ba);
+    c.free();
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    bench_math3();
+    bench_body();
+    bench_mass_and_aabb();
+    return 0;
+}
+
+var r = main();
+sys_exit_group(r);

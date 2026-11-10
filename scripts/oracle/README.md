@@ -48,7 +48,7 @@ harness reads the same files. This README records what is specific to impetus.
 | Module | Build | Milestone | Golden rows | Golden emitter | Generated Cyrius |
 |---|---|---|---|---|---|
 | `constants` | b2 | M0 | 3 | `src/m_constants.rs` | `src/constants.cyr` (`src/t_constants.rs`, with the completeness proof) |
-| `math` | b2 | M0 | 19,165 | `src/m_math.rs` | — |
+| `math` | b2 | M0 (+ `f64::signum`, M4) | 19,491 | `src/m_math.rs` | — |
 | `config`, `material`, `units`, `force` | b2 | M1a | 293, 2,046, 2,236, 1,308 | `src/m_<module>.rs` | — |
 | `fmtf`, `json` | b2 | M1b (json: + the particle types, M3) | 37,576, 1,092 | `src/m_fmtf.rs`, `src/m_json.rs` | — |
 | `spring`, `types` | b2 | M1b | 1,000, 1 | `src/m_spring.rs`, `src/m_types.rs` | — |
@@ -60,7 +60,9 @@ harness reads the same files. This README records what is specific to impetus.
 | `b2_contact` | b2 | M3 | 418 (+ 2 corrected) | `src/m_b2_contact.rs` | — |
 | `b2_step` | b2 | M3 | 214 (+ 4 corrected) | `src/m_b2_step.rs` | — |
 | `world_step` | b2 | M3 | 198 | `src/m_world.rs` | — |
-| (private constants) | b2 | M2 | — | — | `src/constants_private.cyr` (`src/t_private.rs`: every library `const` of `aabb_tree.rs`, `spatial_hash.rs`, `backend_2d/joints.rs`, `backend_2d/solver.rs`, `backend_2d/types.rs` and `world.rs`, emitted or excused; a `[f64; N]` array, which may span lines, becomes N globals `_0` … `_{N-1}`) |
+| `b3_math` | b3 | M4 | 7,087 | `src/m_b3_math.rs` | — |
+| `b3_body` | b3 | M4 | 234 | `src/m_b3_body.rs` | — |
+| (private constants) | b2 | M2 | — | — | `src/constants_private.cyr` (`src/t_private.rs`: every library `const` of `aabb_tree.rs`, `spatial_hash.rs`, `backend_2d/joints.rs`, `backend_2d/solver.rs`, `backend_2d/types.rs`, `backend_3d/types.rs` and `world.rs`, emitted or excused; a `[f64; N]` array, which may span lines, becomes N globals `_0` … `_{N-1}`) |
 
 ## Format 1
 
@@ -92,6 +94,14 @@ impetus specifics:
   body (`e:BodyType`, `fixed_rotation`), adds its colliders through the public `add_collider`, and reads the body
   back from `oracle_dump()`. Inputs: `v:<colliders>`, then per collider its shape (`flat::shape`), offset x and y,
   density, and `n:` or the explicit mass. Outputs: mass, inertia (about the body origin), inv_mass, inv_inertia.
+- glam rows (`b3_math.tsv`, the 3D build only) call glam 0.29.3's `DVec3`, `DQuat` and `DMat3` through hisab 1.4.0's
+  re-export (an optional dependency of the `b3` build, already in the lock). A vector is 3 f64 tokens, a quaternion 4
+  (x, y, z, w), a matrix 9 by columns. Class A for one IEEE operation per output, B for compositions, C for the
+  rotations built on `sin_cos` (ADR 0012).
+- 3D body rows (`b3_body.tsv`, the 3D build only) come from a world dump, as the 2D mass rows do, with a full
+  `BodyDesc` (`flat::body_desc`) and per collider its shape, offset x, y and z, density, and `n:` or the explicit mass.
+  Outputs: every stored body field but the handle and type (`Body3dDump`), matrices by columns. Class C (the z
+  rotation's `sin_cos`).
 - Narrowphase rows (`b2_narrow.tsv`, the 2D build only) go through the hooks `contacts_2d` and `shapes_touch_2d`.
   Inputs: shape A (`flat::shape`), A's x, y and rotation, then shape B and its pose. `b2::contacts` (class C)
   outputs `v:N` and each contact's normal x, y (A to B), depth and world point x, y, in generation order;
@@ -192,6 +202,10 @@ Standard-library Python, run with `-I`. It never calls the oracle:
   state, rebuilding every result and dump token;
 - every `b2_mass` body is recomputed: its own `shape_props` and `polygon_mass_props` in Rust's operation order,
   the floors, the parallel-axis sum and `refresh_inverse_mass`;
+- every `b3_math` row is recomputed from glam's formulas in their operation order, the rotations on glibc's sin and
+  cos (MPFR's for the corrected oracle);
+- every `b3_body` body is recomputed: `from_desc`, each collider's mass, inertia and centroid, the parallel-axis sum
+  of `recompute_mass_properties`, the inverses and R·I⁻¹·Rᵀ;
 - `src/constants_private.cyr` holds every library `const` of the ported modules, each equal to Python's parse of
   the Rust literal;
 - the corrected oracle and `src/crmath_data.cyr` are current (above).

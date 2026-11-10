@@ -79,6 +79,7 @@ dependencies = [
 name = "impetus-oracle"
 version = "0.0.0"
 dependencies = [
+ "hisab",
  "impetus",
  "serde",
  "serde_json",

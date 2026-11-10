@@ -81,6 +81,32 @@ var _IM_B2_WARM_START_FACTOR: f64 = 0.95;
 
 # FALLBACK is not carried: the (1, [0, 0], 1) tuple local to `shape_props`, written in place in src/b2_types.cyr.
 
+# ── rust-old/src/backend_3d/types.rs ──
+
+# General-purpose geometry epsilon for zero-length checks.
+# Rust: `EPSILON: f64 = 1e-10`
+var _IM_B3_EPSILON: f64 = 0.0000000001;
+
+# Squared epsilon for distance-squared checks.
+# Rust: `EPSILON_SQ: f64 = 1e-20`
+var _IM_B3_EPSILON_SQ: f64 = 0.00000000000000000001;
+
+# Bodies with both linear and angular speed below this are candidates for sleep.
+# Rust: `SLEEP_VELOCITY_THRESHOLD_3D: f64 = 0.01`
+var _IM_B3_SLEEP_VELOCITY_THRESHOLD_3D: f64 = 0.01;
+
+# How many seconds of low motion before a body is put to sleep.
+# Rust: `SLEEP_TIME_THRESHOLD_3D: f64 = 0.5`
+var _IM_B3_SLEEP_TIME_THRESHOLD_3D: f64 = 0.5;
+
+# Minimum mass to avoid division by zero for dynamic bodies.
+# Rust: `MIN_MASS: f64 = 1e-6`
+var _IM_B3_MIN_MASS: f64 = 0.000001;
+
+# Minimum inertia to avoid division by zero.
+# Rust: `MIN_INERTIA: f64 = 1e-10`
+var _IM_B3_MIN_INERTIA: f64 = 0.0000000001;
+
 # ── rust-old/src/world.rs ──
 
 # MAX_SNAPSHOT_INDEX is not carried: the snapshot code's public cap on restored handle indices, carried with M6.

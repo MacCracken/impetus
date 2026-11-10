@@ -7,8 +7,8 @@
 //! the mass floors, …). `complete` proves that every `const` item in each listed module is
 //! emitted or excused, so a constant added to a ported module can't be missed.
 //!
-//! Names: `_IM_<NAME>` for the shared modules, `_IM_B2_<NAME>` for the 2D backend's (the 3D one
-//! repeats some names). f64 values are written positionally (the Cyrius lexer has no exponent)
+//! Names: `_IM_<NAME>` for the shared modules, `_IM_B2_<NAME>` for the 2D backend's and `_IM_B3_<NAME>`
+//! for the 3D backend's (it repeats some names). f64 values are written positionally (the Cyrius lexer has no exponent)
 //! as typed f64 globals; integers as `const`.
 
 use crate::cyr::{doc_comment, header};
@@ -57,6 +57,11 @@ fn sources() -> Vec<Source> {
                 "the (1, [0, 0], 1) tuple local to `shape_props`, written in place in \
                  src/b2_types.cyr",
             )],
+        },
+        Source {
+            file: "backend_3d/types.rs",
+            prefix: "_IM_B3_",
+            excused: &[],
         },
         Source {
             file: "world.rs",

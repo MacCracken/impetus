@@ -45,6 +45,10 @@ mod m_b2_ray;
 mod m_b2_state;
 #[cfg(not(feature = "b3"))]
 mod m_b2_step;
+#[cfg(feature = "b3")]
+mod m_b3_body;
+#[cfg(feature = "b3")]
+mod m_b3_math;
 mod m_broadphase;
 mod m_config;
 mod m_constants;
@@ -80,10 +84,21 @@ fn owns(name: &str) -> bool {
     name.starts_with("b3_") == cfg!(feature = "b3")
 }
 
+/// The 3D build's golden emitters, in file-name order.
+#[cfg(feature = "b3")]
+fn b3_modules() -> Vec<tsv::Module> {
+    vec![m_b3_body::emit(), m_b3_math::emit()]
+}
+
+#[cfg(not(feature = "b3"))]
+fn b3_modules() -> Vec<tsv::Module> {
+    vec![]
+}
+
 /// Every golden emitter of this build, in file-name order.
 fn golden_modules() -> Vec<tsv::Module> {
     if cfg!(feature = "b3") {
-        vec![]
+        b3_modules()
     } else {
         vec![
             // The 2D backend's bodies: the 3D dump's inertia is a tensor.

@@ -75,3 +75,32 @@ modules = [
     "src/world.cyr",
     "src/json.cyr",
 ]
+
+# The 3D profile (M4 on): the shared modules in [lib]'s order, glam's 3D math (src/math3.cyr, ADR 0012), then the
+# 3D backend; particle.cyr and json.cyr touch no backend. The 3D world arrives with M5. tests/lib_3d.cyr mirrors
+# this list, and scripts/surface_parity.py fails when either profile's mirror drifts.
+[lib.3d]
+modules = [
+    "src/error.cyr",
+    "src/constants.cyr",
+    "src/constants_private.cyr",
+    "src/crmath_data.cyr",
+    "src/crmath.cyr",
+    "src/mathx.cyr",
+    "src/fmtf.cyr",
+    "src/vec.cyr",
+    "src/config.cyr",
+    "src/material.cyr",
+    "src/units.cyr",
+    "src/force.cyr",
+    "src/types.cyr",
+    "src/arena.cyr",
+    "src/contact_tracker.cyr",
+    "src/spring.cyr",
+    "src/aabb_tree.cyr",
+    "src/spatial_hash.cyr",
+    "src/math3.cyr",
+    "src/b3_types.cyr",
+    "src/particle.cyr",
+    "src/json.cyr",
+]

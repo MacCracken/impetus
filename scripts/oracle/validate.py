@@ -220,9 +220,15 @@ def mul(a, b):
     return a * b
 
 
+def rust_signum(x):
+    """Rust's `f64::signum`: its own NaN constant for a NaN, else 1.0 with x's sign."""
+    return from_bits(0x7FF8000000000000) if math.isnan(x) else math.copysign(1.0, x)
+
+
 UNARY_A = {
     "f64::sqrt": rust_sqrt,
     "f64::abs": abs,
+    "f64::signum": rust_signum,
     "f64::floor": rust_floor,
     "f64::ceil": rust_ceil,
 }
@@ -675,6 +681,18 @@ def corrections(module, rows):
             if not _same_tokens(outs, toks):
                 seen = list(dict.fromkeys(log))
                 out.append((fn, " ".join(ins), " ".join(toks), "oracle " + " ".join(outs) + "; " + "; ".join(seen)))
+            continue
+        elif module == "b3_body":
+            toks = _b3_body_tokens(ins, prim["sin"], prim["cos"])
+            if not _same_tokens(outs, toks):
+                out.append((fn, " ".join(ins), " ".join(toks), "oracle " + " ".join(outs) + "; " + "; ".join(log)))
+            continue
+        elif module == "b3_math":
+            if not fn.startswith("DQuat::from_rotation_"):
+                continue
+            toks = _b3_math_row(fn, ins, prim["sin"], prim["cos"])
+            if not _same_tokens(outs, toks):
+                out.append((fn, " ".join(ins), " ".join(toks), "oracle " + " ".join(outs) + "; " + "; ".join(log)))
             continue
         elif module == "b2_narrow":
             toks = _np_tokens(fn, _Narrow(prim["sin"], prim["cos"]), _np_args(ins))
@@ -3315,6 +3333,7 @@ PRIVATE_SOURCES = (
     ("backend_2d/joints.rs", "_IM_B2_", set()),
     ("backend_2d/solver.rs", "_IM_B2_", set()),
     ("backend_2d/types.rs", "_IM_B2_", {"FALLBACK"}),
+    ("backend_3d/types.rs", "_IM_B3_", set()),
     ("world.rs", "_IM_", {"MAX_SNAPSHOT_INDEX"}),
 )
 PRIVATE_CONST = re.compile(r"^\s*(?:pub(?:\((?:super|crate)\))?\s+)?const\s+(\w+)\s*:\s*([\w(),\[\]; ]+?)\s*=\s*(.+?);")
@@ -3371,7 +3390,9 @@ def check_private(root):
                        ("_IM_B2_RESTITUTION_VELOCITY_THRESHOLD", B2_RESTITUTION_VELOCITY),
                        ("_IM_B2_MAX_CONDITION_NUMBER", B2_MAX_CONDITION), ("_IM_FIELD_SOFTENING", WORLD_SOFT),
                        ("_IM_MAX_SPAWNS_PER_EMITTER_STEP", WORLD_MAX_SPAWNS), ("_IM_R3_ALPHA_0", WORLD_R3[0]),
-                       ("_IM_R3_ALPHA_1", WORLD_R3[1]), ("_IM_R3_ALPHA_2", WORLD_R3[2])):
+                       ("_IM_R3_ALPHA_1", WORLD_R3[1]), ("_IM_R3_ALPHA_2", WORLD_R3[2]),
+                       ("_IM_B3_EPSILON", B3_EPSILON), ("_IM_B3_MIN_MASS", B3_MIN_MASS),
+                       ("_IM_B3_MIN_INERTIA", B3_MIN_INERTIA)):
         if name in cyr and float(cyr[name]) != mine:
             fail(f"validate.py's {name} differs from the generated one")
     if len(FAILS) == before:
@@ -3611,6 +3632,385 @@ def check_b2_mass(rows):
     return counted
 
 
+# ── b3_math: glam 0.29.3's 3D math (M4, ADR 0012) ──────────────────────────────────
+
+def _v_add(a, b):
+    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+
+
+def _v_sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _v_scale(a, s):
+    return (a[0] * s, a[1] * s, a[2] * s)
+
+
+def _v_dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _v_cross(a, b):
+    return (a[1] * b[2] - b[1] * a[2], a[2] * b[0] - b[2] * a[0], a[0] * b[1] - b[0] * a[1])
+
+
+def _v_length(a):
+    return rust_sqrt(_v_dot(a, a))
+
+
+def _v_rcp_ok(r):
+    """glam's `rcp.is_finite() && rcp > 0.0` (try_normalize, normalize_or)."""
+    return math.isfinite(r) and r > 0.0
+
+
+def _q_mul(a, b):
+    x0, y0, z0, w0 = a
+    x1, y1, z1, w1 = b
+    return (w0 * x1 + x0 * w1 + y0 * z1 - z0 * y1,
+            w0 * y1 - x0 * z1 + y0 * w1 + z0 * x1,
+            w0 * z1 + x0 * y1 - y0 * x1 + z0 * w1,
+            w0 * w1 - x0 * x1 - y0 * y1 - z0 * z1)
+
+
+def _q_mul_vec3(q, v):
+    w = q[3]
+    b = q[:3]
+    b2 = _v_dot(b, b)
+    return _v_add(_v_add(_v_scale(v, w * w - b2), _v_scale(b, _v_dot(v, b) * 2.0)), _v_scale(_v_cross(b, v), w * 2.0))
+
+
+def _q_normalize(q):
+    rcp = _np_div(1.0, rust_sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]))
+    return tuple(c * rcp for c in q)
+
+
+def _m_from_quat(q):
+    x, y, z, w = q
+    x2, y2, z2 = x + x, y + y, z + z
+    xx, xy, xz = x * x2, x * y2, x * z2
+    yy, yz, zz = y * y2, y * z2, z * z2
+    wx, wy, wz = w * x2, w * y2, w * z2
+    return ((1.0 - (yy + zz), xy + wz, xz - wy), (xy - wz, 1.0 - (xx + zz), yz + wx), (xz + wy, yz - wx, 1.0 - (xx + yy)))
+
+
+def _m_transpose(m):
+    return tuple(tuple(m[c][r] for c in range(3)) for r in range(3))
+
+
+def _m_mul_vec3(m, v):
+    r = _v_scale(m[0], v[0])
+    r = _v_add(r, _v_scale(m[1], v[1]))
+    return _v_add(r, _v_scale(m[2], v[2]))
+
+
+def _m_inverse(m):
+    t0, t1, t2 = _v_cross(m[1], m[2]), _v_cross(m[2], m[0]), _v_cross(m[0], m[1])
+    inv = _np_div(1.0, _v_dot(m[2], t2))
+    return _m_transpose((_v_scale(t0, inv), _v_scale(t1, inv), _v_scale(t2, inv)))
+
+
+def _b3_math_row(fn, ins, sin, cos):
+    """The output tokens glam computes for one b3_math row, with `sin_cos` from the given sin and cos."""
+    x = [tok_f(t) for t in ins]
+    v = lambda k: tuple(x[k:k + 3])
+    q = lambda k: tuple(x[k:k + 4])
+    mt = lambda k: (tuple(x[k:k + 3]), tuple(x[k + 3:k + 6]), tuple(x[k + 6:k + 9]))
+    F = lambda *vals: [f"f:{bits(c):016x}" for c in vals]
+    M = lambda m: F(*m[0], *m[1], *m[2])
+    I = lambda t: [f"i:{int(t)}"]
+    if fn == "DVec3::add":
+        return F(*_v_add(v(0), v(3)))
+    if fn == "DVec3::sub":
+        return F(*_v_sub(v(0), v(3)))
+    if fn == "DVec3::mul":
+        return F(*(a * b for a, b in zip(v(0), v(3))))
+    if fn == "DVec3::min":
+        return F(*(rust_min(a, b) for a, b in zip(v(0), v(3))))
+    if fn == "DVec3::max":
+        return F(*(rust_max(a, b) for a, b in zip(v(0), v(3))))
+    if fn == "DVec3::dot":
+        return F(_v_dot(v(0), v(3)))
+    if fn == "DVec3::cross":
+        return F(*_v_cross(v(0), v(3)))
+    if fn in ("DVec3::normalize_or", "DVec3::normalize", "DVec3::try_normalize", "DVec3::normalize_or_zero"):
+        a = v(0)
+        rcp = _np_div(1.0, _v_length(a))
+        if fn == "DVec3::normalize":
+            return F(*_v_scale(a, rcp))
+        if _v_rcp_ok(rcp):
+            return F(*_v_scale(a, rcp))
+        if fn == "DVec3::try_normalize":
+            return ["n:"]
+        return F(*(v(3) if fn == "DVec3::normalize_or" else (0.0, 0.0, 0.0)))
+    if fn == "DVec3::neg":
+        return F(*(-c for c in v(0)))
+    if fn == "DVec3::abs":
+        return F(*(abs(c) for c in v(0)))
+    if fn == "DVec3::is_finite":
+        return I(all(math.isfinite(c) for c in v(0)))
+    if fn == "DVec3::length_squared":
+        return F(_v_dot(v(0), v(0)))
+    if fn == "DVec3::length":
+        return F(_v_length(v(0)))
+    if fn == "DVec3::length_recip":
+        return F(_np_div(1.0, _v_length(v(0))))
+    if fn == "DVec3::any_orthogonal_vector":
+        a = v(0)
+        return F(-a[2], 0.0, a[0]) if abs(a[0]) > abs(a[1]) else F(0.0, a[2], -a[1])
+    if fn == "DVec3::mul_f64":
+        return F(*_v_scale(v(0), x[3]))
+    if fn == "DVec3::div_f64":
+        return F(*(_np_div(c, x[3]) for c in v(0)))
+    if fn == "DVec3::any_orthonormal_pair":
+        ax, ay, az = v(0)
+        sign = rust_signum(az)
+        k = _np_div(-1.0, sign + az)
+        m = ax * ay * k
+        return F(1.0 + sign * ax * ax * k, sign * m, -sign * ax, m, sign + ay * ay * k, -ay)
+    if fn.startswith("DQuat::from_rotation_"):
+        h = x[0] * 0.5
+        s, c = sin(h), cos(h)
+        return F(*{"x": (s, 0.0, 0.0, c), "y": (0.0, s, 0.0, c), "z": (0.0, 0.0, s, c)}[fn[-1]])
+    if fn in ("DQuat::conjugate", "DQuat::inverse"):
+        a = q(0)
+        return F(-a[0], -a[1], -a[2], a[3])
+    if fn == "DQuat::is_finite":
+        return I(all(math.isfinite(c) for c in q(0)))
+    if fn == "DQuat::length_squared":
+        a = q(0)
+        return F(a[0] * a[0] + a[1] * a[1] + a[2] * a[2] + a[3] * a[3])
+    if fn == "DQuat::normalize":
+        return F(*_q_normalize(q(0)))
+    if fn == "DQuat::mul_quat":
+        return F(*_q_mul(q(0), q(4)))
+    if fn == "DQuat::mul_vec3":
+        return F(*_q_mul_vec3(q(0), v(4)))
+    if fn == "DMat3::from_quat":
+        return M(_m_from_quat(q(0)))
+    if fn == "DMat3::transpose":
+        return M(_m_transpose(mt(0)))
+    if fn == "DMat3::neg":
+        return M(tuple(tuple(-c for c in col) for col in mt(0)))
+    if fn == "DMat3::determinant":
+        a = mt(0)
+        return F(_v_dot(a[2], _v_cross(a[0], a[1])))
+    if fn == "DMat3::inverse":
+        return M(_m_inverse(mt(0)))
+    if fn in ("DMat3::add_mat3", "DMat3::sub_mat3"):
+        op = _v_add if fn == "DMat3::add_mat3" else _v_sub
+        a, b = mt(0), mt(9)
+        return M(tuple(op(a[c], b[c]) for c in range(3)))
+    if fn == "DMat3::mul_mat3":
+        a, b = mt(0), mt(9)
+        return M(tuple(_m_mul_vec3(a, b[c]) for c in range(3)))
+    if fn == "DMat3::mul_vec3":
+        return F(*_m_mul_vec3(mt(0), v(9)))
+    if fn == "DMat3::mul_scalar":
+        return M(tuple(_v_scale(col, x[9]) for col in mt(0)))
+    if fn == "DMat3::from_diagonal":
+        d = v(0)
+        return M(((d[0], 0.0, 0.0), (0.0, d[1], 0.0), (0.0, 0.0, d[2])))
+    return None
+
+
+def check_b3_math(rows):
+    """Recomputes every b3_math row from glam's formulas on glibc's sin and cos."""
+    for fn, cls, ins, outs, note in rows:
+        want = _b3_math_row(fn, ins, _glibc("sin"), _glibc("cos"))
+        if want is None:
+            fail(f"b3_math: unknown function {fn}")
+        elif not _same_tokens(outs, want):
+            fail(f"b3_math: {note[:160]}: Python computes {' '.join(want)[:200]}")
+    return len(rows)
+
+
+# ── b3_body: the 3D backend's bodies (M4) ──────────────────────────────────────────
+
+B3_EPSILON = 1e-10
+B3_MIN_MASS = 1e-6
+B3_MIN_INERTIA = 1e-10
+_ZERO3 = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+
+
+def _b3_shape(ins, k):
+    """The shape at token k (flat::shape's layout), with every coordinate, and the token after it."""
+    kind = ins[k].split(".", 1)[1]
+    k += 1
+    v = lambda j: (tok_f(ins[j]), tok_f(ins[j + 1]), tok_f(ins[j + 2]))
+    if kind == "Ball":
+        return ("Ball", tok_f(ins[k])), k + 1
+    if kind == "Box":
+        return ("Box", v(k)), k + 3
+    if kind == "Capsule":
+        return ("Capsule", tok_f(ins[k]), tok_f(ins[k + 1])), k + 2
+    if kind == "Segment":
+        return ("Segment", v(k), v(k + 3)), k + 6
+    if kind in ("ConvexHull", "TriMesh"):
+        n = int(ins[k][2:])
+        pts = [v(k + 1 + 3 * j) for j in range(n)]
+        k += 1 + 3 * n
+        if kind == "TriMesh":
+            k += 1 + 3 * int(ins[k][2:])
+        return (kind, pts), k
+    if kind == "Heightfield":
+        nh = int(ins[k][2:])
+        return ("Heightfield", [tok_f(ins[k + 1 + j]) for j in range(nh)], v(k + 1 + nh)), k + 1 + nh + 3
+    fail(f"b3_body: unknown shape {kind}")
+    return ("?",), len(ins)
+
+
+def _b3_solid_aabb(shape):
+    """Collider3d::solid_points_aabb: the points' AABB when the shape is a hull or mesh of volume > EPSILON."""
+    if shape[0] not in ("ConvexHull", "TriMesh") or not shape[1]:
+        return None
+    lo, hi = (math.inf,) * 3, (-math.inf,) * 3
+    for p in shape[1]:
+        lo = tuple(rust_min(a, b) for a, b in zip(lo, p))
+        hi = tuple(rust_max(a, b) for a, b in zip(hi, p))
+    if not lo[0] <= hi[0]:
+        return None
+    sz = _v_sub(hi, lo)
+    return (lo, hi) if sz[0] * sz[1] * sz[2] > B3_EPSILON else None
+
+
+def _b3_mass(shape, density, explicit):
+    if explicit is not None:
+        return rust_max(explicit, B3_MIN_MASS)
+    k43 = 4.0 / 3.0
+    if shape[0] == "Ball":
+        r = shape[1]
+        vol = k43 * math.pi * (r * r * r)
+    elif shape[0] == "Box":
+        h = shape[1]
+        vol = 8.0 * h[0] * h[1] * h[2]
+    elif shape[0] == "Capsule":
+        hh, r = shape[1], shape[2]
+        vol = math.pi * r * r * 2.0 * hh + k43 * math.pi * (r * r * r)
+    elif shape[0] in ("ConvexHull", "TriMesh"):
+        ab = _b3_solid_aabb(shape)
+        vol = 1.0
+        if ab is not None:
+            s = _v_sub(ab[1], ab[0])
+            vol = s[0] * s[1] * s[2]
+    else:
+        vol = 1.0
+    return rust_max(vol * density, B3_MIN_MASS)
+
+
+def _b3_inertia(shape, m):
+    box = lambda w, h, d: (m * (h * h + d * d) / 12.0, m * (w * w + d * d) / 12.0, m * (w * w + h * h) / 12.0)
+    d = (m, m, m)
+    if shape[0] == "Ball":
+        r = shape[1]
+        i = 0.4 * m * r * r
+        d = (i, i, i)
+    elif shape[0] == "Box":
+        h = shape[1]
+        d = box(2.0 * h[0], 2.0 * h[1], 2.0 * h[2])
+    elif shape[0] == "Capsule":
+        hh, r = shape[1], shape[2]
+        r2 = r * r
+        h = 2.0 * hh
+        cyl = math.pi * r2 * h
+        hem = 4.0 / 3.0 * math.pi * r2 * r
+        tot = cyl + hem
+        mc, mh = (m * (cyl / tot), m * (1.0 - cyl / tot)) if tot > 0.0 else (0.0, m)
+        ia = mc * r2 / 2.0 + mh * 2.0 * r2 / 5.0
+        ip = mc * (h * h / 12.0 + r2 / 4.0) + mh * (2.0 * r2 / 5.0 + h * h / 4.0 + 3.0 * h * r / 8.0)
+        d = (ip, ia, ip)
+    elif shape[0] in ("ConvexHull", "TriMesh"):
+        ab = _b3_solid_aabb(shape)
+        if ab is not None:
+            s = _v_sub(ab[1], ab[0])
+            d = box(*s)
+    d = tuple(rust_max(c, B3_MIN_INERTIA) for c in d)
+    return ((d[0], 0.0, 0.0), (0.0, d[1], 0.0), (0.0, 0.0, d[2]))
+
+
+def _b3_centroid(shape):
+    ab = _b3_solid_aabb(shape)
+    return (0.0, 0.0, 0.0) if ab is None else _v_scale(_v_add(ab[0], ab[1]), 0.5)
+
+
+def _b3_parallel_axis(m, d):
+    dd = _v_dot(d, d)
+    s = m * dd
+    diag = ((s, 0.0, 0.0), (0.0, s, 0.0), (0.0, 0.0, s))
+    outer = (_v_scale(d, m * d[0]), _v_scale(d, m * d[1]), _v_scale(d, m * d[2]))
+    return tuple(_v_sub(diag[c], outer[c]) for c in range(3))
+
+
+def _m_add(a, b):
+    return tuple(_v_add(a[c], b[c]) for c in range(3))
+
+
+def _m_mul(a, b):
+    return tuple(_m_mul_vec3(a, b[c]) for c in range(3))
+
+
+def _b3_body_tokens(ins, sin, cos):
+    """The output tokens of one b3::body row: RigidBody3d::from_desc (its z rotation on the given sin and cos), each
+    collider's mass, inertia and centroid, the parallel-axis sum of recompute_mass_properties (run only when a
+    collider is added), the inverses and R·I⁻¹·Rᵀ."""
+    btype = ins[0].split(".", 1)[1]
+    pos = tuple(tok_f(t) for t in ins[1:4])
+    h = tok_f(ins[4]) * 0.5
+    lv = tuple(tok_f(t) for t in ins[5:8])
+    av, ld, ad = tok_f(ins[8]), tok_f(ins[9]), tok_f(ins[10])
+    fixed = tok_i(ins[11]) == 1
+    gs = 1.0 if ins[12] == "n:" else tok_f(ins[12])
+    q = (0.0, 0.0, sin(h), cos(h))
+    n = int(ins[13][2:])
+    k = 14
+    mass, inertia = 0.0, _ZERO3
+    for _ in range(n):
+        shape, k = _b3_shape(ins, k)
+        off = tuple(tok_f(t) for t in ins[k:k + 3])
+        density = tok_f(ins[k + 3])
+        explicit = None if ins[k + 4] == "n:" else tok_f(ins[k + 4])
+        k += 5
+        cm = _b3_mass(shape, density, explicit)
+        mass += cm
+        shift = _b3_parallel_axis(cm, _v_add(off, _b3_centroid(shape)))
+        inertia = _m_add(inertia, _m_add(_b3_inertia(shape, cm), shift))
+    if k != len(ins):
+        fail(f"b3_body: {len(ins) - k} input tokens left over")
+    dynamic = btype == "Dynamic"
+    inv_m, inv_i, world = 0.0, _ZERO3, _ZERO3
+    if n > 0:
+        if not dynamic or mass <= 0.0:
+            if not dynamic:
+                mass, inertia = 0.0, _ZERO3
+        else:
+            inv_m = _np_div(1.0, mass)
+            det = _v_dot(inertia[2], _v_cross(inertia[0], inertia[1]))
+            if not (fixed or not math.isfinite(det) or det <= 0.0):
+                inv_i = _m_inverse(inertia)
+        if dynamic and not fixed:
+            r = _m_from_quat(q)
+            world = _m_mul(_m_mul(r, inv_i), _m_transpose(r))
+    F = lambda *vals: [f"f:{bits(c):016x}" for c in vals]
+    M = lambda m: F(*m[0], *m[1], *m[2])
+    return (F(*pos) + F(*q) + F(*lv) + F(0.0, 0.0, av) + F(ld, ad) + [f"i:{int(fixed)}"] + F(gs) + F(*(0.0,) * 6)
+            + F(mass, inv_m) + M(inertia) + M(inv_i) + M(world) + F(*(0.0,) * 6) + ["i:0"] + F(0.0))
+
+
+def check_b3_body(rows):
+    """Recomputes every body from its descriptor and colliders on glibc's sin and cos."""
+    for fn, cls, ins, outs, note in rows:
+        if fn != "b3::body":
+            fail(f"b3_body: unknown function {fn}")
+            continue
+        want = _b3_body_tokens(ins, _glibc("sin"), _glibc("cos"))
+        if not _same_tokens(outs, want):
+            first = next((j for j, (a, b) in enumerate(zip(outs, want)) if a != b and not (
+                a.startswith("f:") and b.startswith("f:") and same(tok_f(a), tok_f(b)))), len(want))
+            got_t = outs[first] if first < len(outs) else "-"
+            want_t = want[first] if first < len(want) else "-"
+            fail(f"b3_body: {note[:120]}: the model differs at output {first}: {got_t} vs {want_t}")
+    return len(rows)
+
+
 def main():
     root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
     check_tables(root)
@@ -3626,7 +4026,8 @@ def main():
     for name in names:
         rows = read_module(golden / f"{name}.tsv")
         total += len(rows)
-        if name in ("math", "spring", "b2_narrow", "b2_ray", "b2_step", "b2_contact", "world_step"):
+        if name in ("math", "spring", "b2_narrow", "b2_ray", "b2_step", "b2_contact", "world_step", "b3_math",
+                    "b3_body"):
             check_corrections(root, name, golden / f"{name}.tsv", rows)
         if name == "constants":
             check_constants(root, rows)
@@ -3651,6 +4052,10 @@ def main():
             print(f"b2_ray: {check_b2_ray(rows)} rows recomputed (a transcription on glibc's sin, cos, hypot)")
         elif name == "b2_narrow":
             print(f"b2_narrow: {check_b2_narrow(rows)} rows recomputed (a transcription on Python's libm)")
+        elif name == "b3_body":
+            print(f"b3_body: {check_b3_body(rows)} bodies recomputed (from_desc, mass, inertia, parallel axis, R·I⁻¹·Rᵀ)")
+        elif name == "b3_math":
+            print(f"b3_math: {check_b3_math(rows)} rows recomputed (glam's formulas on glibc's sin and cos)")
         elif name == "b2_mass":
             print(f"b2_mass: {check_b2_mass(rows)} bodies recomputed (shape_props, parallel-axis sum)")
         elif name == "spring":

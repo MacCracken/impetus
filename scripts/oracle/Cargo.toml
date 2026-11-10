@@ -20,6 +20,9 @@ impetus = { path = "../../rust-old", default-features = false, features = ["orac
 # correctly rounded. Writing is the same in both modes.
 serde_json = { version = "=1.0.154", features = ["float_roundtrip"] }
 serde = "1"
+# glam's D-types as the oracle links them, re-exported by hisab 1.4.0 (`b3_math.tsv`, ADR 0012): the version
+# rust-old's 3D backend resolves (its Cargo.lock), already in this lock, so nothing new is fetched.
+hisab = { version = "=1.4.0", optional = true }
 
 # The oracle's backends are exclusive, so the generator is one crate run twice
 # (port plan §4 step 5):
@@ -29,7 +32,7 @@ serde = "1"
 [features]
 default = ["b2"]
 b2 = ["impetus/2d"]
-b3 = ["impetus/3d"]
+b3 = ["impetus/3d", "dep:hisab"]
 
 [[bin]]
 name = "oracle"

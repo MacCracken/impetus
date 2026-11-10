@@ -306,3 +306,31 @@ expired before most of its 100,000 iterations, and the emitter scene holds about
   terms in double-double and 11 more in double, and exp's table phase. The first design ran the full double-double
   series and exp's phase 2 on every call: 5.4 µs.
 - **Not acted on.** Speed is measured, not gated: S5 is filed with the cyrius memcpy issue, and pow is a first number.
+
+## M4 part 1: glam's 3D math and the 3D backend's types (2026-11-09)
+
+Cyrius-only rows (`tests/impetus_3d.bcyr`, the 3D profile), x86_64 ELF. Rust's `simulation.rs` times the 3D backend
+only through its world, which ports in M5. The hisab rows are its allocating forms of the same operation, for ADR
+0012's trade. Each hisab call leaks 24 B (rotation) or 72 B (product) of global heap.
+
+| Bench | Body | First form | Now |
+|---|---|---|---|
+| `b3/math_quat_mul_vec3` | glam's `DQuat * DVec3` | 128 ns | **41 ns** |
+| `b3/hisab_hquat_rotate_vec3` | hisab's rotation (divides by \|q\|² unless it is 1) | 51 ns | 51 ns |
+| `b3/math_mat3_mul_mat3` | glam's `DMat3 * DMat3` | 297 ns | **86 ns** |
+| `b3/hisab_m3_mul` | hisab's product | 90 ns | 89 ns |
+| `b3/math_mat3_inverse` | glam's adjugate inverse | 213 ns | **50 ns** |
+| `b3/gyroscopic_step` | one implicit Newton step with the energy projection | 1.28 µs | 742 ns |
+| `b3/integrate_velocities` | gravity, force, the body-frame gyroscopic step and torque, damping, the speed cap | 1.95 µs | 1.10 µs |
+| `b3/integrate_positions` | position and quaternion integration, renormalised; R·I⁻¹·Rᵀ | 952 ns | 523 ns |
+| `b3/body_mass_box_offset` | the mass recompute for one offset box | 1.68 µs | 1.07 µs |
+| `b3/world_aabb_box_rotated` | a rotated box's world AABB (eight rotated corners) | 2.04 µs | 1.23 µs |
+
+**Reading it.** A struct passed by value is copied on entry, and its result comes back through the hidden pointer. The
+first `ImQuat_mul_vec3` chained nine helpers (dots, scales, a cross, adds), each copying 24 to 48 bytes in and 24
+out. Written with f64 locals in glam's operation order it does the same arithmetic in one frame, with identical bits:
+the `b3_math` digest and all 7,321 rows are unchanged. The same rewrite went into the 3×3 product, the inverse and the
+determinant. The value forms are now faster than hisab's and allocate nothing.
+
+The body rows still chain helpers (`gyroscopic_step` builds and multiplies four matrices). M5's solver loops are where
+to take the same step next, measured there.

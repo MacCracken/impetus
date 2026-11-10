@@ -322,6 +322,38 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     to 1,092 rows (sequence forms, bare variant names, missing and extra fields, a u32 out of range),
     all on the first run. The two particle serde tests are ported.
     **98,548 ok, 0 failed, 0 measured, 7 pending, 165 accepted.**
+- **Cyrius port, M4 part 1: 3D math and the 3D backend's types** ([ADR 0012](docs/adr/0012-impetus-owned-3d-math-stopgap.md);
+  `docs/development/port-parity.md` §17):
+  - **ADR 0012**: the 3D step path runs on impetus-owned math until hisab's allocations can be scoped
+    (S1 in cyrius, or H9 in hisab). H9 is filed in hisab with a repro that exits 1 while 7 of 7 step-path
+    calls leak (24 B for a vector operation to 105,920 B for `gjk_epa_3d`).
+  - `src/math3.cyr`: glam 0.29.3's `DVec3`, `DQuat` and `DMat3` operations, transcribed by value with
+    glam's operation order (`ImVec3` operations, `ImQuat`, `ImMat3`; `+` and `−` overloaded).
+  - `src/b3_types.cyr`: `ImRigidBody3d` (`from_desc`, the world inverse inertia R·I⁻¹·Rᵀ,
+    `integrate_velocities` with the implicit, energy-projected gyroscopic step, `integrate_positions`),
+    `ImCollider3d` (world AABBs, mass, inertia and centroid for every shape), the parallel-axis shift,
+    the mass recompute in three steps, `ImJoint3d`, `ImAabb3d` and `ImContact3d`. The 3D private
+    constants are generated (`_IM_B3_*`).
+  - `_im_signum` (Rust's `f64::signum`, for glam's `any_orthonormal_pair`); `math.tsv` grows by 326
+    signum rows to 19,491.
+  - **The 3D profile**: `[lib.3d]` in `cyrius.cyml` (bundle `dist/impetus-3d.cyr`), `tests/lib_3d.cyr`,
+    and `tests/parity_3d.tcyr` for the `b3_*` modules. The descriptor token helpers moved from
+    `parity_2d.tcyr` to the shared `tests/parity_types.cyr`.
+  - The oracle's `b3` build writes its first modules: `b3_math.tsv` (7,087 rows of glam operations,
+    through hisab 1.4.0's re-export, now a dependency of the `b3` build) and `b3_body.tsv` (234 bodies
+    from world dumps). All 0 ulp on x86_64 ELF, x86_64 PE and aarch64, with identical digests, and
+    recomputed by `validate.py`. **7,321 ok, 0 failed** in 3D; the 2D corpus is **98,874 ok**.
+  - 23 assertions in `tests/b3_types.tcyr`: the Rust type tests (quaternions, masses, the capsule
+    tensor, the parallel-axis theorem, gyroscopic precession), a free spin integrated for 600 steps
+    without gaining energy, and a flat heap.
+  - Surface parity is 583/583 across 24 modules. It now also checks that each profile's test mirror
+    matches `cyrius.cyml`, and scans for the compiler defect below.
+  - **Compiler defect, worked around and filed**: cyrius 6.7.18 stores the wrong value in
+    `s.f = g(t.e)` when `g` returns a struct and `t.e` is a struct-typed field. It stores `t.e`
+    instead of the result. The defect left 202 of the 234 bodies with their inertia as their
+    inverse inertia. `src/b3_types.cyr` binds such calls to a local first. The filing is
+    `cyrius/docs/development/issues/2026-11-09-field-store-of-struct-call-copies-a-field-argument.md`,
+    with a repro that exits 1.
 
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
@@ -369,6 +401,16 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - `step_1000_particles` (93 µs against 5.5 µs), `spawn_particle` (694 ns against 20 ns) and
     `emitter_step` (18.5 µs against 493 ns) are 17–37×. Each 136-byte particle record moves by the
     stdlib's byte-loop `memcpy` (S5) on push and on every removal.
+- **3D math and types, first numbers** (Cyrius only; Rust times the 3D backend only through its world,
+  M5). Writing the composite operations with f64 locals, in glam's order (identical bits), took:
+  - a quaternion rotation from 128 to 41 ns;
+  - a 3×3 product from 297 to 86 ns;
+  - a 3×3 inverse from 213 to 50 ns;
+  - `integrate_velocities` from 1.95 to 1.10 µs.
+
+  hisab's allocating `hquat_rotate_vec3` and `m3_mul` take 51 and 89 ns. A box's mass recompute takes
+  1.07 µs and a rotated box's world AABB 1.23 µs. A by-value struct is copied on entry, so chains of
+  small helper calls dominate (`port-parity.md` §4.2).
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

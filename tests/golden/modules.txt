@@ -6,6 +6,8 @@ b2_narrow
 b2_ray
 b2_state
 b2_step
+b3_body
+b3_math
 broadphase
 config
 constants

@@ -1,0 +1,28 @@
+# lib_3d.cyr — the 3D profile's module list, in cyrius.cyml [lib.3d] order, for test compiles.
+#
+# `cyrius test` never prepends [lib.3d] (it is read only by `cyrius distlib`), and `[test] modules`
+# can't differ by profile (port-parity.md §4.4), so every 3D test file includes this one. Keep it
+# in step with [lib.3d]; scripts/surface_parity.py checks both mirrors.
+
+include "src/error.cyr"
+include "src/constants.cyr"
+include "src/constants_private.cyr"
+include "src/crmath_data.cyr"
+include "src/crmath.cyr"
+include "src/mathx.cyr"
+include "src/fmtf.cyr"
+include "src/vec.cyr"
+include "src/config.cyr"
+include "src/material.cyr"
+include "src/units.cyr"
+include "src/force.cyr"
+include "src/types.cyr"
+include "src/arena.cyr"
+include "src/contact_tracker.cyr"
+include "src/spring.cyr"
+include "src/aabb_tree.cyr"
+include "src/spatial_hash.cyr"
+include "src/math3.cyr"
+include "src/b3_types.cyr"
+include "src/particle.cyr"
+include "src/json.cyr"

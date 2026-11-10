@@ -34,11 +34,11 @@ MODULES = [
     "body", "collider", "joint", "event", "query", "arena", "contact_tracker", "spring",
     "aabb_tree", "spatial_hash", "backend_2d/types", "backend_2d/narrowphase",
     "backend_2d/raycast", "backend_2d/state", "backend_2d/joints", "backend_2d/solver",
-    "particle", "world",
+    "particle", "world", "backend_3d/types",
 ]
 PENDING_MODULES = {
     "backend_2d/tests": "M3",
-    "backend_3d/types": "M4", "backend_3d/narrowphase": "M4", "backend_3d/raycast": "M4",
+    "backend_3d/narrowphase": "M4", "backend_3d/raycast": "M4",
     "backend_3d/solver": "M5", "backend_3d/joints": "M5", "backend_3d/state": "M5",
     "backend_3d/tests": "M5", "serialize": "M6",
 }
@@ -87,6 +87,8 @@ FN_RENAMES = {
         "shapes_touch", "circle_circle", "circle_aabb", "capsule_endpoints", "closest_point_on_segment",
         "generate_contacts_multi",
     )},
+    # The 3D backend's free helpers are backend-internal (`pub(super)`): private `_im_b3_` helpers here.
+    **{f: f"_im_b3_{f}" for f in ("skew", "gyroscopic_step", "parallel_axis")},
 }
 # Rust field -> the Cyrius fields that carry it (Option<T> is a presence flag plus the value).
 FIELD_RENAMES = {
@@ -96,11 +98,14 @@ FIELD_RENAMES = {
     ("Collider2d", "mass"): ["has_mass", "mass"],
     ("Joint2d", "motor"): ["has_motor", "motor"],
     ("Joint2d", "break_force"): ["has_break_force", "break_force"],
+    ("Collider3d", "mass"): ["has_mass", "mass"],
+    ("Joint3d", "motor"): ["has_motor", "motor"],
+    ("Joint3d", "break_force"): ["has_break_force", "break_force"],
     # A Vec is its records' address and their count.
     ("ContactManifold", "points"): ["points", "point_count"],
 }
 # The Cyrius prefix of a module's crate-internal constants (scripts/oracle/src/t_private.rs).
-PRIVATE_PREFIX = {"backend_2d/types": "_IM_B2_"}
+PRIVATE_PREFIX = {"backend_2d/types": "_IM_B2_", "backend_3d/types": "_IM_B3_"}
 PENDING_CONSTS = {"MAX_SNAPSHOT_INDEX": "M6, with the snapshot module"}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
 PENDING_FNS = {
@@ -257,6 +262,70 @@ def rust_items(module):
     return items
 
 
+def profile_drift():
+    """Each profile's test mirror (tests/lib_2d.cyr, tests/lib_3d.cyr) includes exactly its cyrius.cyml module
+    list ([lib], [lib.3d]) in the same order (port-parity.md §4.4)."""
+    manifest = (root / "cyrius.cyml").read_text()
+    out = []
+    for table, mirror in (("lib", "tests/lib_2d.cyr"), ("lib.3d", "tests/lib_3d.cyr")):
+        m = re.search(r"^\[" + re.escape(table) + r"\]\nmodules = \[(.*?)\]", manifest, re.S | re.M)
+        if m is None:
+            out.append(f"cyrius.cyml has no [{table}] modules list")
+            continue
+        want = re.findall(r'"([^"]+)"', m.group(1))
+        got = re.findall(r'^include "([^"]+)"', (root / mirror).read_text(), re.M)
+        if got != want:
+            out.append(f"{mirror} includes {len(got)} modules that differ from cyrius.cyml [{table}]'s {len(want)}")
+    return out
+
+
+def field_store_scan():
+    """No `s.f = g(.., t.e, ..)` where g returns a struct and t.e is struct-typed: cyrius 6.7.18 stores t.e instead of
+    g's result (cyrius docs/development/issues/2026-11-09-field-store-of-struct-call-copies-a-field-argument.md). Bind
+    the call to a local first. Types are resolved from struct fields, fn parameters, `var x: T` and `self` in an impl."""
+    files = sorted(list((root / "src").glob("*.cyr")) + list((root / "tests").glob("*.*cyr")))
+    texts = {f: f.read_text() for f in files}
+    fields = {}
+    for text in texts.values():
+        for m in re.finditer(r"^struct (\w+)\s*\{(.*?)\}", text, re.M | re.S):
+            fields[m.group(1)] = dict(re.findall(r"(\w+)\s*:\s*\*?(\w+)\s*;", m.group(2)))
+    sret = set()
+    for text in texts.values():
+        for m in re.finditer(r"^\s*fn (\w+)\([^)]*\)\s*:\s*(\w+)\s*\{", text, re.M):
+            if m.group(2) in fields:
+                sret.add(m.group(1))
+    store = re.compile(r"([a-z_]\w*(?:\.\w+)+)\s*=\s*(\w+)\(([^;]*)\);")
+    ref = re.compile(r"\b([a-z_]\w*)((?:\.[a-z_]\w*)+)\b(?!\s*\()")
+    out = []
+    for f, text in texts.items():
+        types, impl = {}, None
+        for i, line in enumerate(text.split("\n"), 1):
+            m = re.match(r"^impl (\w+)", line)
+            if m:
+                impl = m.group(1)
+            elif line.startswith("}"):
+                impl = None
+            m = re.match(r"^\s*fn \w+\(([^)]*)\)", line)
+            if m:
+                types = dict(re.findall(r"(\w+)\s*:\s*\*?(\w+)", m.group(1)))
+                if impl:
+                    types["self"] = impl
+            for name, ty in re.findall(r"\bvar (\w+)\s*:\s*\*?(\w+)", line):
+                types[name] = ty
+            for sm in store.finditer(line):
+                if sm.group(2) not in sret:
+                    continue
+                for base, chain in ref.findall(sm.group(3)):
+                    ty = types.get(base)
+                    for name in chain.split(".")[1:]:
+                        ty = fields.get(ty, {}).get(name)
+                    if ty in fields:
+                        out.append(f"{f.relative_to(root)}:{i}: a struct call with a struct-field argument stored into "
+                                   f"a field (cyrius 6.7.18 misstores it; bind to a local): {line.strip()[:90]}")
+                        break
+    return out
+
+
 def main():
     fns, consts, members, enums, structs = cyrius_index()
     enum_owners = set()
@@ -349,6 +418,8 @@ def main():
     for pn in PENDING_FNS:
         if pn not in used_pending:
             missing.append(f"PENDING_FNS entry names no Rust function: {pn}")
+    missing.extend(profile_drift())
+    missing.extend(field_store_scan())
     # Every rust-old/src file is accounted for.
     accounted = set(MODULES) | set(PENDING_MODULES) | set(DEFERRED_MODULES) | set(NOT_APPLICABLE_MODULES)
     for path in sorted((root / "rust-old/src").rglob("*.rs")):

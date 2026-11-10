@@ -1,0 +1,305 @@
+# parity_3d.tcyr — replays the 3D backend's golden modules (tests/golden/b3_*.tsv) against the port.
+#
+# The 3D twin of tests/parity_2d.tcyr, which replays the shared modules and the 2D backend's (`b2_*`). The replay
+# machinery is tests/parity_core.cyr; this file holds the 3D dispatchers. Rows are ok, FAILED, measured, accepted or
+# pending exactly as there, and the exit code is the number of modules with a failure. The 3D math and backend are
+# impetus-owned (ADR 0012), so their rows are classes A–C, gated at 0 ulp against the corrected oracle.
+
+include "tests/ulp.cyr"
+include "tests/lib_3d.cyr"
+
+alloc_init();
+
+include "tests/parity_core.cyr"
+include "tests/parity_types.cyr"
+
+# ── hooks ───────────────────────────────────────────────────────────────────────────
+
+# The Rust variant name of an error code (src/error.cyr).
+#must_use
+fn _par_error_name(code): i64 {
+    return im_error_name(code);
+}
+
+# ── cross-target digest ─────────────────────────────────────────────────────────────
+# A 64-bit FNV-1a-style fold (word at a time) of every output word b3_math returns, in row order, as parity_2d.tcyr
+# does for the math module: equal digests on x86_64 ELF, x86_64 PE and aarch64 mean bit-identical results on every
+# row.
+var _par_dg3: i64 = 0xcbf29ce484222325;
+
+fn _par_dg3_fold() {
+    for (var k = 0; k < _par_got_n; k = k + 1) {
+        _par_dg3 = (_par_dg3 ^ load64(_par_got_v + k * 8)) * 0x100000001b3;
+    }
+    return 0;
+}
+
+# ── token helpers (the shared types' are tests/parity_types.cyr) ─────────────────────
+
+# Input tokens k..k+3 as a quaternion (x, y, z, w).
+#must_use
+fn _par_in_q4(k): ImQuat {
+    var x: f64 = _par_in(k);
+    var y: f64 = _par_in(k + 1);
+    var z: f64 = _par_in(k + 2);
+    var w: f64 = _par_in(k + 3);
+    return ImQuat_new(x, y, z, w);
+}
+
+# Input tokens k..k+8 as a matrix, by columns.
+#must_use
+fn _par_in_m9(k): ImMat3 {
+    return ImMat3_from_cols(_par_in_v3(k), _par_in_v3(k + 3), _par_in_v3(k + 6));
+}
+
+fn _par_got_q4(q: ImQuat) {
+    _par_got_f(q.x);
+    _par_got_f(q.y);
+    _par_got_f(q.z);
+    _par_got_f(q.w);
+    return 0;
+}
+
+fn _par_got_m9(m: ImMat3) {
+    _par_got_v3(m.x);
+    _par_got_v3(m.y);
+    _par_got_v3(m.z);
+    return 0;
+}
+
+# ── b3_math: glam's 3D math (src/math3.cyr) ─────────────────────────────────────────
+
+# Vector rows: one vector, two vectors, or a vector and a scalar in.
+fn _par_b3_vec(fp, fl): i64 {
+    var a: ImVec3 = _par_in_v3(0);
+    if (_par_eq(fp, fl, "DVec3::neg") == 1) { _par_got_v3(ImVec3_neg(a)); return 1; }
+    if (_par_eq(fp, fl, "DVec3::abs") == 1) { _par_got_v3(ImVec3_abs(a)); return 1; }
+    if (_par_eq(fp, fl, "DVec3::is_finite") == 1) { _par_got_i(ImVec3_is_finite(a)); return 1; }
+    if (_par_eq(fp, fl, "DVec3::length_squared") == 1) {
+        var r: f64 = ImVec3_length_squared(a);
+        _par_got_f(r);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "DVec3::length") == 1) {
+        var r: f64 = ImVec3_length(a);
+        _par_got_f(r);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "DVec3::length_recip") == 1) {
+        var r: f64 = ImVec3_length_recip(a);
+        _par_got_f(r);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "DVec3::normalize") == 1) { _par_got_v3(ImVec3_normalize(a)); return 1; }
+    if (_par_eq(fp, fl, "DVec3::try_normalize") == 1) {
+        var out: ImVec3 = ImVec3_zero();
+        if (ImVec3_try_normalize(a, &out) == 1) { _par_got_v3(out); } else { _par_got_none(); }
+        return 1;
+    }
+    if (_par_eq(fp, fl, "DVec3::normalize_or_zero") == 1) { _par_got_v3(ImVec3_normalize_or_zero(a)); return 1; }
+    if (_par_eq(fp, fl, "DVec3::any_orthogonal_vector") == 1) {
+        _par_got_v3(ImVec3_any_orthogonal_vector(a));
+        return 1;
+    }
+    if (_par_eq(fp, fl, "DVec3::any_orthonormal_pair") == 1) {
+        var p: ImVec3 = ImVec3_zero();
+        var q: ImVec3 = ImVec3_zero();
+        ImVec3_any_orthonormal_pair(a, &p, &q);
+        _par_got_v3(p);
+        _par_got_v3(q);
+        return 1;
+    }
+    if (_par_in_n == 4) {
+        var s: f64 = _par_in(3);
+        if (_par_eq(fp, fl, "DVec3::mul_f64") == 1) { _par_got_v3(ImVec3_scale(a, s)); return 1; }
+        if (_par_eq(fp, fl, "DVec3::div_f64") == 1) { _par_got_v3(ImVec3_div_scalar(a, s)); return 1; }
+        return 0;
+    }
+    var b: ImVec3 = _par_in_v3(3);
+    if (_par_eq(fp, fl, "DVec3::add") == 1) { _par_got_v3(a + b); return 1; }
+    if (_par_eq(fp, fl, "DVec3::sub") == 1) { _par_got_v3(a - b); return 1; }
+    if (_par_eq(fp, fl, "DVec3::mul") == 1) { _par_got_v3(ImVec3_mul_elem(a, b)); return 1; }
+    if (_par_eq(fp, fl, "DVec3::min") == 1) { _par_got_v3(ImVec3_min(a, b)); return 1; }
+    if (_par_eq(fp, fl, "DVec3::max") == 1) { _par_got_v3(ImVec3_max(a, b)); return 1; }
+    if (_par_eq(fp, fl, "DVec3::dot") == 1) {
+        var r: f64 = ImVec3_dot(a, b);
+        _par_got_f(r);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "DVec3::cross") == 1) { _par_got_v3(ImVec3_cross(a, b)); return 1; }
+    if (_par_eq(fp, fl, "DVec3::normalize_or") == 1) { _par_got_v3(ImVec3_normalize_or(a, b)); return 1; }
+    return 0;
+}
+
+# Quaternion rows: an angle, one quaternion, two, or a quaternion and a vector in.
+fn _par_b3_quat(fp, fl): i64 {
+    if (_par_in_n == 1) {
+        var ang: f64 = _par_in(0);
+        if (_par_eq(fp, fl, "DQuat::from_rotation_x") == 1) { _par_got_q4(ImQuat_from_rotation_x(ang)); return 1; }
+        if (_par_eq(fp, fl, "DQuat::from_rotation_y") == 1) { _par_got_q4(ImQuat_from_rotation_y(ang)); return 1; }
+        if (_par_eq(fp, fl, "DQuat::from_rotation_z") == 1) { _par_got_q4(ImQuat_from_rotation_z(ang)); return 1; }
+        return 0;
+    }
+    var q: ImQuat = _par_in_q4(0);
+    if (_par_eq(fp, fl, "DQuat::conjugate") == 1) { _par_got_q4(ImQuat_conjugate(q)); return 1; }
+    if (_par_eq(fp, fl, "DQuat::inverse") == 1) { _par_got_q4(ImQuat_inverse(q)); return 1; }
+    if (_par_eq(fp, fl, "DQuat::is_finite") == 1) { _par_got_i(ImQuat_is_finite(q)); return 1; }
+    if (_par_eq(fp, fl, "DQuat::length_squared") == 1) {
+        var r: f64 = ImQuat_length_squared(q);
+        _par_got_f(r);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "DQuat::normalize") == 1) { _par_got_q4(ImQuat_normalize(q)); return 1; }
+    if (_par_eq(fp, fl, "DQuat::mul_quat") == 1) { _par_got_q4(ImQuat_mul_quat(q, _par_in_q4(4))); return 1; }
+    if (_par_eq(fp, fl, "DQuat::mul_vec3") == 1) { _par_got_v3(ImQuat_mul_vec3(q, _par_in_v3(4))); return 1; }
+    return 0;
+}
+
+# Matrix rows: a quaternion, a diagonal, one matrix, two, or a matrix and a vector or scalar in.
+fn _par_b3_mat(fp, fl): i64 {
+    if (_par_eq(fp, fl, "DMat3::from_quat") == 1) { _par_got_m9(ImMat3_from_quat(_par_in_q4(0))); return 1; }
+    if (_par_eq(fp, fl, "DMat3::from_diagonal") == 1) { _par_got_m9(ImMat3_from_diagonal(_par_in_v3(0))); return 1; }
+    var a: ImMat3 = _par_in_m9(0);
+    if (_par_eq(fp, fl, "DMat3::transpose") == 1) { _par_got_m9(ImMat3_transpose(a)); return 1; }
+    if (_par_eq(fp, fl, "DMat3::neg") == 1) { _par_got_m9(ImMat3_neg(a)); return 1; }
+    if (_par_eq(fp, fl, "DMat3::determinant") == 1) {
+        var r: f64 = ImMat3_determinant(a);
+        _par_got_f(r);
+        return 1;
+    }
+    if (_par_eq(fp, fl, "DMat3::inverse") == 1) { _par_got_m9(ImMat3_inverse(a)); return 1; }
+    if (_par_eq(fp, fl, "DMat3::mul_vec3") == 1) { _par_got_v3(ImMat3_mul_vec3(a, _par_in_v3(9))); return 1; }
+    if (_par_eq(fp, fl, "DMat3::mul_scalar") == 1) {
+        var s: f64 = _par_in(9);
+        _par_got_m9(ImMat3_mul_scalar(a, s));
+        return 1;
+    }
+    var b: ImMat3 = _par_in_m9(9);
+    if (_par_eq(fp, fl, "DMat3::add_mat3") == 1) { _par_got_m9(a + b); return 1; }
+    if (_par_eq(fp, fl, "DMat3::sub_mat3") == 1) { _par_got_m9(a - b); return 1; }
+    if (_par_eq(fp, fl, "DMat3::mul_mat3") == 1) { _par_got_m9(ImMat3_mul_mat3(a, b)); return 1; }
+    return 0;
+}
+
+fn _par_b3_math(fp, fl): i64 {
+    if (fl > 7 && _par_eq(fp, 7, "DVec3::") == 1) { return _par_b3_vec(fp, fl); }
+    if (fl > 7 && _par_eq(fp, 7, "DQuat::") == 1) { return _par_b3_quat(fp, fl); }
+    if (fl > 7 && _par_eq(fp, 7, "DMat3::") == 1) { return _par_b3_mat(fp, fl); }
+    return 0;
+}
+
+# ── b3_body: the 3D backend's bodies (src/b3_types.cyr) ─────────────────────────────
+# `b3::body`: a body from its descriptor, each collider (shape, offset, density, explicit mass) added in order. Rust
+# recomputes the mass from all of the body's colliders on every add, so the last recompute is the one that stands;
+# with no collider none runs and the body keeps from_desc's zeros. Outputs every stored field but the handle and type.
+
+fn _par_b3_body(fp, fl): i64 {
+    if (_par_eq(fp, fl, "b3::body") != 1) { return 0; }
+    var bd: ImBodyDesc = _par_in_body_desc(0);
+    var b: ImRigidBody3d = ImRigidBody3d_from_desc(0, bd);
+    var n = _par_in(13);
+    var k = 14;
+    if (n > 0) { _im_b3_mass_reset(&b); }
+    for (var j = 0; j < n; j = j + 1) {
+        var sh: ImColliderShape = _im_shape(IM_SHAPE_BALL);
+        k = _par_in_shape(k, &sh);
+        var d: ImColliderDesc = ImColliderDesc_new(sh);
+        d.offset = _par_in_v3(k);
+        var den: f64 = _par_in(k + 3);
+        var mat: ImPhysicsMaterial = ImPhysicsMaterial_default();
+        mat.density = den;
+        d.material = mat;
+        if (_par_in_is_none(k + 4) == 0) {
+            var ms: f64 = _par_in(k + 4);
+            d.has_mass = 1;
+            d.mass = ms;
+        }
+        var c: ImCollider3d = ImCollider3d_from_desc(j, 0, d);
+        _im_b3_mass_add(&b, &c);
+        c.free();
+        sh.free();
+        k = k + 5;
+    }
+    if (n > 0) { _im_b3_mass_finish(&b); }
+    var ld: f64 = b.linear_damping;
+    var ad: f64 = b.angular_damping;
+    var gs: f64 = b.gravity_scale;
+    var m: f64 = b.mass;
+    var im: f64 = b.inv_mass;
+    var st: f64 = b.sleep_timer;
+    _par_got_v3(b.position);
+    _par_got_q4(b.rotation);
+    _par_got_v3(b.linear_velocity);
+    _par_got_v3(b.angular_velocity);
+    _par_got_f(ld);
+    _par_got_f(ad);
+    _par_got_i(b.fixed_rotation);
+    _par_got_f(gs);
+    _par_got_v3(b.force_accumulator);
+    _par_got_v3(b.torque_accumulator);
+    _par_got_f(m);
+    _par_got_f(im);
+    _par_got_m9(b.inertia);
+    _par_got_m9(b.inv_inertia);
+    _par_got_m9(b.inv_inertia_world);
+    _par_got_v3(b.pseudo_velocity);
+    _par_got_v3(b.pseudo_angular_velocity);
+    _par_got_i(b.is_sleeping);
+    _par_got_f(st);
+    return 1;
+}
+
+# ── dispatch and hooks ──────────────────────────────────────────────────────────────
+
+fn _par_dispatch(mp, ml, fp, fl): i64 {
+    _par_got_n = 0;
+    if (_par_eq(mp, ml, "b3_body") == 1) { return _par_b3_body(fp, fl); }
+    if (_par_eq(mp, ml, "b3_math") == 1) { return _par_b3_math(fp, fl); }
+    return 0;
+}
+
+# The cross-target digest folds every b3_math output, after the port's own outputs are in.
+fn _par_shadows(mp, ml, fp, fl, cls) {
+    if (_par_eq(mp, ml, "b3_math") == 1 && _par_got_n > 0) { _par_dg3_fold(); }
+    return 0;
+}
+
+# The class-C bound for a function, in ulps; -1 when none is set. The rotations are built on crmath's correctly
+# rounded sin_cos (ADR 0011), so the bound is 0 against the corrected oracle (ADR 0012).
+#must_use
+fn _par_c_bound(fp, fl): i64 {
+    if (_par_eq(fp, fl, "b3::body") == 1) { return 0; }
+    if (_par_eq(fp, fl, "DQuat::from_rotation_x") == 1) { return 0; }
+    if (_par_eq(fp, fl, "DQuat::from_rotation_y") == 1) { return 0; }
+    if (_par_eq(fp, fl, "DQuat::from_rotation_z") == 1) { return 0; }
+    return 0 - 1;
+}
+
+# No 3D row is accepted as a divergence: the 3D path is impetus-owned and exact (ADR 0012).
+#must_use
+fn _par_accepted(fp, fl, ip, il): i64 {
+    return 0;
+}
+
+#must_use
+fn _par_accepted_quiet(adr): i64 {
+    return 0;
+}
+
+fn _par_module_done(mp, ml) {
+    if (_par_eq(mp, ml, "b3_math") != 1) { return 0; }
+    print("  digest b3_math: 0x", 20);
+    fmt_hex(_par_dg3);
+    println("");
+    return 0;
+}
+
+# Every module but the 3D backend's (`b3_*`) is replayed by tests/parity_2d.tcyr.
+#must_use
+fn _par_skip(mp, ml): i64 {
+    if (ml >= 3 && load8(mp) == 98 && load8(mp + 1) == 51 && load8(mp + 2) == 95) { return 0; }
+    return 1;
+}
+
+var exit_code = _par_main();
+sys_exit_group(exit_code);
