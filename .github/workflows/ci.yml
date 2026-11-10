@@ -64,6 +64,20 @@ jobs:
       - name: Surface parity against rust-old/
         run: python3 -I scripts/surface_parity.py .
 
-      # Added as the port reaches it (port plan §6 gates): M4 — a job for the [lib.3d] profile.
-      # The golden corpus is regenerated locally from rust-old/, so CI has no Rust job;
-      # rust-old/.github/workflows/ keeps the 1.4.0 Rust CI for reference.
+      - name: Rust-test ledger (every Rust test ported or recorded)
+        run: python3 -I scripts/rust_test_ledger.py . --check
+
+      - name: Benchmark twins (every Rust bench has one)
+        run: python3 -I scripts/bench_record.py . --check
+
+      - name: Fuzz targets (both profiles)
+        run: cyrius fuzz
+
+      - name: Doc examples (the README's and guides' code blocks compile and run)
+        # Builds against dist/, so it runs after the bundles are checked current.
+        run: python3 -I scripts/doc_examples.py .
+
+      # `cyrius test` runs both profiles: each tests/*.tcyr includes tests/lib_2d.cyr or tests/lib_3d.cyr, and
+      # `distlib --check` covers both bundles. The golden corpus is regenerated locally from rust-old/, so CI has
+      # no Rust job; rust-old/.github/workflows/ keeps the 1.4.0 Rust CI for reference. The PE and aarch64 runs
+      # (wine, qemu) are local release gates (docs/development/port-parity.md, "How to reproduce").

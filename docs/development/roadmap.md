@@ -12,6 +12,7 @@
 | 1.2 | Cross-crate bridges: dravya, sharira, ushma |
 | 1.3 | sharira bridge additions (muscle torque, cylinder inertia, gait GRF, CoM gravity) |
 | 1.4 | Rust 1.99 / hisab 1.4; audit and repair sweep — contact normal orientation, polygon clipping, solver (restitution, block solver, warm start, split impulse), velocity-level joints, sub-step forces/events, 3D world-space inertia, GJK/EPA/SAT fixes, mass properties, sleep/islands, balanced AABB tree, validated config and snapshot restore, exact springs |
+| 2.0 | The Cyrius port of 1.4.0 as two bundles (2D, 3D); fallible `add_collider` / `add_joint`, the full 3D body state, 3D revolute/prismatic/motors and XPBD refused (ADR 0008); complete snapshots with a checksummed binary form and JSON (ADR 0013); correctly rounded transcendentals, so results are bit-identical across targets (ADR 0011) |
 
 **2.0 is the Cyrius port.** Rust 1.4.0 is the final Rust release and stays in `rust-old/` as the
 parity oracle; see [`impetus-port-plan.md`](impetus-port-plan.md),

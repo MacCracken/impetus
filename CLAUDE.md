@@ -10,7 +10,7 @@
 
 **Impetus** (Latin: driving force) — Physics engine — 2D/3D rigid bodies, collision, constraints, spatial hash, particles
 
-- **Type**: Flat library (Cyrius), being ported from the Rust crate 1.4.0; the port ships as 2.0.0
+- **Type**: Flat library (Cyrius), ported from the Rust crate 1.4.0; the port shipped as 2.0.0
 - **License**: GPL-3.0-only
 - **Language**: Cyrius. The toolchain is pinned in `cyrius.cyml` `[package].cyrius`
 - **Version**: `VERSION` at the project root is the source of truth. Don't inline the number here

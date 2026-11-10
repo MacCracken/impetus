@@ -1315,6 +1315,24 @@ fails when either drifts from `cyrius.cyml`.
       the ball or spring moves.
 - **Unchanged:** the golden corpus (no new rows) and surface parity (662).
 
+## 31. M7d: the 2.0.0 release gates (2026-11-10)
+
+The corpus is unchanged since §29: no new rows, and none moved. What 2.0.0 adds is the whole gate set run once on the
+release state (`VERSION` 2.0.0, both bundles regenerated):
+
+| Gate | x86_64 ELF | x86_64 PE (wine) | aarch64 (qemu) |
+|---|---|---|---|
+| `cyrius build src/main.cyr` | ok, no warnings | ok, no warnings | ok, no warnings |
+| `cyrius test` (33 files) | 33 passed, no warnings | 33 passed, no warnings | 33 passed, no warnings |
+| `tests/parity_2d.tcyr` | 98,874 ok, 0 failed, 6 pending, 166 accepted | the same | the same |
+| `tests/parity_3d.tcyr` | 29,404 ok, 0 failed, 11 accepted | the same | the same |
+| parity digests (2D 8 lines, 3D 1 line, shadows excluded) | — | equal to ELF | equal to ELF |
+
+On ELF only: `cyrius test --bounds`, `cyrius fuzz` (also `--bounds --poison`), `cyrius bench` (129 rows), `cyrius
+audit`, `cyrius vet`, `deps --locked` and `distlib --check` all pass. So do surface parity (662), the ledger (432), the
+bench twins (41) and the doc examples (9). `validate.py` and the generator's `--check` for both profiles confirm the
+corpus is current, and the oracle's own tests still pass (2D 344, 3D 306, rustc 1.99.1).
+
 ## How to reproduce
 
 ```sh
@@ -1327,6 +1345,8 @@ cyrius test --aarch64 tests/parity_2d.tcyr        # aarch64, needs qemu-aarch64
 cargo run --release --locked --manifest-path scripts/oracle/Cargo.toml --no-default-features --features b3 -- --check
 cyrius test tests/parity_3d.tcyr                  # the b3_* modules; also --win and --aarch64
 python3 -I scripts/rust_test_ledger.py . --check  # §30: every Rust test ported or recorded
+python3 -I scripts/bench_record.py . --check      # every Rust bench has its twin
+python3 -I scripts/doc_examples.py .              # the docs' code blocks compile and run (after distlib)
 cyrius run scripts/probes/p1_memory.cyr           # §4.1
 cyrius bench scripts/probes/p2_vectors.bcyr       # §4.2
 ```

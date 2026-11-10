@@ -6,11 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
-The Cyrius port (2.0.0) has begun; the plan of record is
-`docs/development/impetus-port-plan.md`. Rust 1.4.0 is frozen in `rust-old/` as
-the parity oracle, together with the port-tooling changes below. Those are not
-scheduled for a Rust release; they exist so the port's golden-value generator
-can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
+## [2.0.0] - 2026-11-10
+
+**impetus is a Cyrius library.** 2.0.0 ports the Rust crate 1.4.0 to Cyrius 6.7.18, on two bundles:
+`dist/impetus.cyr` (2D) and `dist/impetus-3d.cyr` (3D). The Rust crate is frozen in `rust-old/` as the parity
+oracle. Every module is ported except the bridges to dravya, sharira and ushma, which wait for a Cyrius consumer
+(port plan §9). The plan of record is `docs/development/impetus-port-plan.md`; code moving from the Rust crate reads
+[the migration guide](docs/guides/migration-2.0.md).
 
 ### Breaking
 **impetus 2.0 is a Cyrius library.** The Rust crate stays at 1.4.0, frozen in `rust-old/`. Code that used it moves
@@ -44,6 +46,41 @@ with the [migration guide](docs/guides/migration-2.0.md), whose every Cyrius exa
      platform.
 - **Not carried over:** XPBD (#6); the dravya, sharira and ushma bridges, deferred until a Cyrius consumer needs
   them (port plan §9).
+
+### Verified
+On x86_64 Linux (ELF), x86_64 Windows (PE, under wine) and aarch64 (under qemu), with Cyrius 6.7.18 and the oracle
+built by rustc 1.99.1 against glibc 2.44:
+- **Golden corpus:** 2D **98,874 ok, 0 failed, 6 pending, 166 accepted**; 3D **29,404 ok, 0 failed, 11 accepted**
+  (`docs/development/port-parity.md`). The digests of impetus's own outputs are equal on all three targets
+  (ADR 0008 #7).
+  - Every single-step, contact and world-step row is at 0 ulp. The accepted rows are inputs the 2.0 API refuses
+    (ADR 0008) and the rows where glibc misrounds and the port is correctly rounded (ADR 0011, against MPFR).
+  - The 6 pending rows wait on bayan: integers above `i64::MAX` (S3) and duplicate keys (S4).
+- **The Rust tests:** all 432 are accounted for in `docs/development/rust-test-ledger.md`, gated by
+  `scripts/rust_test_ledger.py --check`. 388 are ported to a test of the same name, 17 are not applicable (8 XPBD,
+  9 for the oracle hooks), and 27 are deferred with the bridges. Rust's two `#[ignore]`d restore tests run and pass.
+- **Surface parity:** all 662 public items of the 30 ported Rust modules have their Cyrius names
+  (`scripts/surface_parity.py`).
+- **Benchmarks:** every one of Rust's 41 benches has a twin on each profile it applies to
+  (`docs/benchmarks-rust-v-cyrius.md`, `scripts/bench_record.py --check`).
+- **Snapshots** (no oracle): exact round trips, step-equivalence on both profiles, refusals that leave the world
+  unchanged, and the fuzz targets on both profiles.
+- **The docs:** every Cyrius code block in the README and the guides compiles and runs against the bundles
+  (`scripts/doc_examples.py`).
+
+### Known limitations
+- JSON can't read back an integer above `i64::MAX`, so a handle whose slot was reused more than 2^31 times
+  doesn't round-trip through JSON (bayan S3). The binary snapshot holds it.
+- A JSON document with a duplicate key is refused, where serde ignores repeats of unknown fields (bayan S4).
+- The JSON writers exit the process when the stdlib's `str_builder` can't grow, the one abort left in the
+  library (port plan §8).
+- Speed: the median benchmark is 10× Rust's in 2D and 13× in 3D; a whole step is 2.6–11× and 5.7–17×. These are
+  first numbers. The upstream issues behind them are filed (port plan §8), among them S5, the stdlib's byte-loop
+  `memcpy`.
+
+The entries below record the port in the order it was done. The `oracle` feature and the `2d` change are
+port tooling in `rust-old/`, not a Rust release: they let the golden generator drive the oracle (M0 step 0), and
+the simulation is unchanged.
 
 ### Added
 - **oracle** — a hidden, non-default `oracle` feature (`impetus::oracle`, not
@@ -710,6 +747,23 @@ with the [migration guide](docs/guides/migration-2.0.md), whose every Cyrius exa
     items are done, and the new-physics items (3D islands, consistent joint frames) and shape validation are open.
     The README's links to a root `docs/architecture/overview.md` and `docs/guides/testing.md`, which never existed
     in the port, now point at the Rust copies in `rust-old/docs/`.
+
+- **Cyrius port, M7 part 4: the 2.0.0 release:**
+  - `VERSION` is 2.0.0, which `cyrius.cyml` reads. Both bundles are regenerated, and only their version line
+    changed.
+  - This CHANGELOG's `[Unreleased]` became `[2.0.0]`, with the Breaking, Verified and Known limitations sections
+    above. The release workflow's extraction of it is 69,758 characters, within GitHub's limit.
+  - CI also runs the Rust-test ledger check, the bench-twin check, `cyrius fuzz` and `scripts/doc_examples.py`.
+    Its stale note about a separate 3D job is gone: `cyrius test` already runs both profiles.
+  - The release gates, all green:
+    - `cyrius test` passes on x86_64 ELF, x86_64 PE and aarch64, and under `--bounds`: 33 files each, no warnings;
+    - the corpus on all three targets: 2D 98,874 ok, 6 pending, 166 accepted; 3D 29,404 ok, 11 accepted. The parity
+      digests are equal across targets;
+    - `cyrius fuzz` (also under `--bounds --poison`), `cyrius bench` (129 rows, no warnings), `cyrius audit`,
+      `cyrius vet`, `deps --locked` and `distlib --check` all pass, and the build succeeds for all three targets;
+    - surface parity (662), the ledger (432), the bench twins (41) and the doc examples (9) pass;
+    - `validate.py` and the generator's `--check` for both profiles confirm the corpus is current, and the Rust
+      oracle's own tests still pass (2D 344, 3D 306).
 
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
