@@ -101,6 +101,7 @@ modules = [
     "src/spatial_hash.cyr",
     "src/math3.cyr",
     "src/b3_types.cyr",
+    "src/b3_narrowphase.cyr",
     "src/particle.cyr",
     "src/json.cyr",
 ]

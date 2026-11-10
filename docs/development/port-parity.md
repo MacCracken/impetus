@@ -710,6 +710,61 @@ fails when either drifts from `cyrius.cyml`.
 - **Result, every target:** 3D **7,321 ok, 0 failed** (2 modules); 2D **98,874 ok, 0 failed, 0 measured, 7 pending,
   165 accepted** (18 modules). The digests are equal on ELF, PE and aarch64, except the 2D native shadows, as before.
 
+## 18. M4b: the 3D narrowphase (2026-11-09, ADR 0012)
+
+- **`src/b3_narrowphase.cyr`** transcribes `backend_3d/narrowphase.rs`:
+  - `generate_contact_3d`'s dispatch, and the closed forms (ball–ball, ball–box, capsule–ball, capsule–capsule,
+    capsule–box with its five candidate points, segment–ball, segment–box with its nine samples);
+  - the AABB fast path, and the OBB SAT over 15 axes with reference-face clipping and edge-pair points;
+  - impetus's own GJK + EPA (ADR 0012), for hull pairs and hull against ball.
+
+  One contact per pair: normal from A to B, depth, point.
+- **The details that decide bits:**
+  - glam's `DVec3::clamp` (`max` then `min`) where Rust clamps a vector, and `f64::clamp` where it clamps a parameter.
+    They differ on a NaN and on ±0. `ImVec3_clamp` joins math3, with 229 `b3_math` rows;
+  - `ZERO − la`, a subtraction, in `capsule_box_3d`'s centre projection, against `−la`, a negation, in
+    `segment_box_3d`'s;
+  - `Sum` folds from +0, so the clip fallback starts there;
+  - the NaN polarity of each test, e.g. `if len < 1e-6 { continue }` doesn't skip a NaN length.
+
+  Three inversions the first draft had were caught in review, before any run.
+- **GJK and EPA's state** is an `ImGjkScratch3d` the caller owns and reuses: the polytope's vertices and faces
+  (`ImRecordList`, now in `src/aabb_tree.cyr` for both profiles) and the horizon edges (`ImWordList`). The simplex is
+  four records on the stack. Rust's `Vec` semantics are kept, since they decide which face wins: `retain` keeps
+  order, `swap_remove` moves the last edge into the hole, and the closest face is the first minimum by `total_cmp`
+  (its key built in `_im_b3_total_key`). If a list can't grow (no memory), the pair returns no contact rather than
+  aborting. The narrowphase's function-local constants (`REL_TOL`, `ABS_TOL`, `GJK_MAX_ITER`, `EPA_MAX_ITER`) are
+  generated.
+- **`b3_narrow.tsv`**, 16,340 rows through the oracle's `contact_3d` hook:
+  - every ordered pair of a 15-shape catalog (two balls, three boxes, three capsules, two segments, five hulls with
+    the flat and two-point ones), at 4 rotation pairs × 3 directions × 5 distances;
+  - the mesh, heightfield, empty and one-point hulls against all of them;
+  - targeted cases: exact touching, concentric, ball centres inside the box near every face, edge and corner,
+    face-touching and edge–edge boxes, the 1e-12 identity test, lying and standing capsules, segments through and
+    along a box, degenerate hulls (flat, collinear, duplicate points) and 24- and 64-point clouds, coordinates to
+    1e12, NaN and ±∞;
+  - 2,000 seeded pairs.
+
+  Every input rotation is a quaternion normalized from rational components, so no input depends on the host's sin
+  or cos. **Class A** (the narrowphase has no transcendental): **all 16,340 rows match bit for bit**, 6,828 contacts
+  and 47,796 floats with signs of zero, on x86_64 ELF, x86_64 PE and aarch64, on the first run.
+- **The transcription.** `validate.py` ports the narrowphase to Python, Rust's `Vec`s as lists with the same
+  semantics, and reproduces every row. A tampered output and a dropped contact both fail it.
+- **Rust tests.** `tests/b3_narrowphase.tcyr` ports the 37 narrowphase tests of `backend_3d/tests.rs`:
+  - the shape-pair tests and the closest-point tests (the 300-pair brute-force check on the test's own LCG);
+  - the normal-direction sweep;
+  - GJK on a collinear start, EPA at its cap on two balls, the hull–sphere depths, the AABB and OBB contact points;
+  - the edge-axis separation and edge–edge contact.
+
+  Cyrius-only groups cover the unhandled pairs and the scratch reuse (no heap growth over 600 GJK pairs after
+  warm-up): 65 assertions.
+- **Performance** (`docs/benchmarks-rust-v-cyrius.md`). Against Rust timing the same pairs through the same hook:
+  - the closed forms are 6–20×;
+  - the OBB SAT 14–17× after a pass that reads the overlap test, the clip and the hull support from f64 words. It
+    was 25×; the bits are identical;
+  - GJK + EPA 6–11×.
+- **Result, every target:** 3D **23,890 ok, 0 failed** (3 modules); 2D unchanged at **98,874 ok**.
+
 ## How to reproduce
 
 ```sh

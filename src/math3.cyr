@@ -200,6 +200,20 @@ fn ImVec3_max(a: ImVec3, b: ImVec3): ImVec3 {
     return v;
 }
 
+# a restricted to [lo, hi] per component as glam does it, `a.max(lo).min(hi)` with Rust's f64 max and min, so a NaN
+# component gives lo and ±0 follows max and min (not `f64::clamp`, whose NaN stays NaN). `DVec3::clamp`.
+#must_use
+fn ImVec3_clamp(a: ImVec3, lo: ImVec3, hi: ImVec3): ImVec3 {
+    var v: ImVec3;
+    var x: f64 = _im_max(a.x, lo.x);
+    var y: f64 = _im_max(a.y, lo.y);
+    var z: f64 = _im_max(a.z, lo.z);
+    v.x = _im_min(x, hi.x);
+    v.y = _im_min(y, hi.y);
+    v.z = _im_min(z, hi.z);
+    return v;
+}
+
 # 1 when every component is finite. `DVec3::is_finite`.
 #must_use
 fn ImVec3_is_finite(a: ImVec3): i64 {

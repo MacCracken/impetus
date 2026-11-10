@@ -173,6 +173,22 @@ var _IM_B2_WARM_START_FACTOR: f64 = 0.95;
 
 # FALLBACK is not carried: the (1, [0, 0], 1) tuple local to `shape_props`, written in place in src/b2_types.cyr.
 
+# ── rust-old/src/backend_3d/narrowphase.rs ──
+
+# Rust: `GJK_MAX_ITER: usize = 64`
+const _IM_B3_GJK_MAX_ITER = 64;
+
+# Rust: `EPA_MAX_ITER: usize = 64`
+const _IM_B3_EPA_MAX_ITER = 64;
+
+# Prefer face axes (and box A) over nearly-equal alternatives so the
+# reference feature doesn't flicker between frames.
+# Rust: `REL_TOL: f64 = 0.98`
+var _IM_B3_REL_TOL: f64 = 0.98;
+
+# Rust: `ABS_TOL: f64 = 1e-3`
+var _IM_B3_ABS_TOL: f64 = 0.001;
+
 # ── rust-old/src/backend_3d/types.rs ──
 
 # General-purpose geometry epsilon for zero-length checks.
@@ -5224,6 +5240,57 @@ impl ImWordList {
     #must_use
     fn at(self, i): i64 {
         return load64(self.data + i * 8);
+    }
+
+    # Releases the buffer.
+    fn free(self) {
+        if (self.data != 0) { fl_free(self.data); }
+        self.data = 0;
+        self.len = 0;
+        self.cap = 0;
+        return 0;
+    }
+}
+
+# A growable buffer of fixed-size records: `len` of `size` bytes at `data`, room for `cap`.
+struct ImRecordList { data; len; cap; size; }
+
+#must_use
+fn ImRecordList_new(size): ImRecordList {
+    var l: ImRecordList;
+    l.data = 0;
+    l.len = 0;
+    l.cap = 0;
+    l.size = size;
+    return l;
+}
+
+impl ImRecordList {
+    # Room for n records: 1, or 0 when there is no memory (the list is unchanged).
+    fn reserve(self, n): i64 {
+        if (n <= self.cap) { return 1; }
+        var cap = self.cap * 2;
+        if (cap < 8) { cap = 8; }
+        while (cap < n) { cap = cap * 2; }
+        var d = fl_alloc(cap * self.size);
+        if (d == 0) { return 0; }
+        if (self.len > 0) { memcpy(d, self.data, self.len * self.size); }
+        if (self.data != 0) { fl_free(self.data); }
+        self.data = d;
+        self.cap = cap;
+        return 1;
+    }
+
+    # The address of record i.
+    #must_use
+    fn at(self, i): i64 { return self.data + i * self.size; }
+
+    # Appends a copy of the record at r: 1, or 0 when there is no memory.
+    fn push(self, r): i64 {
+        if (self.reserve(self.len + 1) == 0) { return 0; }
+        memcpy(self.data + self.len * self.size, r, self.size);
+        self.len = self.len + 1;
+        return 1;
     }
 
     # Releases the buffer.
@@ -11683,57 +11750,6 @@ fn _im_as_emitter(p): *ImParticleEmitter { return p; }
 fn _im_as_force_field(p): *ImForceField { return p; }
 #must_use
 fn _im_as_config(p): *ImWorldConfig { return p; }
-
-# A growable buffer of fixed-size records: `len` of `size` bytes at `data`, room for `cap`.
-struct ImRecordList { data; len; cap; size; }
-
-#must_use
-fn ImRecordList_new(size): ImRecordList {
-    var l: ImRecordList;
-    l.data = 0;
-    l.len = 0;
-    l.cap = 0;
-    l.size = size;
-    return l;
-}
-
-impl ImRecordList {
-    # Room for n records: 1, or 0 when there is no memory (the list is unchanged).
-    fn reserve(self, n): i64 {
-        if (n <= self.cap) { return 1; }
-        var cap = self.cap * 2;
-        if (cap < 8) { cap = 8; }
-        while (cap < n) { cap = cap * 2; }
-        var d = fl_alloc(cap * self.size);
-        if (d == 0) { return 0; }
-        if (self.len > 0) { memcpy(d, self.data, self.len * self.size); }
-        if (self.data != 0) { fl_free(self.data); }
-        self.data = d;
-        self.cap = cap;
-        return 1;
-    }
-
-    # The address of record i.
-    #must_use
-    fn at(self, i): i64 { return self.data + i * self.size; }
-
-    # Appends a copy of the record at r: 1, or 0 when there is no memory.
-    fn push(self, r): i64 {
-        if (self.reserve(self.len + 1) == 0) { return 0; }
-        memcpy(self.data + self.len * self.size, r, self.size);
-        self.len = self.len + 1;
-        return 1;
-    }
-
-    # Releases the buffer.
-    fn free(self) {
-        if (self.data != 0) { fl_free(self.data); }
-        self.data = 0;
-        self.len = 0;
-        self.cap = 0;
-        return 0;
-    }
-}
 
 # ── particle against collider ───────────────────────────────────────────────────────
 # Each writes (normal from the shape to the particle, depth) into out as f64 words and returns 1, or

@@ -174,6 +174,22 @@ var _IM_B2_WARM_START_FACTOR: f64 = 0.95;
 
 # FALLBACK is not carried: the (1, [0, 0], 1) tuple local to `shape_props`, written in place in src/b2_types.cyr.
 
+# ── rust-old/src/backend_3d/narrowphase.rs ──
+
+# Rust: `GJK_MAX_ITER: usize = 64`
+const _IM_B3_GJK_MAX_ITER = 64;
+
+# Rust: `EPA_MAX_ITER: usize = 64`
+const _IM_B3_EPA_MAX_ITER = 64;
+
+# Prefer face axes (and box A) over nearly-equal alternatives so the
+# reference feature doesn't flicker between frames.
+# Rust: `REL_TOL: f64 = 0.98`
+var _IM_B3_REL_TOL: f64 = 0.98;
+
+# Rust: `ABS_TOL: f64 = 1e-3`
+var _IM_B3_ABS_TOL: f64 = 0.001;
+
 # ── rust-old/src/backend_3d/types.rs ──
 
 # General-purpose geometry epsilon for zero-length checks.
@@ -5237,6 +5253,57 @@ impl ImWordList {
     }
 }
 
+# A growable buffer of fixed-size records: `len` of `size` bytes at `data`, room for `cap`.
+struct ImRecordList { data; len; cap; size; }
+
+#must_use
+fn ImRecordList_new(size): ImRecordList {
+    var l: ImRecordList;
+    l.data = 0;
+    l.len = 0;
+    l.cap = 0;
+    l.size = size;
+    return l;
+}
+
+impl ImRecordList {
+    # Room for n records: 1, or 0 when there is no memory (the list is unchanged).
+    fn reserve(self, n): i64 {
+        if (n <= self.cap) { return 1; }
+        var cap = self.cap * 2;
+        if (cap < 8) { cap = 8; }
+        while (cap < n) { cap = cap * 2; }
+        var d = fl_alloc(cap * self.size);
+        if (d == 0) { return 0; }
+        if (self.len > 0) { memcpy(d, self.data, self.len * self.size); }
+        if (self.data != 0) { fl_free(self.data); }
+        self.data = d;
+        self.cap = cap;
+        return 1;
+    }
+
+    # The address of record i.
+    #must_use
+    fn at(self, i): i64 { return self.data + i * self.size; }
+
+    # Appends a copy of the record at r: 1, or 0 when there is no memory.
+    fn push(self, r): i64 {
+        if (self.reserve(self.len + 1) == 0) { return 0; }
+        memcpy(self.data + self.len * self.size, r, self.size);
+        self.len = self.len + 1;
+        return 1;
+    }
+
+    # Releases the buffer.
+    fn free(self) {
+        if (self.data != 0) { fl_free(self.data); }
+        self.data = 0;
+        self.len = 0;
+        self.cap = 0;
+        return 0;
+    }
+}
+
 # A node is 12 words: the box (min x, y, z, max x, y, z as f64 words), parent, left, right (−1 for
 # none), whether it holds a key, the key, and its height (0 for a leaf).
 const _IM_TN = 96;
@@ -6196,6 +6263,20 @@ fn ImVec3_max(a: ImVec3, b: ImVec3): ImVec3 {
     return v;
 }
 
+# a restricted to [lo, hi] per component as glam does it, `a.max(lo).min(hi)` with Rust's f64 max and min, so a NaN
+# component gives lo and ±0 follows max and min (not `f64::clamp`, whose NaN stays NaN). `DVec3::clamp`.
+#must_use
+fn ImVec3_clamp(a: ImVec3, lo: ImVec3, hi: ImVec3): ImVec3 {
+    var v: ImVec3;
+    var x: f64 = _im_max(a.x, lo.x);
+    var y: f64 = _im_max(a.y, lo.y);
+    var z: f64 = _im_max(a.z, lo.z);
+    v.x = _im_min(x, hi.x);
+    v.y = _im_min(y, hi.y);
+    v.z = _im_min(z, hi.z);
+    return v;
+}
+
 # 1 when every component is finite. `DVec3::is_finite`.
 #must_use
 fn ImVec3_is_finite(a: ImVec3): i64 {
@@ -7115,6 +7196,1424 @@ struct ImContact3d {
     normal: ImVec3;
     depth: f64;
     point: ImVec3;
+}
+
+# --- b3_narrowphase.cyr ---
+
+# b3_narrowphase.cyr — the 3D narrowphase (port of rust-old/src/backend_3d/narrowphase.rs): one contact (normal from
+# A to B, depth, world point) per shape pair. Closed forms for balls, boxes, capsules and segments, the 15-axis OBB
+# separating-axis test with reference-face clipping, and impetus's own GJK + EPA for hulls (ADR 0012: not hisab's,
+# whose calls can't yet be kept off the global heap).
+#
+# Every expression keeps Rust's operation order on src/math3.cyr's glam transcription, and the narrowphase has no
+# transcendental, so tests/golden/b3_narrow.tsv is class A: every bit, signs of zero included. Two details decide
+# bits: glam's `DVec3::clamp` (max then min, ImVec3_clamp) where Rust clamps a vector and `f64::clamp` (_im_clamp)
+# where it clamps a parameter; and `ZERO - v` (a subtraction) where Rust writes it, `-v` (a negation) where it
+# writes that.
+#
+# GJK and EPA keep their working sets in an ImGjkScratch3d the caller owns and reuses (port plan §7.5): Rust's
+# `Vec`s, with the same order semantics (`retain` keeps order, `swap_remove` moves the last edge into the hole,
+# the closest face is the first minimum by `total_cmp`). A scratch list that can't grow (no memory) ends the pair
+# with no contact.
+#
+# A struct-returning call whose arguments read a struct-typed field is bound to a local before a field store
+# (the cyrius 6.7.18 defect, see src/b3_types.cyr).
+
+# One contact: the normal from A to B, the depth, the world point.
+struct ImHit3d { normal: ImVec3; depth: f64; point: ImVec3; }
+
+#must_use
+fn _im_b3_as_shape(p): *ImColliderShape { return p; }
+
+# Writes a contact into *out.
+fn _im_b3_hit(out: *ImHit3d, n: ImVec3, d: f64, p: ImVec3) {
+    out.normal = n;
+    out.depth = d;
+    out.point = p;
+    return 0;
+}
+
+# Negates the contact's normal: Rust's `.map(|(n, d, p)| (-n, d, p))`.
+fn _im_b3_flip(out: *ImHit3d) {
+    var n: ImVec3 = ImVec3_neg(out.normal);
+    out.normal = n;
+    return 0;
+}
+
+# Stores v into the vector at dst.
+fn _im_b3_put(dst: *ImVec3, v: ImVec3) {
+    dst.x = v.x;
+    dst.y = v.y;
+    dst.z = v.z;
+    return 0;
+}
+
+# Writes v as three f64 words at p (the inverse of _im_b3_point).
+fn _im_b3_store(p, v: ImVec3) {
+    var x: f64 = v.x;
+    var y: f64 = v.y;
+    var z: f64 = v.z;
+    store64(p, _im_bits(x));
+    store64(p + 8, _im_bits(y));
+    store64(p + 16, _im_bits(z));
+    return 0;
+}
+
+# Component i (0, 1, 2) of v: glam's `Index`.
+#must_use
+fn _im_b3_at(v: ImVec3, i): f64 {
+    var r: f64 = v.z;
+    if (i == 0) { r = v.x; }
+    if (i == 1) { r = v.y; }
+    return r;
+}
+
+# The unit axis i scaled by s, the other components +0: Rust's `let mut n = DVec3::ZERO; n[i] = s;`.
+#must_use
+fn _im_b3_axis_vec(i, s: f64): ImVec3 {
+    var v: ImVec3 = ImVec3_zero();
+    if (i == 0) { v.x = s; }
+    if (i == 1) { v.y = s; }
+    if (i == 2) { v.z = s; }
+    return v;
+}
+
+# The axis of the least component, the first on a tie: Rust's `if x <= y && x <= z { 0 } else if y <= z { 1 } else
+# { 2 }`.
+#must_use
+fn _im_b3_min_axis(d: ImVec3): i64 {
+    if (d.x <= d.y && d.x <= d.z) { return 0; }
+    if (d.y <= d.z) { return 1; }
+    return 2;
+}
+
+# 1.0 for x ≥ 0, else −1.0 (NaN included): Rust's `if x >= 0.0 { 1.0 } else { -1.0 }`.
+#must_use
+fn _im_b3_sign(x: f64): f64 {
+    if (x >= 0.0) { return 1.0; }
+    return -1.0;
+}
+
+# The key `f64::total_cmp` orders by: the bits as a signed integer, the magnitude bits flipped for a negative sign.
+#must_use
+fn _im_b3_total_key(x: f64): i64 {
+    var b = _im_bits(x);
+    if (b < 0) { b = b ^ 0x7FFFFFFFFFFFFFFF; }
+    return b;
+}
+
+# ── helpers ─────────────────────────────────────────────────────────────────────────
+
+# 1 when q is within EPSILON of ±identity in every component. Mirrors `is_identity_quat`.
+#must_use
+fn _im_b3_is_identity_quat(q: ImQuat): i64 {
+    var ax: f64 = f64_abs(q.x);
+    var ay: f64 = f64_abs(q.y);
+    var az: f64 = f64_abs(q.z);
+    var aw: f64 = f64_abs(q.w);
+    var dw: f64 = f64_abs(aw - 1.0);
+    if (ax < _IM_B3_EPSILON && ay < _IM_B3_EPSILON && az < _IM_B3_EPSILON && dw < _IM_B3_EPSILON) { return 1; }
+    return 0;
+}
+
+# The point of segment [a, b] nearest p (a for a segment shorter than EPSILON). Mirrors `closest_point_on_segment_3d`.
+#must_use
+fn _im_b3_closest_point_on_segment_3d(a: ImVec3, b: ImVec3, p: ImVec3): ImVec3 {
+    var ab: ImVec3 = b - a;
+    var len_sq: f64 = ImVec3_dot(ab, ab);
+    if (len_sq < _IM_B3_EPSILON_SQ) { return a; }
+    var pa: ImVec3 = p - a;
+    var num: f64 = ImVec3_dot(pa, ab);
+    var t: f64 = _im_clamp(num / len_sq, 0.0, 1.0);
+    return a + ImVec3_scale(ab, t);
+}
+
+# A capsule's segment endpoints in world space, pos ∓ rot·(0, half_height, 0), into *ea and *eb. Mirrors
+# `capsule_endpoints_3d`.
+fn _im_b3_capsule_endpoints_3d(pos: ImVec3, rot: ImQuat, half_height: f64, ea: *ImVec3, eb: *ImVec3) {
+    var axis: ImVec3 = ImQuat_mul_vec3(rot, ImVec3_new(0.0, half_height, 0.0));
+    _im_b3_put(ea, pos - axis);
+    _im_b3_put(eb, pos + axis);
+    return 0;
+}
+
+# The closest points between segments [a, b] and [c, d] into *op and *oq: the best of the four endpoint projections,
+# then the clamped interior solution if it is strictly better. Mirrors `closest_points_segments_3d`.
+fn _im_b3_closest_points_segments_3d(a: ImVec3, b: ImVec3, c: ImVec3, d: ImVec3, op: *ImVec3, oq: *ImVec3) {
+    var ab: ImVec3 = b - a;
+    var cd: ImVec3 = d - c;
+    var d1: f64 = ImVec3_dot(ab, ab);
+    var d2: f64 = ImVec3_dot(cd, cd);
+    var bp: ImVec3 = a;
+    var bq: ImVec3 = _im_b3_closest_point_on_segment_3d(c, d, a);
+    var df: ImVec3 = bp - bq;
+    var best_d: f64 = ImVec3_length_squared(df);
+    var p1: ImVec3 = b;
+    var q1: ImVec3 = _im_b3_closest_point_on_segment_3d(c, d, b);
+    var e1: ImVec3 = p1 - q1;
+    var dd1: f64 = ImVec3_length_squared(e1);
+    if (dd1 < best_d) {
+        bp = p1;
+        bq = q1;
+        best_d = dd1;
+    }
+    var p2: ImVec3 = _im_b3_closest_point_on_segment_3d(a, b, c);
+    var q2: ImVec3 = c;
+    var e2: ImVec3 = p2 - q2;
+    var dd2: f64 = ImVec3_length_squared(e2);
+    if (dd2 < best_d) {
+        bp = p2;
+        bq = q2;
+        best_d = dd2;
+    }
+    var p3: ImVec3 = _im_b3_closest_point_on_segment_3d(a, b, d);
+    var q3: ImVec3 = d;
+    var e3: ImVec3 = p3 - q3;
+    var dd3: f64 = ImVec3_length_squared(e3);
+    if (dd3 < best_d) {
+        bp = p3;
+        bq = q3;
+        best_d = dd3;
+    }
+    if (d1 > _IM_B3_EPSILON_SQ && d2 > _IM_B3_EPSILON_SQ) {
+        var r: ImVec3 = a - c;
+        var d3: f64 = ImVec3_dot(ab, cd);
+        var d4: f64 = ImVec3_dot(ab, r);
+        var d5: f64 = ImVec3_dot(cd, r);
+        var denom: f64 = d1 * d2 - d3 * d3;
+        if (denom > 0.000000000001 * d1 * d2) {
+            var s: f64 = _im_clamp((d3 * d5 - d4 * d2) / denom, 0.0, 1.0);
+            var t: f64 = _im_clamp((d3 * s + d5) / d2, 0.0, 1.0);
+            s = _im_clamp((t * d3 - d4) / d1, 0.0, 1.0);
+            t = _im_clamp((d3 * s + d5) / d2, 0.0, 1.0);
+            var pp: ImVec3 = a + ImVec3_scale(ab, s);
+            var qq: ImVec3 = c + ImVec3_scale(cd, t);
+            var e4: ImVec3 = pp - qq;
+            var dd4: f64 = ImVec3_length_squared(e4);
+            if (dd4 < best_d) {
+                bp = pp;
+                bq = qq;
+            }
+        }
+    }
+    _im_b3_put(op, bp);
+    _im_b3_put(oq, bq);
+    return 0;
+}
+
+# ── the closed forms ────────────────────────────────────────────────────────────────
+# Each writes the contact into *out and returns 1, or returns 0 for none.
+
+# Two balls: the centre line, or +y for centres within EPSILON; the point on A's surface. Mirrors `sphere_sphere`.
+fn _im_b3_sphere_sphere(pa: ImVec3, ra: f64, pb: ImVec3, rb: f64, out: *ImHit3d): i64 {
+    var d: ImVec3 = pb - pa;
+    var dist_sq: f64 = ImVec3_dot(d, d);
+    var sum_r: f64 = ra + rb;
+    if (dist_sq >= sum_r * sum_r) { return 0; }
+    var dist: f64 = f64_sqrt(dist_sq);
+    var normal: ImVec3 = ImVec3_new(0.0, 1.0, 0.0);
+    var depth: f64 = sum_r;
+    if (dist < _IM_B3_EPSILON) {
+        normal = ImVec3_new(0.0, 1.0, 0.0);
+    } else {
+        normal = ImVec3_div_scalar(d, dist);
+        depth = sum_r - dist;
+    }
+    var point: ImVec3 = pa + ImVec3_scale(normal, ra);
+    _im_b3_hit(out, normal, depth, point);
+    return 1;
+}
+
+# A ball against an oriented box, in the box's frame: the clamped nearest point, or for a centre inside the box the
+# least-penetrated face. The normal points from the box to the ball. Mirrors `sphere_obb`.
+fn _im_b3_sphere_obb(sp: ImVec3, radius: f64, bp: ImVec3, brot: ImQuat, he: ImVec3, out: *ImHit3d): i64 {
+    var inv: ImQuat = ImQuat_inverse(brot);
+    var ls: ImVec3 = ImQuat_mul_vec3(inv, sp - bp);
+    var closest: ImVec3 = ImVec3_clamp(ls, ImVec3_neg(he), he);
+    var diff: ImVec3 = ls - closest;
+    var dist_sq: f64 = ImVec3_dot(diff, diff);
+    if (dist_sq >= radius * radius) { return 0; }
+    var dist: f64 = f64_sqrt(dist_sq);
+    var ln: ImVec3 = ImVec3_zero();
+    var depth: f64 = 0.0;
+    if (dist < _IM_B3_EPSILON) {
+        var ax: f64 = f64_abs(ls.x);
+        var ay: f64 = f64_abs(ls.y);
+        var az: f64 = f64_abs(ls.z);
+        var fd: ImVec3 = ImVec3_new(he.x - ax, he.y - ay, he.z - az);
+        var k = _im_b3_min_axis(fd);
+        var lk: f64 = _im_b3_at(ls, k);
+        ln = _im_b3_axis_vec(k, _im_b3_sign(lk));
+        var fk: f64 = _im_b3_at(fd, k);
+        depth = fk + radius;
+    } else {
+        ln = ImVec3_div_scalar(diff, dist);
+        depth = radius - dist;
+    }
+    var normal: ImVec3 = ImQuat_mul_vec3(brot, ln);
+    var point: ImVec3 = ImQuat_mul_vec3(brot, closest) + bp;
+    _im_b3_hit(out, normal, depth, point);
+    return 1;
+}
+
+# Two axis-aligned boxes: the least overlapping axis, and the centre of the overlap region. Mirrors `aabb_aabb_3d`.
+fn _im_b3_aabb_aabb_3d(pa: ImVec3, hea: ImVec3, pb: ImVec3, heb: ImVec3, out: *ImHit3d): i64 {
+    var d: ImVec3 = pb - pa;
+    var dx: f64 = f64_abs(d.x);
+    var dy: f64 = f64_abs(d.y);
+    var dz: f64 = f64_abs(d.z);
+    var ov: ImVec3 = ImVec3_new(hea.x + heb.x - dx, hea.y + heb.y - dy, hea.z + heb.z - dz);
+    if (ov.x <= 0.0 || ov.y <= 0.0 || ov.z <= 0.0) { return 0; }
+    var k = _im_b3_min_axis(ov);
+    var dk: f64 = _im_b3_at(d, k);
+    var normal: ImVec3 = _im_b3_axis_vec(k, _im_b3_sign(dk));
+    var depth: f64 = _im_b3_at(ov, k);
+    var lo: ImVec3 = ImVec3_max(pa - hea, pb - heb);
+    var hi: ImVec3 = ImVec3_min(pa + hea, pb + heb);
+    var point: ImVec3 = ImVec3_scale(lo + hi, 0.5);
+    _im_b3_hit(out, normal, depth, point);
+    return 1;
+}
+
+# A capsule against a ball: the ball against the capsule segment's nearest point. Mirrors `capsule_sphere_3d`.
+fn _im_b3_capsule_sphere_3d(cp: ImVec3, crot: ImQuat, hh: f64, cr: f64, sp: ImVec3, sr: f64, out: *ImHit3d): i64 {
+    var ea: ImVec3 = ImVec3_zero();
+    var eb: ImVec3 = ImVec3_zero();
+    _im_b3_capsule_endpoints_3d(cp, crot, hh, &ea, &eb);
+    var closest: ImVec3 = _im_b3_closest_point_on_segment_3d(ea, eb, sp);
+    return _im_b3_sphere_sphere(closest, cr, sp, sr, out);
+}
+
+# Two capsules: the balls at the segments' closest points. Mirrors `capsule_capsule_3d`.
+fn _im_b3_capsule_capsule_3d(pa: ImVec3, ra: ImQuat, hha: f64, cra: f64, pb: ImVec3, rb: ImQuat, hhb: f64, crb: f64,
+    out: *ImHit3d): i64 {
+    var a1: ImVec3 = ImVec3_zero();
+    var a2: ImVec3 = ImVec3_zero();
+    var b1: ImVec3 = ImVec3_zero();
+    var b2: ImVec3 = ImVec3_zero();
+    _im_b3_capsule_endpoints_3d(pa, ra, hha, &a1, &a2);
+    _im_b3_capsule_endpoints_3d(pb, rb, hhb, &b1, &b2);
+    var qa: ImVec3 = ImVec3_zero();
+    var qb: ImVec3 = ImVec3_zero();
+    _im_b3_closest_points_segments_3d(a1, a2, b1, b2, &qa, &qb);
+    return _im_b3_sphere_sphere(qa, cra, qb, crb, out);
+}
+
+# The segment parameter of p projected onto la + t·ab, clamped to [0, 1]; 0 for a segment shorter than EPSILON. The
+# `project` closure of `capsule_box_3d`.
+#must_use
+fn _im_b3_project(p: ImVec3, la: ImVec3, ab: ImVec3, len_sq: f64): f64 {
+    if (len_sq < _IM_B3_EPSILON_SQ) { return 0.0; }
+    var pl: ImVec3 = p - la;
+    var num: f64 = ImVec3_dot(pl, ab);
+    var t: f64 = _im_clamp(num / len_sq, 0.0, 1.0);
+    return t;
+}
+
+# The squared gap between la + t·ab and the box ±he. The `gap_sq` closure of `capsule_box_3d`.
+#must_use
+fn _im_b3_gap_sq(t: f64, la: ImVec3, ab: ImVec3, he: ImVec3): f64 {
+    var p: ImVec3 = la + ImVec3_scale(ab, t);
+    var c: ImVec3 = ImVec3_clamp(p, ImVec3_neg(he), he);
+    var g: ImVec3 = p - c;
+    var r: f64 = ImVec3_length_squared(g);
+    return r;
+}
+
+# A capsule against an oriented box: ball-against-box tests at the segment midpoint, the projection of the box
+# centre, an alternating-projection point and both endpoints, keeping the deepest by more than 1e-9 (the midpoint
+# wins ties). The normal points from the box to the capsule. Mirrors `capsule_box_3d`.
+fn _im_b3_capsule_box_3d(cp: ImVec3, crot: ImQuat, hh: f64, cr: f64, bp: ImVec3, brot: ImQuat, he: ImVec3,
+    out: *ImHit3d): i64 {
+    var ea: ImVec3 = ImVec3_zero();
+    var eb: ImVec3 = ImVec3_zero();
+    _im_b3_capsule_endpoints_3d(cp, crot, hh, &ea, &eb);
+    var inv: ImQuat = ImQuat_inverse(brot);
+    var la: ImVec3 = ImQuat_mul_vec3(inv, ea - bp);
+    var lb: ImVec3 = ImQuat_mul_vec3(inv, eb - bp);
+    var ab: ImVec3 = lb - la;
+    var len_sq: f64 = ImVec3_dot(ab, ab);
+    var t_center: f64 = _im_b3_project(ImVec3_zero(), la, ab, len_sq);
+    # The seed: the least gap among 0.5, t_center, 0 and 1, starting from (0.5, ∞).
+    var zero: f64 = 0.0;
+    var t_alt: f64 = 0.5;
+    var g_best: f64 = 1.0 / zero;
+    var seeds[32];
+    store64(&seeds, _im_bits(0.5));
+    store64(&seeds + 8, _im_bits(t_center));
+    store64(&seeds + 16, _im_bits(0.0));
+    store64(&seeds + 24, _im_bits(1.0));
+    for (var k = 0; k < 4; k = k + 1) {
+        var ts: f64 = load64(&seeds + k * 8);
+        var g: f64 = _im_b3_gap_sq(ts, la, ab, he);
+        if (g < g_best) {
+            t_alt = ts;
+            g_best = g;
+        }
+    }
+    var nhe: ImVec3 = ImVec3_neg(he);
+    for (var it = 0; it < 8; it = it + 1) {
+        var p: ImVec3 = la + ImVec3_scale(ab, t_alt);
+        t_alt = _im_b3_project(ImVec3_clamp(p, nhe, he), la, ab, len_sq);
+    }
+    var cands[40];
+    store64(&cands, _im_bits(0.5));
+    store64(&cands + 8, _im_bits(t_center));
+    store64(&cands + 16, _im_bits(t_alt));
+    store64(&cands + 24, _im_bits(0.0));
+    store64(&cands + 32, _im_bits(1.0));
+    var have = 0;
+    var best: ImHit3d;
+    var c: ImHit3d;
+    for (var j = 0; j < 5; j = j + 1) {
+        var t: f64 = load64(&cands + j * 8);
+        var wp: ImVec3 = ImQuat_mul_vec3(brot, la + ImVec3_scale(ab, t)) + bp;
+        if (_im_b3_sphere_obb(wp, cr, bp, brot, he, &c) == 1) {
+            var cd: f64 = c.depth;
+            var bd: f64 = best.depth;
+            if (have == 0 || cd > bd + 0.000000001) {
+                best = c;
+                have = 1;
+            }
+        }
+    }
+    if (have == 0) { return 0; }
+    _im_b3_hit(out, best.normal, best.depth, best.point);
+    return 1;
+}
+
+# ── the box pair ────────────────────────────────────────────────────────────────────
+# A box's frame is three axis vectors (9 f64 words) and three half extents (3 f64 words).
+
+# Writes rot·x, rot·y and rot·z at axes.
+fn _im_b3_box_axes(rot: ImQuat, axes) {
+    _im_b3_store(axes, ImQuat_mul_vec3(rot, ImVec3_new(1.0, 0.0, 0.0)));
+    _im_b3_store(axes + 24, ImQuat_mul_vec3(rot, ImVec3_new(0.0, 1.0, 0.0)));
+    _im_b3_store(axes + 48, ImQuat_mul_vec3(rot, ImVec3_new(0.0, 0.0, 1.0)));
+    return 0;
+}
+
+# The box's projected half length on (ax, ay, az): ((h0·|e0·axis| + h1·|e1·axis|) + h2·|e2·axis|), each dot glam's
+# (x·x' + y·y') + z·z', read from the axis and half-extent words without building vectors.
+#must_use
+fn _im_b3_box_reach(axes, he, ax: f64, ay: f64, az: f64): f64 {
+    var r: f64 = 0.0;
+    for (var k = 0; k < 3; k = k + 1) {
+        var ex: f64 = load64(axes + k * 24);
+        var ey: f64 = load64(axes + k * 24 + 8);
+        var ez: f64 = load64(axes + k * 24 + 16);
+        var h: f64 = load64(he + k * 8);
+        var dt: f64 = ex * ax + ey * ay + ez * az;
+        var term: f64 = h * f64_abs(dt);
+        if (k == 0) { r = term; } else { r = r + term; }
+    }
+    return r;
+}
+
+# The overlap of the two boxes' projections on axis less the centre distance's: the `overlap_on` closure.
+#must_use
+fn _im_b3_overlap_on(axa, ha, axb, hb, d: ImVec3, axis: ImVec3): f64 {
+    var ax: f64 = axis.x;
+    var ay: f64 = axis.y;
+    var az: f64 = axis.z;
+    var pa: f64 = _im_b3_box_reach(axa, ha, ax, ay, az);
+    var pb: f64 = _im_b3_box_reach(axb, hb, ax, ay, az);
+    var dd: f64 = d.x * ax + d.y * ay + d.z * az;
+    var r: f64 = pa + pb - f64_abs(dd);
+    return r;
+}
+
+# Sutherland–Hodgman: the part of the count points at poly (24-byte records) with n·p ≤ d, into out (room for 8),
+# returning its count, on f64 words in glam's operation order. Mirrors `clip_polygon`.
+fn _im_b3_clip_polygon(poly, count, n: ImVec3, d: f64, out): i64 {
+    var nx: f64 = n.x;
+    var ny: f64 = n.y;
+    var nz: f64 = n.z;
+    var cnt = 0;
+    for (var i = 0; i < count; i = i + 1) {
+        var pp = poly + i * 24;
+        var qp = poly + ((i + 1) % count) * 24;
+        var px: f64 = load64(pp);
+        var py: f64 = load64(pp + 8);
+        var pz: f64 = load64(pp + 16);
+        var qx: f64 = load64(qp);
+        var qy: f64 = load64(qp + 8);
+        var qz: f64 = load64(qp + 16);
+        var np: f64 = nx * px + ny * py + nz * pz;
+        var nq: f64 = nx * qx + ny * qy + nz * qz;
+        var dp: f64 = np - d;
+        var dq: f64 = nq - d;
+        if (dp <= 0.0 && cnt < 8) {
+            store64(out + cnt * 24, _im_bits(px));
+            store64(out + cnt * 24 + 8, _im_bits(py));
+            store64(out + cnt * 24 + 16, _im_bits(pz));
+            cnt = cnt + 1;
+        }
+        var sp = 0;
+        var sq = 0;
+        if (dp < 0.0) { sp = 1; }
+        if (dq < 0.0) { sq = 1; }
+        var gap: f64 = f64_abs(dp - dq);
+        if (sp != sq && gap > _IM_B3_EPSILON && cnt < 8) {
+            var t: f64 = dp / (dp - dq);
+            var ix: f64 = px + (qx - px) * t;
+            var iy: f64 = py + (qy - py) * t;
+            var iz: f64 = pz + (qz - pz) * t;
+            store64(out + cnt * 24, _im_bits(ix));
+            store64(out + cnt * 24 + 8, _im_bits(iy));
+            store64(out + cnt * 24 + 16, _im_bits(iz));
+            cnt = cnt + 1;
+        }
+    }
+    return cnt;
+}
+
+# A face contact's point: the incident box's face most anti-parallel to the reference normal, clipped against the
+# reference face's four side planes; the mean of the clipped points that penetrate the reference face, each moved
+# halfway to its plane (else the mean of all, else the midpoint of the two face centres). Mirrors
+# `face_contact_point`.
+#must_use
+fn _im_b3_face_contact_point(ref_pos: ImVec3, ref_axes, ref_he, ref_axis, ref_normal: ImVec3, inc_pos: ImVec3,
+    inc_axes, inc_he): ImVec3 {
+    var inc_axis = 0;
+    var best_dot: f64 = 0.0;
+    for (var k = 0; k < 3; k = k + 1) {
+        var ax: ImVec3 = _im_b3_point(inc_axes + k * 24);
+        var dk: f64 = ImVec3_dot(ax, ref_normal);
+        var dt: f64 = f64_abs(dk);
+        if (dt > best_dot) {
+            best_dot = dt;
+            inc_axis = k;
+        }
+    }
+    var ia: ImVec3 = _im_b3_point(inc_axes + inc_axis * 24);
+    var sd: f64 = ImVec3_dot(ia, ref_normal);
+    var inc_n: ImVec3 = ia;
+    if (sd > 0.0) { inc_n = ImVec3_neg(ia); }
+    var ih: f64 = load64(inc_he + inc_axis * 8);
+    var inc_centre: ImVec3 = inc_pos + ImVec3_scale(inc_n, ih);
+    var u = (inc_axis + 1) % 3;
+    var v = (inc_axis + 2) % 3;
+    var hu: f64 = load64(inc_he + u * 8);
+    var hv: f64 = load64(inc_he + v * 8);
+    var eu: ImVec3 = ImVec3_scale(_im_b3_point(inc_axes + u * 24), hu);
+    var ev: ImVec3 = ImVec3_scale(_im_b3_point(inc_axes + v * 24), hv);
+    var bufa[192];
+    var bufb[192];
+    var poly = &bufa;
+    var spare = &bufb;
+    _im_b3_store(poly, inc_centre + eu + ev);
+    _im_b3_store(poly + 24, inc_centre - eu + ev);
+    _im_b3_store(poly + 48, inc_centre - eu - ev);
+    _im_b3_store(poly + 72, inc_centre + eu - ev);
+    var count = 4;
+    for (var k2 = 0; k2 < 3; k2 = k2 + 1) {
+        if (k2 != ref_axis) {
+            var rk: ImVec3 = _im_b3_point(ref_axes + k2 * 24);
+            var rh: f64 = load64(ref_he + k2 * 8);
+            for (var si = 0; si < 2; si = si + 1) {
+                var s: f64 = 1.0;
+                if (si == 1) { s = -1.0; }
+                var plane_n: ImVec3 = ImVec3_scale(rk, s);
+                var pd: f64 = ImVec3_dot(plane_n, ref_pos);
+                var plane_d: f64 = pd + rh;
+                count = _im_b3_clip_polygon(poly, count, plane_n, plane_d, spare);
+                var sw = poly;
+                poly = spare;
+                spare = sw;
+                if (count == 0) { si = 2; }
+            }
+        }
+    }
+    var rha: f64 = load64(ref_he + ref_axis * 8);
+    var rp: f64 = ImVec3_dot(ref_normal, ref_pos);
+    var ref_offset: f64 = rp + rha;
+    var sum: ImVec3 = ImVec3_zero();
+    var n_pen = 0;
+    for (var j = 0; j < count; j = j + 1) {
+        var p: ImVec3 = _im_b3_point(poly + j * 24);
+        var np: f64 = ImVec3_dot(ref_normal, p);
+        var pen: f64 = ref_offset - np;
+        if (pen >= 0.0) {
+            sum = sum + (p + ImVec3_scale(ref_normal, pen * 0.5));
+            n_pen = n_pen + 1;
+        }
+    }
+    if (n_pen > 0) {
+        var fp: f64 = f64_from(n_pen);
+        return ImVec3_div_scalar(sum, fp);
+    }
+    if (count > 0) {
+        var all: ImVec3 = ImVec3_zero();
+        for (var j2 = 0; j2 < count; j2 = j2 + 1) { all = all + _im_b3_point(poly + j2 * 24); }
+        var fc: f64 = f64_from(count);
+        return ImVec3_div_scalar(all, fc);
+    }
+    var mid: ImVec3 = ref_pos + ImVec3_scale(ref_normal, rha) + inc_centre;
+    return ImVec3_scale(mid, 0.5);
+}
+
+# Two oriented boxes by the separating axis test over the 15 axes (three face normals each, nine edge cross products,
+# near-parallel edges skipped), preferring A's faces, then B's, then an edge pair, unless the alternative is clearly
+# shallower (REL_TOL, ABS_TOL). The point: reference-face clipping for a face, the closest points of the two edges for
+# an edge pair. Mirrors `obb_obb_3d`.
+fn _im_b3_obb_obb_3d(pa: ImVec3, ra: ImQuat, hea: ImVec3, pb: ImVec3, rb: ImQuat, heb: ImVec3, out: *ImHit3d): i64 {
+    var axa[72];
+    var axb[72];
+    var ha[24];
+    var hb[24];
+    _im_b3_box_axes(ra, &axa);
+    _im_b3_box_axes(rb, &axb);
+    _im_b3_store(&ha, hea);
+    _im_b3_store(&hb, heb);
+    var d: ImVec3 = pb - pa;
+    var zero: f64 = 0.0;
+    var inf: f64 = 1.0 / zero;
+    var best_a: f64 = inf;
+    var ia = 0;
+    var best_b: f64 = inf;
+    var ib = 0;
+    for (var i = 0; i < 3; i = i + 1) {
+        var oa: f64 = _im_b3_overlap_on(&axa, &ha, &axb, &hb, d, _im_b3_point(&axa + i * 24));
+        if (oa <= 0.0) { return 0; }
+        if (oa < best_a) {
+            best_a = oa;
+            ia = i;
+        }
+        var ob: f64 = _im_b3_overlap_on(&axa, &ha, &axb, &hb, d, _im_b3_point(&axb + i * 24));
+        if (ob <= 0.0) { return 0; }
+        if (ob < best_b) {
+            best_b = ob;
+            ib = i;
+        }
+    }
+    # The feature: 0 face of A, 1 face of B, 2 an edge pair.
+    var feature = 0;
+    var fi = ia;
+    var fj = 0;
+    var depth: f64 = best_a;
+    var axis: ImVec3 = _im_b3_point(&axa + ia * 24);
+    if (best_b < _IM_B3_REL_TOL * best_a - _IM_B3_ABS_TOL) {
+        feature = 1;
+        fi = ib;
+        depth = best_b;
+        axis = _im_b3_point(&axb + ib * 24);
+    }
+    var best_e: f64 = inf;
+    var ei = 0;
+    var ej = 0;
+    var eax: ImVec3 = ImVec3_zero();
+    for (var i2 = 0; i2 < 3; i2 = i2 + 1) {
+        var ea: ImVec3 = _im_b3_point(&axa + i2 * 24);
+        for (var j2 = 0; j2 < 3; j2 = j2 + 1) {
+            var eb: ImVec3 = _im_b3_point(&axb + j2 * 24);
+            var c: ImVec3 = ImVec3_cross(ea, eb);
+            var len: f64 = ImVec3_length(c);
+            # Rust's `if len < 1e-6 { continue; }`: a NaN length is not skipped.
+            var skip = 0;
+            if (len < 0.000001) { skip = 1; }
+            if (skip == 0) {
+                var ax: ImVec3 = ImVec3_div_scalar(c, len);
+                var o: f64 = _im_b3_overlap_on(&axa, &ha, &axb, &hb, d, ax);
+                if (o <= 0.0) { return 0; }
+                if (o < best_e) {
+                    best_e = o;
+                    ei = i2;
+                    ej = j2;
+                    eax = ax;
+                }
+            }
+        }
+    }
+    if (best_e < _IM_B3_REL_TOL * depth - _IM_B3_ABS_TOL) {
+        depth = best_e;
+        feature = 2;
+        fi = ei;
+        fj = ej;
+        axis = eax;
+    }
+    var da: f64 = ImVec3_dot(d, axis);
+    var normal: ImVec3 = axis;
+    if (da < 0.0) { normal = ImVec3_neg(axis); }
+    var point: ImVec3 = ImVec3_zero();
+    if (feature == 0) {
+        point = _im_b3_face_contact_point(pa, &axa, &ha, fi, normal, pb, &axb, &hb);
+    } elif (feature == 1) {
+        point = _im_b3_face_contact_point(pb, &axb, &hb, fi, ImVec3_neg(normal), pa, &axa, &ha);
+    } else {
+        var centre_a: ImVec3 = pa;
+        var centre_b: ImVec3 = pb;
+        for (var k = 0; k < 3; k = k + 1) {
+            if (k != fi) {
+                var ak: ImVec3 = _im_b3_point(&axa + k * 24);
+                var sa: f64 = ImVec3_dot(ak, normal);
+                var hak: f64 = load64(&ha + k * 8);
+                centre_a = centre_a + ImVec3_scale(ak, _im_b3_sign(sa) * hak);
+            }
+            if (k != fj) {
+                var bk: ImVec3 = _im_b3_point(&axb + k * 24);
+                var sb: f64 = ImVec3_dot(bk, normal);
+                var hbk: f64 = load64(&hb + k * 8);
+                centre_b = centre_b - ImVec3_scale(bk, _im_b3_sign(sb) * hbk);
+            }
+        }
+        var ai: ImVec3 = _im_b3_point(&axa + fi * 24);
+        var bj: ImVec3 = _im_b3_point(&axb + fj * 24);
+        var hai: f64 = load64(&ha + fi * 8);
+        var hbj: f64 = load64(&hb + fj * 8);
+        var sa_: ImVec3 = ImVec3_scale(ai, hai);
+        var sb_: ImVec3 = ImVec3_scale(bj, hbj);
+        var qa: ImVec3 = ImVec3_zero();
+        var qb: ImVec3 = ImVec3_zero();
+        _im_b3_closest_points_segments_3d(centre_a - sa_, centre_a + sa_, centre_b - sb_, centre_b + sb_, &qa, &qb);
+        point = ImVec3_scale(qa + qb, 0.5);
+    }
+    _im_b3_hit(out, normal, depth, point);
+    return 1;
+}
+
+# ── segments ────────────────────────────────────────────────────────────────────────
+
+# A segment (local endpoints la, lb at seg_pos, seg_rot) against a ball: a zero-radius ball at the segment's nearest
+# point. Mirrors `segment_sphere_3d`.
+fn _im_b3_segment_sphere_3d(seg_pos: ImVec3, seg_rot: ImQuat, la: ImVec3, lb: ImVec3, sp: ImVec3, radius: f64,
+    out: *ImHit3d): i64 {
+    var wa: ImVec3 = seg_pos + ImQuat_mul_vec3(seg_rot, la);
+    var wb: ImVec3 = seg_pos + ImQuat_mul_vec3(seg_rot, lb);
+    var closest: ImVec3 = _im_b3_closest_point_on_segment_3d(wa, wb, sp);
+    return _im_b3_sphere_sphere(closest, 0.0, sp, radius, out);
+}
+
+# One sample of `segment_box_3d`: a segment point inside the box (gap below EPSILON_SQ) offers its least face depth;
+# outside but within EPSILON, minus its distance (never the best, since only a positive depth makes a contact).
+# Updates (*best_depth, *best_normal, *best_point) when deeper.
+fn _im_b3_seg_box_sample(sp: ImVec3, he: ImVec3, nhe: ImVec3, bd, bn: *ImVec3, bpt: *ImVec3, outside_too) {
+    var clamped: ImVec3 = ImVec3_clamp(sp, nhe, he);
+    var diff: ImVec3 = sp - clamped;
+    var dist_sq: f64 = ImVec3_dot(diff, diff);
+    var best: f64 = load64(bd);
+    if (dist_sq < _IM_B3_EPSILON_SQ) {
+        var ax: f64 = f64_abs(sp.x);
+        var ay: f64 = f64_abs(sp.y);
+        var az: f64 = f64_abs(sp.z);
+        var fd: ImVec3 = ImVec3_new(he.x - ax, he.y - ay, he.z - az);
+        var k = _im_b3_min_axis(fd);
+        var depth: f64 = _im_b3_at(fd, k);
+        if (depth > best) {
+            store64(bd, _im_bits(depth));
+            var sk: f64 = _im_b3_at(sp, k);
+            _im_b3_put(bn, _im_b3_axis_vec(k, _im_b3_sign(sk)));
+            _im_b3_put(bpt, clamped);
+        }
+    } elif (outside_too == 1) {
+        var dist: f64 = f64_sqrt(dist_sq);
+        var nd: f64 = -dist;
+        if (nd > best && dist_sq < _IM_B3_EPSILON) { store64(bd, _im_bits(nd)); }
+    }
+    return 0;
+}
+
+# A segment against an oriented box, in the box's frame: nine samples along the segment and the projection of the box
+# centre; the deepest point inside the box gives the least face depth, its face normal and the point. The normal
+# points from the box to the segment. Mirrors `segment_box_3d`.
+fn _im_b3_segment_box_3d(seg_pos: ImVec3, seg_rot: ImQuat, la0: ImVec3, lb0: ImVec3, bp: ImVec3, brot: ImQuat,
+    he: ImVec3, out: *ImHit3d): i64 {
+    var wa: ImVec3 = seg_pos + ImQuat_mul_vec3(seg_rot, la0);
+    var wb: ImVec3 = seg_pos + ImQuat_mul_vec3(seg_rot, lb0);
+    var inv: ImQuat = ImQuat_inverse(brot);
+    var la: ImVec3 = ImQuat_mul_vec3(inv, wa - bp);
+    var lb: ImVec3 = ImQuat_mul_vec3(inv, wb - bp);
+    var ab: ImVec3 = lb - la;
+    var len_sq: f64 = ImVec3_dot(ab, ab);
+    var nhe: ImVec3 = ImVec3_neg(he);
+    var zero: f64 = 0.0;
+    var ninf: f64 = -1.0 / zero;
+    var bd[8];
+    store64(&bd, _im_bits(ninf));
+    var bn: ImVec3 = ImVec3_zero();
+    var bpt: ImVec3 = ImVec3_zero();
+    for (var i = 0; i <= 8; i = i + 1) {
+        var fi: f64 = f64_from(i);
+        var t: f64 = fi / 8.0;
+        _im_b3_seg_box_sample(la + ImVec3_scale(ab, t), he, nhe, &bd, &bn, &bpt, 1);
+    }
+    var tc: f64 = 0.0;
+    if (len_sq < _IM_B3_EPSILON_SQ) { tc = 0.0; } else {
+        var nla: ImVec3 = ImVec3_neg(la);
+        var num: f64 = ImVec3_dot(nla, ab);
+        tc = num / len_sq;
+    }
+    var t_center: f64 = _im_clamp(tc, 0.0, 1.0);
+    _im_b3_seg_box_sample(la + ImVec3_scale(ab, t_center), he, nhe, &bd, &bn, &bpt, 0);
+    var best_depth: f64 = load64(&bd);
+    if (best_depth <= 0.0) { return 0; }
+    var normal: ImVec3 = ImQuat_mul_vec3(brot, bn);
+    var point: ImVec3 = ImQuat_mul_vec3(brot, bpt) + bp;
+    _im_b3_hit(out, normal, best_depth, point);
+    return 1;
+}
+
+# ── GJK + EPA ───────────────────────────────────────────────────────────────────────
+
+# A vertex of the Minkowski difference A − B with the support points on A and B that made it.
+struct ImSupportPoint3d { w: ImVec3; a: ImVec3; b: ImVec3; }
+
+# An EPA face (vertex indices, outward normal, distance from the origin); a degenerate one has no normal.
+struct ImEpaFace3d { i0; i1; i2; normal: ImVec3; dist: f64; degenerate; }
+
+# GJK and EPA's working sets, owned by the caller and reused: the polytope's vertices (ImSupportPoint3d) and faces
+# (ImEpaFace3d), and the horizon edges (index pairs).
+struct ImGjkScratch3d { verts: ImRecordList; faces: ImRecordList; edges: ImWordList; }
+
+# An empty scratch; it grows to the deepest pair's needs and is then reused.
+#must_use
+fn ImGjkScratch3d_new(): ImGjkScratch3d {
+    var s: ImGjkScratch3d;
+    s.verts = ImRecordList_new(sizeof(ImSupportPoint3d));
+    s.faces = ImRecordList_new(sizeof(ImEpaFace3d));
+    s.edges = ImWordList_new();
+    return s;
+}
+
+impl ImGjkScratch3d {
+    # Releases the lists.
+    fn free(self) {
+        self.verts.free();
+        self.faces.free();
+        self.edges.free();
+        return 0;
+    }
+}
+
+#must_use
+fn _im_b3_as_sp(p): *ImSupportPoint3d { return p; }
+
+#must_use
+fn _im_b3_as_face(p): *ImEpaFace3d { return p; }
+
+# Copies support point src into dst.
+fn _im_b3_sp_copy(dst: *ImSupportPoint3d, src: *ImSupportPoint3d) {
+    dst.w = src.w;
+    dst.a = src.a;
+    dst.b = src.b;
+    return 0;
+}
+
+# A support function: kind 0 is `shape_support` of `shape` at (pos, rot); kind 1 a ball of `radius` at pos in world
+# axes, `sphere_pos + ball_support(radius, d)` as `convex_hull_sphere_3d` builds it.
+struct ImSupport3d { kind; shape; pos: ImVec3; rot: ImQuat; radius: f64; }
+
+# The support point of a ball of `radius` at the origin along local_dir; (0, radius, 0) for a direction shorter than
+# EPSILON. Mirrors `ball_support`.
+#must_use
+fn _im_b3_ball_support(radius: f64, ld: ImVec3): ImVec3 {
+    var len: f64 = ImVec3_length(ld);
+    if (len < _IM_B3_EPSILON) { return ImVec3_new(0.0, radius, 0.0); }
+    return ImVec3_scale(ImVec3_div_scalar(ld, len), radius);
+}
+
+# The point of the n points at pts farthest along local_dir, the first on a tie; zero for none. Mirrors
+# `hull_support`.
+#must_use
+fn _im_b3_hull_support(pts, n, ld: ImVec3): ImVec3 {
+    var lx: f64 = ld.x;
+    var ly: f64 = ld.y;
+    var lz: f64 = ld.z;
+    var bi = 0 - 1;
+    var zero: f64 = 0.0;
+    var best_dot: f64 = -1.0 / zero;
+    for (var i = 0; i < n; i = i + 1) {
+        var px: f64 = load64(pts + i * 24);
+        var py: f64 = load64(pts + i * 24 + 8);
+        var pz: f64 = load64(pts + i * 24 + 16);
+        var d: f64 = px * lx + py * ly + pz * lz;
+        if (d > best_dot) {
+            best_dot = d;
+            bi = i;
+        }
+    }
+    if (bi < 0) { return ImVec3_zero(); }
+    return _im_b3_point(pts + bi * 24);
+}
+
+# The farthest point of a shape at (pos, rot) along a world direction: the local support, rotated and translated.
+# A mesh, a heightfield and a segment have none (the shape's origin). Mirrors `shape_support`.
+#must_use
+fn _im_b3_shape_support(sh: *ImColliderShape, pos: ImVec3, rot: ImQuat, dir: ImVec3): ImVec3 {
+    var ld: ImVec3 = ImQuat_mul_vec3(ImQuat_inverse(rot), dir);
+    var lp: ImVec3 = ImVec3_zero();
+    var k = sh.kind;
+    if (k == IM_SHAPE_BALL) {
+        var r: f64 = sh.radius;
+        lp = _im_b3_ball_support(r, ld);
+    } elif (k == IM_SHAPE_BOX) {
+        var hx: f64 = sh.half_extents.x;
+        var hy: f64 = sh.half_extents.y;
+        var hz: f64 = sh.half_extents.z;
+        var px: f64 = -hx;
+        var py: f64 = -hy;
+        var pz: f64 = -hz;
+        if (ld.x >= 0.0) { px = hx; }
+        if (ld.y >= 0.0) { py = hy; }
+        if (ld.z >= 0.0) { pz = hz; }
+        lp = ImVec3_new(px, py, pz);
+    } elif (k == IM_SHAPE_CAPSULE) {
+        var hh: f64 = sh.half_height;
+        var cr: f64 = sh.radius;
+        var ay: f64 = -hh;
+        if (ld.y >= 0.0) { ay = hh; }
+        var ap: ImVec3 = ImVec3_new(0.0, ay, 0.0);
+        var len: f64 = ImVec3_length(ld);
+        if (len < _IM_B3_EPSILON) {
+            lp = ap;
+        } else {
+            lp = ap + ImVec3_scale(ImVec3_div_scalar(ld, len), cr);
+        }
+    } elif (k == IM_SHAPE_CONVEX_HULL) {
+        lp = _im_b3_hull_support(sh.points, sh.point_count, ld);
+    }
+    return pos + ImQuat_mul_vec3(rot, lp);
+}
+
+# Support function s along a world direction.
+#must_use
+fn _im_b3_support(s: *ImSupport3d, dir: ImVec3): ImVec3 {
+    if (s.kind == 1) {
+        var r: f64 = s.radius;
+        var bs: ImVec3 = _im_b3_ball_support(r, dir);
+        return s.pos + bs;
+    }
+    return _im_b3_shape_support(_im_b3_as_shape(s.shape), s.pos, s.rot, dir);
+}
+
+# The Minkowski support along dir into *out: a = A's support along dir, b = B's along −dir, w = a − b.
+fn _im_b3_minkowski(sa: *ImSupport3d, sb: *ImSupport3d, dir: ImVec3, out: *ImSupportPoint3d) {
+    var a: ImVec3 = _im_b3_support(sa, dir);
+    var b: ImVec3 = _im_b3_support(sb, ImVec3_neg(dir));
+    var w: ImVec3 = a - b;
+    out.w = w;
+    out.a = a;
+    out.b = b;
+    return 0;
+}
+
+# The simplex (up to four ImSupportPoint3d records at smp, the newest last) is replaced by the records `order` names
+# (oldest first), as Rust's `clear` then `push`es.
+fn _im_b3_simplex_set(smp, n, i0, i1, i2) {
+    var tmp[216];
+    var sz = sizeof(ImSupportPoint3d);
+    _im_b3_sp_copy(_im_b3_as_sp(&tmp), _im_b3_as_sp(smp + i0 * sz));
+    if (n > 1) { _im_b3_sp_copy(_im_b3_as_sp(&tmp + sz), _im_b3_as_sp(smp + i1 * sz)); }
+    if (n > 2) { _im_b3_sp_copy(_im_b3_as_sp(&tmp + 2 * sz), _im_b3_as_sp(smp + i2 * sz)); }
+    for (var k = 0; k < n; k = k + 1) { _im_b3_sp_copy(_im_b3_as_sp(smp + k * sz), _im_b3_as_sp(&tmp + k * sz)); }
+    return 0;
+}
+
+# The w of simplex record i.
+#must_use
+fn _im_b3_sw(smp, i): ImVec3 {
+    var p: *ImSupportPoint3d = _im_b3_as_sp(smp + i * sizeof(ImSupportPoint3d));
+    var w: ImVec3 = p.w;
+    return w;
+}
+
+# A search direction for a simplex whose closest feature holds the origin. Mirrors `degenerate_search_dir`.
+#must_use
+fn _im_b3_degenerate_search_dir(smp, n, initial: ImVec3): ImVec3 {
+    if (n == 2 || n == 3) {
+        var e1: ImVec3 = _im_b3_sw(smp, 1) - _im_b3_sw(smp, 0);
+        if (n == 3) {
+            var e2: ImVec3 = _im_b3_sw(smp, 2) - _im_b3_sw(smp, 0);
+            var nn: ImVec3 = ImVec3_cross(e1, e2);
+            var ls: f64 = ImVec3_length_squared(nn);
+            if (ls > _IM_B3_EPSILON_SQ) { return nn; }
+        }
+        return ImVec3_any_orthogonal_vector(e1);
+    }
+    return ImVec3_neg(initial);
+}
+
+# GJK's simplex step on the simplex at smp with *np records, the newest last: reduces it to the feature nearest the
+# origin and sets *dir to the next search direction. 1 when a tetrahedron encloses the origin. Mirrors
+# `gjk_do_simplex`.
+fn _im_b3_gjk_do_simplex(smp, np, dir: *ImVec3): i64 {
+    var n = load64(np);
+    if (n == 2) {
+        var a: ImVec3 = _im_b3_sw(smp, 1);
+        var b: ImVec3 = _im_b3_sw(smp, 0);
+        var ab: ImVec3 = b - a;
+        var ao: ImVec3 = ImVec3_neg(a);
+        var t: f64 = ImVec3_dot(ab, ao);
+        if (t > 0.0) {
+            var perp: ImVec3 = ImVec3_cross(ImVec3_cross(ab, ao), ab);
+            var lp: f64 = ImVec3_length_squared(perp);
+            var lab: f64 = ImVec3_length_squared(ab);
+            var m1: f64 = _im_max(lab, 1.0);
+            if (lp > _IM_B3_EPSILON_SQ * m1) {
+                _im_b3_put(dir, perp);
+            } else {
+                _im_b3_put(dir, ImVec3_any_orthogonal_vector(ab));
+            }
+        } else {
+            _im_b3_simplex_set(smp, 1, 1, 0, 0);
+            store64(np, 1);
+            _im_b3_put(dir, ao);
+        }
+        return 0;
+    }
+    if (n == 3) {
+        var a3: ImVec3 = _im_b3_sw(smp, 2);
+        var b3: ImVec3 = _im_b3_sw(smp, 1);
+        var c3: ImVec3 = _im_b3_sw(smp, 0);
+        var ab3: ImVec3 = b3 - a3;
+        var ac3: ImVec3 = c3 - a3;
+        var ao3: ImVec3 = ImVec3_neg(a3);
+        var abc: ImVec3 = ImVec3_cross(ab3, ac3);
+        var la: f64 = ImVec3_length_squared(abc);
+        if (la < _IM_B3_EPSILON_SQ) {
+            # Collinear: [pb, pa], as a line.
+            _im_b3_simplex_set(smp, 2, 1, 2, 0);
+            store64(np, 2);
+            return _im_b3_gjk_do_simplex(smp, np, dir);
+        }
+        var t1: f64 = ImVec3_dot(ImVec3_cross(abc, ac3), ao3);
+        if (t1 > 0.0) {
+            var t2: f64 = ImVec3_dot(ac3, ao3);
+            if (t2 > 0.0) {
+                _im_b3_simplex_set(smp, 2, 0, 2, 0);
+                store64(np, 2);
+                _im_b3_put(dir, ImVec3_cross(ImVec3_cross(ac3, ao3), ac3));
+                return 0;
+            }
+            _im_b3_simplex_set(smp, 2, 1, 2, 0);
+            store64(np, 2);
+            return _im_b3_gjk_do_simplex(smp, np, dir);
+        }
+        var t3: f64 = ImVec3_dot(ImVec3_cross(ab3, abc), ao3);
+        if (t3 > 0.0) {
+            _im_b3_simplex_set(smp, 2, 1, 2, 0);
+            store64(np, 2);
+            return _im_b3_gjk_do_simplex(smp, np, dir);
+        }
+        var t4: f64 = ImVec3_dot(abc, ao3);
+        if (t4 > 0.0) {
+            _im_b3_put(dir, abc);
+        } else {
+            # Below the triangle: swap(0, 1).
+            _im_b3_simplex_set(smp, 3, 1, 0, 2);
+            _im_b3_put(dir, ImVec3_neg(abc));
+        }
+        return 0;
+    }
+    if (n == 4) {
+        var a4: ImVec3 = _im_b3_sw(smp, 3);
+        var ao4: ImVec3 = ImVec3_neg(a4);
+        var ab4: ImVec3 = _im_b3_sw(smp, 2) - a4;
+        var ac4: ImVec3 = _im_b3_sw(smp, 1) - a4;
+        var ad4: ImVec3 = _im_b3_sw(smp, 0) - a4;
+        var abc4: ImVec3 = ImVec3_cross(ab4, ac4);
+        var acd4: ImVec3 = ImVec3_cross(ac4, ad4);
+        var adb4: ImVec3 = ImVec3_cross(ad4, ab4);
+        var vol: f64 = ImVec3_dot(abc4, ad4);
+        var avol: f64 = f64_abs(vol);
+        if (avol < _IM_B3_EPSILON_SQ) {
+            # Flat: [pc, pb, pa] and search off the plane.
+            _im_b3_simplex_set(smp, 3, 1, 2, 3);
+            store64(np, 3);
+            var s0: f64 = ImVec3_dot(abc4, ao4);
+            var nd: ImVec3 = ImVec3_neg(abc4);
+            if (s0 >= 0.0) { nd = abc4; }
+            var lnd: f64 = ImVec3_length_squared(nd);
+            if (lnd < _IM_B3_EPSILON_SQ) { nd = ImVec3_any_orthogonal_vector(ab4); }
+            _im_b3_put(dir, nd);
+            return 0;
+        }
+        var u1: f64 = ImVec3_dot(abc4, ao4);
+        if (u1 > 0.0) {
+            _im_b3_simplex_set(smp, 3, 1, 2, 3);
+            store64(np, 3);
+            return _im_b3_gjk_do_simplex(smp, np, dir);
+        }
+        var u2: f64 = ImVec3_dot(acd4, ao4);
+        if (u2 > 0.0) {
+            _im_b3_simplex_set(smp, 3, 0, 1, 3);
+            store64(np, 3);
+            return _im_b3_gjk_do_simplex(smp, np, dir);
+        }
+        var u3: f64 = ImVec3_dot(adb4, ao4);
+        if (u3 > 0.0) {
+            _im_b3_simplex_set(smp, 3, 2, 0, 3);
+            store64(np, 3);
+            return _im_b3_gjk_do_simplex(smp, np, dir);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+# Appends the EPA face (i0, i1, i2) of the polytope's vertices: normal (v1 − v0) × (v2 − v0) over its length,
+# distance normal · v0, or degenerate (zero normal, infinite distance) when the normal is shorter than EPSILON.
+# 1, or 0 when the list can't grow. Mirrors `EpaFace::new`.
+fn _im_b3_epa_face_push(sc: *ImGjkScratch3d, i0, i1, i2): i64 {
+    if (sc.faces.reserve(sc.faces.len + 1) == 0) { return 0; }
+    var a: ImVec3 = _im_b3_sw(sc.verts.data, i0);
+    var e1: ImVec3 = _im_b3_sw(sc.verts.data, i1) - a;
+    var e2: ImVec3 = _im_b3_sw(sc.verts.data, i2) - a;
+    var nrm: ImVec3 = ImVec3_cross(e1, e2);
+    var len: f64 = ImVec3_length(nrm);
+    var f: *ImEpaFace3d = _im_b3_as_face(sc.faces.data + sc.faces.len * sizeof(ImEpaFace3d));
+    f.i0 = i0;
+    f.i1 = i1;
+    f.i2 = i2;
+    if (len < _IM_B3_EPSILON) {
+        var zero: f64 = 0.0;
+        f.normal = ImVec3_zero();
+        f.dist = 1.0 / zero;
+        f.degenerate = 1;
+    } else {
+        var nn: ImVec3 = ImVec3_div_scalar(nrm, len);
+        var dd: f64 = ImVec3_dot(nn, a);
+        f.normal = nn;
+        f.dist = dd;
+        f.degenerate = 0;
+    }
+    sc.faces.len = sc.faces.len + 1;
+    return 1;
+}
+
+# Appends support point p to the polytope's vertices: 1, or 0 when the list can't grow.
+fn _im_b3_vert_push(sc: *ImGjkScratch3d, p: *ImSupportPoint3d): i64 {
+    if (sc.verts.reserve(sc.verts.len + 1) == 0) { return 0; }
+    _im_b3_sp_copy(_im_b3_as_sp(sc.verts.data + sc.verts.len * sizeof(ImSupportPoint3d)), p);
+    sc.verts.len = sc.verts.len + 1;
+    return 1;
+}
+
+# The contact of EPA face f: its normal, its distance (at least 0), and the midpoint of the witness points on A and B
+# from the barycentric coordinates of the origin's projection (or, for a degenerate triangle, of the support points
+# along the normal). Mirrors `epa_result`.
+fn _im_b3_epa_result(sa: *ImSupport3d, sb: *ImSupport3d, sc: *ImGjkScratch3d, f: *ImEpaFace3d, out: *ImHit3d) {
+    var sz = sizeof(ImSupportPoint3d);
+    var v0: *ImSupportPoint3d = _im_b3_as_sp(sc.verts.data + f.i0 * sz);
+    var v1: *ImSupportPoint3d = _im_b3_as_sp(sc.verts.data + f.i1 * sz);
+    var v2: *ImSupportPoint3d = _im_b3_as_sp(sc.verts.data + f.i2 * sz);
+    var normal: ImVec3 = f.normal;
+    var dist: f64 = f.dist;
+    var p: ImVec3 = ImVec3_scale(normal, dist);
+    var w0: ImVec3 = v0.w;
+    var e0: ImVec3 = v1.w - w0;
+    var e1: ImVec3 = v2.w - w0;
+    var e2: ImVec3 = p - w0;
+    var d00: f64 = ImVec3_dot(e0, e0);
+    var d01: f64 = ImVec3_dot(e0, e1);
+    var d11: f64 = ImVec3_dot(e1, e1);
+    var d20: f64 = ImVec3_dot(e2, e0);
+    var d21: f64 = ImVec3_dot(e2, e1);
+    var denom: f64 = d00 * d11 - d01 * d01;
+    var point: ImVec3 = ImVec3_zero();
+    var ad: f64 = f64_abs(denom);
+    if (ad > _IM_B3_EPSILON_SQ) {
+        var v: f64 = (d11 * d20 - d01 * d21) / denom;
+        var w: f64 = (d00 * d21 - d01 * d20) / denom;
+        var u: f64 = 1.0 - v - w;
+        var on_a: ImVec3 = ImVec3_scale(v0.a, u) + ImVec3_scale(v1.a, v) + ImVec3_scale(v2.a, w);
+        var on_b: ImVec3 = ImVec3_scale(v0.b, u) + ImVec3_scale(v1.b, v) + ImVec3_scale(v2.b, w);
+        point = ImVec3_scale(on_a + on_b, 0.5);
+    } else {
+        var s: ImSupportPoint3d;
+        _im_b3_minkowski(sa, sb, normal, &s);
+        point = ImVec3_scale(s.a + s.b, 0.5);
+    }
+    var depth: f64 = _im_max(dist, 0.0);
+    _im_b3_hit(out, normal, depth, point);
+    return 0;
+}
+
+# EPA from GJK's enclosing tetrahedron (4 records at smp): expand the polytope toward the origin's nearest face until
+# the support point no longer moves it (1e-9 absolute plus relative), or EPA_MAX_ITER, then the contact of the
+# closest face found. 1 with *out set, or 0 (a flat tetrahedron, or no memory). Mirrors `epa_penetration`.
+fn _im_b3_epa_penetration(sa: *ImSupport3d, sb: *ImSupport3d, smp, n, sc: *ImGjkScratch3d, out: *ImHit3d): i64 {
+    if (n < 4) { return 0; }
+    var sz = sizeof(ImSupportPoint3d);
+    sc.verts.len = 0;
+    sc.faces.len = 0;
+    for (var k = 0; k < 4; k = k + 1) {
+        if (_im_b3_vert_push(sc, _im_b3_as_sp(smp + k * sz)) == 0) { return 0; }
+    }
+    var w0: ImVec3 = _im_b3_sw(sc.verts.data, 0);
+    var x1: ImVec3 = _im_b3_sw(sc.verts.data, 1) - w0;
+    var x2: ImVec3 = _im_b3_sw(sc.verts.data, 2) - w0;
+    var x3: ImVec3 = _im_b3_sw(sc.verts.data, 3) - w0;
+    var orient: f64 = ImVec3_dot(ImVec3_cross(x1, x2), x3);
+    var ao: f64 = f64_abs(orient);
+    if (ao < _IM_B3_EPSILON_SQ) { return 0; }
+    if (orient > 0.0) {
+        var tmp: ImSupportPoint3d;
+        _im_b3_sp_copy(&tmp, _im_b3_as_sp(sc.verts.data + sz));
+        _im_b3_sp_copy(_im_b3_as_sp(sc.verts.data + sz), _im_b3_as_sp(sc.verts.data + 2 * sz));
+        _im_b3_sp_copy(_im_b3_as_sp(sc.verts.data + 2 * sz), &tmp);
+    }
+    if (_im_b3_epa_face_push(sc, 0, 1, 2) == 0 || _im_b3_epa_face_push(sc, 0, 3, 1) == 0) { return 0; }
+    if (_im_b3_epa_face_push(sc, 0, 2, 3) == 0 || _im_b3_epa_face_push(sc, 1, 3, 2) == 0) { return 0; }
+    var fz = sizeof(ImEpaFace3d);
+    var have = 0;
+    var best: ImEpaFace3d;
+    var np: ImSupportPoint3d;
+    for (var iter = 0; iter < _IM_B3_EPA_MAX_ITER; iter = iter + 1) {
+        # The closest non-degenerate face: the first minimum by total_cmp.
+        var ci = 0 - 1;
+        var ck = 0;
+        for (var i = 0; i < sc.faces.len; i = i + 1) {
+            var fi: *ImEpaFace3d = _im_b3_as_face(sc.faces.data + i * fz);
+            if (fi.degenerate == 0) {
+                var key = _im_b3_total_key(fi.dist);
+                if (ci < 0 || key < ck) {
+                    ci = i;
+                    ck = key;
+                }
+            }
+        }
+        if (ci < 0) { iter = _IM_B3_EPA_MAX_ITER; } else {
+            var face: *ImEpaFace3d = _im_b3_as_face(sc.faces.data + ci * fz);
+            best.i0 = face.i0;
+            best.i1 = face.i1;
+            best.i2 = face.i2;
+            best.normal = face.normal;
+            best.dist = face.dist;
+            best.degenerate = face.degenerate;
+            have = 1;
+            _im_b3_minkowski(sa, sb, best.normal, &np);
+            var new_dist: f64 = ImVec3_dot(np.w, best.normal);
+            var bdist: f64 = best.dist;
+            var tol: f64 = 0.000000001 + 0.000000001 * f64_abs(bdist);
+            if (new_dist - bdist < tol) {
+                _im_b3_epa_result(sa, sb, sc, &best, out);
+                return 1;
+            }
+            var new_idx = sc.verts.len;
+            if (_im_b3_vert_push(sc, &np) == 0) { return 0; }
+            # Remove the faces the new point sees (and the degenerate ones), keeping their boundary as the horizon.
+            sc.edges.len = 0;
+            var kept = 0;
+            for (var j = 0; j < sc.faces.len; j = j + 1) {
+                var fj: *ImEpaFace3d = _im_b3_as_face(sc.faces.data + j * fz);
+                var a: ImVec3 = _im_b3_sw(sc.verts.data, fj.i0);
+                var vis: f64 = ImVec3_dot(fj.normal, np.w - a);
+                if (fj.degenerate == 1 || vis > 0.0) {
+                    if (_im_b3_horizon(sc, fj.i0, fj.i1) == 0) { return 0; }
+                    if (_im_b3_horizon(sc, fj.i1, fj.i2) == 0) { return 0; }
+                    if (_im_b3_horizon(sc, fj.i2, fj.i0) == 0) { return 0; }
+                } else {
+                    if (kept != j) {
+                        var fk: *ImEpaFace3d = _im_b3_as_face(sc.faces.data + kept * fz);
+                        fk.i0 = fj.i0;
+                        fk.i1 = fj.i1;
+                        fk.i2 = fj.i2;
+                        fk.normal = fj.normal;
+                        fk.dist = fj.dist;
+                        fk.degenerate = fj.degenerate;
+                    }
+                    kept = kept + 1;
+                }
+            }
+            sc.faces.len = kept;
+            if (sc.edges.len == 0) { iter = _IM_B3_EPA_MAX_ITER; } else {
+                for (var e = 0; e < sc.edges.len; e = e + 2) {
+                    if (_im_b3_epa_face_push(sc, sc.edges.at(e), sc.edges.at(e + 1), new_idx) == 0) { return 0; }
+                }
+            }
+        }
+    }
+    if (have == 0) { return 0; }
+    _im_b3_epa_result(sa, sb, sc, &best, out);
+    return 1;
+}
+
+# Adds edge (e0, e1) to the horizon, or removes its reverse when a neighbouring face already added it (Rust's
+# `position` then `swap_remove`). 1, or 0 when the list can't grow.
+fn _im_b3_horizon(sc: *ImGjkScratch3d, e0, e1): i64 {
+    for (var k = 0; k < sc.edges.len; k = k + 2) {
+        if (sc.edges.at(k) == e1 && sc.edges.at(k + 1) == e0) {
+            var last = sc.edges.len - 2;
+            store64(sc.edges.data + k * 8, sc.edges.at(last));
+            store64(sc.edges.data + (k + 1) * 8, sc.edges.at(last + 1));
+            sc.edges.len = last;
+            return 1;
+        }
+    }
+    if (sc.edges.push(e0) == 0) { return 0; }
+    if (sc.edges.push(e1) == 0) { return 0; }
+    return 1;
+}
+
+# GJK (intersection) then EPA (penetration) on support functions A and B, starting along initial_dir (+x if it is
+# shorter than EPSILON). 1 with *out set (normal from A to B, depth, point), or 0 when a separating axis is found or
+# GJK_MAX_ITER passes. Mirrors `gjk_epa`.
+fn _im_b3_gjk_epa(sa: *ImSupport3d, sb: *ImSupport3d, initial_dir: ImVec3, sc: *ImGjkScratch3d, out: *ImHit3d): i64 {
+    var init: ImVec3 = initial_dir;
+    var li: f64 = ImVec3_length_squared(init);
+    if (li < _IM_B3_EPSILON_SQ) { init = ImVec3_new(1.0, 0.0, 0.0); }
+    var smp[288];
+    var cnt[8];
+    var sz = sizeof(ImSupportPoint3d);
+    _im_b3_minkowski(sa, sb, init, _im_b3_as_sp(&smp));
+    store64(&cnt, 1);
+    var search: ImVec3 = ImVec3_neg(_im_b3_sw(&smp, 0));
+    var np: ImSupportPoint3d;
+    for (var it = 0; it < _IM_B3_GJK_MAX_ITER; it = it + 1) {
+        var ls: f64 = ImVec3_length_squared(search);
+        if (ls < _IM_B3_EPSILON_SQ) { search = _im_b3_degenerate_search_dir(&smp, load64(&cnt), init); }
+        _im_b3_minkowski(sa, sb, search, &np);
+        var proj: f64 = ImVec3_dot(np.w, search);
+        if (proj < 0.0) { return 0; }
+        var n = load64(&cnt);
+        _im_b3_sp_copy(_im_b3_as_sp(&smp + n * sz), &np);
+        store64(&cnt, n + 1);
+        if (_im_b3_gjk_do_simplex(&smp, &cnt, &search) == 1) {
+            return _im_b3_epa_penetration(sa, sb, &smp, load64(&cnt), sc, out);
+        }
+    }
+    return 0;
+}
+
+# GJK + EPA between two shapes, each through `shape_support`, starting along pos_b − pos_a. Mirrors `gjk_epa_shapes`.
+fn _im_b3_gjk_epa_shapes(sa: *ImColliderShape, pa: ImVec3, ra: ImQuat, sb: *ImColliderShape, pb: ImVec3, rb: ImQuat,
+    sc: *ImGjkScratch3d, out: *ImHit3d): i64 {
+    var a: ImSupport3d;
+    a.kind = 0;
+    a.shape = sa;
+    a.pos = pa;
+    a.rot = ra;
+    a.radius = 0.0;
+    var b: ImSupport3d;
+    b.kind = 0;
+    b.shape = sb;
+    b.pos = pb;
+    b.rot = rb;
+    b.radius = 0.0;
+    return _im_b3_gjk_epa(&a, &b, pb - pa, sc, out);
+}
+
+# A hull against a ball by GJK + EPA on the hull's points, the ball's support in world axes; none for an empty hull.
+# The normal points from the hull to the ball. Mirrors `convex_hull_sphere_3d`.
+fn _im_b3_convex_hull_sphere_3d(hull: *ImColliderShape, hp: ImVec3, hrot: ImQuat, sp: ImVec3, radius: f64,
+    sc: *ImGjkScratch3d, out: *ImHit3d): i64 {
+    if (hull.point_count == 0) { return 0; }
+    var a: ImSupport3d;
+    a.kind = 0;
+    a.shape = hull;
+    a.pos = hp;
+    a.rot = hrot;
+    a.radius = 0.0;
+    var b: ImSupport3d;
+    b.kind = 1;
+    b.shape = 0;
+    b.pos = sp;
+    b.rot = ImQuat_identity();
+    b.radius = radius;
+    return _im_b3_gjk_epa(&a, &b, sp - hp, sc, out);
+}
+
+# ── dispatch ────────────────────────────────────────────────────────────────────────
+
+# The contact between shape A at (pa, ra) and shape B at (pb, rb), normal from A to B: 1 with *out set, or 0 for none
+# or an unhandled pair (a mesh, a heightfield, segment–segment, a segment against a capsule or hull). Mirrors
+# `generate_contact_3d`.
+fn _im_b3_generate_contact_3d(sa: *ImColliderShape, pa: ImVec3, ra: ImQuat, sb: *ImColliderShape, pb: ImVec3,
+    rb: ImQuat, sc: *ImGjkScratch3d, out: *ImHit3d): i64 {
+    var ka = sa.kind;
+    var kb = sb.kind;
+    var r: f64 = 0.0;
+    var hit = 0;
+    if (ka == IM_SHAPE_BALL && kb == IM_SHAPE_BALL) {
+        var r1: f64 = sa.radius;
+        var r2: f64 = sb.radius;
+        return _im_b3_sphere_sphere(pa, r1, pb, r2, out);
+    }
+    if (ka == IM_SHAPE_BALL && kb == IM_SHAPE_BOX) {
+        r = sa.radius;
+        hit = _im_b3_sphere_obb(pa, r, pb, rb, sb.half_extents, out);
+        if (hit == 1) { _im_b3_flip(out); }
+        return hit;
+    }
+    if (ka == IM_SHAPE_BOX && kb == IM_SHAPE_BALL) {
+        r = sb.radius;
+        return _im_b3_sphere_obb(pb, r, pa, ra, sa.half_extents, out);
+    }
+    if (ka == IM_SHAPE_BOX && kb == IM_SHAPE_BOX) {
+        if (_im_b3_is_identity_quat(ra) == 1 && _im_b3_is_identity_quat(rb) == 1) {
+            return _im_b3_aabb_aabb_3d(pa, sa.half_extents, pb, sb.half_extents, out);
+        }
+        return _im_b3_obb_obb_3d(pa, ra, sa.half_extents, pb, rb, sb.half_extents, out);
+    }
+    if (ka == IM_SHAPE_CAPSULE && kb == IM_SHAPE_BALL) {
+        var hh1: f64 = sa.half_height;
+        var cr1: f64 = sa.radius;
+        r = sb.radius;
+        return _im_b3_capsule_sphere_3d(pa, ra, hh1, cr1, pb, r, out);
+    }
+    if (ka == IM_SHAPE_BALL && kb == IM_SHAPE_CAPSULE) {
+        var hh2: f64 = sb.half_height;
+        var cr2: f64 = sb.radius;
+        r = sa.radius;
+        hit = _im_b3_capsule_sphere_3d(pb, rb, hh2, cr2, pa, r, out);
+        if (hit == 1) { _im_b3_flip(out); }
+        return hit;
+    }
+    if (ka == IM_SHAPE_CAPSULE && kb == IM_SHAPE_CAPSULE) {
+        var hha: f64 = sa.half_height;
+        var cra: f64 = sa.radius;
+        var hhb: f64 = sb.half_height;
+        var crb: f64 = sb.radius;
+        return _im_b3_capsule_capsule_3d(pa, ra, hha, cra, pb, rb, hhb, crb, out);
+    }
+    if (ka == IM_SHAPE_CAPSULE && kb == IM_SHAPE_BOX) {
+        var hh3: f64 = sa.half_height;
+        var cr3: f64 = sa.radius;
+        hit = _im_b3_capsule_box_3d(pa, ra, hh3, cr3, pb, rb, sb.half_extents, out);
+        if (hit == 1) { _im_b3_flip(out); }
+        return hit;
+    }
+    if (ka == IM_SHAPE_BOX && kb == IM_SHAPE_CAPSULE) {
+        var hh4: f64 = sb.half_height;
+        var cr4: f64 = sb.radius;
+        return _im_b3_capsule_box_3d(pb, rb, hh4, cr4, pa, ra, sa.half_extents, out);
+    }
+    if (ka == IM_SHAPE_SEGMENT && kb == IM_SHAPE_BALL) {
+        r = sb.radius;
+        return _im_b3_segment_sphere_3d(pa, ra, sa.a, sa.b, pb, r, out);
+    }
+    if (ka == IM_SHAPE_BALL && kb == IM_SHAPE_SEGMENT) {
+        r = sa.radius;
+        hit = _im_b3_segment_sphere_3d(pb, rb, sb.a, sb.b, pa, r, out);
+        if (hit == 1) { _im_b3_flip(out); }
+        return hit;
+    }
+    if (ka == IM_SHAPE_SEGMENT && kb == IM_SHAPE_BOX) {
+        hit = _im_b3_segment_box_3d(pa, ra, sa.a, sa.b, pb, rb, sb.half_extents, out);
+        if (hit == 1) { _im_b3_flip(out); }
+        return hit;
+    }
+    if (ka == IM_SHAPE_BOX && kb == IM_SHAPE_SEGMENT) {
+        return _im_b3_segment_box_3d(pb, rb, sb.a, sb.b, pa, ra, sa.half_extents, out);
+    }
+    if (ka == IM_SHAPE_CONVEX_HULL && kb == IM_SHAPE_BALL) {
+        r = sb.radius;
+        return _im_b3_convex_hull_sphere_3d(sa, pa, ra, pb, r, sc, out);
+    }
+    if (ka == IM_SHAPE_BALL && kb == IM_SHAPE_CONVEX_HULL) {
+        r = sa.radius;
+        hit = _im_b3_convex_hull_sphere_3d(sb, pb, rb, pa, r, sc, out);
+        if (hit == 1) { _im_b3_flip(out); }
+        return hit;
+    }
+    var ga = 0;
+    if (ka == IM_SHAPE_CONVEX_HULL && (kb == IM_SHAPE_BOX || kb == IM_SHAPE_CAPSULE || kb == IM_SHAPE_CONVEX_HULL)) {
+        ga = 1;
+    }
+    if ((ka == IM_SHAPE_BOX || ka == IM_SHAPE_CAPSULE) && kb == IM_SHAPE_CONVEX_HULL) { ga = 1; }
+    if (ga == 1) { return _im_b3_gjk_epa_shapes(sa, pa, ra, sb, pb, rb, sc, out); }
+    return 0;
 }
 
 # --- particle.cyr ---

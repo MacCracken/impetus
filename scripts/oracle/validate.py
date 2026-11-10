@@ -3333,6 +3333,7 @@ PRIVATE_SOURCES = (
     ("backend_2d/joints.rs", "_IM_B2_", set()),
     ("backend_2d/solver.rs", "_IM_B2_", set()),
     ("backend_2d/types.rs", "_IM_B2_", {"FALLBACK"}),
+    ("backend_3d/narrowphase.rs", "_IM_B3_", set()),
     ("backend_3d/types.rs", "_IM_B3_", set()),
     ("world.rs", "_IM_", {"MAX_SNAPSHOT_INDEX"}),
 )
@@ -3380,7 +3381,10 @@ def check_private(root):
                 fail(f"constants_private: {name} = {cyr[name]}, Rust's is {lit}")
     for name in sorted(set(cyr) - seen):
         fail(f"constants_private: {name} has no const in the listed Rust sources")
-    for name, mine in (("_IM_B2_MIN_MASS", B2_MIN_MASS), ("_IM_B2_MIN_INERTIA", B2_MIN_INERTIA),
+    for name, mine in (("_IM_B3_REL_TOL", B3_REL_TOL), ("_IM_B3_ABS_TOL", B3_ABS_TOL),
+                       ("_IM_B3_GJK_MAX_ITER", B3_GJK_MAX_ITER), ("_IM_B3_EPA_MAX_ITER", B3_EPA_MAX_ITER),
+                       ("_IM_B3_EPSILON_SQ", B3_EPSILON_SQ),
+                       ("_IM_B2_MIN_MASS", B2_MIN_MASS), ("_IM_B2_MIN_INERTIA", B2_MIN_INERTIA),
                        ("_IM_B2_EPSILON_SQ", B2_EPSILON_SQ), ("_IM_B2_EPSILON", B2_EPSILON),
                        ("_IM_B2_SLEEP_VELOCITY_THRESHOLD", B2_SLEEP_VELOCITY),
                        ("_IM_B2_SLEEP_TIME_THRESHOLD", B2_SLEEP_TIME), ("_IM_B2_JOINT_BAUMGARTE", B2_JOINT_BAUMGARTE),
@@ -3730,6 +3734,8 @@ def _b3_math_row(fn, ins, sin, cos):
         return F(*(rust_max(a, b) for a, b in zip(v(0), v(3))))
     if fn == "DVec3::dot":
         return F(_v_dot(v(0), v(3)))
+    if fn == "DVec3::clamp":
+        return F(*(rust_min(rust_max(a, lo), hi) for a, lo, hi in zip(v(0), v(3), v(6))))
     if fn == "DVec3::cross":
         return F(*_v_cross(v(0), v(3)))
     if fn in ("DVec3::normalize_or", "DVec3::normalize", "DVec3::try_normalize", "DVec3::normalize_or_zero"):
@@ -4011,6 +4017,596 @@ def check_b3_body(rows):
     return len(rows)
 
 
+# ── b3_narrow: the 3D narrowphase (M4 part 2) ───────────────────────────────────────
+# A transcription of backend_3d/narrowphase.rs on the glam helpers above, in Rust's operation order. Python lists
+# stand for Rust's Vecs with the same order semantics (retain keeps order; swap_remove moves the last into the hole).
+
+B3_REL_TOL = 0.98
+B3_ABS_TOL = 1e-3
+B3_GJK_MAX_ITER = 64
+B3_EPA_MAX_ITER = 64
+B3_EPSILON_SQ = 1e-20
+
+
+def _v_neg(a):
+    return (-a[0], -a[1], -a[2])
+
+
+def _v_div(a, s):
+    return (_np_div(a[0], s), _np_div(a[1], s), _np_div(a[2], s))
+
+
+def _v_len_sq(a):
+    return _v_dot(a, a)
+
+
+def _v_clamp(a, lo, hi):
+    """glam's DVec3::clamp: max then min, per component."""
+    return tuple(rust_min(rust_max(x, l), h) for x, l, h in zip(a, lo, hi))
+
+
+def _v_any_orth(a):
+    return (-a[2], 0.0, a[0]) if abs(a[0]) > abs(a[1]) else (0.0, a[2], -a[1])
+
+
+def _q_inv(q):
+    return (-q[0], -q[1], -q[2], q[3])
+
+
+def _axis_vec(i, s):
+    v = [0.0, 0.0, 0.0]
+    v[i] = s
+    return tuple(v)
+
+
+def _min_axis(d):
+    if d[0] <= d[1] and d[0] <= d[2]:
+        return 0
+    return 1 if d[1] <= d[2] else 2
+
+
+def _sgn(x):
+    return 1.0 if x >= 0.0 else -1.0
+
+
+def _total_key(x):
+    b = bits(x)
+    if b >= 1 << 63:
+        b -= 1 << 64
+    return b ^ 0x7FFFFFFFFFFFFFFF if b < 0 else b
+
+
+def _is_identity_quat(q):
+    e = B3_EPSILON
+    return abs(q[0]) < e and abs(q[1]) < e and abs(q[2]) < e and abs(abs(q[3]) - 1.0) < e
+
+
+def _cp_seg(a, b, p):
+    ab = _v_sub(b, a)
+    ls = _v_dot(ab, ab)
+    if ls < B3_EPSILON_SQ:
+        return a
+    t = rust_clamp(_np_div(_v_dot(_v_sub(p, a), ab), ls), 0.0, 1.0)
+    return _v_add(a, _v_scale(ab, t))
+
+
+def _cap_ends(pos, rot, hh):
+    axis = _q_mul_vec3(rot, (0.0, hh, 0.0))
+    return _v_sub(pos, axis), _v_add(pos, axis)
+
+
+def _cp_segs(a, b, c, d):
+    ab, cd = _v_sub(b, a), _v_sub(d, c)
+    d1, d2 = _v_dot(ab, ab), _v_dot(cd, cd)
+    cands = [(a, _cp_seg(c, d, a)), (b, _cp_seg(c, d, b)), (_cp_seg(a, b, c), c), (_cp_seg(a, b, d), d)]
+    best = cands[0]
+    best_d = _v_len_sq(_v_sub(best[0], best[1]))
+    for p, q in cands[1:]:
+        dd = _v_len_sq(_v_sub(p, q))
+        if dd < best_d:
+            best, best_d = (p, q), dd
+    if d1 > B3_EPSILON_SQ and d2 > B3_EPSILON_SQ:
+        r = _v_sub(a, c)
+        d3, d4, d5 = _v_dot(ab, cd), _v_dot(ab, r), _v_dot(cd, r)
+        denom = d1 * d2 - d3 * d3
+        if denom > 1e-12 * d1 * d2:
+            sv = rust_clamp(_np_div(d3 * d5 - d4 * d2, denom), 0.0, 1.0)
+            tv = rust_clamp(_np_div(d3 * sv + d5, d2), 0.0, 1.0)
+            sv = rust_clamp(_np_div(tv * d3 - d4, d1), 0.0, 1.0)
+            tv = rust_clamp(_np_div(d3 * sv + d5, d2), 0.0, 1.0)
+            p, q = _v_add(a, _v_scale(ab, sv)), _v_add(c, _v_scale(cd, tv))
+            if _v_len_sq(_v_sub(p, q)) < best_d:
+                best = (p, q)
+    return best
+
+
+def _sphere_sphere(pa, ra, pb, rb):
+    d = _v_sub(pb, pa)
+    dist_sq = _v_dot(d, d)
+    sum_r = ra + rb
+    if dist_sq >= sum_r * sum_r:
+        return None
+    dist = rust_sqrt(dist_sq)
+    normal, depth = ((0.0, 1.0, 0.0), sum_r) if dist < B3_EPSILON else (_v_div(d, dist), sum_r - dist)
+    return normal, depth, _v_add(pa, _v_scale(normal, ra))
+
+
+def _sphere_obb(sp, r, bp, brot, he):
+    ls = _q_mul_vec3(_q_inv(brot), _v_sub(sp, bp))
+    closest = _v_clamp(ls, _v_neg(he), he)
+    diff = _v_sub(ls, closest)
+    dist_sq = _v_dot(diff, diff)
+    if dist_sq >= r * r:
+        return None
+    dist = rust_sqrt(dist_sq)
+    if dist < B3_EPSILON:
+        fd = tuple(h - abs(c) for h, c in zip(he, ls))
+        k = _min_axis(fd)
+        ln, depth = _axis_vec(k, _sgn(ls[k])), fd[k] + r
+    else:
+        ln, depth = _v_div(diff, dist), r - dist
+    return _q_mul_vec3(brot, ln), depth, _v_add(_q_mul_vec3(brot, closest), bp)
+
+
+def _aabb_aabb(pa, hea, pb, heb):
+    d = _v_sub(pb, pa)
+    ov = tuple(ha + hb - abs(c) for ha, hb, c in zip(hea, heb, d))
+    if ov[0] <= 0.0 or ov[1] <= 0.0 or ov[2] <= 0.0:
+        return None
+    k = _min_axis(ov)
+    lo = tuple(rust_max(x, y) for x, y in zip(_v_sub(pa, hea), _v_sub(pb, heb)))
+    hi = tuple(rust_min(x, y) for x, y in zip(_v_add(pa, hea), _v_add(pb, heb)))
+    return _axis_vec(k, _sgn(d[k])), ov[k], _v_scale(_v_add(lo, hi), 0.5)
+
+
+def _capsule_box(cp, crot, hh, cr, bp, brot, he):
+    ea, eb = _cap_ends(cp, crot, hh)
+    inv = _q_inv(brot)
+    la, lb = _q_mul_vec3(inv, _v_sub(ea, bp)), _q_mul_vec3(inv, _v_sub(eb, bp))
+    ab = _v_sub(lb, la)
+    ls = _v_dot(ab, ab)
+    nhe = _v_neg(he)
+    project = lambda p: 0.0 if ls < B3_EPSILON_SQ else rust_clamp(_np_div(_v_dot(_v_sub(p, la), ab), ls), 0.0, 1.0)
+
+    def gap_sq(t):
+        p = _v_add(la, _v_scale(ab, t))
+        return _v_len_sq(_v_sub(p, _v_clamp(p, nhe, he)))
+
+    t_center = project((0.0, 0.0, 0.0))
+    acc = (0.5, math.inf)
+    for t in (0.5, t_center, 0.0, 1.0):
+        g = gap_sq(t)
+        if g < acc[1]:
+            acc = (t, g)
+    t_alt = acc[0]
+    for _ in range(8):
+        t_alt = project(_v_clamp(_v_add(la, _v_scale(ab, t_alt)), nhe, he))
+    best = None
+    for t in (0.5, t_center, t_alt, 0.0, 1.0):
+        wp = _v_add(_q_mul_vec3(brot, _v_add(la, _v_scale(ab, t))), bp)
+        c = _sphere_obb(wp, cr, bp, brot, he)
+        if c is not None and (best is None or c[1] > best[1] + 1e-9):
+            best = c
+    return best
+
+
+def _clip_polygon(poly, n, d):
+    out = []
+    for i in range(len(poly)):
+        p, q = poly[i], poly[(i + 1) % len(poly)]
+        dp, dq = _v_dot(n, p) - d, _v_dot(n, q) - d
+        if dp <= 0.0 and len(out) < 8:
+            out.append(p)
+        if (dp < 0.0) != (dq < 0.0) and abs(dp - dq) > B3_EPSILON and len(out) < 8:
+            t = _np_div(dp, dp - dq)
+            out.append(_v_add(p, _v_scale(_v_sub(q, p), t)))
+    return out
+
+
+def _face_contact_point(ref_pos, ref_axes, ref_he, ref_axis, ref_n, inc_pos, inc_axes, inc_he):
+    inc_axis, best_dot = 0, 0.0
+    for k, ax in enumerate(inc_axes):
+        dt = abs(_v_dot(ax, ref_n))
+        if dt > best_dot:
+            best_dot, inc_axis = dt, k
+    ia = inc_axes[inc_axis]
+    inc_n = _v_neg(ia) if _v_dot(ia, ref_n) > 0.0 else ia
+    inc_c = _v_add(inc_pos, _v_scale(inc_n, inc_he[inc_axis]))
+    u, v = (inc_axis + 1) % 3, (inc_axis + 2) % 3
+    eu, ev = _v_scale(inc_axes[u], inc_he[u]), _v_scale(inc_axes[v], inc_he[v])
+    poly = [_v_add(_v_add(inc_c, eu), ev), _v_add(_v_sub(inc_c, eu), ev), _v_sub(_v_sub(inc_c, eu), ev),
+            _v_sub(_v_add(inc_c, eu), ev)]
+    for k in range(3):
+        if k == ref_axis:
+            continue
+        for s in (1.0, -1.0):
+            pn = _v_scale(ref_axes[k], s)
+            poly = _clip_polygon(poly, pn, _v_dot(pn, ref_pos) + ref_he[k])
+            if not poly:
+                break
+    ref_off = _v_dot(ref_n, ref_pos) + ref_he[ref_axis]
+    total, n_pen = (0.0, 0.0, 0.0), 0
+    for p in poly:
+        pen = ref_off - _v_dot(ref_n, p)
+        if pen >= 0.0:
+            total = _v_add(total, _v_add(p, _v_scale(ref_n, pen * 0.5)))
+            n_pen += 1
+    if n_pen > 0:
+        return _v_div(total, float(n_pen))
+    if poly:
+        acc = (0.0, 0.0, 0.0)
+        for p in poly:
+            acc = _v_add(acc, p)
+        return _v_div(acc, float(len(poly)))
+    return _v_scale(_v_add(_v_add(ref_pos, _v_scale(ref_n, ref_he[ref_axis])), inc_c), 0.5)
+
+
+def _obb_obb(pa, ra, hea, pb, rb, heb):
+    axa = [_q_mul_vec3(ra, e) for e in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))]
+    axb = [_q_mul_vec3(rb, e) for e in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))]
+    d = _v_sub(pb, pa)
+
+    def overlap_on(axis):
+        pra = hea[0] * abs(_v_dot(axa[0], axis)) + hea[1] * abs(_v_dot(axa[1], axis)) + hea[2] * abs(_v_dot(axa[2], axis))
+        prb = heb[0] * abs(_v_dot(axb[0], axis)) + heb[1] * abs(_v_dot(axb[1], axis)) + heb[2] * abs(_v_dot(axb[2], axis))
+        return pra + prb - abs(_v_dot(d, axis))
+
+    best_a, best_b = (math.inf, 0), (math.inf, 0)
+    for i in range(3):
+        oa = overlap_on(axa[i])
+        if oa <= 0.0:
+            return None
+        if oa < best_a[0]:
+            best_a = (oa, i)
+        ob = overlap_on(axb[i])
+        if ob <= 0.0:
+            return None
+        if ob < best_b[0]:
+            best_b = (ob, i)
+    if best_b[0] < B3_REL_TOL * best_a[0] - B3_ABS_TOL:
+        depth, feature, axis = best_b[0], ("B", best_b[1]), axb[best_b[1]]
+    else:
+        depth, feature, axis = best_a[0], ("A", best_a[1]), axa[best_a[1]]
+    best_e = (math.inf, 0, 0, (0.0, 0.0, 0.0))
+    for i, ea in enumerate(axa):
+        for j, eb in enumerate(axb):
+            c = _v_cross(ea, eb)
+            ln = rust_sqrt(_v_dot(c, c))
+            if ln < 1e-6:
+                continue
+            ax = _v_div(c, ln)
+            o = overlap_on(ax)
+            if o <= 0.0:
+                return None
+            if o < best_e[0]:
+                best_e = (o, i, j, ax)
+    if best_e[0] < B3_REL_TOL * depth - B3_ABS_TOL:
+        depth, feature, axis = best_e[0], ("E", best_e[1], best_e[2]), best_e[3]
+    normal = _v_neg(axis) if _v_dot(d, axis) < 0.0 else axis
+    if feature[0] == "A":
+        point = _face_contact_point(pa, axa, hea, feature[1], normal, pb, axb, heb)
+    elif feature[0] == "B":
+        point = _face_contact_point(pb, axb, heb, feature[1], _v_neg(normal), pa, axa, hea)
+    else:
+        i, j = feature[1], feature[2]
+        ca, cb = pa, pb
+        for k in range(3):
+            if k != i:
+                ca = _v_add(ca, _v_scale(axa[k], _sgn(_v_dot(axa[k], normal)) * hea[k]))
+            if k != j:
+                cb = _v_sub(cb, _v_scale(axb[k], _sgn(_v_dot(axb[k], normal)) * heb[k]))
+        sa, sb = _v_scale(axa[i], hea[i]), _v_scale(axb[j], heb[j])
+        p, q = _cp_segs(_v_sub(ca, sa), _v_add(ca, sa), _v_sub(cb, sb), _v_add(cb, sb))
+        point = _v_scale(_v_add(p, q), 0.5)
+    return normal, depth, point
+
+
+def _segment_box(spos, srot, la0, lb0, bp, brot, he):
+    wa, wb = _v_add(spos, _q_mul_vec3(srot, la0)), _v_add(spos, _q_mul_vec3(srot, lb0))
+    inv = _q_inv(brot)
+    la, lb = _q_mul_vec3(inv, _v_sub(wa, bp)), _q_mul_vec3(inv, _v_sub(wb, bp))
+    ab = _v_sub(lb, la)
+    ls = _v_dot(ab, ab)
+    nhe = _v_neg(he)
+    best = [-math.inf, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)]
+
+    def sample(sp, outside_too):
+        cl = _v_clamp(sp, nhe, he)
+        diff = _v_sub(sp, cl)
+        dsq = _v_dot(diff, diff)
+        if dsq < B3_EPSILON_SQ:
+            fd = tuple(h - abs(c) for h, c in zip(he, sp))
+            k = _min_axis(fd)
+            if fd[k] > best[0]:
+                best[0], best[1], best[2] = fd[k], _axis_vec(k, _sgn(sp[k])), cl
+        elif outside_too:
+            nd = -rust_sqrt(dsq)
+            if nd > best[0] and dsq < B3_EPSILON:
+                best[0] = nd
+
+    for i in range(9):
+        sample(_v_add(la, _v_scale(ab, i / 8.0)), True)
+    tc = 0.0 if ls < B3_EPSILON_SQ else _np_div(_v_dot(_v_neg(la), ab), ls)
+    sample(_v_add(la, _v_scale(ab, rust_clamp(tc, 0.0, 1.0))), False)
+    if best[0] <= 0.0:
+        return None
+    return _q_mul_vec3(brot, best[1]), best[0], _v_add(_q_mul_vec3(brot, best[2]), bp)
+
+
+def _ball_support(r, ld):
+    ln = rust_sqrt(_v_dot(ld, ld))
+    return (0.0, r, 0.0) if ln < B3_EPSILON else _v_scale(_v_div(ld, ln), r)
+
+
+def _hull_support(pts, ld):
+    best, best_dot = (0.0, 0.0, 0.0), -math.inf
+    for p in pts:
+        dd = _v_dot(p, ld)
+        if dd > best_dot:
+            best_dot, best = dd, p
+    return best
+
+
+def _shape_support(shape, pos, rot, d):
+    ld = _q_mul_vec3(_q_inv(rot), d)
+    kind = shape[0]
+    if kind == "Ball":
+        lp = _ball_support(shape[1], ld)
+    elif kind == "Box":
+        h = shape[1]
+        lp = tuple(h[k] if ld[k] >= 0.0 else -h[k] for k in range(3))
+    elif kind == "Capsule":
+        ap = (0.0, shape[1] if ld[1] >= 0.0 else -shape[1], 0.0)
+        ln = rust_sqrt(_v_dot(ld, ld))
+        lp = ap if ln < B3_EPSILON else _v_add(ap, _v_scale(_v_div(ld, ln), shape[2]))
+    elif kind == "ConvexHull":
+        lp = _hull_support(shape[1], ld)
+    else:
+        lp = (0.0, 0.0, 0.0)
+    return _v_add(pos, _q_mul_vec3(rot, lp))
+
+
+def _gjk_do_simplex(smp, dirbox):
+    n = len(smp)
+    if n == 2:
+        a, b = smp[1][0], smp[0][0]
+        ab, ao = _v_sub(b, a), _v_neg(a)
+        if _v_dot(ab, ao) > 0.0:
+            perp = _v_cross(_v_cross(ab, ao), ab)
+            dirbox[0] = perp if _v_len_sq(perp) > B3_EPSILON_SQ * rust_max(_v_len_sq(ab), 1.0) else _v_any_orth(ab)
+        else:
+            smp[:] = [smp[1]]
+            dirbox[0] = ao
+        return False
+    if n == 3:
+        pa, pb, pc = smp[2], smp[1], smp[0]
+        a, b, c = pa[0], pb[0], pc[0]
+        ab, ac, ao = _v_sub(b, a), _v_sub(c, a), _v_neg(a)
+        abc = _v_cross(ab, ac)
+        if _v_len_sq(abc) < B3_EPSILON_SQ:
+            smp[:] = [pb, pa]
+            return _gjk_do_simplex(smp, dirbox)
+        if _v_dot(_v_cross(abc, ac), ao) > 0.0:
+            if _v_dot(ac, ao) > 0.0:
+                smp[:] = [pc, pa]
+                dirbox[0] = _v_cross(_v_cross(ac, ao), ac)
+            else:
+                smp[:] = [pb, pa]
+                return _gjk_do_simplex(smp, dirbox)
+        elif _v_dot(_v_cross(ab, abc), ao) > 0.0:
+            smp[:] = [pb, pa]
+            return _gjk_do_simplex(smp, dirbox)
+        elif _v_dot(abc, ao) > 0.0:
+            dirbox[0] = abc
+        else:
+            smp[0], smp[1] = smp[1], smp[0]
+            dirbox[0] = _v_neg(abc)
+        return False
+    if n == 4:
+        pa, pb, pc, pd = smp[3], smp[2], smp[1], smp[0]
+        a = pa[0]
+        ao = _v_neg(a)
+        ab, ac, ad = _v_sub(pb[0], a), _v_sub(pc[0], a), _v_sub(pd[0], a)
+        abc, acd, adb = _v_cross(ab, ac), _v_cross(ac, ad), _v_cross(ad, ab)
+        if abs(_v_dot(abc, ad)) < B3_EPSILON_SQ:
+            smp[:] = [pc, pb, pa]
+            dd = abc if _v_dot(abc, ao) >= 0.0 else _v_neg(abc)
+            dirbox[0] = _v_any_orth(ab) if _v_len_sq(dd) < B3_EPSILON_SQ else dd
+            return False
+        for cond, new in ((abc, [pc, pb, pa]), (acd, [pd, pc, pa]), (adb, [pb, pd, pa])):
+            if _v_dot(cond, ao) > 0.0:
+                smp[:] = new
+                return _gjk_do_simplex(smp, dirbox)
+        return True
+    return False
+
+
+def _epa_face(verts, idx):
+    a = verts[idx[0]][0]
+    nn = _v_cross(_v_sub(verts[idx[1]][0], a), _v_sub(verts[idx[2]][0], a))
+    ln = rust_sqrt(_v_dot(nn, nn))
+    if ln < B3_EPSILON:
+        return (idx, (0.0, 0.0, 0.0), math.inf, True)
+    normal = _v_div(nn, ln)
+    return (idx, normal, _v_dot(normal, a), False)
+
+
+def _epa_result(verts, face, support):
+    (i0, i1, i2), normal, dist, _ = face
+    v0, v1, v2 = verts[i0], verts[i1], verts[i2]
+    p = _v_scale(normal, dist)
+    e0, e1, e2 = _v_sub(v1[0], v0[0]), _v_sub(v2[0], v0[0]), _v_sub(p, v0[0])
+    d00, d01, d11, d20, d21 = _v_dot(e0, e0), _v_dot(e0, e1), _v_dot(e1, e1), _v_dot(e2, e0), _v_dot(e2, e1)
+    denom = d00 * d11 - d01 * d01
+    if abs(denom) > B3_EPSILON_SQ:
+        v = _np_div(d11 * d20 - d01 * d21, denom)
+        w = _np_div(d00 * d21 - d01 * d20, denom)
+        u = 1.0 - v - w
+        on_a = _v_add(_v_add(_v_scale(v0[1], u), _v_scale(v1[1], v)), _v_scale(v2[1], w))
+        on_b = _v_add(_v_add(_v_scale(v0[2], u), _v_scale(v1[2], v)), _v_scale(v2[2], w))
+        point = _v_scale(_v_add(on_a, on_b), 0.5)
+    else:
+        sp = support(normal)
+        point = _v_scale(_v_add(sp[1], sp[2]), 0.5)
+    return normal, rust_max(dist, 0.0), point
+
+
+def _epa(support, smp):
+    if len(smp) < 4:
+        return None
+    verts = list(smp)
+    w0 = verts[0][0]
+    orient = _v_dot(_v_cross(_v_sub(verts[1][0], w0), _v_sub(verts[2][0], w0)), _v_sub(verts[3][0], w0))
+    if abs(orient) < B3_EPSILON_SQ:
+        return None
+    if orient > 0.0:
+        verts[1], verts[2] = verts[2], verts[1]
+    faces = [_epa_face(verts, idx) for idx in ((0, 1, 2), (0, 3, 1), (0, 2, 3), (1, 3, 2))]
+    best = None
+    for _ in range(B3_EPA_MAX_ITER):
+        face, key = None, None
+        for f in faces:
+            if not f[3] and (face is None or _total_key(f[2]) < key):
+                face, key = f, _total_key(f[2])
+        if face is None:
+            break
+        best = face
+        np_ = support(face[1])
+        new_dist = _v_dot(np_[0], face[1])
+        if new_dist - face[2] < 1e-9 + 1e-9 * abs(face[2]):
+            return _epa_result(verts, face, support)
+        new_idx = len(verts)
+        verts.append(np_)
+        edges = []
+        kept = []
+        for f in faces:
+            if f[3] or _v_dot(f[1], _v_sub(np_[0], verts[f[0][0]][0])) > 0.0:
+                i0, i1, i2 = f[0]
+                for e in ((i0, i1), (i1, i2), (i2, i0)):
+                    pos = next((k for k, x in enumerate(edges) if x[0] == e[1] and x[1] == e[0]), None)
+                    if pos is None:
+                        edges.append(e)
+                    else:
+                        edges[pos] = edges[-1]
+                        edges.pop()
+            else:
+                kept.append(f)
+        faces = kept
+        if not edges:
+            break
+        for e in edges:
+            faces.append(_epa_face(verts, (e[0], e[1], new_idx)))
+    return None if best is None else _epa_result(verts, best, support)
+
+
+def _gjk_epa(support_a, support_b, initial):
+    def support(d):
+        a, b = support_a(d), support_b(_v_neg(d))
+        return (_v_sub(a, b), a, b)
+
+    if _v_len_sq(initial) < B3_EPSILON_SQ:
+        initial = (1.0, 0.0, 0.0)
+    smp = [support(initial)]
+    dirbox = [_v_neg(smp[0][0])]
+    for _ in range(B3_GJK_MAX_ITER):
+        if _v_len_sq(dirbox[0]) < B3_EPSILON_SQ:
+            n = len(smp)
+            if n in (2, 3):
+                e1 = _v_sub(smp[1][0], smp[0][0])
+                nn = _v_cross(e1, _v_sub(smp[2][0], smp[0][0])) if n == 3 else None
+                dirbox[0] = nn if nn is not None and _v_len_sq(nn) > B3_EPSILON_SQ else _v_any_orth(e1)
+            else:
+                dirbox[0] = _v_neg(initial)
+        np_ = support(dirbox[0])
+        if _v_dot(np_[0], dirbox[0]) < 0.0:
+            return None
+        smp.append(np_)
+        if _gjk_do_simplex(smp, dirbox):
+            return _epa(support, smp)
+    return None
+
+
+def _flip(c):
+    return None if c is None else (_v_neg(c[0]), c[1], c[2])
+
+
+def _contact_3d(sa, pa, ra, sb, pb, rb):
+    ka, kb = sa[0], sb[0]
+    if ka == "Ball" and kb == "Ball":
+        return _sphere_sphere(pa, sa[1], pb, sb[1])
+    if ka == "Ball" and kb == "Box":
+        return _flip(_sphere_obb(pa, sa[1], pb, rb, sb[1]))
+    if ka == "Box" and kb == "Ball":
+        return _sphere_obb(pb, sb[1], pa, ra, sa[1])
+    if ka == "Box" and kb == "Box":
+        if _is_identity_quat(ra) and _is_identity_quat(rb):
+            return _aabb_aabb(pa, sa[1], pb, sb[1])
+        return _obb_obb(pa, ra, sa[1], pb, rb, sb[1])
+    if ka == "Capsule" and kb == "Ball":
+        e0, e1 = _cap_ends(pa, ra, sa[1])
+        return _sphere_sphere(_cp_seg(e0, e1, pb), sa[2], pb, sb[1])
+    if ka == "Ball" and kb == "Capsule":
+        e0, e1 = _cap_ends(pb, rb, sb[1])
+        return _flip(_sphere_sphere(_cp_seg(e0, e1, pa), sb[2], pa, sa[1]))
+    if ka == "Capsule" and kb == "Capsule":
+        a1, a2 = _cap_ends(pa, ra, sa[1])
+        b1, b2 = _cap_ends(pb, rb, sb[1])
+        p, q = _cp_segs(a1, a2, b1, b2)
+        return _sphere_sphere(p, sa[2], q, sb[2])
+    if ka == "Capsule" and kb == "Box":
+        return _flip(_capsule_box(pa, ra, sa[1], sa[2], pb, rb, sb[1]))
+    if ka == "Box" and kb == "Capsule":
+        return _capsule_box(pb, rb, sb[1], sb[2], pa, ra, sa[1])
+    if ka == "Segment" and kb == "Ball":
+        wa, wb = _v_add(pa, _q_mul_vec3(ra, sa[1])), _v_add(pa, _q_mul_vec3(ra, sa[2]))
+        return _sphere_sphere(_cp_seg(wa, wb, pb), 0.0, pb, sb[1])
+    if ka == "Ball" and kb == "Segment":
+        wa, wb = _v_add(pb, _q_mul_vec3(rb, sb[1])), _v_add(pb, _q_mul_vec3(rb, sb[2]))
+        return _flip(_sphere_sphere(_cp_seg(wa, wb, pa), 0.0, pa, sa[1]))
+    if ka == "Segment" and kb == "Box":
+        return _flip(_segment_box(pa, ra, sa[1], sa[2], pb, rb, sb[1]))
+    if ka == "Box" and kb == "Segment":
+        return _segment_box(pb, rb, sb[1], sb[2], pa, ra, sa[1])
+    if ka == "ConvexHull" and kb == "Ball":
+        if not sa[1]:
+            return None
+        return _gjk_epa(lambda d: _shape_support(sa, pa, ra, d), lambda d: _v_add(pb, _ball_support(sb[1], d)),
+                        _v_sub(pb, pa))
+    if ka == "Ball" and kb == "ConvexHull":
+        if not sb[1]:
+            return None
+        return _flip(_gjk_epa(lambda d: _shape_support(sb, pb, rb, d), lambda d: _v_add(pa, _ball_support(sa[1], d)),
+                              _v_sub(pa, pb)))
+    if (ka == "ConvexHull" and kb in ("Box", "Capsule", "ConvexHull")) or (ka in ("Box", "Capsule") and kb == "ConvexHull"):
+        return _gjk_epa(lambda d: _shape_support(sa, pa, ra, d), lambda d: _shape_support(sb, pb, rb, d), _v_sub(pb, pa))
+    return None
+
+
+def check_b3_narrow(rows):
+    """Recomputes every 3D contact from a transcription of narrowphase.rs (+ − × ÷ √ only)."""
+    for fn, cls, ins, outs, note in rows:
+        if fn != "b3::contact":
+            fail(f"b3_narrow: unknown function {fn}")
+            continue
+        sa, k = _b3_shape(ins, 0)
+        pa = tuple(tok_f(t) for t in ins[k:k + 3])
+        ra = tuple(tok_f(t) for t in ins[k + 3:k + 7])
+        sb, k = _b3_shape(ins, k + 7)
+        pb = tuple(tok_f(t) for t in ins[k:k + 3])
+        rb = tuple(tok_f(t) for t in ins[k + 3:k + 7])
+        if k + 7 != len(ins):
+            fail(f"b3_narrow: {note[:120]}: {len(ins) - k - 7} input tokens left over")
+        c = _contact_3d(sa, pa, ra, sb, pb, rb)
+        want = ["n:"] if c is None else [f"f:{bits(x):016x}" for x in (*c[0], c[1], *c[2])]
+        if outs != want and not _same_tokens(outs, want):
+            fail(f"b3_narrow: {note[:120]}: Python computes {' '.join(want)[:200]}")
+        elif outs != want:
+            # Equal up to NaN payloads; class A needs the bits.
+            if any(a != b and not (math.isnan(tok_f(a)) and math.isnan(tok_f(b))) for a, b in zip(outs, want)):
+                fail(f"b3_narrow: {note[:120]}: bits differ: {' '.join(want)[:200]}")
+    return len(rows)
+
+
 def main():
     root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
     check_tables(root)
@@ -4052,6 +4648,8 @@ def main():
             print(f"b2_ray: {check_b2_ray(rows)} rows recomputed (a transcription on glibc's sin, cos, hypot)")
         elif name == "b2_narrow":
             print(f"b2_narrow: {check_b2_narrow(rows)} rows recomputed (a transcription on Python's libm)")
+        elif name == "b3_narrow":
+            print(f"b3_narrow: {check_b3_narrow(rows)} pairs recomputed (a transcription of the 3D narrowphase)")
         elif name == "b3_body":
             print(f"b3_body: {check_b3_body(rows)} bodies recomputed (from_desc, mass, inertia, parallel axis, R·I⁻¹·Rᵀ)")
         elif name == "b3_math":

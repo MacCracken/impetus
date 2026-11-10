@@ -81,6 +81,22 @@ var _IM_B2_WARM_START_FACTOR: f64 = 0.95;
 
 # FALLBACK is not carried: the (1, [0, 0], 1) tuple local to `shape_props`, written in place in src/b2_types.cyr.
 
+# ── rust-old/src/backend_3d/narrowphase.rs ──
+
+# Rust: `GJK_MAX_ITER: usize = 64`
+const _IM_B3_GJK_MAX_ITER = 64;
+
+# Rust: `EPA_MAX_ITER: usize = 64`
+const _IM_B3_EPA_MAX_ITER = 64;
+
+# Prefer face axes (and box A) over nearly-equal alternatives so the
+# reference feature doesn't flicker between frames.
+# Rust: `REL_TOL: f64 = 0.98`
+var _IM_B3_REL_TOL: f64 = 0.98;
+
+# Rust: `ABS_TOL: f64 = 1e-3`
+var _IM_B3_ABS_TOL: f64 = 0.001;
+
 # ── rust-old/src/backend_3d/types.rs ──
 
 # General-purpose geometry epsilon for zero-length checks.

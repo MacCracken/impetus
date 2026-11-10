@@ -59,6 +59,11 @@ fn sources() -> Vec<Source> {
             )],
         },
         Source {
+            file: "backend_3d/narrowphase.rs",
+            prefix: "_IM_B3_",
+            excused: &[],
+        },
+        Source {
             file: "backend_3d/types.rs",
             prefix: "_IM_B3_",
             excused: &[],

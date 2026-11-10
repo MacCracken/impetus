@@ -34,11 +34,11 @@ MODULES = [
     "body", "collider", "joint", "event", "query", "arena", "contact_tracker", "spring",
     "aabb_tree", "spatial_hash", "backend_2d/types", "backend_2d/narrowphase",
     "backend_2d/raycast", "backend_2d/state", "backend_2d/joints", "backend_2d/solver",
-    "particle", "world", "backend_3d/types",
+    "particle", "world", "backend_3d/types", "backend_3d/narrowphase",
 ]
 PENDING_MODULES = {
     "backend_2d/tests": "M3",
-    "backend_3d/narrowphase": "M4", "backend_3d/raycast": "M4",
+    "backend_3d/raycast": "M4",
     "backend_3d/solver": "M5", "backend_3d/joints": "M5", "backend_3d/state": "M5",
     "backend_3d/tests": "M5", "serialize": "M6",
 }
@@ -88,7 +88,13 @@ FN_RENAMES = {
         "generate_contacts_multi",
     )},
     # The 3D backend's free helpers are backend-internal (`pub(super)`): private `_im_b3_` helpers here.
-    **{f: f"_im_b3_{f}" for f in ("skew", "gyroscopic_step", "parallel_axis")},
+    **{f: f"_im_b3_{f}" for f in (
+        "skew", "gyroscopic_step", "parallel_axis",
+        "is_identity_quat", "closest_point_on_segment_3d", "capsule_endpoints_3d", "closest_points_segments_3d",
+        "generate_contact_3d", "gjk_epa_shapes", "sphere_sphere", "sphere_obb", "aabb_aabb_3d", "capsule_sphere_3d",
+        "capsule_capsule_3d", "capsule_box_3d", "obb_obb_3d", "segment_sphere_3d", "segment_box_3d",
+        "convex_hull_sphere_3d",
+    )},
 }
 # Rust field -> the Cyrius fields that carry it (Option<T> is a presence flag plus the value).
 FIELD_RENAMES = {
@@ -105,7 +111,7 @@ FIELD_RENAMES = {
     ("ContactManifold", "points"): ["points", "point_count"],
 }
 # The Cyrius prefix of a module's crate-internal constants (scripts/oracle/src/t_private.rs).
-PRIVATE_PREFIX = {"backend_2d/types": "_IM_B2_", "backend_3d/types": "_IM_B3_"}
+PRIVATE_PREFIX = {"backend_2d/types": "_IM_B2_", "backend_3d/types": "_IM_B3_", "backend_3d/narrowphase": "_IM_B3_"}
 PENDING_CONSTS = {"MAX_SNAPSHOT_INDEX": "M6, with the snapshot module"}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
 PENDING_FNS = {

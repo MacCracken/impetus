@@ -95,6 +95,57 @@ impl ImWordList {
     }
 }
 
+# A growable buffer of fixed-size records: `len` of `size` bytes at `data`, room for `cap`.
+struct ImRecordList { data; len; cap; size; }
+
+#must_use
+fn ImRecordList_new(size): ImRecordList {
+    var l: ImRecordList;
+    l.data = 0;
+    l.len = 0;
+    l.cap = 0;
+    l.size = size;
+    return l;
+}
+
+impl ImRecordList {
+    # Room for n records: 1, or 0 when there is no memory (the list is unchanged).
+    fn reserve(self, n): i64 {
+        if (n <= self.cap) { return 1; }
+        var cap = self.cap * 2;
+        if (cap < 8) { cap = 8; }
+        while (cap < n) { cap = cap * 2; }
+        var d = fl_alloc(cap * self.size);
+        if (d == 0) { return 0; }
+        if (self.len > 0) { memcpy(d, self.data, self.len * self.size); }
+        if (self.data != 0) { fl_free(self.data); }
+        self.data = d;
+        self.cap = cap;
+        return 1;
+    }
+
+    # The address of record i.
+    #must_use
+    fn at(self, i): i64 { return self.data + i * self.size; }
+
+    # Appends a copy of the record at r: 1, or 0 when there is no memory.
+    fn push(self, r): i64 {
+        if (self.reserve(self.len + 1) == 0) { return 0; }
+        memcpy(self.data + self.len * self.size, r, self.size);
+        self.len = self.len + 1;
+        return 1;
+    }
+
+    # Releases the buffer.
+    fn free(self) {
+        if (self.data != 0) { fl_free(self.data); }
+        self.data = 0;
+        self.len = 0;
+        self.cap = 0;
+        return 0;
+    }
+}
+
 # A node is 12 words: the box (min x, y, z, max x, y, z as f64 words), parent, left, right (−1 for
 # none), whether it holds a key, the key, and its height (0 for a leaf).
 const _IM_TN = 96;

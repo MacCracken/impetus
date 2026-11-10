@@ -60,9 +60,11 @@ harness reads the same files. This README records what is specific to impetus.
 | `b2_contact` | b2 | M3 | 418 (+ 2 corrected) | `src/m_b2_contact.rs` | — |
 | `b2_step` | b2 | M3 | 214 (+ 4 corrected) | `src/m_b2_step.rs` | — |
 | `world_step` | b2 | M3 | 198 | `src/m_world.rs` | — |
-| `b3_math` | b3 | M4 | 7,087 | `src/m_b3_math.rs` | — |
+| `b3_math` | b3 | M4 | 7,316 | `src/m_b3_math.rs` | — |
+| `b3_narrow` | b3 | M4 | 16,340 | `src/m_b3_narrow.rs` | — |
 | `b3_body` | b3 | M4 | 234 | `src/m_b3_body.rs` | — |
-| (private constants) | b2 | M2 | — | — | `src/constants_private.cyr` (`src/t_private.rs`: every library `const` of `aabb_tree.rs`, `spatial_hash.rs`, `backend_2d/joints.rs`, `backend_2d/solver.rs`, `backend_2d/types.rs`, `backend_3d/types.rs` and `world.rs`, emitted or excused; a `[f64; N]` array, which may span lines, becomes N globals `_0` … `_{N-1}`) |
+| (private constants) | b2 | M2 | — | — | `src/constants_private.cyr` (`src/t_private.rs`: every library `const` of `aabb_tree.rs`, `spatial_hash.rs`, `backend_2d/joints.rs`, `backend_2d/solver.rs`, `backend_2d/types.rs`, `backend_3d/narrowphase.rs`, `backend_3d/types.rs` and `world.rs`, emitted or excused (a
+function's local `const` counts, as `obb_obb_3d`'s `REL_TOL`); a `[f64; N]` array, which may span lines, becomes N globals `_0` … `_{N-1}`) |
 
 ## Format 1
 
@@ -98,6 +100,11 @@ impetus specifics:
   re-export (an optional dependency of the `b3` build, already in the lock). A vector is 3 f64 tokens, a quaternion 4
   (x, y, z, w), a matrix 9 by columns. Class A for one IEEE operation per output, B for compositions, C for the
   rotations built on `sin_cos` (ADR 0012).
+- 3D narrowphase rows (`b3_narrow.tsv`, the 3D build only) go through the hook `contact_3d`. Inputs: shape A
+  (`flat::shape`), A's position x, y, z and rotation x, y, z, w, then shape B and its pose. `b3::contact` outputs `n:` or
+  the normal x, y, z (A to B), the depth and the point x, y, z. Class A: the 3D narrowphase has no transcendental. Its
+  input rotations are normalized from rational components (a square root, no sin or cos), so no row depends on the
+  host's libm.
 - 3D body rows (`b3_body.tsv`, the 3D build only) come from a world dump, as the 2D mass rows do, with a full
   `BodyDesc` (`flat::body_desc`) and per collider its shape, offset x, y and z, density, and `n:` or the explicit mass.
   Outputs: every stored body field but the handle and type (`Body3dDump`), matrices by columns. Class C (the z
@@ -204,6 +211,8 @@ Standard-library Python, run with `-I`. It never calls the oracle:
   the floors, the parallel-axis sum and `refresh_inverse_mass`;
 - every `b3_math` row is recomputed from glam's formulas in their operation order, the rotations on glibc's sin and
   cos (MPFR's for the corrected oracle);
+- every `b3_narrow` row is recomputed by a Python transcription of the 3D narrowphase (GJK and EPA with Rust's `Vec`
+  order semantics), bit for bit;
 - every `b3_body` body is recomputed: `from_desc`, each collider's mass, inertia and centroid, the parallel-axis sum
   of `recompute_mass_properties`, the inverses and R·I⁻¹·Rᵀ;
 - `src/constants_private.cyr` holds every library `const` of the ported modules, each equal to Python's parse of

@@ -334,3 +334,36 @@ determinant. The value forms are now faster than hisab's and allocate nothing.
 
 The body rows still chain helpers (`gyroscopic_step` builds and multiplies four matrices). M5's solver loops are where
 to take the same step next, measured there.
+
+## M4 part 2: the 3D narrowphase (2026-11-09)
+
+One pair per row through `generate_contact_3d`, a reused GJK scratch, x86_64 ELF. Rust benches its narrowphase only
+inside its step (M5), so the Rust column is a scratch timing for context: the same pairs through the oracle's
+`contact_3d` hook, release build, best of five batches of 200,000 (`rust-old/` untouched). Cyrius is
+`tests/impetus_3d.bcyr`, one batch of 100,000 (10,000 for the EPA cap row).
+
+| Bench | Path | Rust | Cyrius, first | Cyrius, now |
+|---|---|---|---|---|
+| `b3/contact_ball_ball` | closed form | 41 ns | 240 ns | 237–247 ns |
+| `b3/contact_ball_box_rotated` | ball against OBB | 75 ns | 747 ns | 753–776 ns |
+| `b3/contact_box_box_aabb` | the AABB fast path | 49 ns | 607 ns | 602–639 ns |
+| `b3/contact_box_box_obb_face` | SAT, a face contact (clipping) | 579 ns | 14.6 µs | **8.3–8.5 µs** |
+| `b3/contact_box_box_obb_edge` | SAT, an edge pair | 465 ns | 12.6 µs | **6.3–8.0 µs** |
+| `b3/contact_capsule_box` | five ball-against-box candidates | 451 ns | 8.2 µs | 6.2–8.2 µs |
+| `b3/contact_capsule_capsule` | segment closest points | 123 ns | 2.45 µs | 2.45–2.50 µs |
+| `b3/contact_hull_ball_gjk` | GJK + EPA, hull against ball | 5.50 µs | 44 µs | 54–56 µs |
+| `b3/contact_hull_box_gjk` | GJK + EPA, hull against box | 4.82 µs | 49 µs | 30–49 µs |
+| `b3/gjk_epa_ball_ball` | two balls through GJK, EPA to its 64-iteration cap | — | 663 µs | 684–738 µs |
+
+The Rust hull pair `hull_hull` (two cubes 0.8 apart) took 3.41 µs. Two balls never reach GJK through
+`generate_contact_3d`, so the EPA-cap row has no Rust twin.
+
+**Reading it.** The closed forms are 6–20× Rust. Each step is a struct-valued helper call that copies its arguments,
+where Rust's are inlined into registers.
+- The SAT was the outlier at 25–27×: 15 overlap tests, each building six vectors to take six dot products. Reading
+  the axes and half extents as f64 words in the same operation order took it to 14–17×. The polygon clip and the
+  hull support got the same rewrite, and all 16,340 rows keep their bits.
+- GJK + EPA is 6–11×; most of it is the EPA loop's face scan, retain and horizon.
+- The GJK rows move by up to 1.6× between runs: each is one long batch (3–5 s). The ranges above are three runs.
+
+Not pursued further here. Speed is measured, not gated, and M5's step is where the pair costs add up and get profiled.

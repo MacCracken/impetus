@@ -354,6 +354,30 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     inverse inertia. `src/b3_types.cyr` binds such calls to a local first. The filing is
     `cyrius/docs/development/issues/2026-11-09-field-store-of-struct-call-copies-a-field-argument.md`,
     with a repro that exits 1.
+- **Cyrius port, M4 part 2: the 3D narrowphase** (`docs/development/port-parity.md` §18):
+  - `src/b3_narrowphase.cyr` ports `generate_contact_3d` and every pair it handles:
+    - the closed forms for ball, box, capsule and segment pairs;
+    - the AABB fast path, and the 15-axis OBB separating-axis test with reference-face clipping and edge–edge points;
+    - impetus's own GJK + EPA for hulls (ADR 0012).
+
+    The GJK and EPA working sets live in an `ImGjkScratch3d` the caller owns and reuses. Rust's `Vec` order
+    semantics (`retain`, `swap_remove`, the first minimum by `total_cmp`) are kept exactly.
+  - The golden `b3_narrow.tsv` has 16,340 pairs through the oracle's `contact_3d` hook:
+    - every ordered pair of a 15-shape catalog at 4 rotation pairs and 15 placements;
+    - the unhandled shapes against all of them;
+    - targeted cases (exact touching, centres inside boxes, edge–edge boxes, lying capsules, degenerate hulls, large
+      and non-finite poses);
+    - 2,000 seeded pairs.
+
+    Class A, because the narrowphase has no transcendental. **All 16,340 match bit for bit** (6,828 contacts, signs
+    of zero included) on x86_64 ELF, x86_64 PE and aarch64, on the first run. `validate.py` transcribes the whole
+    narrowphase in Python and reproduces every row.
+  - glam's `DVec3::clamp` (max then min, unlike `f64::clamp`) joins `src/math3.cyr`, with 229 `b3_math` rows.
+  - The narrowphase's own constants (`REL_TOL`, `ABS_TOL`, the GJK and EPA iteration caps) are generated.
+    `ImRecordList` moved to `src/aabb_tree.cyr`, so both profiles have it.
+  - 37 Rust narrowphase tests are ported in `tests/b3_narrowphase.tcyr`, plus Cyrius-only groups for the unhandled
+    pairs and the scratch reuse (a flat heap after warm-up): 65 assertions.
+  - Surface parity is 599/599 across 25 modules. **3D: 23,890 ok, 0 failed.**
 
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
@@ -411,6 +435,12 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   hisab's allocating `hquat_rotate_vec3` and `m3_mul` take 51 and 89 ns. A box's mass recompute takes
   1.07 µs and a rotated box's world AABB 1.23 µs. A by-value struct is copied on entry, so chains of
   small helper calls dominate (`port-parity.md` §4.2).
+- **The 3D narrowphase, first numbers against Rust** (both timed per pair through `generate_contact_3d`; Rust
+  through the oracle hook in a scratch timing, since Rust benches its narrowphase only inside a step):
+  - the closed forms: 0.24–2.5 µs against 41–450 ns (6–20×);
+  - the OBB SAT: 8.3 µs against 580 ns (face) and 6.3–8.0 µs against 465 ns (edge pair), down from 14.6 and
+    12.6 µs once its overlap test, clip and hull support read f64 words (identical bits);
+  - GJK + EPA on hulls: 30–55 µs a pair (one long batch, noisy) against 4.8–5.5 µs.
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

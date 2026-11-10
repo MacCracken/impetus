@@ -1,0 +1,344 @@
+# b3_narrowphase.tcyr — the ported Rust tests of rust-old/src/backend_3d/narrowphase.rs (M4 part 2): the shape-pair,
+# closest-point, GJK/EPA and SAT tests of backend_3d/tests.rs, plus Cyrius-only tests of the unhandled pairs and of
+# the GJK scratch (reused, so the heap stays flat once it has grown).
+
+include "tests/lib_3d.cyr"
+
+var eps: f64 = 0.000001;
+
+# 1 when |got − want| < tol.
+fn near(got: f64, want: f64, tol: f64): i64 {
+    var d: f64 = f64_abs(got - want);
+    if (d < tol) { return 1; }
+    return 0;
+}
+
+# 1 when |a − b| < tol.
+fn vnear(a: ImVec3, b: ImVec3, tol: f64): i64 {
+    var l: f64 = ImVec3_length(a - b);
+    if (l < tol) { return 1; }
+    return 0;
+}
+
+fn v(x: f64, y: f64, z: f64): ImVec3 { return ImVec3_new(x, y, z); }
+
+fn ident(): ImQuat { return ImQuat_identity(); }
+
+# The hull of the eight corners ±h, in the Rust test's order (x outermost, z innermost).
+fn cube_hull(h: f64): ImColliderShape {
+    var w = fl_alloc(8 * 24);
+    for (var k = 0; k < 8; k = k + 1) {
+        var x: f64 = h;
+        var y: f64 = h;
+        var z: f64 = h;
+        if ((k & 4) == 0) { x = -h; }
+        if ((k & 2) == 0) { y = -h; }
+        if ((k & 1) == 0) { z = -h; }
+        store64(w + k * 24, _im_bits(x));
+        store64(w + k * 24 + 8, _im_bits(y));
+        store64(w + k * 24 + 16, _im_bits(z));
+    }
+    var s: ImColliderShape = ImColliderShape_convex_hull(w, 8);
+    fl_free(w);
+    return s;
+}
+
+# The triangle hull (−1, −1, 0), (1, −1, 0), (0, 1, 0).
+fn tri_hull(): ImColliderShape {
+    var w = fl_alloc(9 * 8);
+    var m1: f64 = -1.0;
+    var z: f64 = 0.0;
+    var one: f64 = 1.0;
+    store64(w, _im_bits(m1));
+    store64(w + 8, _im_bits(m1));
+    store64(w + 16, _im_bits(z));
+    store64(w + 24, _im_bits(one));
+    store64(w + 32, _im_bits(m1));
+    store64(w + 40, _im_bits(z));
+    store64(w + 48, _im_bits(z));
+    store64(w + 56, _im_bits(one));
+    store64(w + 64, _im_bits(z));
+    var s: ImColliderShape = ImColliderShape_convex_hull(w, 3);
+    fl_free(w);
+    return s;
+}
+
+# The contact between two shapes at identity rotations, both orders, as the Rust test's `assert_normal_a_to_b`: the
+# A→B normal equals `expected`, the B→A one its negation, and the depths agree. Returns the number of checks passed
+# (5 for a pass).
+fn normal_a_to_b(sa: *ImColliderShape, pa: ImVec3, sb: *ImColliderShape, pb: ImVec3, expected: ImVec3,
+  sc: *ImGjkScratch3d): i64 {
+    var h1: ImHit3d;
+    var h2: ImHit3d;
+    var ok = 0;
+    ok = ok + _im_b3_generate_contact_3d(sa, pa, ident(), sb, pb, ident(), sc, &h1);
+    ok = ok + _im_b3_generate_contact_3d(sb, pb, ident(), sa, pa, ident(), sc, &h2);
+    ok = ok + vnear(h1.normal, expected, eps);
+    ok = ok + vnear(h2.normal, ImVec3_neg(expected), eps);
+    var d1: f64 = h1.depth;
+    var d2: f64 = h2.depth;
+    ok = ok + near(d1, d2, eps);
+    return ok;
+}
+
+# The Rust test's LCG, in [−2, 2): seed ← seed·6364136223846793005 + 1442695040888963407 (wrapping), then the top 53
+# bits as a fraction.
+var lcg: i64 = 0x2545F4914F6CDD1D;
+
+fn rnd(): f64 {
+    lcg = lcg * 6364136223846793005 + 1442695040888963407;
+    var top = (lcg >> 11) & 0x1FFFFFFFFFFFFF;
+    var f: f64 = f64_from(top);
+    var r: f64 = f / 9007199254740992.0 * 4.0 - 2.0;
+    return r;
+}
+
+# min over s in {0, 1/2000, …, 1} of the distance from a + (b − a)s to segment [c, d]: the test's brute force.
+fn seg_dist(a: ImVec3, b: ImVec3, c: ImVec3, d: ImVec3): f64 {
+    var ab: ImVec3 = b - a;
+    var best: f64 = 0.0;
+    for (var i = 0; i <= 2000; i = i + 1) {
+        var fi: f64 = f64_from(i);
+        var s: f64 = fi / 2000.0;
+        var p: ImVec3 = a + ImVec3_scale(ab, s);
+        var q: ImVec3 = _im_b3_closest_point_on_segment_3d(c, d, p);
+        var l: f64 = ImVec3_length(p - q);
+        if (i == 0 || l < best) { best = l; }
+    }
+    return best;
+}
+
+fn main() {
+    alloc_init();
+    var sc: ImGjkScratch3d = ImGjkScratch3d_new();
+    var h: ImHit3d;
+    var zero: ImVec3 = ImVec3_zero();
+    var one: ImVec3 = ImVec3_splat(1.0);
+    var pi: f64 = _IM_PI;
+    var r45z: ImQuat = ImQuat_from_rotation_z(pi / 4.0);
+
+    test_group("sphere_sphere");
+    assert_eq(_im_b3_sphere_sphere(zero, 1.0, v(1.5, 0.0, 0.0), 1.0, &h), 1, "overlap");
+    var d0: f64 = h.depth;
+    assert_eq(near(h.normal.x, 1.0, eps) + near(d0, 0.5, eps), 2, "normal +x, depth 0.5");
+    assert_eq(_im_b3_sphere_sphere(zero, 1.0, v(5.0, 0.0, 0.0), 1.0, &h), 0, "no overlap");
+
+    test_group("sphere_obb");
+    assert_eq(_im_b3_sphere_obb(v(1.8, 0.0, 0.0), 0.5, zero, ident(), v(1.5, 1.0, 1.0), &h), 1, "overlap");
+    assert_eq(_im_b3_sphere_obb(v(5.0, 0.0, 0.0), 0.5, zero, ident(), one, &h), 0, "miss");
+    assert_eq(_im_b3_sphere_obb(v(1.5, 1.5, 0.0), 0.5, zero, r45z, v(2.0, 0.5, 1.0), &h), 1, "rotated box hit");
+
+    test_group("aabb_3d");
+    assert_eq(_im_b3_aabb_aabb_3d(zero, one, v(1.5, 0.0, 0.0), one, &h), 1, "overlap");
+    var d1: f64 = h.depth;
+    assert_eq(near(h.normal.x, 1.0, eps) + near(d1, 0.5, eps), 2, "normal +x, depth 0.5");
+    assert_eq(_im_b3_aabb_aabb_3d(zero, one, v(5.0, 0.0, 0.0), one, &h), 0, "no overlap");
+
+    test_group("capsule_sphere_3d");
+    assert_eq(_im_b3_capsule_sphere_3d(zero, ident(), 1.0, 0.5, v(0.8, 0.0, 0.0), 0.5, &h), 1, "overlap");
+    assert_eq(_im_b3_capsule_sphere_3d(zero, ident(), 1.0, 0.5, v(5.0, 0.0, 0.0), 0.5, &h), 0, "miss");
+
+    test_group("obb_obb");
+    assert_eq(_im_b3_obb_obb_3d(zero, ident(), one, v(1.5, 0.0, 0.0), ident(), one, &h), 1, "aligned overlap");
+    var d2: f64 = h.depth;
+    assert_eq(near(h.normal.x, 1.0, eps) + near(d2, 0.5, eps), 2, "normal +x, depth 0.5");
+    assert_eq(_im_b3_obb_obb_3d(zero, ident(), one, v(5.0, 0.0, 0.0), ident(), one, &h), 0, "no overlap");
+    assert_eq(_im_b3_obb_obb_3d(zero, ident(), one, v(1.5, 0.0, 0.0), r45z, one, &h), 1, "rotated overlap");
+    var half: ImVec3 = ImVec3_splat(0.5);
+    assert_eq(_im_b3_obb_obb_3d(zero, ident(), half, v(3.0, 0.0, 0.0), r45z, half, &h), 0, "rotated separated");
+
+    test_group("capsule_capsule");
+    assert_eq(_im_b3_capsule_capsule_3d(zero, ident(), 1.0, 0.5, v(0.8, 0.0, 0.0), ident(), 1.0, 0.5, &h), 1,
+      "overlap");
+    assert_eq(_im_b3_capsule_capsule_3d(zero, ident(), 1.0, 0.5, v(5.0, 0.0, 0.0), ident(), 1.0, 0.5, &h), 0, "miss");
+    var rx: ImQuat = ImQuat_from_rotation_x(pi / 2.0);
+    assert_eq(_im_b3_capsule_capsule_3d(zero, ident(), 2.0, 0.3, zero, rx, 2.0, 0.3, &h), 1, "crossed");
+
+    test_group("capsule_box");
+    assert_eq(_im_b3_capsule_box_3d(zero, ident(), 1.0, 0.5, v(1.0, 0.0, 0.0), ident(), one, &h), 1, "overlap");
+    assert_eq(_im_b3_capsule_box_3d(zero, ident(), 1.0, 0.5, v(5.0, 0.0, 0.0), ident(), one, &h), 0, "miss");
+
+    test_group("segment_sphere_and_box");
+    var sa: ImVec3 = v(-2.0, 0.0, 0.0);
+    var sb: ImVec3 = v(2.0, 0.0, 0.0);
+    assert_eq(_im_b3_segment_sphere_3d(zero, ident(), sa, sb, v(0.0, 0.3, 0.0), 0.5, &h), 1, "sphere overlap");
+    assert_eq(_im_b3_segment_sphere_3d(zero, ident(), sa, sb, v(0.0, 5.0, 0.0), 0.5, &h), 0, "sphere miss");
+    var ha: ImVec3 = v(-0.5, 0.0, 0.0);
+    var hb: ImVec3 = v(0.5, 0.0, 0.0);
+    assert_eq(_im_b3_segment_box_3d(zero, ident(), ha, hb, zero, ident(), one, &h), 1, "box overlap");
+    assert_eq(_im_b3_segment_box_3d(zero, ident(), ha, hb, v(5.0, 5.0, 5.0), ident(), one, &h), 0, "box miss");
+
+    test_group("convex_hull_sphere");
+    var tri: ImColliderShape = tri_hull();
+    assert_eq(_im_b3_convex_hull_sphere_3d(&tri, zero, ident(), v(0.0, 1.2, 0.0), 0.5, &sc, &h), 1, "overlap");
+    assert_eq(_im_b3_convex_hull_sphere_3d(&tri, zero, ident(), v(0.0, 5.0, 0.0), 0.5, &sc, &h), 0, "miss");
+    tri.free();
+
+    test_group("closest_points_segments");
+    var p: ImVec3 = zero;
+    var q: ImVec3 = zero;
+    _im_b3_closest_points_segments_3d(zero, v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), v(1.0, 1.0, 0.0), &p, &q);
+    var py: f64 = f64_abs(p.y);
+    assert_eq(py < eps && near(q.y, 1.0, eps) == 1, 1, "parallel");
+    _im_b3_closest_points_segments_3d(v(-1.0, 0.0, 0.0), v(1.0, 0.0, 0.0), v(0.0, -1.0, 1.0), v(0.0, 1.0, 1.0), &p,
+      &q);
+    assert_eq(vnear(p, zero, eps) + vnear(q, v(0.0, 0.0, 1.0), eps), 2, "crossing");
+    _im_b3_closest_points_segments_3d(zero, v(10.0, 0.0, 0.0), v(5.0, 1.0, 0.0), v(15.0, 1.0, 0.0), &p, &q);
+    var gap: f64 = ImVec3_length(p - q);
+    assert_eq(near(gap, 1.0, 0.000000001), 1, "parallel offset: distance 1");
+    var worse = 0;
+    for (var i = 0; i < 300; i = i + 1) {
+        var a: ImVec3 = v(rnd(), rnd(), rnd());
+        var b: ImVec3 = v(rnd(), rnd(), rnd());
+        var c: ImVec3 = v(rnd(), rnd(), rnd());
+        var d: ImVec3 = v(rnd(), rnd(), rnd());
+        _im_b3_closest_points_segments_3d(a, b, c, d, &p, &q);
+        var got: f64 = ImVec3_length(p - q);
+        var want: f64 = seg_dist(a, b, c, d);
+        if (got > want + 0.001) { worse = worse + 1; }
+    }
+    assert_eq(worse, 0, "match brute force on 300 random pairs");
+
+    test_group("contact_normals_point_from_a_to_b");
+    var cube: ImColliderShape = ImColliderShape_box(1.0, 0.5, 1.0);
+    var ball: ImColliderShape = ImColliderShape_ball(0.6);
+    var cap: ImColliderShape = ImColliderShape_capsule(0.5, 0.6);
+    var seg: ImColliderShape = ImColliderShape_segment(v(-0.5, 0.0, 0.0), v(0.5, 0.0, 0.0));
+    var hull5: ImColliderShape = cube_hull(0.5);
+    var up: ImVec3 = v(0.0, 1.0, 0.0);
+    assert_eq(normal_a_to_b(&cube, zero, &ball, v(0.0, 1.0, 0.0), up, &sc), 5, "box, ball");
+    assert_eq(normal_a_to_b(&cube, zero, &cap, v(0.0, 1.5, 0.0), up, &sc), 5, "box, capsule");
+    assert_eq(normal_a_to_b(&cube, zero, &seg, v(0.0, 0.4, 0.0), up, &sc), 5, "box, segment");
+    assert_eq(normal_a_to_b(&ball, zero, &ball, v(0.0, 1.0, 0.0), up, &sc), 5, "ball, ball");
+    assert_eq(normal_a_to_b(&cap, zero, &ball, v(0.0, 1.5, 0.0), up, &sc), 5, "capsule, ball");
+    assert_eq(normal_a_to_b(&seg, zero, &ball, v(0.0, 0.5, 0.0), up, &sc), 5, "segment, ball");
+    assert_eq(normal_a_to_b(&hull5, zero, &ball, v(0.0, 0.9, 0.0), up, &sc), 5, "hull, ball");
+    assert_eq(normal_a_to_b(&hull5, zero, &cube, v(0.0, 0.9, 0.0), up, &sc), 5, "hull, box");
+
+    test_group("capsule_endpoint_touches_box");
+    var sq2: f64 = f64_sqrt(2.0);
+    assert_eq(_im_b3_capsule_box_3d(v(7.0, 2.0, 0.0), r45z, sq2, 0.6, zero, ident(), v(10.0, 0.5, 10.0), &h), 1,
+      "touches");
+    var d3: f64 = h.depth;
+    assert_eq(vnear(h.normal, up, eps) + near(d3, 0.1, eps), 2, "normal +y, depth 0.1");
+
+    test_group("gjk_handles_collinear_initial_simplex");
+    assert_eq(_im_b3_gjk_epa_shapes(&hull5, zero, ident(), &hull5, v(0.8, 0.0, 0.0), ident(), &sc, &h), 1, "collide");
+    var d4: f64 = h.depth;
+    assert_eq(vnear(h.normal, v(1.0, 0.0, 0.0), eps) + near(d4, 0.2, eps), 2, "normal +x, depth 0.2");
+
+    test_group("epa_on_curved_shapes_returns_best_face");
+    var unit: ImColliderShape = ImColliderShape_ball(1.0);
+    var pb: ImVec3 = v(1.2, 0.5, 0.3);
+    assert_eq(_im_b3_gjk_epa_shapes(&unit, zero, ident(), &unit, pb, ident(), &sc, &h), 1, "collide");
+    var lpb: f64 = ImVec3_length(pb);
+    var d5: f64 = h.depth;
+    var al: f64 = ImVec3_dot(h.normal, ImVec3_normalize(pb));
+    assert_eq(near(d5, 2.0 - lpb, 0.02) == 1 && al > 0.99, 1, "depth within 0.02, normal along the centres");
+
+    test_group("convex_hull_sphere_uses_hull_volume");
+    assert_eq(_im_b3_convex_hull_sphere_3d(&hull5, zero, ident(), v(0.0, 0.7, 0.0), 0.3, &sc, &h), 1, "top face");
+    var d6: f64 = h.depth;
+    assert_eq(vnear(h.normal, up, eps) + near(d6, 0.1, eps), 2, "normal +y, depth 0.1");
+    assert_eq(_im_b3_convex_hull_sphere_3d(&hull5, zero, ident(), v(0.05, 0.4, 0.1), 0.3, &sc, &h), 1, "inside");
+    var d7: f64 = h.depth;
+    assert_eq(vnear(h.normal, up, eps) + near(d7, 0.4, eps), 2, "outward normal, gap + radius");
+
+    test_group("aabb_contact_point_is_overlap_centre");
+    var ground: ImVec3 = v(10.0, 0.5, 10.0);
+    var pos: ImVec3 = v(3.0, 0.95, 2.0);
+    assert_eq(_im_b3_aabb_aabb_3d(zero, ground, pos, half, &h), 1, "overlap");
+    var d8: f64 = h.depth;
+    var p1: ImVec3 = h.point;
+    assert_eq(vnear(h.normal, up, eps) + near(d8, 0.05, eps) + vnear(p1, v(3.0, 0.475, 2.0), eps), 3, "centre");
+    assert_eq(_im_b3_aabb_aabb_3d(pos, half, zero, ground, &h), 1, "reversed");
+    assert_eq(vnear(h.point, p1, eps), 1, "same point");
+
+    test_group("obb_contact_point_is_under_the_box");
+    var ry: ImQuat = ImQuat_from_rotation_y(0.3);
+    var tight: f64 = 0.000000001;
+    assert_eq(_im_b3_obb_obb_3d(zero, ident(), ground, pos, ry, half, &h), 1, "ground first");
+    var d9: f64 = h.depth;
+    var px: f64 = h.point.x;
+    var pyy: f64 = h.point.y;
+    var pz: f64 = h.point.z;
+    assert_eq(vnear(h.normal, up, tight) + near(d9, 0.05, tight) + near(px, 3.0, tight) + near(pz, 2.0, tight), 4,
+      "normal, depth, under the box");
+    assert_eq(pyy > 0.44 && pyy < 0.51, 1, "in the slab");
+    assert_eq(_im_b3_obb_obb_3d(pos, ry, half, zero, ident(), ground, &h), 1, "box first");
+    var d10: f64 = h.depth;
+    var qx: f64 = h.point.x;
+    var qy: f64 = h.point.y;
+    var qz: f64 = h.point.z;
+    assert_eq(vnear(h.normal, ImVec3_neg(up), tight) + near(d10, 0.05, tight) + near(qx, 3.0, tight)
+      + near(qz, 2.0, tight), 4, "normal, depth, under the box");
+    assert_eq(qy > 0.44 && qy < 0.51, 1, "in the slab");
+
+    test_group("obb_edge_axes");
+    var ry45: ImQuat = ImQuat_from_rotation_y(pi / 4.0);
+    assert_eq(_im_b3_obb_obb_3d(zero, ry45, half, v(1.5, 0.0, 0.0), r45z, half, &h), 0, "edge-edge separated");
+    var sep: f64 = sq2 - 0.1;
+    assert_eq(_im_b3_obb_obb_3d(zero, ry45, half, v(sep, 0.0, 0.0), r45z, half, &h), 1, "edge-edge overlap");
+    var d11: f64 = h.depth;
+    var mid: ImVec3 = v(sep * 0.5, 0.0, 0.0);
+    assert_eq(vnear(h.normal, v(1.0, 0.0, 0.0), eps) + near(d11, 0.1, eps) + vnear(h.point, mid, eps), 3,
+      "normal +x, depth 0.1, point between the edges");
+
+    test_group("unhandled_pairs");
+    # A mesh, a heightfield, segment–segment and a segment against a capsule have no contact.
+    var mesh_v = fl_alloc(9 * 8);
+    for (var k = 0; k < 9; k = k + 1) {
+        var fk: f64 = f64_from(k % 3);
+        store64(mesh_v + k * 8, _im_bits(fk));
+    }
+    var idx = fl_alloc(3 * 8);
+    store64(idx, 0);
+    store64(idx + 8, 1);
+    store64(idx + 16, 2);
+    var mesh: ImColliderShape = ImColliderShape_tri_mesh(mesh_v, 3, idx, 1);
+    fl_free(mesh_v);
+    fl_free(idx);
+    var none = 0;
+    none = none + _im_b3_generate_contact_3d(&mesh, zero, ident(), &ball, zero, ident(), &sc, &h);
+    none = none + _im_b3_generate_contact_3d(&seg, zero, ident(), &seg, zero, ident(), &sc, &h);
+    none = none + _im_b3_generate_contact_3d(&seg, zero, ident(), &cap, zero, ident(), &sc, &h);
+    none = none + _im_b3_generate_contact_3d(&cap, zero, ident(), &seg, zero, ident(), &sc, &h);
+    none = none + _im_b3_generate_contact_3d(&seg, zero, ident(), &hull5, zero, ident(), &sc, &h);
+    assert_eq(none, 0, "no contact");
+    mesh.free();
+
+    test_group("gjk_scratch_is_reused");
+    # Once the scratch has grown to a pair's needs, the same pairs again allocate nothing on either heap.
+    var cube1: ImColliderShape = ImColliderShape_box(0.5, 0.5, 0.5);
+    var ryx: ImQuat = ImQuat_mul_quat(ImQuat_from_rotation_y(0.4), ImQuat_from_rotation_x(0.9));
+    for (var w = 0; w < 2; w = w + 1) {
+        _im_b3_generate_contact_3d(&hull5, zero, ryx, &cube1, v(0.6, 0.3, 0.1), ident(), &sc, &h);
+        _im_b3_generate_contact_3d(&hull5, zero, ident(), &ball, v(0.0, 0.7, 0.2), ident(), &sc, &h);
+        _im_b3_gjk_epa_shapes(&unit, zero, ident(), &unit, pb, ident(), &sc, &h);
+    }
+    var heap0 = alloc_used();
+    var arena0 = _fl_arena;
+    var pos0 = _fl_arena_pos;
+    var hits = 0;
+    for (var r = 0; r < 200; r = r + 1) {
+        hits = hits + _im_b3_generate_contact_3d(&hull5, zero, ryx, &cube1, v(0.6, 0.3, 0.1), ident(), &sc, &h);
+        hits = hits + _im_b3_generate_contact_3d(&hull5, zero, ident(), &ball, v(0.0, 0.7, 0.2), ident(), &sc, &h);
+        hits = hits + _im_b3_gjk_epa_shapes(&unit, zero, ident(), &unit, pb, ident(), &sc, &h);
+    }
+    assert_eq(hits, 600, "every pair collides");
+    assert_eq(alloc_used() == heap0 && _fl_arena == arena0 && _fl_arena_pos == pos0, 1, "no growth");
+
+    cube.free();
+    ball.free();
+    cap.free();
+    seg.free();
+    hull5.free();
+    unit.free();
+    cube1.free();
+    sc.free();
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

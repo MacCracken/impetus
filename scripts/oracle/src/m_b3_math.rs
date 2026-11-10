@@ -219,6 +219,10 @@ fn emit_vectors(m: &mut Module) {
         m.row("DVec3::dot", Class::B, &ins, &[f(a.dot(c))]);
         m.row("DVec3::cross", Class::B, &ins, &v3(a.cross(c)));
         m.row("DVec3::normalize_or", Class::B, &ins, &v3(a.normalize_or(c)));
+        // clamp to the box ±|c| (lo ≤ hi, as glam asserts in debug builds), as the narrowphase clamps to a box.
+        let hi = black_box(c.abs());
+        let lo = black_box(-hi);
+        m.row("DVec3::clamp", Class::A, &cat(&[v3(a), v3(lo), v3(hi)]), &v3(a.clamp(lo, hi)));
     }
     for &a in &vs {
         let a = black_box(a);

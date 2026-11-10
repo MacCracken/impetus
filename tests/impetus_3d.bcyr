@@ -4,7 +4,7 @@
 # bench_batch_stop -> bench_report.
 #
 # M4 part 1: glam's value math (src/math3.cyr) beside hisab's allocating calls for the same operation (ADR 0012's
-# trade), the gyroscopic step, body integration, the mass recompute and a world AABB.
+# trade), the gyroscopic step, body integration, the mass recompute and a world AABB. M4 part 2: the narrowphase.
 
 include "tests/lib_3d.cyr"
 
@@ -140,11 +140,87 @@ fn bench_mass_and_aabb() {
     return 0;
 }
 
+# The eight corners ±h as a hull.
+fn cube_hull(h: f64): ImColliderShape {
+    var w = fl_alloc(8 * 24);
+    for (var k = 0; k < 8; k = k + 1) {
+        var x: f64 = h;
+        var y: f64 = h;
+        var z: f64 = h;
+        if ((k & 4) == 0) { x = -h; }
+        if ((k & 2) == 0) { y = -h; }
+        if ((k & 1) == 0) { z = -h; }
+        store64(w + k * 24, _im_bits(x));
+        store64(w + k * 24 + 8, _im_bits(y));
+        store64(w + k * 24 + 16, _im_bits(z));
+    }
+    var s: ImColliderShape = ImColliderShape_convex_hull(w, 8);
+    fl_free(w);
+    return s;
+}
+
+# One pair through `generate_contact_3d`, n times, on a reused GJK scratch.
+fn bench_pair(name, sa: *ImColliderShape, pa: ImVec3, ra: ImQuat, sb: *ImColliderShape, pb: ImVec3, rb: ImQuat,
+    sc: *ImGjkScratch3d, n) {
+    var h: ImHit3d;
+    _im_b3_generate_contact_3d(sa, pa, ra, sb, pb, rb, sc, &h);
+    var b = bench_new(name);
+    bench_batch_start(b);
+    for (var i = 0; i < n; i = i + 1) { g_sink = _im_b3_generate_contact_3d(sa, pa, ra, sb, pb, rb, sc, &h); }
+    bench_batch_stop(b, n);
+    bench_report(b);
+    return 0;
+}
+
+# M4 part 2: the narrowphase, one row per path: the closed forms, the AABB fast path, the OBB SAT (a face contact
+# and an edge pair), and GJK + EPA (a hull against a ball and a box; two balls through GJK, which runs EPA to its cap).
+fn bench_narrowphase() {
+    var sc: ImGjkScratch3d = ImGjkScratch3d_new();
+    var ball: ImColliderShape = ImColliderShape_ball(0.5);
+    var cube: ImColliderShape = ImColliderShape_box(0.5, 0.5, 0.5);
+    var cap: ImColliderShape = ImColliderShape_capsule(0.5, 0.25);
+    var hull: ImColliderShape = cube_hull(0.5);
+    var i0: ImQuat = ImQuat_identity();
+    var q: ImQuat = quat();
+    var r45: ImQuat = ImQuat_from_rotation_z(_IM_PI / 4.0);
+    var ry45: ImQuat = ImQuat_from_rotation_y(_IM_PI / 4.0);
+    var z: ImVec3 = ImVec3_zero();
+    var n = 100000;
+    bench_pair("b3/contact_ball_ball", &ball, z, i0, &ball, ImVec3_new(0.6, 0.3, 0.0), i0, &sc, n);
+    bench_pair("b3/contact_ball_box_rotated", &ball, ImVec3_new(0.6, 0.5, 0.2), i0, &cube, z, q, &sc, n);
+    bench_pair("b3/contact_box_box_aabb", &cube, z, i0, &cube, ImVec3_new(0.8, 0.3, 0.1), i0, &sc, n);
+    bench_pair("b3/contact_box_box_obb_face", &cube, z, i0, &cube, ImVec3_new(0.0, 0.9, 0.1), r45, &sc, n);
+    var sep: f64 = f64_sqrt(2.0) - 0.1;
+    bench_pair("b3/contact_box_box_obb_edge", &cube, z, ry45, &cube, ImVec3_new(sep, 0.0, 0.0), r45, &sc, n);
+    bench_pair("b3/contact_capsule_box", &cap, ImVec3_new(0.2, 0.7, 0.0), r45, &cube, z, i0, &sc, n);
+    bench_pair("b3/contact_capsule_capsule", &cap, z, i0, &cap, ImVec3_new(0.3, 0.2, 0.1), q, &sc, n);
+    bench_pair("b3/contact_hull_ball_gjk", &hull, z, q, &ball, ImVec3_new(0.0, 0.8, 0.2), i0, &sc, n);
+    bench_pair("b3/contact_hull_box_gjk", &hull, z, q, &cube, ImVec3_new(0.6, 0.3, 0.1), i0, &sc, n);
+    var unit: ImColliderShape = ImColliderShape_ball(1.0);
+    var h: ImHit3d;
+    var pb: ImVec3 = ImVec3_new(1.2, 0.5, 0.3);
+    _im_b3_gjk_epa_shapes(&unit, z, i0, &unit, pb, i0, &sc, &h);
+    var b = bench_new("b3/gjk_epa_ball_ball (EPA to its cap)");
+    var m = 10000;
+    bench_batch_start(b);
+    for (var i = 0; i < m; i = i + 1) { g_sink = _im_b3_gjk_epa_shapes(&unit, z, i0, &unit, pb, i0, &sc, &h); }
+    bench_batch_stop(b, m);
+    bench_report(b);
+    ball.free();
+    cube.free();
+    cap.free();
+    hull.free();
+    unit.free();
+    sc.free();
+    return 0;
+}
+
 fn main() {
     alloc_init();
     bench_math3();
     bench_body();
     bench_mass_and_aabb();
+    bench_narrowphase();
     return 0;
 }
 

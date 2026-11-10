@@ -116,6 +116,10 @@ fn _par_b3_vec(fp, fl): i64 {
         return 0;
     }
     var b: ImVec3 = _par_in_v3(3);
+    if (_par_in_n == 9) {
+        if (_par_eq(fp, fl, "DVec3::clamp") == 1) { _par_got_v3(ImVec3_clamp(a, b, _par_in_v3(6))); return 1; }
+        return 0;
+    }
     if (_par_eq(fp, fl, "DVec3::add") == 1) { _par_got_v3(a + b); return 1; }
     if (_par_eq(fp, fl, "DVec3::sub") == 1) { _par_got_v3(a - b); return 1; }
     if (_par_eq(fp, fl, "DVec3::mul") == 1) { _par_got_v3(ImVec3_mul_elem(a, b)); return 1; }
@@ -249,12 +253,51 @@ fn _par_b3_body(fp, fl): i64 {
     return 1;
 }
 
+# ── b3_narrow: the 3D narrowphase (src/b3_narrowphase.cyr) ───────────────────────────
+# `b3::contact`: shape A, its position and rotation (x, y, z, w), then shape B and its pose; `n:` or the normal, the
+# depth and the point. One GJK scratch serves every row, as a world's would serve every pair.
+
+var _par_gjk = 0;
+
+#must_use
+fn _par_as_gjk(p): *ImGjkScratch3d { return p; }
+
+fn _par_b3_narrow(fp, fl): i64 {
+    if (_par_eq(fp, fl, "b3::contact") != 1) { return 0; }
+    if (_par_gjk == 0) {
+        _par_gjk = fl_alloc(sizeof(ImGjkScratch3d));
+        var fresh: ImGjkScratch3d = ImGjkScratch3d_new();
+        memcpy(_par_gjk, &fresh, sizeof(ImGjkScratch3d));
+    }
+    var sa: ImColliderShape = _im_shape(IM_SHAPE_BALL);
+    var sb: ImColliderShape = _im_shape(IM_SHAPE_BALL);
+    var k = _par_in_shape(0, &sa);
+    var pa: ImVec3 = _par_in_v3(k);
+    var ra: ImQuat = _par_in_q4(k + 3);
+    k = _par_in_shape(k + 7, &sb);
+    var pb: ImVec3 = _par_in_v3(k);
+    var rb: ImQuat = _par_in_q4(k + 3);
+    var h: ImHit3d;
+    if (_im_b3_generate_contact_3d(&sa, pa, ra, &sb, pb, rb, _par_as_gjk(_par_gjk), &h) == 1) {
+        var d: f64 = h.depth;
+        _par_got_v3(h.normal);
+        _par_got_f(d);
+        _par_got_v3(h.point);
+    } else {
+        _par_got_none();
+    }
+    sa.free();
+    sb.free();
+    return 1;
+}
+
 # ── dispatch and hooks ──────────────────────────────────────────────────────────────
 
 fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_got_n = 0;
     if (_par_eq(mp, ml, "b3_body") == 1) { return _par_b3_body(fp, fl); }
     if (_par_eq(mp, ml, "b3_math") == 1) { return _par_b3_math(fp, fl); }
+    if (_par_eq(mp, ml, "b3_narrow") == 1) { return _par_b3_narrow(fp, fl); }
     return 0;
 }
 
