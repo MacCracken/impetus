@@ -102,6 +102,7 @@ modules = [
     "src/math3.cyr",
     "src/b3_types.cyr",
     "src/b3_narrowphase.cyr",
+    "src/b3_raycast.cyr",
     "src/particle.cyr",
     "src/json.cyr",
 ]

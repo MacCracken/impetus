@@ -706,7 +706,8 @@ fails when either drifts from `cyrius.cyml`.
   fails if either mirror drifts. The descriptor token helpers moved to `tests/parity_types.cyr`, shared by both
   harnesses.
 - **Still unpinned by golden rows:** `integrate_velocities`, `integrate_positions` and the gyroscopic step (M5's
-  single steps), and `world_aabb` (M4's 3D queries and M5's broadphase). The reference tests above exercise them.
+  single steps), and `world_aabb` (M5's broadphase: Rust 1.4.0's 3D world has no overlap queries, so M4 part 3 has
+  none to pin it with). The reference tests above exercise them.
 - **Result, every target:** 3D **7,321 ok, 0 failed** (2 modules); 2D **98,874 ok, 0 failed, 0 measured, 7 pending,
   165 accepted** (18 modules). The digests are equal on ELF, PE and aarch64, except the 2D native shadows, as before.
 
@@ -764,6 +765,50 @@ fails when either drifts from `cyrius.cyml`.
     was 25×; the bits are identical;
   - GJK + EPA 6–11×.
 - **Result, every target:** 3D **23,890 ok, 0 failed** (3 modules); 2D unchanged at **98,874 ok**.
+
+## 19. M4c: the 3D raycast; M4 done (2026-11-09)
+
+- **Scope.** `backend_3d/raycast.rs` is the state's `raycast` and `raycast_filtered` over `raycast_impl`, and three
+  ray tests. Rust 1.4.0's 3D world has no overlap queries: `PhysicsWorld::overlap_sphere` and `overlap_aabb` return an
+  empty list in 3D ("not implemented yet"). So there is nothing more to port, and nothing in M4 pins `world_aabb`;
+  M5's broadphase will.
+- **`src/b3_raycast.cyr`:**
+  - `ray_sphere` (the nearer non-negative root, normal `normalize_or(+y)`);
+  - `ray_aabb_3d`, by slabs: a near-zero direction component needs the origin inside its slab, and the normal is the
+    entry face's, zero from inside;
+  - `ray_capsule`: six candidates (the infinite cylinder's two roots, both end balls' two), the nearest
+    non-negative one within 1e-9·max(r, 1) of the surface. `EPSILON * EPSILON` is computed, as Rust writes it, not
+    the `EPSILON_SQ` constant;
+  - `raycast_impl`'s loop as `_im_b3_raycast` over a body arena and a collider arena in slot order (Rust's
+    `values()`), for M5's state to call.
+
+  The layer filter is a has-mask flag: Rust's unfiltered `raycast` passes `None`, which skips nothing, not even a
+  layer-0 collider, so it isn't the same as an all-ones mask.
+- **`b3_ray.tsv`**, 4,138 rays through the public world API, static bodies with one collider each:
+  - every shape kind (balls, boxes and capsules with zero sizes among them; a hull, a segment and a heightfield,
+    which the raycast doesn't hit) at four poses, with rotations about z and collider offsets;
+  - 52 rays per pose: from each axis at the four max distances (100, 3.9, 4.0, ∞), obliques, a tangent and a near
+    miss, from inside, parallel to a slab inside and out, along the axis, and away from the body, each filtered and
+    unfiltered;
+  - degenerate rays: zero, 1e-300 (its length underflows, so no direction), NaN and infinite directions,
+    overflowing ones, non-finite origins, and max distances 0, −1 and NaN;
+  - several bodies: the nearest hit, an exact tie (the first collider keeps it), hits behind the origin, and layers
+    0, 1 and 2 under masks 0 to 4, all-ones and none;
+  - 2,000 seeded scenes of 1–6 bodies.
+
+  Class C (a body's rotation is `from_rotation_z`, a `sin_cos`). 4,136 rows are 0 ulp. Two rows have a `sin` that
+  glibc misrounds; one of them, cancelling, was 2,765 ulp off the oracle. `validate.py --write` corrected them
+  (`b3_ray.cr.tsv`, 2 rows), and the port matches both corrections exactly. Same on all three targets.
+- **The transcription.** `validate.py` transcribes the three ray tests and the loop, and reproduces all 4,138 rows
+  on glibc's sin and cos.
+- **Rust tests.** `tests/b3_raycast.tcyr` ports all 7 raycast tests of `backend_3d/tests.rs`. The four state-level
+  ones run on a test-local pair of arenas, filled as the state fills its own. A Cyrius-only group covers layer 0
+  under both entry points, and there is a flat heap over 1,000 rays: 23 assertions.
+- **Performance.** `queries/raycast_100_bodies` on the 3D build takes 21.1 µs against Rust's 2.28 µs (criterion on
+  `--all-features`; the bench history holds only the 2D build), 9.3×.
+- **M4 result, every target:** 3D **28,026 ok, 0 failed, 2 accepted (ADR 0011)** over b3_body, b3_math, b3_narrow and
+  b3_ray; 2D unchanged at **98,874 ok, 0 failed, 7 pending, 165 accepted**. Surface parity is 604 across 26 modules.
+  Pending M5: the two 3D state raycast methods; M6: the 3 snapshot functions.
 
 ## How to reproduce
 

@@ -8616,6 +8616,254 @@ fn _im_b3_generate_contact_3d(sa: *ImColliderShape, pa: ImVec3, ra: ImQuat, sb: 
     return 0;
 }
 
+# --- b3_raycast.cyr ---
+
+# b3_raycast.cyr — the 3D raycast (port of rust-old/src/backend_3d/raycast.rs): the ray tests against a ball, a box
+# (in its own frame) and a capsule, and `raycast_impl`'s nearest-hit loop over the colliders.
+#
+# Every expression keeps Rust's operation order on src/math3.cyr's glam transcription; a body's rotation comes from
+# its descriptor's z angle through crmath's correctly rounded sin_cos (ADR 0011), so tests/golden/b3_ray.tsv is class C
+# at 0 ulp against the corrected oracle. The loop takes the state's two arenas, so the 3D state (M5) calls it with its
+# own; it visits the colliders in slot order, as Rust's `values()` does. Rust 1.4.0's 3D world has no overlap
+# queries, so there are none to port.
+
+# A ray test's result: the parameter along the unit direction and the surface normal.
+struct ImRayT3d { t: f64; normal: ImVec3; }
+
+#must_use
+fn _im_b3_as_body(p): *ImRigidBody3d { return p; }
+
+#must_use
+fn _im_b3_as_coll(p): *ImCollider3d { return p; }
+
+# Writes (t, normal) into *out.
+fn _im_b3_ray_put(out: *ImRayT3d, t: f64, n: ImVec3) {
+    out.t = t;
+    out.normal = n;
+    return 0;
+}
+
+# The first non-negative hit of origin + t·dir (dir unit) on the ball (center, radius), with its outward normal (+y
+# for a zero-length one): 1 with *out set, or 0. Mirrors `ray_sphere`.
+fn _im_b3_ray_sphere(origin: ImVec3, dir: ImVec3, center: ImVec3, radius: f64, out: *ImRayT3d): i64 {
+    var oc: ImVec3 = origin - center;
+    var half_b: f64 = ImVec3_dot(oc, dir);
+    var cc: f64 = ImVec3_dot(oc, oc);
+    var c: f64 = cc - radius * radius;
+    var disc: f64 = half_b * half_b - c;
+    if (disc < 0.0) { return 0; }
+    var sq: f64 = f64_sqrt(disc);
+    var t1: f64 = -half_b - sq;
+    var t2: f64 = -half_b + sq;
+    var t: f64 = t1;
+    if (t1 >= 0.0) {
+        t = t1;
+    } elif (t2 >= 0.0) {
+        t = t2;
+    } else {
+        return 0;
+    }
+    var point: ImVec3 = origin + ImVec3_scale(dir, t);
+    var n: ImVec3 = ImVec3_normalize_or(point - center, ImVec3_new(0.0, 1.0, 0.0));
+    _im_b3_ray_put(out, t, n);
+    return 1;
+}
+
+# The first non-negative hit of origin + t·dir on the box [lo, hi] by slabs, with the entry face's normal (zero for an
+# origin inside): an axis whose direction is under EPSILON misses unless the origin lies in its slab. 1 with *out
+# set, or 0. Mirrors `ray_aabb_3d`.
+fn _im_b3_ray_aabb_3d(origin: ImVec3, dir: ImVec3, lo: ImVec3, hi: ImVec3, out: *ImRayT3d): i64 {
+    var zero: f64 = 0.0;
+    var t_min: f64 = -1.0 / zero;
+    var t_max: f64 = 1.0 / zero;
+    var normal: ImVec3 = ImVec3_zero();
+    for (var i = 0; i < 3; i = i + 1) {
+        var d: f64 = _im_b3_at(dir, i);
+        var o: f64 = _im_b3_at(origin, i);
+        var mn: f64 = _im_b3_at(lo, i);
+        var mx: f64 = _im_b3_at(hi, i);
+        var ad: f64 = f64_abs(d);
+        if (ad < _IM_B3_EPSILON) {
+            if (o < mn || o > mx) { return 0; }
+        } else {
+            var inv_d: f64 = 1.0 / d;
+            var t1: f64 = (mn - o) * inv_d;
+            var t2: f64 = (mx - o) * inv_d;
+            var s: f64 = -1.0;
+            if (t1 > t2) {
+                var tt: f64 = t1;
+                t1 = t2;
+                t2 = tt;
+                s = 1.0;
+            }
+            if (t1 > t_min) {
+                t_min = t1;
+                normal = _im_b3_axis_vec(i, s);
+            }
+            t_max = _im_min(t_max, t2);
+            if (t_min > t_max) { return 0; }
+        }
+    }
+    var t: f64 = t_min;
+    if (t_min >= 0.0) {
+        t = t_min;
+    } elif (t_max >= 0.0) {
+        t = t_max;
+    } else {
+        return 0;
+    }
+    _im_b3_ray_put(out, t, normal);
+    return 1;
+}
+
+# The two roots of the ball (centre, radius) along the ray into candidates k and k + 1 when it meets the ray.
+fn _im_b3_ray_cap_ball(origin: ImVec3, dir: ImVec3, centre: ImVec3, radius: f64, cands, k) {
+    var oc: ImVec3 = origin - centre;
+    var half_b: f64 = ImVec3_dot(oc, dir);
+    var cc: f64 = ImVec3_dot(oc, oc);
+    var h: f64 = half_b * half_b - (cc - radius * radius);
+    if (h >= 0.0) {
+        var sq: f64 = f64_sqrt(h);
+        var c0: f64 = -half_b - sq;
+        var c1: f64 = -half_b + sq;
+        store64(cands + k * 8, _im_bits(c0));
+        store64(cands + (k + 1) * 8, _im_bits(c1));
+    }
+    return 0;
+}
+
+# The first hit of origin + t·dir (dir unit) on the capsule (segment pa–pb, radius): the entry and exit of the
+# infinite cylinder and of both end balls are candidates, and the nearest that lies on the capsule surface (within
+# 1e-9·max(radius, 1)) wins, with its outward normal (+y for a zero-length one). 1 with *out set, or 0. Mirrors
+# `ray_capsule`.
+fn _im_b3_ray_capsule(origin: ImVec3, dir: ImVec3, pa: ImVec3, pb: ImVec3, radius: f64, out: *ImRayT3d): i64 {
+    var cands[48];
+    var nan: f64 = _im_cr_from_word(0x7ff8000000000000);
+    for (var k = 0; k < 6; k = k + 1) { store64(&cands + k * 8, _im_bits(nan)); }
+    var ba: ImVec3 = pb - pa;
+    var baba: f64 = ImVec3_dot(ba, ba);
+    if (baba > _IM_B3_EPSILON * _IM_B3_EPSILON) {
+        var oa: ImVec3 = origin - pa;
+        var bard: f64 = ImVec3_dot(ba, dir);
+        var baoa: f64 = ImVec3_dot(ba, oa);
+        var a: f64 = baba - bard * bard;
+        var doa: f64 = ImVec3_dot(dir, oa);
+        var b: f64 = baba * doa - baoa * bard;
+        var oaoa: f64 = ImVec3_dot(oa, oa);
+        var c: f64 = baba * oaoa - baoa * baoa - radius * radius * baba;
+        var h: f64 = b * b - a * c;
+        if (a > _IM_B3_EPSILON && h >= 0.0) {
+            var sq: f64 = f64_sqrt(h);
+            var r0: f64 = (-b - sq) / a;
+            var r1: f64 = (-b + sq) / a;
+            store64(&cands, _im_bits(r0));
+            store64(&cands + 8, _im_bits(r1));
+        }
+    }
+    _im_b3_ray_cap_ball(origin, dir, pa, radius, &cands, 2);
+    _im_b3_ray_cap_ball(origin, dir, pb, radius, &cands, 4);
+    var rm: f64 = _im_max(radius, 1.0);
+    var tol: f64 = 0.000000001 * rm;
+    var have = 0;
+    var bt: f64 = 0.0;
+    var bn: ImVec3 = ImVec3_zero();
+    for (var j = 0; j < 6; j = j + 1) {
+        var t: f64 = load64(&cands + j * 8);
+        var skip = 0;
+        if (_im_is_nan(t) == 1 || t < 0.0) { skip = 1; }
+        if (have == 1 && t >= bt) { skip = 1; }
+        if (skip == 0) {
+            var p: ImVec3 = origin + ImVec3_scale(dir, t);
+            var axis_pt: ImVec3 = _im_b3_closest_point_on_segment_3d(pa, pb, p);
+            var offset: ImVec3 = p - axis_pt;
+            var ol: f64 = ImVec3_length(offset);
+            var gap: f64 = f64_abs(ol - radius);
+            if (gap <= tol) {
+                have = 1;
+                bt = t;
+                bn = ImVec3_normalize_or(offset, ImVec3_new(0.0, 1.0, 0.0));
+            }
+        }
+    }
+    if (have == 0) { return 0; }
+    _im_b3_ray_put(out, bt, bn);
+    return 1;
+}
+
+# The ray's hit on collider c of body b: a ball, a box (tested in its own frame, rotation preserving distances along
+# the ray), or a capsule; any other shape is not hit. 1 with *out set, or 0. The match in `raycast_impl`'s loop.
+fn _im_b3_raycast_collider(b: *ImRigidBody3d, c: *ImCollider3d, origin: ImVec3, dir: ImVec3, out: *ImRayT3d): i64 {
+    var rot: ImQuat = b.rotation;
+    var pos: ImVec3 = b.position + ImQuat_mul_vec3(rot, c.offset);
+    var k = c.shape.kind;
+    if (k == IM_SHAPE_BALL) {
+        var r: f64 = c.shape.radius;
+        return _im_b3_ray_sphere(origin, dir, pos, r, out);
+    }
+    if (k == IM_SHAPE_BOX) {
+        var inv: ImQuat = ImQuat_inverse(rot);
+        var he: ImVec3 = c.shape.half_extents;
+        var lo: ImVec3 = ImQuat_mul_vec3(inv, origin - pos);
+        var ld: ImVec3 = ImQuat_mul_vec3(inv, dir);
+        var lr: ImRayT3d;
+        if (_im_b3_ray_aabb_3d(lo, ld, ImVec3_neg(he), he, &lr) == 0) { return 0; }
+        var t: f64 = lr.t;
+        var wn: ImVec3 = ImQuat_mul_vec3(rot, lr.normal);
+        _im_b3_ray_put(out, t, wn);
+        return 1;
+    }
+    if (k == IM_SHAPE_CAPSULE) {
+        var hh: f64 = c.shape.half_height;
+        var cr: f64 = c.shape.radius;
+        var axis: ImVec3 = ImQuat_mul_vec3(rot, ImVec3_new(0.0, hh, 0.0));
+        return _im_b3_ray_capsule(origin, dir, pos - axis, pos + axis, cr, out);
+    }
+    return 0;
+}
+
+# The nearest hit, within [0, max_dist], of the ray from origin along direction (normalized), over the colliders in
+# the collider arena (slot order) whose collision layer meets `mask` when has_mask is 1 (Rust's `raycast_filtered`;
+# 0 is `raycast`, which filters nothing), each at its body in the body arena; a collider whose body is missing is
+# skipped. 1 with *out (collider handle, point, normal, distance), or 0 for no hit, a non-finite origin, or a zero or
+# non-finite direction. Mirrors `PhysicsState3d::raycast_impl`.
+fn _im_b3_raycast(bodies: *ImArena, colliders: *ImArena, origin: ImVec3, direction: ImVec3, max_dist: f64, has_mask,
+    mask, out: *ImRayHit): i64 {
+    if (ImVec3_is_finite(origin) == 0) { return 0; }
+    var dir: ImVec3 = ImVec3_zero();
+    if (ImVec3_try_normalize(direction, &dir) == 0) { return 0; }
+    var have = 0;
+    var bt: f64 = 0.0;
+    var bh = 0;
+    var bn: ImVec3 = ImVec3_zero();
+    var hit: ImRayT3d;
+    for (var s = 0; s < colliders.slot_count(); s = s + 1) {
+        var h = colliders.slot_handle(s);
+        if (h != 0 - 1) {
+            var c: *ImCollider3d = _im_b3_as_coll(colliders.get(h));
+            var keep = 1;
+            if (has_mask == 1 && (c.collision_layer & mask) == 0) { keep = 0; }
+            var bp = 0;
+            if (keep == 1) { bp = bodies.get(c.body); }
+            if (bp != 0 && _im_b3_raycast_collider(_im_b3_as_body(bp), c, origin, dir, &hit) == 1) {
+                var t: f64 = hit.t;
+                if (t >= 0.0 && t <= max_dist && (have == 0 || t < bt)) {
+                    have = 1;
+                    bt = t;
+                    bh = c.handle;
+                    bn = hit.normal;
+                }
+            }
+        }
+    }
+    if (have == 0) { return 0; }
+    var point: ImVec3 = origin + ImVec3_scale(dir, bt);
+    out.collider = bh;
+    out.point = point;
+    out.normal = bn;
+    out.distance = bt;
+    return 1;
+}
+
 # --- particle.cyr ---
 
 # particle.cyr — physics particles, emitters and force fields (port of rust-old/src/particle.rs).

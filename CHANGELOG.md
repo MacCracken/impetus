@@ -378,6 +378,28 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - 37 Rust narrowphase tests are ported in `tests/b3_narrowphase.tcyr`, plus Cyrius-only groups for the unhandled
     pairs and the scratch reuse (a flat heap after warm-up): 65 assertions.
   - Surface parity is 599/599 across 25 modules. **3D: 23,890 ok, 0 failed.**
+- **Cyrius port, M4 part 3: the 3D raycast; M4 done** (`docs/development/port-parity.md` §19):
+  - `src/b3_raycast.cyr`:
+    - the ray tests against a ball, a box in its own frame, and a capsule (cylinder and end-ball candidates, kept on
+      the surface);
+    - `raycast_impl`'s nearest-hit loop over a body arena and a collider arena in slot order, with the layer filter
+      (`raycast_filtered`) or none (`raycast`, which also sees layer-0 colliders).
+
+    The 3D state (M5) calls it with its own arenas. Rust 1.4.0's 3D world has no overlap queries (`overlap_sphere` and
+    `overlap_aabb` return nothing in 3D), so there are none to port.
+  - The golden `b3_ray.tsv` has 4,138 rays through the public world API:
+    - every shape kind at four poses with 52 rays each (axes, obliques, tangents, from inside, along a slab and along
+      the axis, max distances 3.9, 4, 100 and ∞);
+    - degenerate rays (zero, tiny, NaN and infinite directions, non-finite origins, max distance 0 or negative);
+    - nearest-hit, tie and layer-mask scenes;
+    - 2,000 seeded scenes.
+
+    Class C (a body's z rotation is a `sin_cos`): 4,136 at 0 ulp, and the 2 that glibc's `sin` misrounds match the
+    corrected oracle (`b3_ray.cr.tsv`), on all three targets. `validate.py` transcribes the raycast.
+  - The 7 Rust raycast tests are ported in `tests/b3_raycast.tcyr` (23 assertions, with a Cyrius-only layer and
+    nearest-hit group and a flat heap). The four state-level tests run on a test-local pair of arenas until M5.
+  - Surface parity is 604/604 across 26 modules, with `PhysicsState3d::raycast` and `raycast_filtered` pending M5.
+  - **M4 is done.** 3D: 4 modules, **28,026 ok, 0 failed, 2 accepted (ADR 0011)**. 2D unchanged at **98,874 ok**.
 
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
@@ -441,6 +463,9 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - the OBB SAT: 8.3 µs against 580 ns (face) and 6.3–8.0 µs against 465 ns (edge pair), down from 14.6 and
     12.6 µs once its overlap test, clip and hull support read f64 words (identical bits);
   - GJK + EPA on hulls: 30–55 µs a pair (one long batch, noisy) against 4.8–5.5 µs.
+- **The 3D raycast against Rust**: `queries/raycast_100_bodies` on the 3D build takes 21.1 µs a ray against Rust's
+  2.28 µs (criterion, `--all-features`), 9.3×. Alone, a ray test costs 141 ns (box), 220 ns (ball) and 630 ns
+  (capsule).
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

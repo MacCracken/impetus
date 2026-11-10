@@ -9,6 +9,7 @@ b2_step
 b3_body
 b3_math
 b3_narrow
+b3_ray
 broadphase
 config
 constants

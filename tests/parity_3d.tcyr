@@ -291,6 +291,65 @@ fn _par_b3_narrow(fp, fl): i64 {
     return 1;
 }
 
+# ── b3_ray: the 3D raycast (src/b3_raycast.cyr) ─────────────────────────────────────
+# `b3::raycast`: static bodies, one collider each, inserted into a body arena and a collider arena as Rust's
+# add_body and add_collider do (each record's handle set after its insert); then the ray, with its mask or `n:` for
+# the unfiltered `raycast`. Output: `n:`, or the collider handle, the point, the normal and the distance.
+
+fn _par_b3_ray(fp, fl): i64 {
+    if (_par_eq(fp, fl, "b3::raycast") != 1) { return 0; }
+    var bodies: *ImArena = ImArena_new(sizeof(ImRigidBody3d));
+    var colls: *ImArena = ImArena_new(sizeof(ImCollider3d));
+    var n = _par_in(0);
+    var k = 1;
+    for (var i = 0; i < n; i = i + 1) {
+        var pos: ImVec3 = _par_in_v3(k);
+        var rot: f64 = _par_in(k + 3);
+        var sh: ImColliderShape = _im_shape(IM_SHAPE_BALL);
+        k = _par_in_shape(k + 4, &sh);
+        var bd: ImBodyDesc = ImBodyDesc_default();
+        bd.body_type = IM_BODY_STATIC;
+        bd.position = pos;
+        bd.rotation = rot;
+        var b: ImRigidBody3d = ImRigidBody3d_from_desc(0, bd);
+        var bh = bodies.insert(&b);
+        var bp: *ImRigidBody3d = _im_b3_as_body(bodies.get(bh));
+        bp.handle = bh;
+        var cd: ImColliderDesc = ImColliderDesc_new(sh);
+        cd.offset = _par_in_v3(k);
+        cd.collision_layer = _par_in(k + 3);
+        var c: ImCollider3d = ImCollider3d_from_desc(0, bh, cd);
+        var ch = colls.insert(&c);
+        var cp: *ImCollider3d = _im_b3_as_coll(colls.get(ch));
+        cp.handle = ch;
+        sh.free();
+        k = k + 4;
+    }
+    var o: ImVec3 = _par_in_v3(k);
+    var d: ImVec3 = _par_in_v3(k + 3);
+    var max: f64 = _par_in(k + 6);
+    var has_mask = 1 - _par_in_is_none(k + 7);
+    var mask = 0;
+    if (has_mask == 1) { mask = _par_in(k + 7); }
+    var hit: ImRayHit;
+    if (_im_b3_raycast(bodies, colls, o, d, max, has_mask, mask, &hit) == 1) {
+        var dist: f64 = hit.distance;
+        _par_got_i(hit.collider);
+        _par_got_v3(hit.point);
+        _par_got_v3(hit.normal);
+        _par_got_f(dist);
+    } else {
+        _par_got_none();
+    }
+    for (var s = 0; s < colls.slot_count(); s = s + 1) {
+        var h = colls.slot_handle(s);
+        if (h != 0 - 1) { _im_b3_as_coll(colls.get(h)).free(); }
+    }
+    bodies.free();
+    colls.free();
+    return 1;
+}
+
 # ── dispatch and hooks ──────────────────────────────────────────────────────────────
 
 fn _par_dispatch(mp, ml, fp, fl): i64 {
@@ -298,6 +357,7 @@ fn _par_dispatch(mp, ml, fp, fl): i64 {
     if (_par_eq(mp, ml, "b3_body") == 1) { return _par_b3_body(fp, fl); }
     if (_par_eq(mp, ml, "b3_math") == 1) { return _par_b3_math(fp, fl); }
     if (_par_eq(mp, ml, "b3_narrow") == 1) { return _par_b3_narrow(fp, fl); }
+    if (_par_eq(mp, ml, "b3_ray") == 1) { return _par_b3_ray(fp, fl); }
     return 0;
 }
 
@@ -312,6 +372,7 @@ fn _par_shadows(mp, ml, fp, fl, cls) {
 #must_use
 fn _par_c_bound(fp, fl): i64 {
     if (_par_eq(fp, fl, "b3::body") == 1) { return 0; }
+    if (_par_eq(fp, fl, "b3::raycast") == 1) { return 0; }
     if (_par_eq(fp, fl, "DQuat::from_rotation_x") == 1) { return 0; }
     if (_par_eq(fp, fl, "DQuat::from_rotation_y") == 1) { return 0; }
     if (_par_eq(fp, fl, "DQuat::from_rotation_z") == 1) { return 0; }

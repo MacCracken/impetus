@@ -682,6 +682,11 @@ def corrections(module, rows):
                 seen = list(dict.fromkeys(log))
                 out.append((fn, " ".join(ins), " ".join(toks), "oracle " + " ".join(outs) + "; " + "; ".join(seen)))
             continue
+        elif module == "b3_ray":
+            toks = _b3_ray_tokens(ins, prim["sin"], prim["cos"])
+            if not _same_tokens(outs, toks):
+                out.append((fn, " ".join(ins), " ".join(toks), "oracle " + " ".join(outs) + "; " + "; ".join(log)))
+            continue
         elif module == "b3_body":
             toks = _b3_body_tokens(ins, prim["sin"], prim["cos"])
             if not _same_tokens(outs, toks):
@@ -4607,6 +4612,152 @@ def check_b3_narrow(rows):
     return len(rows)
 
 
+# ── b3_ray: the 3D raycast (M4 part 3) ──────────────────────────────────────────────
+
+def _ray_sphere3(o, d, c, r):
+    oc = _v_sub(o, c)
+    half_b = _v_dot(oc, d)
+    disc = half_b * half_b - (_v_dot(oc, oc) - r * r)
+    if disc < 0.0:
+        return None
+    sq = rust_sqrt(disc)
+    t1, t2 = -half_b - sq, -half_b + sq
+    if t1 >= 0.0:
+        t = t1
+    elif t2 >= 0.0:
+        t = t2
+    else:
+        return None
+    p = _v_add(o, _v_scale(d, t))
+    n = _v_sub(p, c)
+    rcp = _np_div(1.0, rust_sqrt(_v_dot(n, n)))
+    return t, (_v_scale(n, rcp) if math.isfinite(rcp) and rcp > 0.0 else (0.0, 1.0, 0.0))
+
+
+def _ray_aabb3(o, d, lo, hi):
+    t_min, t_max, normal = -math.inf, math.inf, (0.0, 0.0, 0.0)
+    for i in range(3):
+        if abs(d[i]) < B3_EPSILON:
+            if o[i] < lo[i] or o[i] > hi[i]:
+                return None
+        else:
+            inv = _np_div(1.0, d[i])
+            t1, t2 = (lo[i] - o[i]) * inv, (hi[i] - o[i]) * inv
+            s = -1.0
+            if t1 > t2:
+                t1, t2, s = t2, t1, 1.0
+            if t1 > t_min:
+                t_min, normal = t1, _axis_vec(i, s)
+            t_max = rust_min(t_max, t2)
+            if t_min > t_max:
+                return None
+    if t_min >= 0.0:
+        return t_min, normal
+    if t_max >= 0.0:
+        return t_max, normal
+    return None
+
+
+def _normalize_or_y(v):
+    rcp = _np_div(1.0, rust_sqrt(_v_dot(v, v)))
+    return _v_scale(v, rcp) if math.isfinite(rcp) and rcp > 0.0 else (0.0, 1.0, 0.0)
+
+
+def _ray_capsule3(o, d, pa, pb, r):
+    cands = [math.nan] * 6
+    ba = _v_sub(pb, pa)
+    baba = _v_dot(ba, ba)
+    if baba > B3_EPSILON * B3_EPSILON:
+        oa = _v_sub(o, pa)
+        bard, baoa = _v_dot(ba, d), _v_dot(ba, oa)
+        a = baba - bard * bard
+        b = baba * _v_dot(d, oa) - baoa * bard
+        c = baba * _v_dot(oa, oa) - baoa * baoa - r * r * baba
+        h = b * b - a * c
+        if a > B3_EPSILON and h >= 0.0:
+            sq = rust_sqrt(h)
+            cands[0], cands[1] = _np_div(-b - sq, a), _np_div(-b + sq, a)
+    for k, centre in enumerate((pa, pb)):
+        oc = _v_sub(o, centre)
+        half_b = _v_dot(oc, d)
+        h = half_b * half_b - (_v_dot(oc, oc) - r * r)
+        if h >= 0.0:
+            sq = rust_sqrt(h)
+            cands[2 + 2 * k], cands[3 + 2 * k] = -half_b - sq, -half_b + sq
+    tol = 1e-9 * rust_max(r, 1.0)
+    best = None
+    for t in cands:
+        if math.isnan(t) or t < 0.0 or (best is not None and t >= best[0]):
+            continue
+        p = _v_add(o, _v_scale(d, t))
+        off = _v_sub(p, _cp_seg(pa, pb, p))
+        if abs(rust_sqrt(_v_dot(off, off)) - r) <= tol:
+            best = (t, _normalize_or_y(off))
+    return best
+
+
+def _b3_ray_tokens(ins, sin, cos):
+    """The output tokens of one b3::raycast row: raycast_impl over static bodies at their z rotations (on the given
+    sin and cos), in insertion order."""
+    n = int(ins[0][2:])
+    k = 1
+    colls = []
+    for idx in range(n):
+        pos = tuple(tok_f(t) for t in ins[k:k + 3])
+        h = tok_f(ins[k + 3]) * 0.5
+        rot = (0.0, 0.0, sin(h), cos(h))
+        shape, k = _b3_shape(ins, k + 4)
+        off = tuple(tok_f(t) for t in ins[k:k + 3])
+        layer = tok_i(ins[k + 3])
+        k += 4
+        colls.append((idx, pos, rot, shape, off, layer))
+    o = tuple(tok_f(t) for t in ins[k:k + 3])
+    dr = tuple(tok_f(t) for t in ins[k + 3:k + 6])
+    max_d = tok_f(ins[k + 6])
+    mask = None if ins[k + 7] == "n:" else tok_i(ins[k + 7])
+    if k + 8 != len(ins):
+        fail(f"b3_ray: {len(ins) - k - 8} input tokens left over")
+    if not all(math.isfinite(c) for c in o):
+        return ["n:"]
+    rcp = _np_div(1.0, rust_sqrt(_v_dot(dr, dr)))
+    if not (math.isfinite(rcp) and rcp > 0.0):
+        return ["n:"]
+    d = _v_scale(dr, rcp)
+    best = None
+    for handle, pos, rot, shape, off, layer in colls:
+        if mask is not None and (layer & mask) == 0:
+            continue
+        wp = _v_add(pos, _q_mul_vec3(rot, off))
+        hit = None
+        if shape[0] == "Ball":
+            hit = _ray_sphere3(o, d, wp, shape[1])
+        elif shape[0] == "Box":
+            inv = _q_inv(rot)
+            r = _ray_aabb3(_q_mul_vec3(inv, _v_sub(o, wp)), _q_mul_vec3(inv, d), _v_neg(shape[1]), shape[1])
+            hit = None if r is None else (r[0], _q_mul_vec3(rot, r[1]))
+        elif shape[0] == "Capsule":
+            axis = _q_mul_vec3(rot, (0.0, shape[1], 0.0))
+            hit = _ray_capsule3(o, d, _v_sub(wp, axis), _v_add(wp, axis), shape[2])
+        if hit is not None and hit[0] >= 0.0 and hit[0] <= max_d and (best is None or hit[0] < best[0]):
+            best = (hit[0], handle, _v_add(o, _v_scale(d, hit[0])), hit[1])
+    if best is None:
+        return ["n:"]
+    t, handle, p, nrm = best
+    return [f"i:{handle}"] + [f"f:{bits(x):016x}" for x in (*p, *nrm, t)]
+
+
+def check_b3_ray(rows):
+    """Recomputes every 3D ray on glibc's sin and cos."""
+    for fn, cls, ins, outs, note in rows:
+        if fn != "b3::raycast":
+            fail(f"b3_ray: unknown function {fn}")
+            continue
+        want = _b3_ray_tokens(ins, _glibc("sin"), _glibc("cos"))
+        if not _same_tokens(outs, want):
+            fail(f"b3_ray: {note[:120]}: Python computes {' '.join(want)[:200]}")
+    return len(rows)
+
+
 def main():
     root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
     check_tables(root)
@@ -4623,7 +4774,7 @@ def main():
         rows = read_module(golden / f"{name}.tsv")
         total += len(rows)
         if name in ("math", "spring", "b2_narrow", "b2_ray", "b2_step", "b2_contact", "world_step", "b3_math",
-                    "b3_body"):
+                    "b3_body", "b3_ray"):
             check_corrections(root, name, golden / f"{name}.tsv", rows)
         if name == "constants":
             check_constants(root, rows)
@@ -4648,6 +4799,8 @@ def main():
             print(f"b2_ray: {check_b2_ray(rows)} rows recomputed (a transcription on glibc's sin, cos, hypot)")
         elif name == "b2_narrow":
             print(f"b2_narrow: {check_b2_narrow(rows)} rows recomputed (a transcription on Python's libm)")
+        elif name == "b3_ray":
+            print(f"b3_ray: {check_b3_ray(rows)} rays recomputed (raycast_impl on glibc's sin and cos)")
         elif name == "b3_narrow":
             print(f"b3_narrow: {check_b3_narrow(rows)} pairs recomputed (a transcription of the 3D narrowphase)")
         elif name == "b3_body":

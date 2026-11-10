@@ -1,0 +1,174 @@
+# b3_raycast.tcyr — the ported Rust tests of rust-old/src/backend_3d/raycast.rs (M4 part 3): the ray-helper tests and
+# the state-level raycast tests of backend_3d/tests.rs. Until the 3D state arrives (M5), a test-local body arena and
+# collider arena stand in for it, filled as its add_body and add_collider fill theirs. Plus a Cyrius-only flat heap.
+
+include "tests/lib_3d.cyr"
+
+var eps: f64 = 0.000001;
+var tight: f64 = 0.000000001;
+
+fn near(got: f64, want: f64, tol: f64): i64 {
+    var d: f64 = f64_abs(got - want);
+    if (d < tol) { return 1; }
+    return 0;
+}
+
+fn vnear(a: ImVec3, b: ImVec3, tol: f64): i64 {
+    var l: f64 = ImVec3_length(a - b);
+    if (l < tol) { return 1; }
+    return 0;
+}
+
+fn v(x: f64, y: f64, z: f64): ImVec3 { return ImVec3_new(x, y, z); }
+
+# A test-local 3D world: the two arenas the state's raycast reads.
+struct World3 { bodies; colls; }
+
+fn world3(): World3 {
+    var w: World3;
+    w.bodies = ImArena_new(sizeof(ImRigidBody3d));
+    w.colls = ImArena_new(sizeof(ImCollider3d));
+    return w;
+}
+
+#must_use
+fn _as_arena(p): *ImArena { return p; }
+
+# A static body at pos rotated rot_z about z with one collider of `shape` (default descriptor otherwise): the test's
+# `static_shape`.
+fn static_shape(w: *World3, pos: ImVec3, rot_z: f64, shape: ImColliderShape) {
+    var bd: ImBodyDesc = ImBodyDesc_default();
+    bd.body_type = IM_BODY_STATIC;
+    bd.position = pos;
+    bd.rotation = rot_z;
+    var b: ImRigidBody3d = ImRigidBody3d_from_desc(0, bd);
+    var ba: *ImArena = _as_arena(w.bodies);
+    var ca: *ImArena = _as_arena(w.colls);
+    var bh = ba.insert(&b);
+    var bp: *ImRigidBody3d = _im_b3_as_body(ba.get(bh));
+    bp.handle = bh;
+    var c: ImCollider3d = ImCollider3d_from_desc(0, bh, ImColliderDesc_new(shape));
+    var ch = ca.insert(&c);
+    var cp: *ImCollider3d = _im_b3_as_coll(ca.get(ch));
+    cp.handle = ch;
+    return 0;
+}
+
+# `state.raycast` (has_mask 0) or `raycast_filtered` (1, mask).
+fn cast(w: *World3, o: ImVec3, d: ImVec3, max: f64, has_mask, mask, out: *ImRayHit): i64 {
+    return _im_b3_raycast(_as_arena(w.bodies), _as_arena(w.colls), o, d, max, has_mask, mask, out);
+}
+
+fn free3(w: *World3) {
+    var ca: *ImArena = _as_arena(w.colls);
+    for (var s = 0; s < ca.slot_count(); s = s + 1) {
+        var h = ca.slot_handle(s);
+        if (h != 0 - 1) { _im_b3_as_coll(ca.get(h)).free(); }
+    }
+    ca.free();
+    _as_arena(w.bodies).free();
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    var r: ImRayT3d;
+    var hit: ImRayHit;
+    var zero: ImVec3 = ImVec3_zero();
+    var x: ImVec3 = v(1.0, 0.0, 0.0);
+    var pi: f64 = _IM_PI;
+
+    test_group("ray_sphere_hit");
+    assert_eq(_im_b3_ray_sphere(zero, x, v(5.0, 0.0, 0.0), 1.0, &r), 1, "hit");
+    var t0: f64 = r.t;
+    assert_eq(near(t0, 4.0, eps), 1, "t = 4");
+
+    test_group("ray_sphere_miss");
+    assert_eq(_im_b3_ray_sphere(zero, v(0.0, 1.0, 0.0), v(5.0, 0.0, 0.0), 1.0, &r), 0, "miss");
+
+    test_group("ray_aabb_3d_hit");
+    assert_eq(_im_b3_ray_aabb_3d(zero, x, v(4.0, -1.0, -1.0), v(6.0, 1.0, 1.0), &r), 1, "hit");
+    var t1: f64 = r.t;
+    assert_eq(near(t1, 4.0, eps), 1, "t = 4");
+
+    test_group("raycast_3d");
+    var w1: World3 = world3();
+    static_shape(&w1, v(5.0, 0.0, 0.0), 0.0, ImColliderShape_ball(1.0));
+    assert_eq(cast(&w1, zero, x, 100.0, 0, 0, &hit), 1, "hit");
+    var d1: f64 = hit.distance;
+    assert_eq(near(d1, 4.0, 0.1), 1, "distance 4");
+    free3(&w1);
+
+    test_group("raycast_respects_box_rotation");
+    var w2: World3 = world3();
+    static_shape(&w2, zero, pi / 2.0, ImColliderShape_box(2.0, 0.1, 0.5));
+    var ok = 0;
+    for (var f = 0; f < 2; f = f + 1) {
+        if (cast(&w2, v(5.0, 1.5, 0.0), v(-1.0, 0.0, 0.0), 100.0, f, 0xFFFFFFFF, &hit) == 1) {
+            var dd: f64 = hit.distance;
+            ok = ok + near(dd, 4.9, tight) + vnear(hit.normal, x, tight);
+        }
+    }
+    assert_eq(ok, 4, "hits the rotated box at 4.9 with normal +x, filtered or not");
+    assert_eq(cast(&w2, v(1.5, 5.0, 0.0), v(0.0, -1.0, 0.0), 100.0, 0, 0, &hit), 0, "misses outside its span");
+    free3(&w2);
+
+    test_group("raycast_zero_direction_returns_none");
+    var w3: World3 = world3();
+    static_shape(&w3, zero, 0.0, ImColliderShape_ball(1.0));
+    var nan: f64 = _im_cr_from_word(0x7ff8000000000000);
+    var none = 0;
+    none = none + cast(&w3, v(0.0, -5.0, 0.0), zero, 100.0, 0, 0, &hit);
+    none = none + cast(&w3, v(0.0, -5.0, 0.0), zero, 100.0, 1, 0xFFFFFFFF, &hit);
+    none = none + cast(&w3, v(0.0, -5.0, 0.0), v(nan, 1.0, 0.0), 100.0, 0, 0, &hit);
+    assert_eq(none, 0, "no hit");
+    free3(&w3);
+
+    test_group("raycast_hits_capsule");
+    var w4: World3 = world3();
+    static_shape(&w4, v(5.0, 0.0, 0.0), 0.0, ImColliderShape_capsule(1.0, 0.5));
+    assert_eq(cast(&w4, zero, x, 100.0, 0, 0, &hit), 1, "side hit");
+    var d4: f64 = hit.distance;
+    assert_eq(near(d4, 4.5, tight) + vnear(hit.normal, v(-1.0, 0.0, 0.0), tight), 2, "t 4.5, normal −x");
+    assert_eq(cast(&w4, v(5.0, -5.0, 0.0), v(0.0, 1.0, 0.0), 100.0, 0, 0, &hit), 1, "cap hit");
+    var d5: f64 = hit.distance;
+    assert_eq(near(d5, 3.5, tight) + vnear(hit.normal, v(0.0, -1.0, 0.0), tight), 2, "t 3.5, normal −y");
+    assert_eq(cast(&w4, v(0.0, 0.0, 0.6), x, 100.0, 0, 0, &hit), 0, "grazing miss");
+    free3(&w4);
+    var w5: World3 = world3();
+    static_shape(&w5, v(5.0, 0.0, 0.0), pi / 2.0, ImColliderShape_capsule(1.0, 0.5));
+    assert_eq(cast(&w5, zero, x, 100.0, 0, 0, &hit), 1, "rotated: cap hit");
+    var d6: f64 = hit.distance;
+    assert_eq(near(d6, 3.5, tight), 1, "t 3.5");
+    free3(&w5);
+
+    test_group("layers_and_nearest_hit");
+    # Cyrius-only: the unfiltered raycast sees a layer-0 collider, a filtered one doesn't; the nearest of several wins.
+    var w6: World3 = world3();
+    static_shape(&w6, v(3.0, 0.0, 0.0), 0.0, ImColliderShape_ball(0.5));
+    static_shape(&w6, v(6.0, 0.0, 0.0), 0.0, ImColliderShape_box(0.5, 0.5, 0.5));
+    var ca6: *ImArena = _as_arena(w6.colls);
+    var first: *ImCollider3d = _im_b3_as_coll(ca6.get(ca6.slot_handle(0)));
+    first.collision_layer = 0;
+    assert_eq(cast(&w6, zero, x, 100.0, 0, 0, &hit), 1, "unfiltered hit");
+    var near_h = hit.collider;
+    assert_eq(near_h, ca6.slot_handle(0), "the layer-0 ball, nearest");
+    assert_eq(cast(&w6, zero, x, 100.0, 1, 0xFFFFFFFF, &hit), 1, "filtered hit");
+    assert_eq(hit.collider, ca6.slot_handle(1), "the box behind it");
+
+    test_group("flat_heap_raycast");
+    var heap0 = alloc_used();
+    var arena0 = _fl_arena;
+    var pos0 = _fl_arena_pos;
+    var hits = 0;
+    for (var k = 0; k < 1000; k = k + 1) { hits = hits + cast(&w6, zero, x, 100.0, 1, 0xFFFFFFFF, &hit); }
+    assert_eq(hits, 1000, "every ray hits");
+    assert_eq(alloc_used() == heap0 && _fl_arena == arena0 && _fl_arena_pos == pos0, 1, "no growth");
+    free3(&w6);
+
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

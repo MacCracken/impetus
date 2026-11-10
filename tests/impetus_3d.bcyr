@@ -5,6 +5,7 @@
 #
 # M4 part 1: glam's value math (src/math3.cyr) beside hisab's allocating calls for the same operation (ADR 0012's
 # trade), the gyroscopic step, body integration, the mass recompute and a world AABB. M4 part 2: the narrowphase.
+# M4 part 3: the raycast.
 
 include "tests/lib_3d.cyr"
 
@@ -215,12 +216,77 @@ fn bench_narrowphase() {
     return 0;
 }
 
+# A static body at pos with one collider of `shape`, inserted as the 3D state will insert them.
+fn add_static(ba: *ImArena, ca: *ImArena, pos: ImVec3, rot_z: f64, shape: ImColliderShape) {
+    var bd: ImBodyDesc = ImBodyDesc_default();
+    bd.body_type = IM_BODY_STATIC;
+    bd.position = pos;
+    bd.rotation = rot_z;
+    var b: ImRigidBody3d = ImRigidBody3d_from_desc(0, bd);
+    var bh = ba.insert(&b);
+    var bp: *ImRigidBody3d = _im_b3_as_body(ba.get(bh));
+    bp.handle = bh;
+    var c: ImCollider3d = ImCollider3d_from_desc(0, bh, ImColliderDesc_new(shape));
+    var ch = ca.insert(&c);
+    var cp: *ImCollider3d = _im_b3_as_coll(ca.get(ch));
+    cp.handle = ch;
+    return 0;
+}
+
+# M4 part 3: one ray against each shape the raycast handles, and Rust's `queries/raycast_100_bodies` scene (100 unit
+# balls on a 10 × 10 grid 3 apart, a ray along +x from the origin).
+fn bench_raycast() {
+    var r: ImRayT3d;
+    var z: ImVec3 = ImVec3_zero();
+    var x: ImVec3 = ImVec3_new(1.0, 0.0, 0.0);
+    var n = 1000000;
+    var b1 = bench_new("b3/ray_sphere");
+    bench_batch_start(b1);
+    for (var i = 0; i < n; i = i + 1) { g_sink = _im_b3_ray_sphere(z, x, ImVec3_new(5.0, 0.2, 0.1), 1.0, &r); }
+    bench_batch_stop(b1, n);
+    bench_report(b1);
+    var lo: ImVec3 = ImVec3_new(4.0, -1.0, -1.0);
+    var hi: ImVec3 = ImVec3_new(6.0, 1.0, 1.0);
+    var b2 = bench_new("b3/ray_aabb_3d");
+    bench_batch_start(b2);
+    for (var i2 = 0; i2 < n; i2 = i2 + 1) { g_sink = _im_b3_ray_aabb_3d(z, x, lo, hi, &r); }
+    bench_batch_stop(b2, n);
+    bench_report(b2);
+    var pa: ImVec3 = ImVec3_new(5.0, -1.0, 0.0);
+    var pb: ImVec3 = ImVec3_new(5.0, 1.0, 0.0);
+    var b3 = bench_new("b3/ray_capsule");
+    bench_batch_start(b3);
+    for (var i3 = 0; i3 < n; i3 = i3 + 1) { g_sink = _im_b3_ray_capsule(z, x, pa, pb, 0.5, &r); }
+    bench_batch_stop(b3, n);
+    bench_report(b3);
+
+    var ba: *ImArena = ImArena_new(sizeof(ImRigidBody3d));
+    var ca: *ImArena = ImArena_new(sizeof(ImCollider3d));
+    for (var k = 0; k < 100; k = k + 1) {
+        var px: f64 = f64_from(k % 10) * 3.0;
+        var py: f64 = f64_from(k / 10) * 3.0;
+        add_static(ba, ca, ImVec3_new(px, py, 0.0), 0.0, ImColliderShape_ball(1.0));
+    }
+    var hit: ImRayHit;
+    var m = 100000;
+    var b4 = bench_new("queries/raycast_100_bodies (3D)");
+    bench_batch_start(b4);
+    for (var i4 = 0; i4 < m; i4 = i4 + 1) { g_sink = _im_b3_raycast(ba, ca, z, x, 100.0, 0, 0, &hit); }
+    bench_batch_stop(b4, m);
+    bench_report(b4);
+    for (var s = 0; s < ca.slot_count(); s = s + 1) { _im_b3_as_coll(ca.get(ca.slot_handle(s))).free(); }
+    ca.free();
+    ba.free();
+    return 0;
+}
+
 fn main() {
     alloc_init();
     bench_math3();
     bench_body();
     bench_mass_and_aabb();
     bench_narrowphase();
+    bench_raycast();
     return 0;
 }
 

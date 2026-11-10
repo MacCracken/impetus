@@ -51,6 +51,8 @@ mod m_b3_body;
 mod m_b3_math;
 #[cfg(feature = "b3")]
 mod m_b3_narrow;
+#[cfg(feature = "b3")]
+mod m_b3_ray;
 mod m_broadphase;
 mod m_config;
 mod m_constants;
@@ -89,7 +91,7 @@ fn owns(name: &str) -> bool {
 /// The 3D build's golden emitters, in file-name order.
 #[cfg(feature = "b3")]
 fn b3_modules() -> Vec<tsv::Module> {
-    vec![m_b3_body::emit(), m_b3_math::emit(), m_b3_narrow::emit()]
+    vec![m_b3_body::emit(), m_b3_math::emit(), m_b3_narrow::emit(), m_b3_ray::emit()]
 }
 
 #[cfg(not(feature = "b3"))]

@@ -62,6 +62,7 @@ harness reads the same files. This README records what is specific to impetus.
 | `world_step` | b2 | M3 | 198 | `src/m_world.rs` | — |
 | `b3_math` | b3 | M4 | 7,316 | `src/m_b3_math.rs` | — |
 | `b3_narrow` | b3 | M4 | 16,340 | `src/m_b3_narrow.rs` | — |
+| `b3_ray` | b3 | M4 | 4,138 (+ 2 corrected) | `src/m_b3_ray.rs` | — |
 | `b3_body` | b3 | M4 | 234 | `src/m_b3_body.rs` | — |
 | (private constants) | b2 | M2 | — | — | `src/constants_private.cyr` (`src/t_private.rs`: every library `const` of `aabb_tree.rs`, `spatial_hash.rs`, `backend_2d/joints.rs`, `backend_2d/solver.rs`, `backend_2d/types.rs`, `backend_3d/narrowphase.rs`, `backend_3d/types.rs` and `world.rs`, emitted or excused (a
 function's local `const` counts, as `obb_obb_3d`'s `REL_TOL`); a `[f64; N]` array, which may span lines, becomes N globals `_0` … `_{N-1}`) |
@@ -105,6 +106,11 @@ impetus specifics:
   the normal x, y, z (A to B), the depth and the point x, y, z. Class A: the 3D narrowphase has no transcendental. Its
   input rotations are normalized from rational components (a square root, no sin or cos), so no row depends on the
   host's libm.
+- 3D ray rows (`b3_ray.tsv`, the 3D build only) build a 3D world of static bodies, one collider each, through the
+  public API. Inputs: `v:<bodies>`, then per body its position x, y, z, rotation about z, shape, collider offset x, y,
+  z and layer (`i:`); then the ray's origin, direction, max distance, and the layer mask (`raycast_filtered`) or `n:`
+  (`raycast`). Output: `n:`, or the hit's collider handle, point x, y, z, normal x, y, z and distance. Class C (the
+  rotation's `sin_cos`). Rust's 3D world has no overlap queries, so there are no 3D overlap rows.
 - 3D body rows (`b3_body.tsv`, the 3D build only) come from a world dump, as the 2D mass rows do, with a full
   `BodyDesc` (`flat::body_desc`) and per collider its shape, offset x, y and z, density, and `n:` or the explicit mass.
   Outputs: every stored body field but the handle and type (`Body3dDump`), matrices by columns. Class C (the z
@@ -213,6 +219,8 @@ Standard-library Python, run with `-I`. It never calls the oracle:
   cos (MPFR's for the corrected oracle);
 - every `b3_narrow` row is recomputed by a Python transcription of the 3D narrowphase (GJK and EPA with Rust's `Vec`
   order semantics), bit for bit;
+- every `b3_ray` row is recomputed by a transcription of `raycast_impl` and its ray tests on glibc's sin and cos;
+  the same on MPFR's writes `b3_ray.cr.tsv`;
 - every `b3_body` body is recomputed: `from_desc`, each collider's mass, inertia and centroid, the parallel-axis sum
   of `recompute_mass_properties`, the inverses and R·I⁻¹·Rᵀ;
 - `src/constants_private.cyr` holds every library `const` of the ported modules, each equal to Python's parse of

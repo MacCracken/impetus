@@ -367,3 +367,21 @@ where Rust's are inlined into registers.
 - The GJK rows move by up to 1.6× between runs: each is one long batch (3–5 s). The ranges above are three runs.
 
 Not pursued further here. Speed is measured, not gated, and M5's step is where the pair costs add up and get profiled.
+
+## M4 part 3: the 3D raycast (2026-11-09)
+
+x86_64 ELF, `tests/impetus_3d.bcyr`. Rust's `queries/raycast_100_bodies` was run on the 3D build for this row
+(criterion, `cargo bench --all-features -- queries/raycast_100_bodies`, median 2,277 ns, interval 2,274–2,279). The
+bench history holds only the default 2D build.
+
+| Bench | Body | Rust | Cyrius |
+|---|---|---|---|
+| `queries/raycast_100_bodies` (3D) | 100 unit balls on a 10 × 10 grid 3 apart, one ray along +x | 2.28 µs | 21.1 µs (9.3×) |
+| `b3/ray_sphere` | a hit, normal included | — | 220 ns |
+| `b3/ray_aabb_3d` | a slab hit | — | 141 ns |
+| `b3/ray_capsule` | six candidates, a side hit | — | 630 ns |
+
+**Reading it.** Per collider, the loop rotates the offset into the world (a quaternion rotation), adds the body
+position and runs the ray test. Ninety of the hundred balls are rejected at the discriminant. As in the narrowphase,
+the cost is struct-valued helper calls copying their arguments. Not pursued here: M5's step is where the queries
+meet the rest of the pipeline.

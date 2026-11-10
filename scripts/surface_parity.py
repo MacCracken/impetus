@@ -34,11 +34,10 @@ MODULES = [
     "body", "collider", "joint", "event", "query", "arena", "contact_tracker", "spring",
     "aabb_tree", "spatial_hash", "backend_2d/types", "backend_2d/narrowphase",
     "backend_2d/raycast", "backend_2d/state", "backend_2d/joints", "backend_2d/solver",
-    "particle", "world", "backend_3d/types", "backend_3d/narrowphase",
+    "particle", "world", "backend_3d/types", "backend_3d/narrowphase", "backend_3d/raycast",
 ]
 PENDING_MODULES = {
     "backend_2d/tests": "M3",
-    "backend_3d/raycast": "M4",
     "backend_3d/solver": "M5", "backend_3d/joints": "M5", "backend_3d/state": "M5",
     "backend_3d/tests": "M5", "serialize": "M6",
 }
@@ -93,7 +92,7 @@ FN_RENAMES = {
         "is_identity_quat", "closest_point_on_segment_3d", "capsule_endpoints_3d", "closest_points_segments_3d",
         "generate_contact_3d", "gjk_epa_shapes", "sphere_sphere", "sphere_obb", "aabb_aabb_3d", "capsule_sphere_3d",
         "capsule_capsule_3d", "capsule_box_3d", "obb_obb_3d", "segment_sphere_3d", "segment_box_3d",
-        "convex_hull_sphere_3d",
+        "convex_hull_sphere_3d", "ray_sphere", "ray_aabb_3d", "ray_capsule",
     )},
 }
 # Rust field -> the Cyrius fields that carry it (Option<T> is a presence flag plus the value).
@@ -115,6 +114,9 @@ PRIVATE_PREFIX = {"backend_2d/types": "_IM_B2_", "backend_3d/types": "_IM_B3_", 
 PENDING_CONSTS = {"MAX_SNAPSHOT_INDEX": "M6, with the snapshot module"}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
 PENDING_FNS = {
+    # The loop is _im_b3_raycast (src/b3_raycast.cyr), over the arenas M5's state passes in.
+    "PhysicsState3d::raycast": "M5, a method of the 3D state over _im_b3_raycast",
+    "PhysicsState3d::raycast_filtered": "M5, a method of the 3D state over _im_b3_raycast",
     "PhysicsWorld::snapshot": "M6, with the snapshot module",
     "PhysicsWorld::restore": "M6 (ADR 0008 #2: one fallible restore)",
     "PhysicsWorld::try_restore": "M6 (ADR 0008 #2: one fallible restore)",
