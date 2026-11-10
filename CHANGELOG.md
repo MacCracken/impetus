@@ -642,6 +642,20 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     - `lib.rs`'s `create_default_world`, and the README's Quick Start, in the shared world cases (both profiles);
     - the README's spring example (`tests/spring.tcyr`).
 
+- **Cyrius port, M7 part 2: every Rust benchmark has its twin** (`docs/benchmarks-rust-v-cyrius.md`):
+  - All 41 of Rust's benches now have a 2D twin, and 26 a 3D one. The other 15: 14 profile-free rows that are the
+    same code on both profiles, and `joints/revolute_chain_20`, which the 3D profile refuses (ADR 0008 #5). The plan
+    counted 38, without Rust's three `serialize`-gated snapshot benches.
+  - New 2D twins in `tests/impetus.bcyr`: `queries/raycast_100_bodies`, `queries/overlap_sphere_100_bodies`,
+    `mutation/get_body_state`, `set_body_state`, `set_body_type`, `substep/step_100_bodies_substep4`,
+    `stacking/box_stack_10`, `joints/revolute_chain_20` and `broadphase/aabb_tree_1000_row`. The new 3D twins are the
+    overlap, `set_body_type`, the box stack and the tree row. The rows both profiles share are in the new
+    `tests/bench_cases.cyr`.
+  - M2's Cyrius-only tree row is renamed `broadphase/aabb_tree_1000_row (rebuild only)`, since Rust's name now belongs
+    to the whole-step twin.
+  - `scripts/bench_record.py` holds the mapping. Its `--check` fails when a Rust bench lacks a twin. Given Rust's and
+    Cyrius's bench logs, it prints the record's table.
+
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
   sin_cos from 3.3 µs to 187 ns (the polyfills: 48–64 and 75–83 ns).
@@ -757,6 +771,11 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - 3D: `serialize_100_bodies` 390 → 330 µs (29× → 24×), `roundtrip_100_bodies` 481 → 416 µs (13× → 11×).
 
   The JSON rows are unchanged within noise.
+- **The full benchmark record** (M7 part 2; quiet machine, Rust's 2D and 3D builds): Cyrius's median ratio to Rust is
+  10× in 2D (geometric mean 9.4×, 41 rows) and 13× in 3D (12×, 26 rows). Rust's whole-step rows are closest: 2.6–11× in
+  2D and 5.7–17× in 3D. The widest gaps are its smallest bodies: `add_joint` 24 ns → 1.14 µs, and `spawn_particle`
+  20 ns → 711 ns. The AABB-tree step (`broadphase/aabb_tree_1000_row`, 517 µs → 5.69 ms) is mostly the tree's
+  rebuild, 4.73 ms on its own (M2's open finding).
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

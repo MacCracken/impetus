@@ -8,11 +8,15 @@
 # degrees_to_radians, quantity_new. materials/quantity_display waits for S2 (port plan §8).
 # M6 part 1: the snapshot struct's capture and restore on Rust's snapshot/* scenes (ADR 0013). Part 2: Rust's
 # snapshot/* rows through the binary form. Part 3: the JSON form's write and round trip (Cyrius only).
+# M7 part 2: the rest of Rust's rows (queries, mutation, substep, stacking, joints, the AABB-tree world step), so every
+# Rust bench has its twin; four of them come from tests/bench_cases.cyr, which the 3D file shares.
 
 include "tests/lib_2d.cyr"
 
 var N = 1000000;
 var g_sink = 0;
+
+include "tests/bench_cases.cyr"
 
 # forces/force_magnitude: |(3, 4, 0)|.
 fn bench_force_magnitude() {
@@ -332,11 +336,11 @@ fn bench_sin_cos_cr() {
     return 0;
 }
 
-# broadphase/aabb_tree_1000_row: rebuild the tree over 1,000 unit boxes 1.5 apart (Rust's
-# aabb_tree_1000_row bench layout) and query its pairs, reusing the storage, as a world step does.
-# No Rust row: Rust times the whole step (M3).
+# broadphase/aabb_tree_1000_row (rebuild only): rebuild the tree over 1,000 unit boxes 1.5 apart (Rust's
+# aabb_tree_1000_row bench layout) and query its pairs, reusing the storage, as a world step does. Cyrius-only: Rust
+# times the whole step, whose twin (M7 part 2) is bc_aabb_tree_row.
 fn bench_aabb_tree_row() {
-    var b = bench_new("broadphase/aabb_tree_1000_row");
+    var b = bench_new("broadphase/aabb_tree_1000_row (rebuild only)");
     var t: ImAabbTree = ImAabbTree_new();
     var out: ImPairList = ImPairList_new();
     var reps = 100;
@@ -964,6 +968,109 @@ fn bench_snapshot_json() {
     return 0;
 }
 
+# Rust's rows that had no 2D twin before M7 part 2, on its scenes: the queries, the body mutations, the sub-stepped
+# floor, a revolute chain, and (tests/bench_cases.cyr, shared with 3D) the overlap, set_body_type, the box stack and
+# the AABB-tree row.
+fn bench_rust_rest() {
+    var qw: ImPhysicsWorld = bc_still_world();
+    bc_ball_grid(&qw);
+    var hit: ImRayHit;
+    var o: ImVec3 = ImVec3_zero();
+    var dx: ImVec3 = ImVec3_new(1.0, 0.0, 0.0);
+    var br = bench_new("queries/raycast_100_bodies");
+    bench_batch_start(br);
+    for (var r = 0; r < 100000; r = r + 1) { g_sink = qw.raycast(o, dx, 100.0, &hit); }
+    bench_batch_stop(br, 100000);
+    bench_report(br);
+    qw.free();
+    bc_overlap_sphere("queries/overlap_sphere_100_bodies");
+
+    # mutation/*: a dynamic ball of radius 0.5; Rust's state written back each time.
+    var mw: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    var mh = mw.add_body(ImBodyDesc_default());
+    var tm, cm = mw.add_collider(mh, ImColliderDesc_new(ImColliderShape_ball(0.5)));
+    var bs: ImBodyState;
+    var bg = bench_new("mutation/get_body_state");
+    bench_batch_start(bg);
+    for (var r2 = 0; r2 < N; r2 = r2 + 1) {
+        var tg, vg = mw.get_body_state(mh, &bs);
+        g_sink = is_ok(tg);
+    }
+    bench_batch_stop(bg, N);
+    bench_report(bg);
+    var ns: ImBodyState = bs;
+    ns.handle = mh;
+    ns.body_type = IM_BODY_DYNAMIC;
+    ns.position = ImVec3_new(5.0, 10.0, 0.0);
+    ns.rotation = 0.5;
+    ns.linear_velocity = ImVec3_new(1.0, 2.0, 0.0);
+    ns.angular_velocity = 0.1;
+    ns.is_sleeping = 0;
+    var bset = bench_new("mutation/set_body_state");
+    bench_batch_start(bset);
+    for (var r3 = 0; r3 < N; r3 = r3 + 1) {
+        var ts, vs = mw.set_body_state(mh, ns);
+        g_sink = is_ok(ts);
+    }
+    bench_batch_stop(bset, N);
+    bench_report(bset);
+    mw.free();
+    bc_set_body_type("mutation/set_body_type");
+
+    # substep/step_100_bodies_substep4: 100 balls over a static floor (half extents 50, 0.5), four sub-steps a frame.
+    var c4: ImWorldConfig = ImWorldConfig_default();
+    c4.sub_steps = 4;
+    var sw: ImPhysicsWorld = ImPhysicsWorld_new(c4);
+    var fd: ImBodyDesc = ImBodyDesc_default();
+    fd.body_type = IM_BODY_STATIC;
+    fd.position = ImVec3_new(0.0, -0.5, 0.0);
+    var fl = sw.add_body(fd);
+    var tf, cf = sw.add_collider(fl, ImColliderDesc_new(ImColliderShape_box(50.0, 0.5, 0.0)));
+    for (var i = 0; i < 100; i = i + 1) {
+        var d: ImBodyDesc = ImBodyDesc_default();
+        var x: f64 = f64_from(i % 10);
+        var y: f64 = f64_from(i / 10) * 2.0 + 1.0;
+        d.position = ImVec3_new(x, y, 0.0);
+        var h = sw.add_body(d);
+        var tb, cb = sw.add_collider(h, ImColliderDesc_new(ImColliderShape_ball(0.5)));
+    }
+    var bsub = bench_new("substep/step_100_bodies_substep4");
+    bench_batch_start(bsub);
+    for (var r4 = 0; r4 < 200; r4 = r4 + 1) { sw.step(); }
+    bench_batch_stop(bsub, 200);
+    bench_report(bsub);
+    sw.free();
+    bc_box_stack_10("stacking/box_stack_10");
+
+    # joints/revolute_chain_20: 20 thin links (half extents 0.5, 0.05) hanging from a static anchor at (0, 20) by
+    # revolute joints, swinging.
+    var jw: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    var ad: ImBodyDesc = ImBodyDesc_default();
+    ad.body_type = IM_BODY_STATIC;
+    ad.position = ImVec3_new(0.0, 20.0, 0.0);
+    var prev = jw.add_body(ad);
+    for (var k = 0; k < 20; k = k + 1) {
+        var ld: ImBodyDesc = ImBodyDesc_default();
+        var lx: f64 = 0.5 + f64_from(k);
+        ld.position = ImVec3_new(lx, 20.0, 0.0);
+        var link = jw.add_body(ld);
+        var tl, cl = jw.add_collider(link, ImColliderDesc_new(ImColliderShape_box(0.5, 0.05, 0.05)));
+        var la: ImVec2 = ImVec2_new(0.5, 0.0);
+        if (k == 0) { la = ImVec2_new(0.0, 0.0); }
+        var rev: ImJointType = ImJointType_revolute(ImVec2_new(0.0, 0.0), 0, 0.0, 0.0);
+        var tj, jh = jw.add_joint(ImJointDesc_new(prev, link, rev, la, ImVec2_new(-0.5, 0.0)));
+        prev = link;
+    }
+    var bj = bench_new("joints/revolute_chain_20");
+    bench_batch_start(bj);
+    for (var r5 = 0; r5 < 2000; r5 = r5 + 1) { jw.step(); }
+    bench_batch_stop(bj, 2000);
+    bench_report(bj);
+    jw.free();
+    bc_aabb_tree_row("broadphase/aabb_tree_1000_row");
+    return 0;
+}
+
 # Runs every bench.
 fn main(): i64 {
     alloc_init();
@@ -1000,6 +1107,7 @@ fn main(): i64 {
     bench_snapshot();
     bench_snapshot_bytes();
     bench_snapshot_json();
+    bench_rust_rest();
     return 0;
 }
 

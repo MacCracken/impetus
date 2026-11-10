@@ -11,13 +11,16 @@
 # gyroscopic velocity step, a 20-link chain's joint work for one sub-step, and its whole frame (mask 0, so no
 # contacts). M5 part 3: Rust's `world/step_*` scenes on the 3D build. M5 part 4: those scenes through ImPhysicsWorld
 # (as Rust's rows run), and Rust's `particles/*` rows on the 3D world. ADR 0008 #4: Rust's `mutation/get_body_state`
-# and `set_body_state` on the 3D world. M6 part 4: Rust's `snapshot/*` rows on the 3D world.
+# and `set_body_state` on the 3D world. M6 part 4: Rust's `snapshot/*` rows on the 3D world. M7 part 2: the overlap,
+# set_body_type, box-stack and AABB-tree rows from tests/bench_cases.cyr, shared with 2D.
 
 include "tests/lib_3d.cyr"
 include "tests/frame3.cyr"
 
 var N = 1000000;
 var g_sink = 0;
+
+include "tests/bench_cases.cyr"
 
 # A unit quaternion off every axis.
 fn quat(): ImQuat {
@@ -667,6 +670,12 @@ fn main() {
     bench_step3_world();
     bench_mutation3();
     bench_snapshot3();
+    # M7 part 2: Rust's rows that had no 3D twin (tests/bench_cases.cyr, shared with 2D). Its revolute_chain_20 has
+    # none: the 3D profile refuses Revolute (ADR 0008 #5), where Rust's 3D build steps the links unjoined.
+    bc_overlap_sphere("b3/queries/overlap_sphere_100_bodies");
+    bc_set_body_type("b3/mutation/set_body_type");
+    bc_box_stack_10("b3/stacking/box_stack_10");
+    bc_aabb_tree_row("b3/broadphase/aabb_tree_1000_row");
     return 0;
 }
 

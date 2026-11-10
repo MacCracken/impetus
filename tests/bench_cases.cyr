@@ -1,0 +1,117 @@
+# bench_cases.cyr — Rust's world-level benches that both profiles time the same way (M7 part 2), on
+# rust-old/benches/simulation.rs's scenes. Each takes its row's name: Rust's own on 2D (tests/impetus.bcyr), the same
+# with a `b3/` prefix on 3D (tests/impetus_3d.bcyr). Each includes its profile's module list first.
+
+# Rust's queries/* scene into w: 100 static balls of radius 1 on a 10 × 10 grid 3 apart.
+fn bc_ball_grid(w: *ImPhysicsWorld) {
+    for (var i = 0; i < 100; i = i + 1) {
+        var d: ImBodyDesc = ImBodyDesc_default();
+        d.body_type = IM_BODY_STATIC;
+        var x: f64 = f64_from(i % 10) * 3.0;
+        var y: f64 = f64_from(i / 10) * 3.0;
+        d.position = ImVec3_new(x, y, 0.0);
+        var h = w.add_body(d);
+        var t, c = w.add_collider(h, ImColliderDesc_new(ImColliderShape_ball(1.0)));
+    }
+    return 0;
+}
+
+# A world with no gravity.
+fn bc_still_world(): ImPhysicsWorld {
+    var cfg: ImWorldConfig = ImWorldConfig_default();
+    cfg.gravity = ImVec3_zero();
+    return ImPhysicsWorld_new(cfg);
+}
+
+# queries/overlap_sphere_100_bodies: a sphere of radius 5 at (15, 15, 0) over the ball grid.
+fn bc_overlap_sphere(name) {
+    var w: ImPhysicsWorld = bc_still_world();
+    bc_ball_grid(&w);
+    var out: ImWordList = ImWordList_new();
+    var centre: ImVec3 = ImVec3_new(15.0, 15.0, 0.0);
+    var b = bench_new(name);
+    var reps = 20000;
+    bench_batch_start(b);
+    for (var r = 0; r < reps; r = r + 1) { g_sink = w.overlap_sphere(centre, 5.0, &out) + out.len; }
+    bench_batch_stop(b, reps);
+    bench_report(b);
+    out.free();
+    w.free();
+    return 0;
+}
+
+# mutation/set_body_type: a dynamic ball of radius 0.5, switched to static and back on alternate calls.
+fn bc_set_body_type(name) {
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    var h = w.add_body(ImBodyDesc_default());
+    var t, c = w.add_collider(h, ImColliderDesc_new(ImColliderShape_ball(0.5)));
+    var b = bench_new(name);
+    var reps = 200000;
+    bench_batch_start(b);
+    for (var r = 0; r < reps; r = r + 1) {
+        var kind = IM_BODY_DYNAMIC;
+        if ((r & 1) == 0) { kind = IM_BODY_STATIC; }
+        var ts, vs = w.set_body_type(h, kind);
+        g_sink = is_ok(ts);
+    }
+    bench_batch_stop(b, reps);
+    bench_report(b);
+    w.free();
+    return 0;
+}
+
+# stacking/box_stack_10: ten unit boxes on a static slab (half extents 10, 0.5, 10), settled for 120 frames; each
+# timed frame pushes the top box down with 1 N first, so the stack stays awake and every contact is solved.
+fn bc_box_stack_10(name) {
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    var gd: ImBodyDesc = ImBodyDesc_default();
+    gd.body_type = IM_BODY_STATIC;
+    var g = w.add_body(gd);
+    var tg, cg = w.add_collider(g, ImColliderDesc_new(ImColliderShape_box(10.0, 0.5, 10.0)));
+    var top = 0;
+    for (var i = 0; i < 10; i = i + 1) {
+        var d: ImBodyDesc = ImBodyDesc_default();
+        var y: f64 = 1.0 + f64_from(i);
+        d.position = ImVec3_new(0.0, y, 0.0);
+        top = w.add_body(d);
+        var tb, cb = w.add_collider(top, ImColliderDesc_new(ImColliderShape_box(0.5, 0.5, 0.5)));
+    }
+    for (var k = 0; k < 120; k = k + 1) { w.step(); }
+    var push: ImForce = ImForce_new(0.0, -1.0, 0.0);
+    var b = bench_new(name);
+    var reps = 2000;
+    bench_batch_start(b);
+    for (var r = 0; r < reps; r = r + 1) {
+        w.apply_force(top, push);
+        w.step();
+    }
+    bench_batch_stop(b, reps);
+    bench_report(b);
+    w.free();
+    return 0;
+}
+
+# broadphase/aabb_tree_1000_row: a whole step of 1,000 balls of radius 0.5, 1.5 apart along x and drifting up at
+# 0.1, on the AABB tree with no gravity (sorted inserts once made Rust's tree a list).
+fn bc_aabb_tree_row(name) {
+    var cfg: ImWorldConfig = ImWorldConfig_default();
+    cfg.broadphase = IM_BROADPHASE_AABB_TREE;
+    cfg.gravity = ImVec3_zero();
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    for (var i = 0; i < 1000; i = i + 1) {
+        var d: ImBodyDesc = ImBodyDesc_default();
+        var x: f64 = f64_from(i) * 1.5;
+        d.position = ImVec3_new(x, 0.0, 0.0);
+        d.linear_velocity = ImVec3_new(0.0, 0.1, 0.0);
+        var h = w.add_body(d);
+        var t, c = w.add_collider(h, ImColliderDesc_new(ImColliderShape_ball(0.5)));
+    }
+    var b = bench_new(name);
+    var reps = 50;
+    bench_batch_start(b);
+    for (var r = 0; r < reps; r = r + 1) { w.step(); }
+    bench_batch_stop(b, reps);
+    bench_report(b);
+    w.free();
+    return 0;
+}

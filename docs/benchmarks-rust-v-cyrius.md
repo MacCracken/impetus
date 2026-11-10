@@ -642,3 +642,87 @@ The empty-world and JSON rows are unchanged within noise (`to_json_100_bodies` 2
 Of the 145 µs capture that remains, 87 µs is the byte-loop copies: S5 upstream, whose numbers now include this row.
 Speed is measured, not gated, so the port keeps the stdlib's `memcpy`.
 
+## M7 part 2: every Rust benchmark beside its twin (2026-11-10)
+
+All 41 benches of `rust-old/benches/simulation.rs` with their Cyrius twins, on both profiles. The port plan counted 38:
+the three `snapshot/*` benches are behind Rust's `serialize` feature. Every run was on a quiet machine. Rust's numbers
+are criterion medians from its 2D build (`cargo bench --features serialize --bench simulation`) and its 3D build
+(`--all-features`), on rustc 1.99.1. Cyrius's numbers are `cyrius bench` averages over `tests/impetus.bcyr` and
+`tests/impetus_3d.bcyr`, on cyrius 6.7.18. `python3 -I scripts/bench_record.py . <rust 2D log> <rust 3D log>
+<cyrius 2D log> <cyrius 3D log>` regenerates the table, and `--check` fails when a Rust bench has no twin.
+
+| Rust bench | Rust 2D | Cyrius 2D | Ratio | Rust 3D | Cyrius 3D | Ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| `world/step_empty` | 112 ns | 419 ns | 3.7× | 68.7 ns | 444 ns | 6.5× |
+| `world/step_10_bodies` | 4.45 µs | 22.6 µs | 5.1× | 5.01 µs | 56.7 µs | 11× |
+| `world/step_100_bodies` | 101 µs | 266 µs | 2.6× | 115 µs | 663 µs | 5.7× |
+| `world/step_1000_bodies` | 861 µs | 2.44 ms | 2.8× | 1.08 ms | 6.27 ms | 5.8× |
+| `bodies/add_body` | 83 ns | 1.12 µs | 13× | 112 ns | 2.26 µs | 20× |
+| `bodies/add_remove_body` | 63.7 ns | 580 ns | 9.1× | 63.7 ns | 1.13 µs | 18× |
+| `bodies/add_body_with_collider` | 222 ns | 3.02 µs | 14× | 293 ns | 5.24 µs | 18× |
+| `bodies/add_joint` | 24.4 ns | 1.14 µs | 47× | 29.7 ns | 1.55 µs | 52× |
+| `forces/apply_force` | 2.92 ns | 42 ns | 14× | 7.03 ns | 57 ns | 8.1× |
+| `forces/apply_impulse` | 1.95 ns | 38 ns | 19× | 2.19 ns | 40 ns | 18× |
+| `forces/force_magnitude` | 2.15 ns | 12 ns | 5.6× | — | as 2D | — |
+| `forces/gravity_force` | 1.33 ns | 37 ns | 28× | — | as 2D | — |
+| `materials/preset_steel` | 1.33 ns | 20 ns | 15× | — | as 2D | — |
+| `materials/preset_rubber` | 1.33 ns | 20 ns | 15× | — | as 2D | — |
+| `materials/quantity_display` | 81.7 ns | 804 ns | 9.8× | — | as 2D | — |
+| `materials/degrees_to_radians` | 1.07 ns | 6 ns | 5.6× | — | as 2D | — |
+| `materials/quantity_new` | 1.07 ns | 5 ns | 4.7× | — | as 2D | — |
+| `serde/serialize_body_desc` | 256 ns | 3.45 µs | 13× | — | as 2D | — |
+| `serde/deserialize_body_desc` | 282 ns | 6.99 µs | 25× | — | as 2D | — |
+| `serde/serialize_config` | 432 ns | 8.78 µs | 20× | — | as 2D | — |
+| `serde/roundtrip_collider_desc` | 895 ns | 15.9 µs | 18× | — | as 2D | — |
+| `particles/step_100_particles` | 1.86 µs | 9.96 µs | 5.3× | 1.89 µs | 10 µs | 5.3× |
+| `particles/step_1000_particles` | 5.69 µs | 98.2 µs | 17× | 6.42 µs | 95.4 µs | 15× |
+| `particles/step_100_particles_with_floor` | 457 ns | 1.59 µs | 3.5× | 335 ns | 2.86 µs | 8.5× |
+| `particles/spawn_particle` | 19.8 ns | 711 ns | 36× | 19.9 ns | 715 ns | 36× |
+| `particles/emitter_step` | 492 ns | 18.7 µs | 38× | 525 ns | 18.7 µs | 36× |
+| `snapshot/serialize_empty` | 1.24 µs | 2.23 µs | 1.8× | 1.21 µs | 2.18 µs | 1.8× |
+| `snapshot/serialize_100_bodies` | 15 µs | 219 µs | 15× | 14.5 µs | 336 µs | 23× |
+| `snapshot/roundtrip_100_bodies` | 33.4 µs | 286 µs | 8.6× | 37.7 µs | 421 µs | 11× |
+| `queries/raycast_100_bodies` | 975 ns | 9.97 µs | 10× | 1.06 µs | 17 µs | 16× |
+| `queries/overlap_sphere_100_bodies` | 1.36 µs | 13.9 µs | 10× | 0.97 ns | 7 ns | 7.2× |
+| `mutation/get_body_state` | 8.43 ns | 60 ns | 7.1× | 11.6 ns | 41 ns | 3.5× |
+| `mutation/set_body_state` | 3.41 ns | 63 ns | 18× | 26.8 ns | 376 ns | 14× |
+| `mutation/set_body_type` | 13.8 ns | 175 ns | 13× | 29.1 ns | 1.01 µs | 35× |
+| `springs/spring_1d_step` | 5.08 ns | 29 ns | 5.7× | — | as 2D | — |
+| `springs/spring_2d_step` | 6.11 ns | 59 ns | 9.7× | — | as 2D | — |
+| `springs/spring_settle_frames` | 1.43 µs | 1.87 µs | 1.3× | — | as 2D | — |
+| `substep/step_100_bodies_substep4` | 625 µs | 2.37 ms | 3.8× | 548 µs | 6.22 ms | 11× |
+| `stacking/box_stack_10` | 10.6 µs | 70.1 µs | 6.6× | 10.4 µs | 129 µs | 12× |
+| `joints/revolute_chain_20` | 14.5 µs | 107 µs | 7.4× | 10.6 µs | n/a (ADR 0008 #5) | — |
+| `broadphase/aabb_tree_1000_row` | 517 µs | 5.69 ms | 11× | 438 µs | 7.44 ms | 17× |
+
+"as 2D" marks a profile-free row (forces, materials, serde, springs): the same code on both profiles, timed once.
+Rust's 3D world has no overlap query, so `queries/overlap_sphere_100_bodies` returns nothing on either side in 3D.
+`joints/revolute_chain_20` has no 3D twin, because the 3D profile refuses Revolute (ADR 0008 #5) while Rust's 3D build
+steps the links unjoined.
+
+**Reading it.**
+- **The overall gap.** 2D's median ratio is 10× (geometric mean 9.4×) over 41 rows, ranging from 1.3×
+  (`spring_settle_frames`) to 47× (`add_joint`). 3D's median is 13× (geometric mean 12×) over 26 rows, ranging from
+  1.8× to 52×.
+- **The frame is closest.** Rust's whole-step rows (`world/step_*`, `substep`, `stacking`, `joints`, `broadphase`)
+  run at 2.6–11× in 2D (geometric mean 4.8×) and 5.7–17× in 3D (9.1×). A frame does enough arithmetic per call that
+  call overhead matters less.
+- **The widest gaps are the smallest bodies.** Rust's `add_joint` (24 ns), `apply_impulse` (2 ns) and
+  `spawn_particle` (20 ns) are a few instructions inlined. The port makes calls and copies records with the
+  byte-loop `memcpy` (S5, port plan §8), as the earlier milestones measured.
+- **The AABB-tree step** (`broadphase/aabb_tree_1000_row`, 11× in 2D) is mostly the tree. The Cyrius-only
+  `broadphase/aabb_tree_1000_row (rebuild only)` row rebuilds and queries the same 1,000 AABBs in 4.73 ms, of the
+  step's 5.69 ms. This is M2's finding, still open. The spatial hash, the default broadphase, rebuilds the same row
+  in 588 µs.
+- **New rows**, none profiled yet:
+  - the 2D queries, 10×;
+  - `set_body_type`, 13× in 2D and 35× in 3D (1.01 µs);
+  - the box stack, 6.6× and 12×;
+  - the revolute chain in 2D, 7.4×.
+
+  Speed is measured, not gated.
+
+**Renamed.** M2's Cyrius-only tree row was `broadphase/aabb_tree_1000_row`. It is now `broadphase/aabb_tree_1000_row
+(rebuild only)`, and Rust's name belongs to the world-step twin. Its numbers in the M2 and M5 sections above are
+that rebuild-only row.
+
