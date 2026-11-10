@@ -119,4 +119,6 @@ modules = [
     "src/json.cyr",
     "src/b3_json.cyr",
     "src/snapshot.cyr",
+    "src/b3_snapshot.cyr",
+    "src/world_snapshot.cyr",
 ]

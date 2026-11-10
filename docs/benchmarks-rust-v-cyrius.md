@@ -594,3 +594,18 @@ x86_64 ELF, quiet machine. Cyrius only: Rust has no bench for a snapshot's JSON.
 A ball writes 29 floats (22 in its body record, 7 in its collider), so about 2,900 in all, each in serde_json's shortest
 form. That is about 0.8 µs a float, near the printer's cost in the M1b serde rows (`serialize_config` 8.9 µs). The binary form is 8× faster to write (282 µs) and 10× faster
 to read back (354 µs).
+
+## M6 part 4: 3D snapshots against Rust (2026-11-10)
+
+x86_64 ELF, quiet machine. Rust's rows are criterion on the 3D build (`cargo bench --all-features -- snapshot/`,
+medians, bitcode). Cyrius writes ADR 0013's binary form for the 3D world into a reused buffer.
+
+| Bench | Body | Rust (3D build) | Cyrius | Ratio |
+|---|---|---|---|---|
+| `b3/snapshot/serialize_empty` | an empty world's bytes | 1.23 µs | 2.13 µs | 1.7× |
+| `b3/snapshot/serialize_100_bodies` | 100 balls in rows of 10 | 13.7 µs | 396 µs | 29× |
+| `b3/snapshot/roundtrip_100_bodies` | those bytes into a fresh world | 37.2 µs | 478 µs | 13× |
+
+The 3D body record is 496 B against 2D's 224 B: the full orientation, the angular-velocity vector and three inertia
+tensors. Rust's 3D snapshot writes the body's descriptor and the angle and spin about z only. The 2D rows' reading
+holds (§M6 part 2): the struct capture dominates and is not profiled yet.

@@ -591,6 +591,22 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     - six reader refusals and one by `restore`;
     - a NaN refused by `to_json`.
 
+- **Cyrius port, M6 part 4: 3D snapshots** ([ADR 0013](docs/adr/0013-complete-snapshots.md);
+  `docs/development/port-parity.md` §28):
+  - `src/b3_snapshot.cyr` gives the 3D profile all three forms: the struct over the 3D backend's own records (the full
+    orientation, angular velocity and inertia tensors, ADR 0008 #4; no manifolds), the binary form (62 words a body)
+    and JSON (the quaternion `[x,y,z,w]`, each matrix its columns).
+  - `restore` refuses a Revolute or Prismatic joint or a motor with `IM_ERR_UNSUPPORTED`, as the 3D `add_joint` does
+    (ADR 0008 #5).
+  - Rust runs its snapshot tests on both backends from one source, and so does the port: `tests/snapshot_cases.cyr`
+    holds Rust's six `serialize.rs` tests, its three restore tests and the Cyrius-only byte and JSON tests (30
+    assertions). `tests/snapshot.tcyr` (2D, 58 assertions) and the new `tests/b3_snapshot.tcyr` (3D, 59) add their
+    own:
+    - in 3D, a tumbling body's full state through both forms;
+    - step-equivalence in eight 3D runs, including the six supported joint types on tumbling bodies;
+    - 13 refusals of edited 3D records;
+    - a pin and a JSON edit.
+
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
   sin_cos from 3.3 µs to 187 ns (the polyfills: 48–64 and 75–83 ns).
@@ -696,6 +712,8 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   whole state (49 words for a ball and its body), and the struct capture is 208 µs of the 282; not profiled yet.
 - **The snapshot's JSON form, first numbers** (Cyrius only): 100 balls written in 2.31 ms and read back and restored
   in 3.70 ms, about 0.8 µs per shortest-form float (29 a ball); the binary form is 8–10× faster.
+- **3D snapshots against Rust** (quiet machine, Rust's bitcode on its 3D build): `snapshot/serialize_empty` 1.23 →
+  2.13 µs, `serialize_100_bodies` 13.7 → 396 µs, `roundtrip_100_bodies` 37.2 → 478 µs. A 3D body record is 496 B.
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

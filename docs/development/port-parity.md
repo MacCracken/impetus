@@ -1211,6 +1211,32 @@ fails when either drifts from `cyrius.cyml`.
 - **Result:** 2D **98,874 ok, 0 failed, 6 pending**; 3D **29,404 ok**; the same on x86_64 ELF, x86_64 PE and aarch64,
   where `tests/snapshot.tcyr` also passes. Surface parity is 662 across 30 modules.
 
+## 28. M6d: 3D snapshots (2026-11-10, ADR 0013)
+
+- **The module.** `src/b3_snapshot.cyr` is the 3D profile's `ImWorldSnapshot` over the 3D backend's own records:
+  the body with its full orientation, angular-velocity vector and three inertia tensors (ADR 0008 #4), the collider,
+  and the joint with its reference rotation. It has no manifolds, since the 3D backend keeps none. It holds the
+  capture, checks and load, and the records' binary and JSON forms. A body is 62 words in the binary form, the
+  quaternion x, y, z, w and each matrix by columns. In JSON the quaternion is `[x,y,z,w]` and a matrix is its three
+  columns. `[lib.3d]` now ends with `snapshot.cyr`, `b3_snapshot.cyr` and the shared `world_snapshot.cyr`, which
+  gives Err(IM_ERR_UNSUPPORTED) for a joint the 3D profile refuses (ADR 0008 #5) and Err(IM_ERR_DESERIALIZE) for
+  any other bad record.
+- **One test source for both profiles.** Rust's `--all-features` build runs its six `serialize.rs` tests and three
+  restore tests on the 3D world from the same source as on 2D. The port now does too: `tests/snapshot_cases.cyr`
+  holds them, with the byte and JSON tests that need no record layout (30 assertions). Its worlds are compared by
+  their bytes, the canonical form, and its records reached by untyped address. `tests/snapshot.tcyr` (2D, 58
+  assertions, unchanged) and the new `tests/b3_snapshot.tcyr` (3D, 59) each add their own:
+  - a tumbling body's quaternion and angular velocity, bit for bit through the bytes and through JSON;
+  - step-equivalence in eight runs over 3D scenes: a stack hit by a tumbling ball, asleep, the six supported joint
+    types on tumbling bodies with a rope that breaks, particles on a turned capsule, removals, four sub-steps on the
+    AABB tree;
+  - 13 refusals of edited records, among them a Revolute joint and a motor (IM_ERR_UNSUPPORTED);
+  - the pinned checksum of a scene's bytes, and a JSON edit.
+- **Mutations.** Swapping two inertia tensors on decode fails the byte round trip. Swapping a quaternion's y and z
+  in the JSON writer fails the JSON round trip, the JSON step-equivalence and the orientation check.
+- **Result:** 2D **98,874 ok, 0 failed, 6 pending**; 3D **29,404 ok**; the same on x86_64 ELF, x86_64 PE and aarch64,
+  where both snapshot test files also pass with their pins. Surface parity is 662 across 30 modules.
+
 ## How to reproduce
 
 ```sh

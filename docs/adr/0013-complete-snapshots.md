@@ -69,6 +69,8 @@ steps to the same bits and hands out the same handles.
   - a joint's bodies are live (a Mouse joint's second body needn't be), and enums are in range;
   - a manifold's colliders and bodies are live and consistent, with at most two points (2D);
   - the tracker's lists are sorted.
+  - in 3D, no joint is a Revolute or Prismatic joint or has a motor: those are refused with `IM_ERR_UNSUPPORTED`, as
+    `add_joint` refuses them (ADR 0008 #5).
 
   Values are restored as stored, finite or not. A world that stepped into NaN restores to the same NaN; damaged bytes
   are the checksum's to catch.

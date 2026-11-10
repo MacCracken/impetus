@@ -11,7 +11,7 @@
 # gyroscopic velocity step, a 20-link chain's joint work for one sub-step, and its whole frame (mask 0, so no
 # contacts). M5 part 3: Rust's `world/step_*` scenes on the 3D build. M5 part 4: those scenes through ImPhysicsWorld
 # (as Rust's rows run), and Rust's `particles/*` rows on the 3D world. ADR 0008 #4: Rust's `mutation/get_body_state`
-# and `set_body_state` on the 3D world.
+# and `set_body_state` on the 3D world. M6 part 4: Rust's `snapshot/*` rows on the 3D world.
 
 include "tests/lib_3d.cyr"
 include "tests/frame3.cyr"
@@ -607,6 +607,53 @@ fn bench_mutation3() {
     return 0;
 }
 
+# Rust's snapshot/* rows on the 3D build (M6 part 4, ADR 0013): serialize an empty world, serialize 100 balls, and the
+# round trip of those bytes into a fresh world. The byte buffer is reused, where Rust allocates a Vec a call.
+fn bench_snapshot3() {
+    var e: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    var bytes: ImWordList = ImWordList_new();
+    var b1 = bench_new("b3/snapshot/serialize_empty");
+    bench_batch_start(b1);
+    for (var r = 0; r < 100000; r = r + 1) {
+        var t1, v1 = serialize_world(&e, &bytes);
+        g_sink = t1;
+    }
+    bench_batch_stop(b1, 100000);
+    bench_report(b1);
+    e.free();
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    for (var i = 0; i < 100; i = i + 1) {
+        var d: ImBodyDesc = ImBodyDesc_default();
+        var x: f64 = f64_from(i % 10);
+        var y: f64 = f64_from(i / 10);
+        d.position = ImVec3_new(x, y, 0.0);
+        var h = w.add_body(d);
+        var tc, c = w.add_collider(h, ImColliderDesc_new(ImColliderShape_ball(0.5)));
+    }
+    var b2 = bench_new("b3/snapshot/serialize_100_bodies");
+    bench_batch_start(b2);
+    for (var r2 = 0; r2 < 10000; r2 = r2 + 1) {
+        var t2, v2 = serialize_world(&w, &bytes);
+        g_sink = t2;
+    }
+    bench_batch_stop(b2, 10000);
+    bench_report(b2);
+    var t3, v3 = serialize_world(&w, &bytes);
+    var b3 = bench_new("b3/snapshot/roundtrip_100_bodies");
+    bench_batch_start(b3);
+    for (var r3 = 0; r3 < 10000; r3 = r3 + 1) {
+        var fresh: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+        var t4, v4 = deserialize_world(&fresh, bytes.data, bytes.len * 8);
+        g_sink = t4;
+        fresh.free();
+    }
+    bench_batch_stop(b3, 10000);
+    bench_report(b3);
+    bytes.free();
+    w.free();
+    return 0;
+}
+
 # Runs the 3D benches.
 fn main() {
     alloc_init();
@@ -619,6 +666,7 @@ fn main() {
     bench_step3();
     bench_step3_world();
     bench_mutation3();
+    bench_snapshot3();
     return 0;
 }
 

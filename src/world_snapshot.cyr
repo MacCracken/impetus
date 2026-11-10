@@ -1,6 +1,6 @@
 # world_snapshot.cyr — `snapshot` and `restore` (ADR 0013), and the world's half of a snapshot: the config, the id
 # counters, the particles, emitters and force fields. Shared by both profiles, after the profile's snapshot file
-# (src/b2_snapshot.cyr), whose `ImWorldSnapshot` and backend half it completes.
+# (src/b2_snapshot.cyr, src/b3_snapshot.cyr), whose `ImWorldSnapshot` and backend half it completes.
 #
 # `restore` is the one fallible restore of ADR 0008 #2 (Rust's `try_restore`; 1.4.0's `restore` that ignored errors is
 # gone). It checks the whole snapshot first, builds a fresh world from it, and only then replaces the world, so on any
@@ -20,7 +20,8 @@ impl ImWorldSnapshot {
 
     # Ok(0) when the snapshot can be restored: the config passes `validate` (else its error, IM_ERR_INVALID_CONFIG or,
     # for XPBD, IM_ERR_UNSUPPORTED), and the world's records and the backend half are well formed (else
-    # Err(IM_ERR_DESERIALIZE)). Mirrors `validate_snapshot`, whose checks it extends (ADR 0013).
+    # Err(IM_ERR_DESERIALIZE); in 3D, Err(IM_ERR_UNSUPPORTED) for a joint the profile refuses, ADR 0008 #5). Mirrors
+    # `validate_snapshot`, whose checks it extends (ADR 0013).
     fn validate(self): Result {
         var cfg: ImWorldConfig = self.config;
         var t, v = cfg.validate();
@@ -45,7 +46,9 @@ impl ImWorldSnapshot {
                 return Err(IM_ERR_DESERIALIZE);
             }
         }
-        if (self._validate_backend() == 0) { return Err(IM_ERR_DESERIALIZE); }
+        var vb = self._validate_backend();
+        if (vb == 2) { return Err(IM_ERR_UNSUPPORTED); }
+        if (vb != 1) { return Err(IM_ERR_DESERIALIZE); }
         return Ok(0);
     }
 

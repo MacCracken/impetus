@@ -15596,3 +15596,1207 @@ fn _im_sr_tracker(o, t: *ImTrackerSnapshot): i64 {
     }
     return 1;
 }
+
+# --- b3_snapshot.cyr ---
+
+# b3_snapshot.cyr — the 3D profile's snapshot (ADR 0013): `ImWorldSnapshot` over the 3D backend's own records, and its
+# backend half: capture, the checks, the load into a fresh state, and the binary and JSON forms of its records.
+# src/world_snapshot.cyr, after this file, holds `snapshot`, `restore`, the world's half and the forms' frames;
+# src/snapshot.cyr, before it, the shared pieces. src/b2_snapshot.cyr is the 2D counterpart.
+#
+# The records are the backend's (ImRigidBody3d with its full orientation and the three inertia tensors, ImCollider3d,
+# ImJoint3d with its reference rotation), field for field, so a snapshot holds what the oracle's dump holds. The 3D
+# backend keeps no contact manifolds, so neither does its snapshot. A snapshot owns its copies (each collider's shape
+# arrays, each body's collider list); `free` releases them. A joint the 3D profile refuses (Revolute, Prismatic, a
+# motor: ADR 0008 #5) is refused by `restore` too, with IM_ERR_UNSUPPORTED.
+
+# A body and its collider handles, in attachment order. Rust's `BodySnapshot`; here the whole body record.
+struct ImBodySnapshot {
+    body: ImRigidBody3d;
+    colliders: ImWordList;
+}
+
+# A joint record and its handle. Rust's `JointSnapshot`; here the whole record, its reference rotation included.
+struct ImJointSnapshot {
+    handle;
+    joint: ImJoint3d;
+}
+
+# A 3D world's whole state (ADR 0013): as the 2D one, without the manifolds. `bodies` are ImBodySnapshot records,
+# `colliders` ImCollider3d (Rust's `ColliderSnapshot`) and `joints` ImJointSnapshot, each in its arena's slot order.
+# Mirrors Rust's `WorldSnapshot`.
+struct ImWorldSnapshot {
+    config: ImWorldConfig;
+    next_particle_id;
+    next_emitter_id;
+    bodies: ImRecordList;
+    colliders: ImRecordList;
+    joints: ImRecordList;
+    particles: ImRecordList;
+    emitters: ImRecordList;
+    force_fields: ImRecordList;
+    body_arena: ImArenaSnapshot;
+    collider_arena: ImArenaSnapshot;
+    joint_arena: ImArenaSnapshot;
+    tracker: ImTrackerSnapshot;
+}
+
+# The binary form's profile word for this profile (ADR 0013).
+const _IM_SNAP_PROFILE = 3;
+
+# The JSON form's profile name for this profile (ADR 0013).
+#must_use
+fn _im_snap_profile_name(): i64 { return "3d"; }
+
+#must_use
+fn _im_as_body_snap(p): *ImBodySnapshot { return p; }
+#must_use
+fn _im_as_joint_snap(p): *ImJointSnapshot { return p; }
+
+# The collider list of the ImBodySnapshot record at r (Cyrius takes no field addresses: the word after the body).
+#must_use
+fn _im_b3_snap_list(r): *ImWordList { return r + sizeof(ImRigidBody3d); }
+
+# An empty snapshot (the default config).
+#must_use
+fn ImWorldSnapshot_new(): ImWorldSnapshot {
+    var s: ImWorldSnapshot;
+    s.config = ImWorldConfig_default();
+    s.next_particle_id = 0;
+    s.next_emitter_id = 0;
+    s.bodies = ImRecordList_new(sizeof(ImBodySnapshot));
+    s.colliders = ImRecordList_new(sizeof(ImCollider3d));
+    s.joints = ImRecordList_new(sizeof(ImJointSnapshot));
+    s.particles = ImRecordList_new(sizeof(ImParticle));
+    s.emitters = ImRecordList_new(sizeof(ImParticleEmitter));
+    s.force_fields = ImRecordList_new(sizeof(ImForceField));
+    s.body_arena = ImArenaSnapshot_new();
+    s.collider_arena = ImArenaSnapshot_new();
+    s.joint_arena = ImArenaSnapshot_new();
+    s.tracker = ImTrackerSnapshot_new();
+    return s;
+}
+
+# ── quaternions and matrices in the two forms ───────────────────────────────────────
+
+# Writes q's four components (x, y, z, w).
+fn _im_b3_put_quat(wr: *ImSnapWriter, q: ImQuat) {
+    var x: f64 = q.x;
+    var y: f64 = q.y;
+    var z: f64 = q.z;
+    var w: f64 = q.w;
+    wr.f(x);
+    wr.f(y);
+    wr.f(z);
+    wr.f(w);
+    return 0;
+}
+
+# Reads four words as a quaternion (x, y, z, w).
+#must_use
+fn _im_b3_get_quat(rd: *ImSnapReader): ImQuat {
+    var x: f64 = rd.f();
+    var y: f64 = rd.f();
+    var z: f64 = rd.f();
+    var w: f64 = rd.f();
+    return ImQuat_new(x, y, z, w);
+}
+
+# Writes m's three columns.
+fn _im_b3_put_mat3(wr: *ImSnapWriter, m: ImMat3) {
+    wr.v3(m.x);
+    wr.v3(m.y);
+    wr.v3(m.z);
+    return 0;
+}
+
+# Reads nine words as a matrix's three columns.
+#must_use
+fn _im_b3_get_mat3(rd: *ImSnapReader): ImMat3 {
+    var x: ImVec3 = rd.v3();
+    var y: ImVec3 = rd.v3();
+    var z: ImVec3 = rd.v3();
+    return ImMat3_from_cols(x, y, z);
+}
+
+# Appends q as [x,y,z,w].
+fn _im_b3_jw_quat(sb, q: ImQuat) {
+    var t[32];
+    var x: f64 = q.x;
+    var y: f64 = q.y;
+    var z: f64 = q.z;
+    var w: f64 = q.w;
+    store64(&t, x);
+    store64(&t + 8, y);
+    store64(&t + 16, z);
+    store64(&t + 24, w);
+    _im_jw_f64_list(sb, &t, 4);
+    return 0;
+}
+
+# Appends m as its three columns, [[x],[y],[z]].
+fn _im_b3_jw_mat3(sb, m: ImMat3) {
+    str_builder_putc(sb, 91);
+    _im_jw_vec3(sb, m.x);
+    str_builder_putc(sb, 44);
+    _im_jw_vec3(sb, m.y);
+    str_builder_putc(sb, 44);
+    _im_jw_vec3(sb, m.z);
+    str_builder_putc(sb, 93);
+    return 0;
+}
+
+# A quaternion field ([x,y,z,w]).
+#must_use
+fn _im_b3_sr_quat(o, form, i, name, bad): ImQuat {
+    var t[32];
+    var q: ImQuat = ImQuat_identity();
+    if (_im_jr_f64s(_im_jr_at(o, form, i, name), 4, &t) == 0) {
+        store64(bad, 1);
+        return q;
+    }
+    var x: f64 = load64(&t);
+    var y: f64 = load64(&t + 8);
+    var z: f64 = load64(&t + 16);
+    var w: f64 = load64(&t + 24);
+    return ImQuat_new(x, y, z, w);
+}
+
+# A matrix field (three columns).
+#must_use
+fn _im_b3_sr_mat3(o, form, i, name, bad): ImMat3 {
+    var v = _im_jr_at(o, form, i, name);
+    var x: ImVec3 = ImVec3_zero();
+    var y: ImVec3 = ImVec3_zero();
+    var z: ImVec3 = ImVec3_zero();
+    if (_im_sr_len(v) != 3) {
+        store64(bad, 1);
+    } else {
+        if (_im_jr_vec3(bayan_json_v_arr_get(v, 0), &x) == 0) { store64(bad, 1); }
+        if (_im_jr_vec3(bayan_json_v_arr_get(v, 1), &y) == 0) { store64(bad, 1); }
+        if (_im_jr_vec3(bayan_json_v_arr_get(v, 2), &z) == 0) { store64(bad, 1); }
+    }
+    return ImMat3_from_cols(x, y, z);
+}
+
+impl ImWorldSnapshot {
+    # Captures the state's arenas, records, collider lists and tracker: 1, or 0 when there is no memory (what was
+    # captured stays owned by the snapshot, for `free`).
+    fn _capture_backend(self, st: *ImPhysicsState3d): i64 {
+        var ba: *ImArena = st._bodies();
+        var ca: *ImArena = st._colliders();
+        var ja: *ImArena = st._joints();
+        if (self.body_arena.capture(ba) == 0) { return 0; }
+        if (self.collider_arena.capture(ca) == 0) { return 0; }
+        if (self.joint_arena.capture(ja) == 0) { return 0; }
+        if (self.bodies.reserve(ba.len()) == 0) { return 0; }
+        var empty: ImWordList = ImWordList_new();
+        for (var s = 0; s < ba.slot_count(); s = s + 1) {
+            var bh = ba.slot_handle(s);
+            if (bh != 0 - 1) {
+                var r = self.bodies.at(self.bodies.len);
+                memcpy(r, ba.get(bh), sizeof(ImRigidBody3d));
+                var dl: *ImWordList = _im_b3_snap_list(r);
+                memcpy(dl, &empty, sizeof(ImWordList));
+                self.bodies.len = self.bodies.len + 1;
+                var sl: *ImWordList = st._list(_im_handle_index(bh));
+                if (sl == 0) { return 0; }
+                if (dl.reserve(sl.len) == 0) { return 0; }
+                for (var q = 0; q < sl.len; q = q + 1) { dl.push(sl.at(q)); }
+            }
+        }
+        if (self.colliders.reserve(ca.len()) == 0) { return 0; }
+        var sh: ImColliderShape;
+        for (var c = 0; c < ca.slot_count(); c = c + 1) {
+            var ch = ca.slot_handle(c);
+            if (ch != 0 - 1) {
+                var src: *ImCollider3d = _im_b3_as_coll(ca.get(ch));
+                if (_im_snap_clone_shape(src.shape, &sh) == 0) { return 0; }
+                var cr: *ImCollider3d = _im_b3_as_coll(self.colliders.at(self.colliders.len));
+                memcpy(cr, src, sizeof(ImCollider3d));
+                cr.shape = sh;
+                self.colliders.len = self.colliders.len + 1;
+            }
+        }
+        if (self.joints.reserve(ja.len()) == 0) { return 0; }
+        for (var j = 0; j < ja.slot_count(); j = j + 1) {
+            var jh = ja.slot_handle(j);
+            if (jh != 0 - 1) {
+                var jr = self.joints.at(self.joints.len);
+                store64(jr, jh);
+                memcpy(jr + 8, ja.get(jh), sizeof(ImJoint3d));
+                self.joints.len = self.joints.len + 1;
+            }
+        }
+        return self.tracker.capture(st.contact_tracker);
+    }
+
+    # 1 when the backend half is consistent (as in 2D, without manifolds), 2 when it holds a joint the 3D profile
+    # refuses (ADR 0008 #5), 0 otherwise or when there is no memory for the check.
+    #must_use
+    fn _validate_backend(self): i64 {
+        if (self.bodies.size != sizeof(ImBodySnapshot) || self.colliders.size != sizeof(ImCollider3d)) { return 0; }
+        if (self.joints.size != sizeof(ImJointSnapshot)) { return 0; }
+        if (self.body_arena.validate() == 0 || self.collider_arena.validate() == 0) { return 0; }
+        if (self.joint_arena.validate() == 0 || self.tracker.validate() == 0) { return 0; }
+        if (self.bodies.len != self.body_arena.occupied()) { return 0; }
+        if (self.colliders.len != self.collider_arena.occupied()) { return 0; }
+        if (self.joints.len != self.joint_arena.occupied()) { return 0; }
+        # seen: one word per collider slot, the index + 1 of its record (0: none yet), then a listed flag per record.
+        var nslots = self.collider_arena.slots.len;
+        var seen = fl_alloc(nslots * 8 + self.colliders.len * 8 + 8);
+        if (seen == 0) { return 0; }
+        var ok = self._validate_records(seen, nslots);
+        fl_free(seen);
+        return ok;
+    }
+
+    # The record checks of `_validate_backend`, with seen: nslots + colliders.len words.
+    #must_use
+    fn _validate_records(self, seen, nslots): i64 {
+        for (var z = 0; z < nslots + self.colliders.len; z = z + 1) { store64(seen + z * 8, 0); }
+        var listed = seen + nslots * 8;
+        # Bodies: live handles in ascending slot order, so one per occupied slot.
+        for (var i = 0; i < self.bodies.len; i = i + 1) {
+            var b: *ImBodySnapshot = _im_as_body_snap(self.bodies.at(i));
+            var bh = b.body.handle;
+            if (self.body_arena.live(bh) == 0) { return 0; }
+            if (i > 0) {
+                var pb: *ImBodySnapshot = _im_as_body_snap(self.bodies.at(i - 1));
+                if (_im_handle_index(pb.body.handle) >= _im_handle_index(bh)) { return 0; }
+            }
+            if (b.body.body_type < IM_BODY_STATIC || b.body.body_type > IM_BODY_KINEMATIC) { return 0; }
+            if (_im_snap_flag(b.body.fixed_rotation) == 0 || _im_snap_flag(b.body.is_sleeping) == 0) { return 0; }
+        }
+        # Colliders: distinct live handles, on live bodies, well formed.
+        for (var c = 0; c < self.colliders.len; c = c + 1) {
+            var cp: *ImCollider3d = _im_b3_as_coll(self.colliders.at(c));
+            if (self.collider_arena.live(cp.handle) == 0 || self.body_arena.live(cp.body) == 0) { return 0; }
+            var ci = _im_handle_index(cp.handle);
+            if (load64(seen + ci * 8) != 0) { return 0; }
+            store64(seen + ci * 8, c + 1);
+            if (_im_snap_flag(cp.is_sensor) == 0 || _im_snap_flag(cp.has_mass) == 0) { return 0; }
+            if (_im_snap_shape_ok(cp.shape) == 0 || _im_snap_material_ok(cp.material) == 0) { return 0; }
+        }
+        # Lists: each entry a live collider of that body, each collider listed once.
+        var total = 0;
+        for (var k = 0; k < self.bodies.len; k = k + 1) {
+            var r = self.bodies.at(k);
+            var kb: *ImBodySnapshot = _im_as_body_snap(r);
+            var l: *ImWordList = _im_b3_snap_list(r);
+            if (l.len < 0 || (l.len > 0 && l.data == 0)) { return 0; }
+            for (var q = 0; q < l.len; q = q + 1) {
+                var lh = l.at(q);
+                if (self.collider_arena.live(lh) == 0) { return 0; }
+                var rec = load64(seen + _im_handle_index(lh) * 8) - 1;
+                var lc: *ImCollider3d = _im_b3_as_coll(self.colliders.at(rec));
+                if (lc.body != kb.body.handle || load64(listed + rec * 8) != 0) { return 0; }
+                store64(listed + rec * 8, 1);
+                total = total + 1;
+            }
+        }
+        if (total != self.colliders.len) { return 0; }
+        # Joints: distinct live handles in slot order, their bodies live, none the 3D profile refuses.
+        var unsupported = 0;
+        for (var j = 0; j < self.joints.len; j = j + 1) {
+            var js: *ImJointSnapshot = _im_as_joint_snap(self.joints.at(j));
+            if (self.joint_arena.live(js.handle) == 0) { return 0; }
+            if (j > 0) {
+                var pj: *ImJointSnapshot = _im_as_joint_snap(self.joints.at(j - 1));
+                if (_im_handle_index(pj.handle) >= _im_handle_index(js.handle)) { return 0; }
+            }
+            if (_im_snap_joint_type_ok(js.joint.joint_type) == 0) { return 0; }
+            if (self.body_arena.live(js.joint.body_a) == 0) { return 0; }
+            var kind = js.joint.joint_type.kind;
+            if (kind != IM_JOINT_MOUSE && self.body_arena.live(js.joint.body_b) == 0) { return 0; }
+            if (_im_snap_flag(js.joint.has_motor) == 0 || _im_snap_flag(js.joint.has_break_force) == 0) { return 0; }
+            if (kind == IM_JOINT_REVOLUTE || kind == IM_JOINT_PRISMATIC || js.joint.has_motor == 1) { unsupported = 1; }
+        }
+        if (unsupported == 1) { return 2; }
+        return 1;
+    }
+
+    # Loads the backend half into the fresh state st: 1, or 0 when there is no memory (st then holds what was loaded,
+    # for its `free`). Assumes `_validate_backend`.
+    fn _load_backend(self, st: *ImPhysicsState3d): i64 {
+        var ba: *ImArena = st._bodies();
+        var ca: *ImArena = st._colliders();
+        var ja: *ImArena = st._joints();
+        if (self.body_arena.load(ba) == 0) { return 0; }
+        for (var i = 0; i < self.bodies.len; i = i + 1) {
+            var r = self.bodies.at(i);
+            var b: *ImBodySnapshot = _im_as_body_snap(r);
+            var bi = _im_handle_index(b.body.handle);
+            memcpy(ba.values + bi * ba.elem_size, r, sizeof(ImRigidBody3d));
+            var src: *ImWordList = _im_b3_snap_list(r);
+            var dst: *ImWordList = st._list(bi);
+            if (dst == 0 || dst.reserve(src.len) == 0) { return 0; }
+            for (var q = 0; q < src.len; q = q + 1) { dst.push(src.at(q)); }
+        }
+        # A collider slot holds no shape arrays until its copy is in, so a failure leaves nothing to double-free.
+        if (self.collider_arena.load(ca) == 0) { return 0; }
+        var sh: ImColliderShape;
+        for (var c = 0; c < self.colliders.len; c = c + 1) {
+            var cp: *ImCollider3d = _im_b3_as_coll(self.colliders.at(c));
+            var slot: *ImCollider3d = _im_b3_as_coll(ca.values + _im_handle_index(cp.handle) * ca.elem_size);
+            memcpy(slot, cp, sizeof(ImCollider3d));
+            var blank: ImColliderShape = _im_shape(cp.shape.kind);
+            slot.shape = blank;
+        }
+        for (var c2 = 0; c2 < self.colliders.len; c2 = c2 + 1) {
+            var cq: *ImCollider3d = _im_b3_as_coll(self.colliders.at(c2));
+            if (_im_snap_clone_shape(cq.shape, &sh) == 0) { return 0; }
+            var s2: *ImCollider3d = _im_b3_as_coll(ca.values + _im_handle_index(cq.handle) * ca.elem_size);
+            s2.shape = sh;
+        }
+        if (self.joint_arena.load(ja) == 0) { return 0; }
+        for (var j = 0; j < self.joints.len; j = j + 1) {
+            var jr = self.joints.at(j);
+            var ji = _im_handle_index(load64(jr));
+            memcpy(ja.values + ji * ja.elem_size, jr + 8, sizeof(ImJoint3d));
+        }
+        return self.tracker.load(st.contact_tracker);
+    }
+
+    # ── the binary form (ADR 0013, version 1): the backend half ──
+    # The body arena, then each body (62 words, its record's fields in order: the quaternion x, y, z, w and each
+    # matrix by columns; then its collider list); the collider arena and colliders (as 2D, the offset three words); the
+    # joint arena and joints (handle, bodies, joint type, anchors, reference rotation, optional motor, damping, optional
+    # break force); the tracker. No manifolds.
+
+    # Writes the backend half: 1, or 0 for a shape or joint type of unknown kind.
+    fn _encode_backend(self, wr: *ImSnapWriter): i64 {
+        _im_snap_put_arena(wr, self.body_arena);
+        wr.w(self.bodies.len);
+        for (var i = 0; i < self.bodies.len; i = i + 1) {
+            var r = self.bodies.at(i);
+            var b: *ImRigidBody3d = _im_b3_as_body(r);
+            var ld: f64 = b.linear_damping;
+            var ad: f64 = b.angular_damping;
+            var gs: f64 = b.gravity_scale;
+            var ms: f64 = b.mass;
+            var im: f64 = b.inv_mass;
+            var st: f64 = b.sleep_timer;
+            wr.w(b.handle);
+            wr.w(b.body_type);
+            wr.v3(b.position);
+            _im_b3_put_quat(wr, b.rotation);
+            wr.v3(b.linear_velocity);
+            wr.v3(b.angular_velocity);
+            wr.f(ld);
+            wr.f(ad);
+            wr.w(b.fixed_rotation);
+            wr.f(gs);
+            wr.v3(b.force_accumulator);
+            wr.v3(b.torque_accumulator);
+            wr.f(ms);
+            wr.f(im);
+            _im_b3_put_mat3(wr, b.inertia);
+            _im_b3_put_mat3(wr, b.inv_inertia);
+            _im_b3_put_mat3(wr, b.inv_inertia_world);
+            wr.v3(b.pseudo_velocity);
+            wr.v3(b.pseudo_angular_velocity);
+            wr.w(b.is_sleeping);
+            wr.f(st);
+            var l: *ImWordList = _im_b3_snap_list(r);
+            wr.w(l.len);
+            wr.words(l.data, l.len);
+        }
+        _im_snap_put_arena(wr, self.collider_arena);
+        wr.w(self.colliders.len);
+        for (var c = 0; c < self.colliders.len; c = c + 1) {
+            var cp: *ImCollider3d = _im_b3_as_coll(self.colliders.at(c));
+            var cm: f64 = cp.mass;
+            wr.w(cp.handle);
+            wr.w(cp.body);
+            if (_im_snap_put_shape(wr, cp.shape) == 0) { return 0; }
+            wr.v3(cp.offset);
+            _im_snap_put_material(wr, cp.material);
+            wr.w(cp.is_sensor);
+            wr.opt_f(cp.has_mass, cm);
+            wr.w(cp.collision_layer);
+            wr.w(cp.collision_mask);
+        }
+        _im_snap_put_arena(wr, self.joint_arena);
+        wr.w(self.joints.len);
+        for (var j = 0; j < self.joints.len; j = j + 1) {
+            var js: *ImJointSnapshot = _im_as_joint_snap(self.joints.at(j));
+            var tv: f64 = js.joint.motor.target_velocity;
+            var mf: f64 = js.joint.motor.max_force;
+            var dp: f64 = js.joint.damping;
+            var bf: f64 = js.joint.break_force;
+            wr.w(js.handle);
+            wr.w(js.joint.body_a);
+            wr.w(js.joint.body_b);
+            if (_im_snap_put_joint_type(wr, js.joint.joint_type) == 0) { return 0; }
+            wr.v3(js.joint.local_anchor_a);
+            wr.v3(js.joint.local_anchor_b);
+            _im_b3_put_quat(wr, js.joint.reference_rotation);
+            wr.w(js.joint.has_motor);
+            if (js.joint.has_motor == 1) {
+                wr.f(tv);
+                wr.f(mf);
+            } else {
+                wr.w(0);
+                wr.w(0);
+            }
+            wr.f(dp);
+            wr.opt_f(js.joint.has_break_force, bf);
+        }
+        _im_snap_put_tracker(wr, self.tracker);
+        return 1;
+    }
+
+    # Reads the backend half into this empty snapshot: 1, or 0 on a bad read, an unknown kind or no memory (what was
+    # read stays owned by the snapshot, for `free`).
+    fn _decode_backend(self, rd: *ImSnapReader): i64 {
+        if (_im_snap_get_arena(rd, self.body_arena) == 0) { return 0; }
+        var nb = rd.count(63);
+        if (self.bodies.reserve(nb) == 0) { return 0; }
+        var empty: ImWordList = ImWordList_new();
+        for (var i = 0; i < nb; i = i + 1) {
+            var r = self.bodies.at(i);
+            var b: *ImRigidBody3d = _im_b3_as_body(r);
+            var dl: *ImWordList = _im_b3_snap_list(r);
+            memcpy(dl, &empty, sizeof(ImWordList));
+            self.bodies.len = i + 1;
+            b.handle = rd.w();
+            b.body_type = rd.w();
+            var pos: ImVec3 = rd.v3();
+            b.position = pos;
+            var rot: ImQuat = _im_b3_get_quat(rd);
+            b.rotation = rot;
+            var lv: ImVec3 = rd.v3();
+            var av: ImVec3 = rd.v3();
+            b.linear_velocity = lv;
+            b.angular_velocity = av;
+            b.linear_damping = rd.f();
+            b.angular_damping = rd.f();
+            b.fixed_rotation = rd.flag();
+            b.gravity_scale = rd.f();
+            var fa: ImVec3 = rd.v3();
+            var ta: ImVec3 = rd.v3();
+            b.force_accumulator = fa;
+            b.torque_accumulator = ta;
+            b.mass = rd.f();
+            b.inv_mass = rd.f();
+            var in1: ImMat3 = _im_b3_get_mat3(rd);
+            var in2: ImMat3 = _im_b3_get_mat3(rd);
+            var in3: ImMat3 = _im_b3_get_mat3(rd);
+            b.inertia = in1;
+            b.inv_inertia = in2;
+            b.inv_inertia_world = in3;
+            var pv: ImVec3 = rd.v3();
+            var pw: ImVec3 = rd.v3();
+            b.pseudo_velocity = pv;
+            b.pseudo_angular_velocity = pw;
+            b.is_sleeping = rd.flag();
+            b.sleep_timer = rd.f();
+            var nl = rd.count(1);
+            if (dl.reserve(nl) == 0) { return 0; }
+            for (var q = 0; q < nl; q = q + 1) { dl.push(rd.w()); }
+            if (rd.bad == 1) { return 0; }
+        }
+        if (_im_snap_get_arena(rd, self.collider_arena) == 0) { return 0; }
+        # A collider is at least 20 words (a ball or an empty hull).
+        var nc = rd.count(20);
+        if (self.colliders.reserve(nc) == 0) { return 0; }
+        var sh: ImColliderShape;
+        for (var c = 0; c < nc; c = c + 1) {
+            var cp: *ImCollider3d = _im_b3_as_coll(self.colliders.at(c));
+            cp.handle = rd.w();
+            cp.body = rd.w();
+            if (_im_snap_get_shape(rd, &sh) == 0) { return 0; }
+            cp.shape = sh;
+            self.colliders.len = c + 1;
+            var off: ImVec3 = rd.v3();
+            cp.offset = off;
+            _im_snap_get_material(rd, cp.material);
+            cp.is_sensor = rd.flag();
+            cp.has_mass = rd.flag();
+            cp.mass = rd.f();
+            cp.collision_layer = rd.w();
+            cp.collision_mask = rd.w();
+            if (rd.bad == 1) { return 0; }
+        }
+        if (_im_snap_get_arena(rd, self.joint_arena) == 0) { return 0; }
+        # A Fixed joint is the shortest: 20 words.
+        var nj = rd.count(20);
+        if (self.joints.reserve(nj) == 0) { return 0; }
+        var jt: ImJointType;
+        for (var j = 0; j < nj; j = j + 1) {
+            var js: *ImJointSnapshot = _im_as_joint_snap(self.joints.at(j));
+            js.handle = rd.w();
+            js.joint.body_a = rd.w();
+            js.joint.body_b = rd.w();
+            if (_im_snap_get_joint_type(rd, &jt) == 0) { return 0; }
+            js.joint.joint_type = jt;
+            var la: ImVec3 = rd.v3();
+            var lb: ImVec3 = rd.v3();
+            js.joint.local_anchor_a = la;
+            js.joint.local_anchor_b = lb;
+            var rr: ImQuat = _im_b3_get_quat(rd);
+            js.joint.reference_rotation = rr;
+            js.joint.has_motor = rd.flag();
+            var tv: f64 = rd.f();
+            var mf: f64 = rd.f();
+            var mo: ImJointMotor = ImJointMotor_new(tv, mf);
+            js.joint.motor = mo;
+            js.joint.damping = rd.f();
+            js.joint.has_break_force = rd.flag();
+            js.joint.break_force = rd.f();
+            self.joints.len = j + 1;
+            if (rd.bad == 1) { return 0; }
+        }
+        return _im_snap_get_tracker(rd, self.tracker);
+    }
+
+    # ── the JSON form (ADR 0013): the backend's records ──
+    # As 2D's: a body {"body":{its record's fields},"colliders":[handles]}, the quaternion [x,y,z,w] and each matrix
+    # its three columns; a collider its fields; a joint {"handle","joint":{its fields}}. No manifolds.
+
+    # Appends the bodies array.
+    fn _json_bodies(self, sb) {
+        str_builder_putc(sb, 91);
+        for (var i = 0; i < self.bodies.len; i = i + 1) {
+            if (i > 0) { str_builder_putc(sb, 44); }
+            var r = self.bodies.at(i);
+            var b: *ImRigidBody3d = _im_b3_as_body(r);
+            var ld: f64 = b.linear_damping;
+            var ad: f64 = b.angular_damping;
+            var gs: f64 = b.gravity_scale;
+            var ms: f64 = b.mass;
+            var im: f64 = b.inv_mass;
+            var st: f64 = b.sleep_timer;
+            str_builder_add_cstr(sb, "{\"body\":{");
+            _im_jw_key(sb, "handle", 1);
+            _im_jw_u64(sb, b.handle);
+            _im_jw_key(sb, "body_type", 0);
+            _im_jw_name(sb, body_type_name(b.body_type));
+            _im_jw_key(sb, "position", 0);
+            _im_jw_vec3(sb, b.position);
+            _im_jw_key(sb, "rotation", 0);
+            _im_b3_jw_quat(sb, b.rotation);
+            _im_jw_key(sb, "linear_velocity", 0);
+            _im_jw_vec3(sb, b.linear_velocity);
+            _im_jw_key(sb, "angular_velocity", 0);
+            _im_jw_vec3(sb, b.angular_velocity);
+            _im_jw_key(sb, "linear_damping", 0);
+            im_fmt_f64_json(sb, ld);
+            _im_jw_key(sb, "angular_damping", 0);
+            im_fmt_f64_json(sb, ad);
+            _im_jw_key(sb, "fixed_rotation", 0);
+            _im_jw_bool(sb, b.fixed_rotation);
+            _im_jw_key(sb, "gravity_scale", 0);
+            im_fmt_f64_json(sb, gs);
+            _im_jw_key(sb, "force_accumulator", 0);
+            _im_jw_vec3(sb, b.force_accumulator);
+            _im_jw_key(sb, "torque_accumulator", 0);
+            _im_jw_vec3(sb, b.torque_accumulator);
+            _im_jw_key(sb, "mass", 0);
+            im_fmt_f64_json(sb, ms);
+            _im_jw_key(sb, "inv_mass", 0);
+            im_fmt_f64_json(sb, im);
+            _im_jw_key(sb, "inertia", 0);
+            _im_b3_jw_mat3(sb, b.inertia);
+            _im_jw_key(sb, "inv_inertia", 0);
+            _im_b3_jw_mat3(sb, b.inv_inertia);
+            _im_jw_key(sb, "inv_inertia_world", 0);
+            _im_b3_jw_mat3(sb, b.inv_inertia_world);
+            _im_jw_key(sb, "pseudo_velocity", 0);
+            _im_jw_vec3(sb, b.pseudo_velocity);
+            _im_jw_key(sb, "pseudo_angular_velocity", 0);
+            _im_jw_vec3(sb, b.pseudo_angular_velocity);
+            _im_jw_key(sb, "is_sleeping", 0);
+            _im_jw_bool(sb, b.is_sleeping);
+            _im_jw_key(sb, "sleep_timer", 0);
+            im_fmt_f64_json(sb, st);
+            str_builder_add_cstr(sb, "},\"colliders\":[");
+            var l: *ImWordList = _im_b3_snap_list(r);
+            for (var q = 0; q < l.len; q = q + 1) {
+                if (q > 0) { str_builder_putc(sb, 44); }
+                _im_jw_u64(sb, l.at(q));
+            }
+            str_builder_add_cstr(sb, "]}");
+        }
+        str_builder_putc(sb, 93);
+        return 0;
+    }
+
+    # Reads the bodies array into this empty snapshot: 1, or 0.
+    fn _read_bodies(self, v): i64 {
+        var n = _im_sr_len(v);
+        if (n < 0 || self.bodies.reserve(n) == 0) { return 0; }
+        var empty: ImWordList = ImWordList_new();
+        var bad[8];
+        store64(&bad, 0);
+        var w[8];
+        for (var i = 0; i < n; i = i + 1) {
+            var r = self.bodies.at(i);
+            var dl: *ImWordList = _im_b3_snap_list(r);
+            memcpy(dl, &empty, sizeof(ImWordList));
+            self.bodies.len = i + 1;
+            var o = bayan_json_v_arr_get(v, i);
+            var f = _im_jr_form(o, 2);
+            if (f == 0) { return 0; }
+            var bo = _im_jr_at(o, f, 0, "body");
+            var g = _im_jr_form(bo, 21);
+            if (g == 0) { return 0; }
+            var b: *ImRigidBody3d = _im_b3_as_body(r);
+            b.handle = _im_sr_u64(bo, g, 0, "handle", &bad);
+            if (_im_jr_body_type(_im_jr_at(bo, g, 1, "body_type"), &w) == 0) { return 0; }
+            b.body_type = load64(&w);
+            b.position = _im_sr_v3(bo, g, 2, "position", &bad);
+            b.rotation = _im_b3_sr_quat(bo, g, 3, "rotation", &bad);
+            b.linear_velocity = _im_sr_v3(bo, g, 4, "linear_velocity", &bad);
+            b.angular_velocity = _im_sr_v3(bo, g, 5, "angular_velocity", &bad);
+            b.linear_damping = _im_sr_f(bo, g, 6, "linear_damping", &bad);
+            b.angular_damping = _im_sr_f(bo, g, 7, "angular_damping", &bad);
+            b.fixed_rotation = _im_sr_bool(bo, g, 8, "fixed_rotation", &bad);
+            b.gravity_scale = _im_sr_f(bo, g, 9, "gravity_scale", &bad);
+            b.force_accumulator = _im_sr_v3(bo, g, 10, "force_accumulator", &bad);
+            b.torque_accumulator = _im_sr_v3(bo, g, 11, "torque_accumulator", &bad);
+            b.mass = _im_sr_f(bo, g, 12, "mass", &bad);
+            b.inv_mass = _im_sr_f(bo, g, 13, "inv_mass", &bad);
+            b.inertia = _im_b3_sr_mat3(bo, g, 14, "inertia", &bad);
+            b.inv_inertia = _im_b3_sr_mat3(bo, g, 15, "inv_inertia", &bad);
+            b.inv_inertia_world = _im_b3_sr_mat3(bo, g, 16, "inv_inertia_world", &bad);
+            b.pseudo_velocity = _im_sr_v3(bo, g, 17, "pseudo_velocity", &bad);
+            b.pseudo_angular_velocity = _im_sr_v3(bo, g, 18, "pseudo_angular_velocity", &bad);
+            b.is_sleeping = _im_sr_bool(bo, g, 19, "is_sleeping", &bad);
+            b.sleep_timer = _im_sr_f(bo, g, 20, "sleep_timer", &bad);
+            var lv = _im_jr_at(o, f, 1, "colliders");
+            var nl = _im_sr_len(lv);
+            if (nl < 0 || dl.reserve(nl) == 0 || load64(&bad) == 1) { return 0; }
+            for (var q = 0; q < nl; q = q + 1) {
+                if (_im_jr_u64(bayan_json_v_arr_get(lv, q), &w) == 0) { return 0; }
+                dl.push(load64(&w));
+            }
+        }
+        return 1;
+    }
+
+    # Appends the colliders array.
+    fn _json_colliders(self, sb) {
+        str_builder_putc(sb, 91);
+        for (var c = 0; c < self.colliders.len; c = c + 1) {
+            if (c > 0) { str_builder_putc(sb, 44); }
+            var cp: *ImCollider3d = _im_b3_as_coll(self.colliders.at(c));
+            var cm: f64 = cp.mass;
+            str_builder_putc(sb, 123);
+            _im_jw_key(sb, "handle", 1);
+            _im_jw_u64(sb, cp.handle);
+            _im_jw_key(sb, "body", 0);
+            _im_jw_u64(sb, cp.body);
+            _im_jw_key(sb, "shape", 0);
+            cp.shape.to_json(sb);
+            _im_jw_key(sb, "offset", 0);
+            _im_jw_vec3(sb, cp.offset);
+            _im_jw_key(sb, "material", 0);
+            cp.material.to_json(sb);
+            _im_jw_key(sb, "is_sensor", 0);
+            _im_jw_bool(sb, cp.is_sensor);
+            _im_jw_key(sb, "mass", 0);
+            _im_jw_opt_f64(sb, cp.has_mass, cm);
+            _im_jw_key(sb, "collision_layer", 0);
+            str_builder_add_int(sb, cp.collision_layer);
+            _im_jw_key(sb, "collision_mask", 0);
+            str_builder_add_int(sb, cp.collision_mask);
+            str_builder_putc(sb, 125);
+        }
+        str_builder_putc(sb, 93);
+        return 0;
+    }
+
+    # Reads the colliders array into this empty snapshot: 1, or 0.
+    fn _read_colliders(self, v): i64 {
+        var n = _im_sr_len(v);
+        if (n < 0 || self.colliders.reserve(n) == 0) { return 0; }
+        var bad[8];
+        store64(&bad, 0);
+        var has[8];
+        var sh: ImColliderShape;
+        for (var c = 0; c < n; c = c + 1) {
+            var o = bayan_json_v_arr_get(v, c);
+            var f = _im_jr_form(o, 9);
+            if (f == 0) { return 0; }
+            var cp: *ImCollider3d = _im_b3_as_coll(self.colliders.at(c));
+            if (_im_jr_shape(_im_jr_at(o, f, 2, "shape"), &sh) == 0) { return 0; }
+            cp.shape = sh;
+            self.colliders.len = c + 1;
+            cp.handle = _im_sr_u64(o, f, 0, "handle", &bad);
+            cp.body = _im_sr_u64(o, f, 1, "body", &bad);
+            cp.offset = _im_sr_v3(o, f, 3, "offset", &bad);
+            if (_im_jr_material(_im_jr_at(o, f, 4, "material"), cp.material) == 0) { return 0; }
+            cp.is_sensor = _im_sr_bool(o, f, 5, "is_sensor", &bad);
+            cp.mass = _im_sr_opt_f(o, f, 6, "mass", &has, &bad);
+            cp.has_mass = load64(&has);
+            cp.collision_layer = _im_sr_int(o, f, 7, "collision_layer", 0, 4294967295, &bad);
+            cp.collision_mask = _im_sr_int(o, f, 8, "collision_mask", 0, 4294967295, &bad);
+            if (load64(&bad) == 1) { return 0; }
+        }
+        return 1;
+    }
+
+    # Appends the joints array.
+    fn _json_joints(self, sb) {
+        str_builder_putc(sb, 91);
+        for (var j = 0; j < self.joints.len; j = j + 1) {
+            if (j > 0) { str_builder_putc(sb, 44); }
+            var js: *ImJointSnapshot = _im_as_joint_snap(self.joints.at(j));
+            var dp: f64 = js.joint.damping;
+            var bf: f64 = js.joint.break_force;
+            str_builder_putc(sb, 123);
+            _im_jw_key(sb, "handle", 1);
+            _im_jw_u64(sb, js.handle);
+            _im_jw_key(sb, "joint", 0);
+            str_builder_putc(sb, 123);
+            _im_jw_key(sb, "body_a", 1);
+            _im_jw_u64(sb, js.joint.body_a);
+            _im_jw_key(sb, "body_b", 0);
+            _im_jw_u64(sb, js.joint.body_b);
+            _im_jw_key(sb, "joint_type", 0);
+            js.joint.joint_type.to_json(sb);
+            _im_jw_key(sb, "local_anchor_a", 0);
+            _im_jw_vec3(sb, js.joint.local_anchor_a);
+            _im_jw_key(sb, "local_anchor_b", 0);
+            _im_jw_vec3(sb, js.joint.local_anchor_b);
+            _im_jw_key(sb, "reference_rotation", 0);
+            _im_b3_jw_quat(sb, js.joint.reference_rotation);
+            _im_jw_key(sb, "motor", 0);
+            if (js.joint.has_motor == 1) { js.joint.motor.to_json(sb); } else { str_builder_add_cstr(sb, "null"); }
+            _im_jw_key(sb, "damping", 0);
+            im_fmt_f64_json(sb, dp);
+            _im_jw_key(sb, "break_force", 0);
+            _im_jw_opt_f64(sb, js.joint.has_break_force, bf);
+            str_builder_add_cstr(sb, "}}");
+        }
+        str_builder_putc(sb, 93);
+        return 0;
+    }
+
+    # Reads the joints array into this empty snapshot: 1, or 0.
+    fn _read_joints(self, v): i64 {
+        var n = _im_sr_len(v);
+        if (n < 0 || self.joints.reserve(n) == 0) { return 0; }
+        var bad[8];
+        store64(&bad, 0);
+        var has[8];
+        var jt: ImJointType;
+        var mo: ImJointMotor = ImJointMotor_new(0.0, 0.0);
+        for (var j = 0; j < n; j = j + 1) {
+            var o = bayan_json_v_arr_get(v, j);
+            var f = _im_jr_form(o, 2);
+            if (f == 0) { return 0; }
+            var jo = _im_jr_at(o, f, 1, "joint");
+            var g = _im_jr_form(jo, 9);
+            if (g == 0) { return 0; }
+            var js: *ImJointSnapshot = _im_as_joint_snap(self.joints.at(j));
+            self.joints.len = j + 1;
+            js.handle = _im_sr_u64(o, f, 0, "handle", &bad);
+            js.joint.body_a = _im_sr_u64(jo, g, 0, "body_a", &bad);
+            js.joint.body_b = _im_sr_u64(jo, g, 1, "body_b", &bad);
+            if (_im_jr_joint_type(_im_jr_at(jo, g, 2, "joint_type"), &jt) == 0) { return 0; }
+            js.joint.joint_type = jt;
+            js.joint.local_anchor_a = _im_sr_v3(jo, g, 3, "local_anchor_a", &bad);
+            js.joint.local_anchor_b = _im_sr_v3(jo, g, 4, "local_anchor_b", &bad);
+            js.joint.reference_rotation = _im_b3_sr_quat(jo, g, 5, "reference_rotation", &bad);
+            var mv = _im_jr_at(jo, g, 6, "motor");
+            js.joint.has_motor = 0;
+            var none: ImJointMotor = ImJointMotor_new(0.0, 0.0);
+            js.joint.motor = none;
+            if (mv != 0 && _im_jr_is_null(mv) == 0) {
+                if (_im_jr_motor(mv, &mo) == 0) { return 0; }
+                js.joint.has_motor = 1;
+                js.joint.motor = mo;
+            }
+            js.joint.damping = _im_sr_f(jo, g, 7, "damping", &bad);
+            js.joint.break_force = _im_sr_opt_f(jo, g, 8, "break_force", &has, &bad);
+            js.joint.has_break_force = load64(&has);
+            if (load64(&bad) == 1) { return 0; }
+        }
+        return 1;
+    }
+
+    # Appends the profile's keys after the arenas: none in 3D (it keeps no manifolds).
+    fn _json_backend_extra(self, sb) { return 0; }
+
+    # Reads the profile's keys after the arenas: none in 3D. 1.
+    fn _read_backend_extra(self, o): i64 { return 1; }
+
+    # Releases the backend half: the collider lists, shapes, arenas and tracker.
+    fn _free_backend(self) {
+        for (var i = 0; i < self.bodies.len; i = i + 1) {
+            var bl: *ImWordList = _im_b3_snap_list(self.bodies.at(i));
+            bl.free();
+        }
+        self.bodies.free();
+        for (var c = 0; c < self.colliders.len; c = c + 1) {
+            var cp: *ImCollider3d = _im_b3_as_coll(self.colliders.at(c));
+            cp.shape.free();
+        }
+        self.colliders.free();
+        self.joints.free();
+        self.body_arena.free();
+        self.collider_arena.free();
+        self.joint_arena.free();
+        self.tracker.free();
+        return 0;
+    }
+}
+
+# --- world_snapshot.cyr ---
+
+# world_snapshot.cyr — `snapshot` and `restore` (ADR 0013), and the world's half of a snapshot: the config, the id
+# counters, the particles, emitters and force fields. Shared by both profiles, after the profile's snapshot file
+# (src/b2_snapshot.cyr, src/b3_snapshot.cyr), whose `ImWorldSnapshot` and backend half it completes.
+#
+# `restore` is the one fallible restore of ADR 0008 #2 (Rust's `try_restore`; 1.4.0's `restore` that ignored errors is
+# gone). It checks the whole snapshot first, builds a fresh world from it, and only then replaces the world, so on any
+# error the world is unchanged.
+
+impl ImWorldSnapshot {
+    # Captures world w: 1, or 0 when there is no memory (what was captured stays owned by the snapshot).
+    fn _capture(self, w: *ImPhysicsWorld): i64 {
+        self.config = w.config;
+        self.next_particle_id = w.next_particle_id;
+        self.next_emitter_id = w.next_emitter_id;
+        if (_im_snap_copy_records(self.particles, w.particles) == 0) { return 0; }
+        if (_im_snap_copy_records(self.emitters, w.emitters) == 0) { return 0; }
+        if (_im_snap_copy_records(self.force_fields, w.force_fields) == 0) { return 0; }
+        return self._capture_backend(w.backend);
+    }
+
+    # Ok(0) when the snapshot can be restored: the config passes `validate` (else its error, IM_ERR_INVALID_CONFIG or,
+    # for XPBD, IM_ERR_UNSUPPORTED), and the world's records and the backend half are well formed (else
+    # Err(IM_ERR_DESERIALIZE); in 3D, Err(IM_ERR_UNSUPPORTED) for a joint the profile refuses, ADR 0008 #5). Mirrors
+    # `validate_snapshot`, whose checks it extends (ADR 0013).
+    fn validate(self): Result {
+        var cfg: ImWorldConfig = self.config;
+        var t, v = cfg.validate();
+        if (is_ok(t) == 0) { return Err(v); }
+        if (self.particles.size != sizeof(ImParticle) || self.emitters.size != sizeof(ImParticleEmitter)) {
+            return Err(IM_ERR_DESERIALIZE);
+        }
+        if (self.force_fields.size != sizeof(ImForceField)) { return Err(IM_ERR_DESERIALIZE); }
+        for (var i = 0; i < self.particles.len; i = i + 1) {
+            var p: *ImParticle = _im_as_particle(self.particles.at(i));
+            if (_im_snap_flag(p.has_on_death_emit) == 0) { return Err(IM_ERR_DESERIALIZE); }
+            var n = p.on_death_emit.count;
+            if (p.has_on_death_emit == 1 && (n < 0 || n > 0xFFFFFFFF)) { return Err(IM_ERR_DESERIALIZE); }
+        }
+        for (var e = 0; e < self.emitters.len; e = e + 1) {
+            var em: *ImParticleEmitter = _im_as_emitter(self.emitters.at(e));
+            if (_im_snap_flag(em.active) == 0) { return Err(IM_ERR_DESERIALIZE); }
+        }
+        for (var f = 0; f < self.force_fields.len; f = f + 1) {
+            var ff: *ImForceField = _im_as_force_field(self.force_fields.at(f));
+            if (ff.kind != IM_FORCE_FIELD_RADIAL && ff.kind != IM_FORCE_FIELD_DIRECTIONAL) {
+                return Err(IM_ERR_DESERIALIZE);
+            }
+        }
+        var vb = self._validate_backend();
+        if (vb == 2) { return Err(IM_ERR_UNSUPPORTED); }
+        if (vb != 1) { return Err(IM_ERR_DESERIALIZE); }
+        return Ok(0);
+    }
+
+    # Loads the snapshot into the fresh world w (built over its config): 1, or 0 when there is no memory. Assumes
+    # `validate`.
+    fn _load(self, w: *ImPhysicsWorld): i64 {
+        w.next_particle_id = self.next_particle_id;
+        w.next_emitter_id = self.next_emitter_id;
+        if (_im_snap_copy_records(w.particles, self.particles) == 0) { return 0; }
+        if (_im_snap_copy_records(w.emitters, self.emitters) == 0) { return 0; }
+        if (_im_snap_copy_records(w.force_fields, self.force_fields) == 0) { return 0; }
+        return self._load_backend(w.backend);
+    }
+
+    # Releases everything the snapshot owns.
+    fn free(self) {
+        self.particles.free();
+        self.emitters.free();
+        self.force_fields.free();
+        self._free_backend();
+        return 0;
+    }
+}
+
+impl ImPhysicsWorld {
+    # The world's whole state into out, overwriting it (free a snapshot it held first): Ok(0), or Err(IM_ERR_SERIALIZE)
+    # when there is no memory. The snapshot owns copies; the world is untouched. Mirrors `snapshot` (ADR 0013).
+    fn snapshot(self, out: *ImWorldSnapshot): Result {
+        var s: ImWorldSnapshot = ImWorldSnapshot_new();
+        if (s._capture(self) == 0) {
+            s.free();
+            return Err(IM_ERR_SERIALIZE);
+        }
+        memcpy(out, &s, sizeof(ImWorldSnapshot));
+        return Ok(0);
+    }
+
+    # Replaces the world with the snapshot's: its config, bodies, colliders, joints, contacts, particles, emitters and
+    # force fields, its arenas' slots (so the next handles are the original's) and the last step's events. Ok(0), or the
+    # error `validate` gives, or Err(IM_ERR_DESERIALIZE) when there is no memory; on any error the world is unchanged.
+    # The snapshot is only read. Mirrors `try_restore` (ADR 0008 #2).
+    fn restore(self, snap: *ImWorldSnapshot): Result {
+        var t, v = snap.validate();
+        if (is_ok(t) == 0) { return Err(v); }
+        var nw: ImPhysicsWorld = ImPhysicsWorld_new(snap.config);
+        if (snap._load(&nw) == 0) {
+            nw.free();
+            return Err(IM_ERR_DESERIALIZE);
+        }
+        self.free();
+        memcpy(self, &nw, sizeof(ImPhysicsWorld));
+        return Ok(0);
+    }
+}
+
+# ── the binary form (ADR 0013, version 1) ───────────────────────────────────────────
+# The payload is the world half (the config, the two counters, then the particles, emitters and force fields, each a
+# count and its records), then the profile's backend half. src/snapshot.cyr has the header and the word codec.
+
+impl ImWorldSnapshot {
+    # Writes the world half: 1, or 0 for a force field of unknown kind.
+    fn _encode_world(self, wr: *ImSnapWriter): i64 {
+        _im_snap_put_config(wr, self.config);
+        wr.w(self.next_particle_id);
+        wr.w(self.next_emitter_id);
+        wr.w(self.particles.len);
+        for (var i = 0; i < self.particles.len; i = i + 1) {
+            _im_snap_put_particle(wr, _im_as_particle(self.particles.at(i)));
+        }
+        wr.w(self.emitters.len);
+        for (var e = 0; e < self.emitters.len; e = e + 1) {
+            _im_snap_put_emitter(wr, _im_as_emitter(self.emitters.at(e)));
+        }
+        wr.w(self.force_fields.len);
+        for (var f = 0; f < self.force_fields.len; f = f + 1) {
+            if (_im_snap_put_field(wr, _im_as_force_field(self.force_fields.at(f))) == 0) { return 0; }
+        }
+        return 1;
+    }
+
+    # Reads the world half into this empty snapshot: 1, or 0 on a bad read or no memory.
+    fn _decode_world(self, rd: *ImSnapReader): i64 {
+        _im_snap_get_config(rd, self.config);
+        self.next_particle_id = rd.w();
+        self.next_emitter_id = rd.w();
+        var np = rd.count(20);
+        if (self.particles.reserve(np) == 0) { return 0; }
+        for (var i = 0; i < np; i = i + 1) {
+            _im_snap_get_particle(rd, _im_as_particle(self.particles.at(i)));
+            self.particles.len = i + 1;
+        }
+        var ne = rd.count(18);
+        if (self.emitters.reserve(ne) == 0) { return 0; }
+        for (var e = 0; e < ne; e = e + 1) {
+            _im_snap_get_emitter(rd, _im_as_emitter(self.emitters.at(e)));
+            self.emitters.len = e + 1;
+        }
+        var nf = rd.count(7);
+        if (self.force_fields.reserve(nf) == 0) { return 0; }
+        for (var f = 0; f < nf; f = f + 1) {
+            if (_im_snap_get_field(rd, _im_as_force_field(self.force_fields.at(f))) == 0) { return 0; }
+            self.force_fields.len = f + 1;
+        }
+        if (rd.bad == 1) { return 0; }
+        return 1;
+    }
+
+    # The snapshot's binary form into out, replacing what it held: Ok(0), or Err(IM_ERR_SERIALIZE) when there is no
+    # memory or a shape, joint type or force field has an unknown kind. The bytes are out.data, out.len × 8 of them: the
+    # header (magic, version, profile, payload length, checksum), then the payload. The snapshot is not checked here;
+    # `restore` checks it. ADR 0013.
+    fn to_bytes(self, out: *ImWordList): Result {
+        out.len = 0;
+        var wr: ImSnapWriter = _im_snap_writer(out);
+        for (var h = 0; h < _IM_SNAP_HEADER; h = h + 1) { wr.w(0); }
+        if (self._encode_world(&wr) == 0 || self._encode_backend(&wr) == 0) { return Err(IM_ERR_SERIALIZE); }
+        if (wr.bad == 1) { return Err(IM_ERR_SERIALIZE); }
+        var n = out.len - _IM_SNAP_HEADER;
+        var payload = out.data + _IM_SNAP_HEADER * 8;
+        store64(out.data, _IM_SNAP_MAGIC);
+        store64(out.data + 8, _IM_SNAP_VERSION);
+        store64(out.data + 16, _IM_SNAP_PROFILE);
+        store64(out.data + 24, n);
+        store64(out.data + 32, _im_snap_checksum(payload, n));
+        return Ok(0);
+    }
+}
+
+# Reads the binary form at buf (len bytes) into *out (overwritten; free it after): Ok(0), or Err(IM_ERR_DESERIALIZE) for
+# a length not a whole number of words or shorter than the header, a wrong magic, version or profile, a payload length
+# that disagrees, a checksum that doesn't match, a malformed or truncated payload, or no memory. A snapshot read here is
+# checked in full by `restore`. ADR 0013.
+fn ImWorldSnapshot_from_bytes(buf, len, out: *ImWorldSnapshot): Result {
+    if (len < _IM_SNAP_HEADER * 8 || (len % 8) != 0) { return Err(IM_ERR_DESERIALIZE); }
+    var words = len / 8;
+    var n = load64(buf + 24);
+    if (load64(buf) != _IM_SNAP_MAGIC || load64(buf + 8) != _IM_SNAP_VERSION) { return Err(IM_ERR_DESERIALIZE); }
+    if (load64(buf + 16) != _IM_SNAP_PROFILE || n != words - _IM_SNAP_HEADER) { return Err(IM_ERR_DESERIALIZE); }
+    var payload = buf + _IM_SNAP_HEADER * 8;
+    if (_im_snap_checksum(payload, n) != load64(buf + 32)) { return Err(IM_ERR_DESERIALIZE); }
+    var s: ImWorldSnapshot = ImWorldSnapshot_new();
+    var rd: ImSnapReader = _im_snap_reader(payload, n);
+    var ok = s._decode_world(&rd);
+    if (ok == 1) { ok = s._decode_backend(&rd); }
+    if (ok == 0 || rd.bad == 1 || rd.at != n) {
+        s.free();
+        return Err(IM_ERR_DESERIALIZE);
+    }
+    memcpy(out, &s, sizeof(ImWorldSnapshot));
+    return Ok(0);
+}
+
+# The world's binary form into out (ADR 0013): `snapshot`, then `to_bytes`. Ok(0), or Err(IM_ERR_SERIALIZE). Mirrors
+# `serialize_world`; its bytes are Cyrius's own, not Rust's bitcode.
+fn serialize_world(w: *ImPhysicsWorld, out: *ImWordList): Result {
+    var s: ImWorldSnapshot = ImWorldSnapshot_new();
+    var t, v = w.snapshot(&s);
+    if (is_ok(t) == 0) { return Err(v); }
+    var tb, vb = s.to_bytes(out);
+    s.free();
+    if (is_ok(tb) == 0) { return Err(vb); }
+    return Ok(0);
+}
+
+# Restores world w from the binary form at buf (len bytes): `ImWorldSnapshot_from_bytes`, then `restore`. Ok(0), or
+# their error; on any error the world is unchanged. Mirrors `deserialize_world`.
+fn deserialize_world(w: *ImPhysicsWorld, buf, len): Result {
+    var s: ImWorldSnapshot = ImWorldSnapshot_new();
+    var t, v = ImWorldSnapshot_from_bytes(buf, len, &s);
+    if (is_ok(t) == 0) { return Err(v); }
+    var tr, vr = w.restore(&s);
+    s.free();
+    if (is_ok(tr) == 0) { return Err(vr); }
+    return Ok(0);
+}
+
+# ── the JSON form (ADR 0013) ────────────────────────────────────────────────────────
+# One object: "format" ("impetus-snapshot"), "version" (1) and "profile" ("2d" or "3d") first, then the struct's fields
+# in order (config, next_particle_id, next_emitter_id, bodies, colliders, joints, particles, emitters, force_fields,
+# body_arena, collider_arena, joint_arena, the profile's own keys, tracker). No checksum: the form is meant to be read
+# and edited, and `restore` checks it as it checks any snapshot.
+
+impl ImWorldSnapshot {
+    # Appends the snapshot as JSON to the str builder sb: Ok(0), or Err(IM_ERR_SERIALIZE) when a value is not finite
+    # (JSON has no form for it, and serde_json would write null; the binary form holds it). sb then holds a document
+    # that must not be read back. ADR 0013.
+    fn to_json(self, sb): Result {
+        _im_json_nonfinite = 0;
+        str_builder_add_cstr(sb, "{\"format\":\"impetus-snapshot\",\"version\":1,\"profile\":");
+        _im_jw_name(sb, _im_snap_profile_name());
+        _im_jw_key(sb, "config", 0);
+        self.config.to_json(sb);
+        _im_jw_key(sb, "next_particle_id", 0);
+        _im_jw_u64(sb, self.next_particle_id);
+        _im_jw_key(sb, "next_emitter_id", 0);
+        _im_jw_u64(sb, self.next_emitter_id);
+        _im_jw_key(sb, "bodies", 0);
+        self._json_bodies(sb);
+        _im_jw_key(sb, "colliders", 0);
+        self._json_colliders(sb);
+        _im_jw_key(sb, "joints", 0);
+        self._json_joints(sb);
+        _im_jw_key(sb, "particles", 0);
+        str_builder_putc(sb, 91);
+        for (var i = 0; i < self.particles.len; i = i + 1) {
+            if (i > 0) { str_builder_putc(sb, 44); }
+            var p: *ImParticle = _im_as_particle(self.particles.at(i));
+            p.to_json(sb);
+        }
+        str_builder_putc(sb, 93);
+        _im_jw_key(sb, "emitters", 0);
+        str_builder_putc(sb, 91);
+        for (var e = 0; e < self.emitters.len; e = e + 1) {
+            if (e > 0) { str_builder_putc(sb, 44); }
+            var em: *ImParticleEmitter = _im_as_emitter(self.emitters.at(e));
+            em.to_json(sb);
+        }
+        str_builder_putc(sb, 93);
+        _im_jw_key(sb, "force_fields", 0);
+        str_builder_putc(sb, 91);
+        for (var f = 0; f < self.force_fields.len; f = f + 1) {
+            if (f > 0) { str_builder_putc(sb, 44); }
+            var ff: *ImForceField = _im_as_force_field(self.force_fields.at(f));
+            ff.to_json(sb);
+        }
+        str_builder_putc(sb, 93);
+        _im_jw_key(sb, "body_arena", 0);
+        _im_sj_arena(sb, self.body_arena);
+        _im_jw_key(sb, "collider_arena", 0);
+        _im_sj_arena(sb, self.collider_arena);
+        _im_jw_key(sb, "joint_arena", 0);
+        _im_sj_arena(sb, self.joint_arena);
+        self._json_backend_extra(sb);
+        _im_jw_key(sb, "tracker", 0);
+        _im_sj_tracker(sb, self.tracker);
+        str_builder_putc(sb, 125);
+        if (_im_json_nonfinite > 0) { return Err(IM_ERR_SERIALIZE); }
+        return Ok(0);
+    }
+
+    # Reads the document node o into this empty snapshot: 1, or 0.
+    fn _read_json(self, o): i64 {
+        var bad[8];
+        store64(&bad, 0);
+        var w[8];
+        var fv = bayan_json_v_obj_get_by_cstr(o, "format");
+        var pv = bayan_json_v_obj_get_by_cstr(o, "profile");
+        if (fv == 0 || bayan_json_v_tag(fv) != JTAG_STR || pv == 0 || bayan_json_v_tag(pv) != JTAG_STR) { return 0; }
+        if (str_eq_cstr(bayan_json_v_str(fv), "impetus-snapshot") != 1) { return 0; }
+        if (str_eq_cstr(bayan_json_v_str(pv), _im_snap_profile_name()) != 1) { return 0; }
+        if (_im_jr_int(bayan_json_v_obj_get_by_cstr(o, "version"), 1, 1, &w) == 0) { return 0; }
+        if (_im_jr_config(bayan_json_v_obj_get_by_cstr(o, "config"), self.config) == 0) { return 0; }
+        self.next_particle_id = _im_sr_u64(o, 1, 0, "next_particle_id", &bad);
+        self.next_emitter_id = _im_sr_u64(o, 1, 0, "next_emitter_id", &bad);
+        if (load64(&bad) == 1) { return 0; }
+        if (self._read_bodies(bayan_json_v_obj_get_by_cstr(o, "bodies")) == 0) { return 0; }
+        if (self._read_colliders(bayan_json_v_obj_get_by_cstr(o, "colliders")) == 0) { return 0; }
+        if (self._read_joints(bayan_json_v_obj_get_by_cstr(o, "joints")) == 0) { return 0; }
+        var plv = bayan_json_v_obj_get_by_cstr(o, "particles");
+        var np = _im_sr_len(plv);
+        if (np < 0 || self.particles.reserve(np) == 0) { return 0; }
+        for (var i = 0; i < np; i = i + 1) {
+            if (_im_jr_particle(bayan_json_v_arr_get(plv, i), _im_as_particle(self.particles.at(i))) == 0) { return 0; }
+            self.particles.len = i + 1;
+        }
+        var elv = bayan_json_v_obj_get_by_cstr(o, "emitters");
+        var ne = _im_sr_len(elv);
+        if (ne < 0 || self.emitters.reserve(ne) == 0) { return 0; }
+        for (var e = 0; e < ne; e = e + 1) {
+            if (_im_jr_emitter(bayan_json_v_arr_get(elv, e), _im_as_emitter(self.emitters.at(e))) == 0) { return 0; }
+            self.emitters.len = e + 1;
+        }
+        var flv = bayan_json_v_obj_get_by_cstr(o, "force_fields");
+        var nf = _im_sr_len(flv);
+        if (nf < 0 || self.force_fields.reserve(nf) == 0) { return 0; }
+        for (var f = 0; f < nf; f = f + 1) {
+            var fp: *ImForceField = _im_as_force_field(self.force_fields.at(f));
+            if (_im_jr_force_field(bayan_json_v_arr_get(flv, f), fp) == 0) { return 0; }
+            self.force_fields.len = f + 1;
+        }
+        if (_im_sr_arena(bayan_json_v_obj_get_by_cstr(o, "body_arena"), self.body_arena) == 0) { return 0; }
+        if (_im_sr_arena(bayan_json_v_obj_get_by_cstr(o, "collider_arena"), self.collider_arena) == 0) { return 0; }
+        if (_im_sr_arena(bayan_json_v_obj_get_by_cstr(o, "joint_arena"), self.joint_arena) == 0) { return 0; }
+        if (self._read_backend_extra(o) == 0) { return 0; }
+        return _im_sr_tracker(bayan_json_v_obj_get_by_cstr(o, "tracker"), self.tracker);
+    }
+}
+
+# Reads a snapshot's JSON form at buf (len bytes) into *out (overwritten; free it after): Ok(0), or
+# Err(IM_ERR_DESERIALIZE) when the text is not one JSON object, its format, version or profile is not this one's, or a
+# field is missing or malformed. A snapshot read here is checked in full by `restore`. ADR 0013.
+fn ImWorldSnapshot_from_json(buf, len, out: *ImWorldSnapshot): Result {
+    var o = _im_jr_parse(buf, len);
+    if (o == 0 || bayan_json_v_tag(o) != JTAG_OBJ) { return Err(IM_ERR_DESERIALIZE); }
+    var s: ImWorldSnapshot = ImWorldSnapshot_new();
+    if (s._read_json(o) == 0) {
+        s.free();
+        return Err(IM_ERR_DESERIALIZE);
+    }
+    memcpy(out, &s, sizeof(ImWorldSnapshot));
+    return Ok(0);
+}
