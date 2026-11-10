@@ -6,9 +6,96 @@
 # interleaved, then breaking joints, (7) the split-impulse position solve, (8) integrate positions, (9) sleep, and
 # (10) the touching pairs recorded. `finish_step` ends the outer step.
 #
-# M5 part 2 ports the stages that run when nothing touches: 1, 6–9 without contacts, `finish_step`, `solver_mass`
-# (src/b3_joints.cyr) and `error_reduction`. The contact stages and `step` come with part 3. Every expression keeps
-# Rust's operation order on src/math3.cyr's glam transcriptions (ADR 0012).
+# Every expression keeps Rust's operation order on src/math3.cyr's glam transcriptions (ADR 0012); friction's slip and
+# impulse lengths go through crmath's correctly rounded hypot (ADR 0011). The sub-step's working sets (the broadphase's
+# boxes and pairs, the contacts, the solve order, the contact constraints) are the state's scratch, reused from step to
+# step, so the heap stays flat. STATIC_FRICTION_SLIP_SPEED and RESTITUTION_VELOCITY_THRESHOLD are generated
+# (`_IM_B3_*`).
+
+# Words per broadphase box: a flag (1 for a collider with a live body), then min x, y, z and max x, y, z.
+const _IM_B3_BOX_W = 7;
+# The solve level of a contact whose bodies have none (u32::MAX in Rust): after every real level.
+const _IM_B3_LEVEL_NONE = 4294967295;
+
+# One contact's solver state for a sub-step: its bodies' solver inverses, the unit normal A → B and the tangent pair,
+# the lever arms from each body's position, the effective masses, `roll_k` = I_a⁻¹ + I_b⁻¹, the restitution target,
+# the combined coefficients, the depth, and the accumulated impulses. Mirrors `ContactConstraint`.
+struct ImContactConstraint3d {
+    body_a;
+    body_b;
+    normal: ImVec3;
+    t1: ImVec3;
+    t2: ImVec3;
+    ra: ImVec3;
+    rb: ImVec3;
+    inv_mass_a: f64;
+    inv_mass_b: f64;
+    inv_i_a: ImMat3;
+    inv_i_b: ImMat3;
+    normal_mass: f64;
+    tangent_mass1: f64;
+    tangent_mass2: f64;
+    roll_k: ImMat3;
+    velocity_bias: f64;
+    friction: f64;
+    static_friction: f64;
+    rolling_friction: f64;
+    depth: f64;
+    normal_impulse: f64;
+    tangent_impulse1: f64;
+    tangent_impulse2: f64;
+    rolling_impulse: ImVec3;
+    position_impulse: f64;
+}
+
+#must_use
+fn _im_b3_as_cc(p): *ImContactConstraint3d { return p; }
+#must_use
+fn _im_b3_as_contact(p): *ImContact3d { return p; }
+
+# A material coefficient clamped to [0, f64::MAX], NaN to 0. Mirrors `sanitize_coefficient`.
+#must_use
+fn _im_b3_sanitize_coefficient(x: f64): f64 {
+    if (x != x) { return 0.0; }
+    # f64::MAX by its bits (the largest finite double; there are no exponent literals).
+    var mx: f64 = _im_cr_from_word(0x7fefffffffffffff);
+    var r: f64 = _im_clamp(x, 0.0, mx);
+    return r;
+}
+
+# `rule_a.max(rule_b).combine(a, b)`: the higher-priority combine rule (the later variant) applied to a and b. Mirrors
+# `prepare_contacts`' `combine_property`.
+#must_use
+fn _im_b3_combine(a: f64, b: f64, rule_a, rule_b): f64 {
+    var rule = rule_a;
+    if (rule_b > rule_a) { rule = rule_b; }
+    var r: f64 = combine_rule_combine(rule, a, b);
+    return r;
+}
+
+# m_a⁻¹ + m_b⁻¹ + (ra × d)·I_a⁻¹(ra × d) + (rb × d)·I_b⁻¹(rb × d): the effective-mass denominator along d. Mirrors
+# `prepare_contacts`' `eff`.
+#must_use
+fn _im_b3_eff(d: ImVec3, ra: ImVec3, rb: ImVec3, ima: f64, imb: f64, ia: *ImMat3, ib: *ImMat3): f64 {
+    var ka: ImVec3 = ImVec3_cross(ra, d);
+    var kb: ImVec3 = ImVec3_cross(rb, d);
+    var ika: ImVec3 = _im_m3_apply(ia, ka.x, ka.y, ka.z);
+    var ikb: ImVec3 = _im_m3_apply(ib, kb.x, kb.y, kb.z);
+    var da: f64 = ImVec3_dot(ka, ika);
+    var db: f64 = ImVec3_dot(kb, ikb);
+    var k: f64 = ima + imb + da + db;
+    return k;
+}
+
+# 1/k for k above EPSILON, else 0. Mirrors `prepare_contacts`' `inv`.
+#must_use
+fn _im_b3_inv_k(k: f64): f64 {
+    if (k > _IM_B3_EPSILON) {
+        var r: f64 = 1.0 / k;
+        return r;
+    }
+    return 0.0;
+}
 
 # The error-reduction parameter of the position solve: from the soft-constraint spring (frequency Hz, damping_ratio)
 # as dt·k / (d + dt·k), k = ω², d = 2ζω, ω = 2π·frequency, when frequency > 0 and dt > 0; else the Baumgarte fraction
@@ -27,6 +114,47 @@ fn _im_b3_error_reduction(frequency: f64, damping_ratio: f64, correction: f64, d
         return r;
     }
     return 0.0;
+}
+
+# The box stored at the broadphase entry p (after its flag word).
+#must_use
+fn _im_b3_box_at(p): ImAabb3d {
+    var x0: f64 = load64(p + 8);
+    var y0: f64 = load64(p + 16);
+    var z0: f64 = load64(p + 24);
+    var x1: f64 = load64(p + 32);
+    var y1: f64 = load64(p + 40);
+    var z1: f64 = load64(p + 48);
+    return ImAabb3d_new(ImVec3_new(x0, y0, z0), ImVec3_new(x1, y1, z1));
+}
+
+# Stores the box (lo, hi) at the broadphase entry p, after its flag word.
+fn _im_b3_box_put(p, lo: ImVec3, hi: ImVec3) {
+    var x0: f64 = lo.x;
+    var y0: f64 = lo.y;
+    var z0: f64 = lo.z;
+    var x1: f64 = hi.x;
+    var y1: f64 = hi.y;
+    var z1: f64 = hi.z;
+    store64(p + 8, x0);
+    store64(p + 16, y0);
+    store64(p + 24, z0);
+    store64(p + 32, x1);
+    store64(p + 40, y1);
+    store64(p + 48, z1);
+    return 0;
+}
+
+# 1 when body rb (0 for none) is awake, dynamic and moving faster than SLEEP_VELOCITY_THRESHOLD_3D, linearly or
+# angularly. Part of `step`'s wake on contact.
+#must_use
+fn _im_b3_moving(rb: *ImRigidBody3d): i64 {
+    if (rb == 0) { return 0; }
+    if (rb.is_sleeping == 1 || rb.is_dynamic() == 0) { return 0; }
+    var lin: f64 = ImVec3_length(rb.linear_velocity);
+    var ang: f64 = ImVec3_length(rb.angular_velocity);
+    if (lin > _IM_B3_SLEEP_VELOCITY_THRESHOLD_3D || ang > _IM_B3_SLEEP_VELOCITY_THRESHOLD_3D) { return 1; }
+    return 0;
 }
 
 impl ImPhysicsState3d {
@@ -103,6 +231,658 @@ impl ImPhysicsState3d {
                 }
             }
         }
+        return 0;
+    }
+
+    # One sub-step of dt with the world's solver settings (the 3D backend always runs the sequential-impulse
+    # solver): steps 1 to 10 of the header, then the touching pairs recorded. Mirrors `PhysicsState3d::step`.
+    fn step(self, gravity: ImVec3, dt: f64, velocity_iterations, position_iterations, slop: f64, correction: f64,
+      max_velocity: f64, constraint_frequency: f64, constraint_damping_ratio: f64, broadphase_kind) {
+        self._integrate_velocities(gravity, dt, max_velocity);
+        self.prepare_joints(dt);
+        self._broadphase(broadphase_kind, dt);
+        self._narrowphase();
+        self._wake_on_contact();
+        self._shock_order();
+        self.prepare_contacts();
+        for (var i = 0; i < velocity_iterations; i = i + 1) {
+            self.solve_contacts();
+            self.solve_joint_velocities(dt);
+        }
+        self.break_joints(dt);
+        self._clear_pseudo();
+        if (dt > 0.0) {
+            var erp: f64 = _im_b3_error_reduction(constraint_frequency, constraint_damping_ratio, correction, dt);
+            for (var p = 0; p < position_iterations; p = p + 1) {
+                self.solve_contact_positions(slop, erp, dt);
+                self.solve_joint_positions(erp, dt);
+            }
+        }
+        self._integrate_positions(dt);
+        self._sleep_check(dt);
+        self._record_contacts();
+        return 0;
+    }
+
+    # ── steps 2–3: broadphase and narrowphase ──
+
+    # 1 when the candidate pair (ha, hb) is kept: two live colliders on different bodies, not both on static bodies,
+    # not both sensors, a layer meeting the other's mask, and overlapping swept boxes. Part of `broadphase`.
+    #must_use
+    fn _pair_kept(self, ha, hb): i64 {
+        var ar: *ImArena = self._colliders();
+        var ca: *ImCollider3d = _im_b3_as_coll(ar.get(ha));
+        var cb: *ImCollider3d = _im_b3_as_coll(ar.get(hb));
+        if (ca == 0 || cb == 0) { return 0; }
+        if (ca.body == cb.body) { return 0; }
+        var ba: *ImRigidBody3d = self._body(ca.body);
+        var bb: *ImRigidBody3d = self._body(cb.body);
+        if (ba != 0 && bb != 0) {
+            if (ba.is_static() == 1 && bb.is_static() == 1) { return 0; }
+        }
+        if (ca.is_sensor == 1 && cb.is_sensor == 1) { return 0; }
+        if ((ca.collision_layer & cb.collision_mask) == 0 && (cb.collision_layer & ca.collision_mask) == 0) {
+            return 0;
+        }
+        var bw = _IM_B3_BOX_W * 8;
+        var pa = self.bp_boxes.data + _im_handle_index(ha) * bw;
+        var pb = self.bp_boxes.data + _im_handle_index(hb) * bw;
+        if (load64(pa) == 0 || load64(pb) == 0) { return 0; }
+        var a: ImAabb3d = _im_b3_box_at(pa);
+        var b: ImAabb3d = _im_b3_box_at(pb);
+        return a.overlaps(&b);
+    }
+
+    # Step 2 into bp_pairs: each collider's world AABB (its body live), expanded along the body's velocity over dt,
+    # in slot order; the candidate pairs of the spatial hash (its cell size from the boxes' largest extents) or the
+    # AABB tree (`kind`), rebuilt from their kept storage; then the pairs `_pair_kept` keeps, in candidate order. 1,
+    # or 0 when there is no memory (no pairs). Mirrors `broadphase`.
+    fn _broadphase(self, kind, dt: f64): i64 {
+        self.bp_pairs.clear();
+        var ar: *ImArena = self._colliders();
+        var ns = ar.slot_count();
+        if (self.bp_boxes.reserve(ns * _IM_B3_BOX_W) == 0 || self.bp_dims.reserve(ns) == 0) { return 0; }
+        self.bp_dims.len = 0;
+        var bw = _IM_B3_BOX_W * 8;
+        for (var s = 0; s < ns; s = s + 1) {
+            var bx = self.bp_boxes.data + s * bw;
+            store64(bx, 0);
+            var h = ar.slot_handle(s);
+            if (h != 0 - 1) {
+                var c: *ImCollider3d = _im_b3_as_coll(ar.get(h));
+                var rb: *ImRigidBody3d = self._body(c.body);
+                if (rb != 0) {
+                    var ab: ImAabb3d = c.world_aabb(rb.position, rb.rotation);
+                    var vel: ImVec3 = ImVec3_scale(rb.linear_velocity, dt);
+                    var lo: ImVec3 = ImVec3_min(ab.min, ab.min + vel);
+                    var hi: ImVec3 = ImVec3_max(ab.max, ab.max + vel);
+                    store64(bx, 1);
+                    _im_b3_box_put(bx, lo, hi);
+                    var size: ImVec3 = hi - lo;
+                    var m0: f64 = _im_max(size.x, size.y);
+                    var dim: f64 = _im_max(m0, size.z);
+                    store64(self.bp_dims.data + self.bp_dims.len * 8, dim);
+                    self.bp_dims.len = self.bp_dims.len + 1;
+                }
+            }
+        }
+        var ok = 1;
+        if (kind == IM_BROADPHASE_AABB_TREE) {
+            self.bp_tree.clear();
+            for (var t = 0; t < ns; t = t + 1) {
+                var tb = self.bp_boxes.data + t * bw;
+                if (load64(tb) == 1) {
+                    var tbox: ImAabb3d = _im_b3_box_at(tb);
+                    var box: ImTreeAabb = ImTreeAabb_from_3d(tbox.min, tbox.max);
+                    if (self.bp_tree.insert(ar.slot_handle(t), box) < 0) { ok = 0; }
+                }
+            }
+            if (ok == 1) { ok = self.bp_tree.query_pairs(self.bp_pairs); }
+        } else {
+            var cell: f64 = ImSpatialHashGrid_auto_cell_size(self.bp_dims.data, self.bp_dims.len);
+            self.bp_grid.reset(cell);
+            for (var g = 0; g < ns; g = g + 1) {
+                var gb = self.bp_boxes.data + g * bw;
+                if (load64(gb) == 1) {
+                    var gbox: ImAabb3d = _im_b3_box_at(gb);
+                    if (self.bp_grid.insert_3d(ar.slot_handle(g), gbox.min, gbox.max) == 0) { ok = 0; }
+                }
+            }
+            if (ok == 1) { ok = self.bp_grid.query_pairs(self.bp_pairs); }
+        }
+        if (ok == 0) {
+            self.bp_pairs.clear();
+            return 0;
+        }
+        var kept = 0;
+        for (var i = 0; i < self.bp_pairs.len; i = i + 1) {
+            var ha = self.bp_pairs.first(i);
+            var hb = self.bp_pairs.second(i);
+            if (self._pair_kept(ha, hb) == 1) {
+                store64(self.bp_pairs.data + kept * 16, ha);
+                store64(self.bp_pairs.data + kept * 16 + 8, hb);
+                kept = kept + 1;
+            }
+        }
+        self.bp_pairs.len = kept;
+        return 1;
+    }
+
+    # Step 3 into ct_contacts: each broadphase pair's contact through `generate_contact_3d` (on the state's GJK
+    # scratch), at each collider's world position (its body's position plus its rotated offset), in pair order; a pair
+    # whose colliders or bodies are gone, or that doesn't touch, gives none. Mirrors `narrowphase`.
+    fn _narrowphase(self) {
+        self.ct_contacts.len = 0;
+        var ar: *ImArena = self._colliders();
+        var hit: ImHit3d;
+        var c: ImContact3d;
+        for (var i = 0; i < self.bp_pairs.len; i = i + 1) {
+            var ha = self.bp_pairs.first(i);
+            var hb = self.bp_pairs.second(i);
+            var ca: *ImCollider3d = _im_b3_as_coll(ar.get(ha));
+            var cb: *ImCollider3d = _im_b3_as_coll(ar.get(hb));
+            if (ca != 0 && cb != 0) {
+                var ba: *ImRigidBody3d = self._body(ca.body);
+                var bb: *ImRigidBody3d = self._body(cb.body);
+                if (ba != 0 && bb != 0) {
+                    var oa: ImVec3 = ImQuat_mul_vec3(ba.rotation, ca.offset);
+                    var ob: ImVec3 = ImQuat_mul_vec3(bb.rotation, cb.offset);
+                    var pa: ImVec3 = ba.position + oa;
+                    var pb: ImVec3 = bb.position + ob;
+                    var sa: *ImColliderShape = _im_b3_coll_shape(ca);
+                    var sb: *ImColliderShape = _im_b3_coll_shape(cb);
+                    var touch = _im_b3_generate_contact_3d(sa, pa, ba.rotation, sb, pb, bb.rotation, self._gjk(), &hit);
+                    if (touch == 1) {
+                        c.collider_a = ha;
+                        c.collider_b = hb;
+                        c.body_a = ca.body;
+                        c.body_b = cb.body;
+                        c.normal = hit.normal;
+                        var hd: f64 = hit.depth;
+                        c.depth = hd;
+                        c.point = hit.point;
+                        if (self.ct_contacts.push(&c) == 0) { return 0; }
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+
+    # ── steps 4–5: wake on contact and the solve order ──
+
+    # Step 4: a sleeping body touched by an awake dynamic body moving faster than SLEEP_VELOCITY_THRESHOLD_3D (linear
+    # or angular) wakes, contact by contact. Part of `step`.
+    fn _wake_on_contact(self) {
+        for (var i = 0; i < self.ct_contacts.len; i = i + 1) {
+            var c: *ImContact3d = _im_b3_as_contact(self.ct_contacts.at(i));
+            var ba: *ImRigidBody3d = self._body(c.body_a);
+            var bb: *ImRigidBody3d = self._body(c.body_b);
+            var a_sleeping = 0;
+            var b_sleeping = 0;
+            if (ba != 0) { a_sleeping = ba.is_sleeping; }
+            if (bb != 0) { b_sleeping = bb.is_sleeping; }
+            var a_moving = _im_b3_moving(ba);
+            var b_moving = _im_b3_moving(bb);
+            if (a_sleeping == 1 && b_moving == 1) {
+                ba.is_sleeping = 0;
+                ba.sleep_timer = 0.0;
+            }
+            if (b_sleeping == 1 && a_moving == 1) {
+                bb.is_sleeping = 0;
+                bb.sleep_timer = 0.0;
+            }
+        }
+        return 0;
+    }
+
+    # The solve level of body h (0 grounded, then one more per contact away), or -1 for none.
+    #must_use
+    fn _level_get(self, h, ns): i64 {
+        var s = _im_handle_index(h);
+        if (s < 0 || s >= ns) { return 0 - 1; }
+        var e = self.ct_level.data + s * 16;
+        if (load64(e) != h) { return 0 - 1; }
+        return load64(e + 8);
+    }
+
+    # Sets body h's solve level to v: 1, or 0 for a handle past the body slots (none such reach here: every contact's
+    # bodies are live).
+    fn _level_set(self, h, ns, v): i64 {
+        var s = _im_handle_index(h);
+        if (s < 0 || s >= ns) { return 0; }
+        var e = self.ct_level.data + s * 16;
+        store64(e, h);
+        store64(e + 8, v);
+        return 1;
+    }
+
+    # Step 5, shock propagation, into ct_sorted: static and kinematic bodies at level 0, each contact putting its
+    # other body one level further until nothing changes; then the contacts in a stable order of the lower level of
+    # their bodies (no level last). Part of `step`.
+    fn _shock_order(self) {
+        var nc = self.ct_contacts.len;
+        self.ct_sorted.len = 0;
+        var bar: *ImArena = self._bodies();
+        var ns = bar.slot_count();
+        if (self.ct_level.reserve(ns * 2) == 0 || self.ct_sorted.reserve(nc) == 0) { return 0; }
+        for (var z = 0; z < ns; z = z + 1) {
+            store64(self.ct_level.data + z * 16, 0 - 1);
+            store64(self.ct_level.data + z * 16 + 8, 0 - 1);
+        }
+        for (var s = 0; s < ns; s = s + 1) {
+            var h = bar.slot_handle(s);
+            if (h != 0 - 1) {
+                var rb: *ImRigidBody3d = self._body(h);
+                if (rb.is_static() == 1 || rb.is_dynamic() == 0) { self._level_set(h, ns, 0); }
+            }
+        }
+        var changed = 1;
+        while (changed == 1) {
+            changed = 0;
+            for (var i = 0; i < nc; i = i + 1) {
+                var c: *ImContact3d = _im_b3_as_contact(self.ct_contacts.at(i));
+                var la = self._level_get(c.body_a, ns);
+                var lb = self._level_get(c.body_b, ns);
+                if (la >= 0 && lb < 0) {
+                    if (self._level_set(c.body_b, ns, la + 1) == 1) { changed = 1; }
+                } elif (la < 0 && lb >= 0) {
+                    if (self._level_set(c.body_a, ns, lb + 1) == 1) { changed = 1; }
+                } elif (la >= 0 && lb >= 0) {
+                    if (la + 1 < lb) {
+                        if (self._level_set(c.body_b, ns, la + 1) == 1) { changed = 1; }
+                    } elif (lb + 1 < la) {
+                        if (self._level_set(c.body_a, ns, lb + 1) == 1) { changed = 1; }
+                    }
+                }
+            }
+        }
+        # A stable counting sort: each contact's bucket (its lower level, or maxl + 1 for none) at sort[0 .. nc), the
+        # bucket starts after them.
+        var maxl = 0 - 1;
+        for (var k = 0; k < nc; k = k + 1) {
+            var ck: *ImContact3d = _im_b3_as_contact(self.ct_contacts.at(k));
+            var ka = self._level_get(ck.body_a, ns);
+            var kb = self._level_get(ck.body_b, ns);
+            if (ka > maxl) { maxl = ka; }
+            if (kb > maxl) { maxl = kb; }
+        }
+        var nb = maxl + 2;
+        if (self.ct_sort.reserve(nc + nb + 1) == 0) { return 0; }
+        var keys = self.ct_sort.data;
+        var starts = keys + nc * 8;
+        for (var b = 0; b <= nb; b = b + 1) { store64(starts + b * 8, 0); }
+        for (var q = 0; q < nc; q = q + 1) {
+            var cq: *ImContact3d = _im_b3_as_contact(self.ct_contacts.at(q));
+            var qa = self._level_get(cq.body_a, ns);
+            var qb = self._level_get(cq.body_b, ns);
+            if (qa < 0) { qa = maxl + 1; }
+            if (qb < 0) { qb = maxl + 1; }
+            var kl = qa;
+            if (qb < qa) { kl = qb; }
+            store64(keys + q * 8, kl);
+            store64(starts + (kl + 1) * 8, load64(starts + (kl + 1) * 8) + 1);
+        }
+        for (var u = 0; u < nb; u = u + 1) {
+            store64(starts + (u + 1) * 8, load64(starts + (u + 1) * 8) + load64(starts + u * 8));
+        }
+        var size = self.ct_contacts.size;
+        for (var r = 0; r < nc; r = r + 1) {
+            var kr = load64(keys + r * 8);
+            var at = load64(starts + kr * 8);
+            store64(starts + kr * 8, at + 1);
+            memcpy(self.ct_sorted.data + at * size, self.ct_contacts.at(r), size);
+        }
+        self.ct_sorted.len = nc;
+        return 0;
+    }
+
+    # ── step 6–7: the contact solver ──
+
+    # Each sorted contact's solver state into cc: lever arms, effective masses, the combined materials (the
+    # higher-priority rule, sanitised; rolling friction averaged) and the restitution target −e·vn₀ for an approach
+    # faster than RESTITUTION_VELOCITY_THRESHOLD, from the velocities before the solve. Sensors, missing colliders or
+    # bodies, two massless sides, a zero normal and a non-finite point give none. Mirrors `prepare_contacts`.
+    fn prepare_contacts(self) {
+        self.cc.len = 0;
+        var n = self.ct_sorted.len;
+        if (self.cc.reserve(n) == 0) { return 0; }
+        var ar: *ImArena = self._colliders();
+        for (var i = 0; i < n; i = i + 1) {
+            var ct: *ImContact3d = _im_b3_as_contact(self.ct_sorted.at(i));
+            var ca: *ImCollider3d = _im_b3_as_coll(ar.get(ct.collider_a));
+            var cb: *ImCollider3d = _im_b3_as_coll(ar.get(ct.collider_b));
+            if (ca != 0 && cb != 0) {
+                if (ca.is_sensor == 0 && cb.is_sensor == 0) {
+                    var ba: *ImRigidBody3d = self._body(ct.body_a);
+                    var bb: *ImRigidBody3d = self._body(ct.body_b);
+                    if (ba != 0 && bb != 0) { self._prepare_contact(ct, ca, cb, ba, bb); }
+                }
+            }
+        }
+        return 0;
+    }
+
+    # One contact's solver state appended to cc (see `prepare_contacts`), unless both sides are massless, the normal
+    # normalises to zero or the point isn't finite.
+    fn _prepare_contact(self, ct: *ImContact3d, ca: *ImCollider3d, cb: *ImCollider3d, ba: *ImRigidBody3d,
+      bb: *ImRigidBody3d) {
+        var ia: ImMat3;
+        var ib: ImMat3;
+        var ima: f64 = _im_b3_solver_mass(ba, &ia);
+        var imb: f64 = _im_b3_solver_mass(bb, &ib);
+        if (ima == 0.0 && imb == 0.0) { return 0; }
+        var nrm: ImVec3 = ImVec3_normalize_or_zero(ct.normal);
+        if (nrm.x == 0.0 && nrm.y == 0.0 && nrm.z == 0.0) { return 0; }
+        if (ImVec3_is_finite(ct.point) == 0) { return 0; }
+        var cc: *ImContactConstraint3d = _im_b3_as_cc(self.cc.at(self.cc.len));
+        var r0: f64 = _im_b3_combine(ca.material.restitution, cb.material.restitution, ca.material.restitution_combine,
+          cb.material.restitution_combine);
+        var restitution: f64 = _im_b3_sanitize_coefficient(r0);
+        var f0: f64 = _im_b3_combine(ca.material.friction, cb.material.friction, ca.material.friction_combine,
+          cb.material.friction_combine);
+        var friction: f64 = _im_b3_sanitize_coefficient(f0);
+        var sa: f64 = ca.material.effective_static_friction();
+        var sb: f64 = cb.material.effective_static_friction();
+        var s0: f64 = _im_b3_combine(sa, sb, ca.material.friction_combine, cb.material.friction_combine);
+        var static_friction: f64 = _im_b3_sanitize_coefficient(s0);
+        var rfa: f64 = ca.material.rolling_friction;
+        var rfb: f64 = cb.material.rolling_friction;
+        var rolling: f64 = _im_b3_sanitize_coefficient((rfa + rfb) * 0.5);
+        var ra: ImVec3 = ct.point - ba.position;
+        var rb: ImVec3 = ct.point - bb.position;
+        var t1: ImVec3;
+        var t2: ImVec3;
+        ImVec3_any_orthonormal_pair(nrm, &t1, &t2);
+        var wra: ImVec3 = ImVec3_cross(ba.angular_velocity, ra);
+        var wrb: ImVec3 = ImVec3_cross(bb.angular_velocity, rb);
+        var rel_vel: ImVec3 = ((bb.linear_velocity + wrb) - ba.linear_velocity) - wra;
+        var vn0: f64 = ImVec3_dot(rel_vel, nrm);
+        var bias: f64 = 0.0;
+        if (vn0 < -_IM_B3_RESTITUTION_VELOCITY_THRESHOLD) {
+            var nr: f64 = -restitution;
+            bias = nr * vn0;
+        }
+        var kn: f64 = _im_b3_eff(nrm, ra, rb, ima, imb, &ia, &ib);
+        var k1: f64 = _im_b3_eff(t1, ra, rb, ima, imb, &ia, &ib);
+        var k2: f64 = _im_b3_eff(t2, ra, rb, ima, imb, &ia, &ib);
+        var nm: f64 = _im_b3_inv_k(kn);
+        var tm1: f64 = _im_b3_inv_k(k1);
+        var tm2: f64 = _im_b3_inv_k(k2);
+        var roll_k: ImMat3 = ia + ib;
+        var depth: f64 = ct.depth;
+        cc.body_a = ct.body_a;
+        cc.body_b = ct.body_b;
+        cc.normal = nrm;
+        cc.t1 = t1;
+        cc.t2 = t2;
+        cc.ra = ra;
+        cc.rb = rb;
+        cc.inv_mass_a = ima;
+        cc.inv_mass_b = imb;
+        cc.inv_i_a = ia;
+        cc.inv_i_b = ib;
+        cc.normal_mass = nm;
+        cc.tangent_mass1 = tm1;
+        cc.tangent_mass2 = tm2;
+        cc.roll_k = roll_k;
+        cc.velocity_bias = bias;
+        cc.friction = friction;
+        cc.static_friction = static_friction;
+        cc.rolling_friction = rolling;
+        cc.depth = depth;
+        cc.normal_impulse = 0.0;
+        cc.tangent_impulse1 = 0.0;
+        cc.tangent_impulse2 = 0.0;
+        cc.rolling_impulse = ImVec3_zero();
+        cc.position_impulse = 0.0;
+        self.cc.len = self.cc.len + 1;
+        return 0;
+    }
+
+    # The velocity of B relative to A at contact c's point (a missing body moves at zero). Mirrors
+    # `contact_relative_velocity`.
+    fn _contact_relative_velocity(self, c: *ImContactConstraint3d): ImVec3 {
+        var z: ImVec3 = ImVec3_zero();
+        var va: ImVec3 = z;
+        var wa: ImVec3 = z;
+        var vb: ImVec3 = z;
+        var wb: ImVec3 = z;
+        var ba: *ImRigidBody3d = self._body(c.body_a);
+        var bb: *ImRigidBody3d = self._body(c.body_b);
+        if (ba != 0) {
+            va = ba.linear_velocity;
+            wa = ba.angular_velocity;
+        }
+        if (bb != 0) {
+            vb = bb.linear_velocity;
+            wb = bb.angular_velocity;
+        }
+        var cb: ImVec3 = ImVec3_cross(wb, c.rb);
+        var ca: ImVec3 = ImVec3_cross(wa, c.ra);
+        var r: ImVec3 = ((vb + cb) - va) - ca;
+        return r;
+    }
+
+    # Applies impulse p at contact c, −p on A and +p on B, to the sides that have mass. Mirrors
+    # `apply_contact_impulse`.
+    fn _apply_contact_impulse(self, c: *ImContactConstraint3d, p: ImVec3) {
+        var ma: f64 = c.inv_mass_a;
+        var mb: f64 = c.inv_mass_b;
+        if (ma > 0.0) {
+            var ba: *ImRigidBody3d = self._body(c.body_a);
+            if (ba != 0) {
+                var lva: ImVec3 = ba.linear_velocity - ImVec3_scale(p, ma);
+                var arm_a: ImVec3 = ImVec3_cross(c.ra, p);
+                var dwa: ImVec3 = ImMat3_mul_vec3(c.inv_i_a, arm_a);
+                var wa: ImVec3 = ba.angular_velocity - dwa;
+                ba.linear_velocity = lva;
+                ba.angular_velocity = wa;
+            }
+        }
+        if (mb > 0.0) {
+            var bb: *ImRigidBody3d = self._body(c.body_b);
+            if (bb != 0) {
+                var lvb: ImVec3 = bb.linear_velocity + ImVec3_scale(p, mb);
+                var arm_b: ImVec3 = ImVec3_cross(c.rb, p);
+                var dwb: ImVec3 = ImMat3_mul_vec3(c.inv_i_b, arm_b);
+                var wb: ImVec3 = bb.angular_velocity + dwb;
+                bb.linear_velocity = lvb;
+                bb.angular_velocity = wb;
+            }
+        }
+        return 0;
+    }
+
+    # One sequential-impulse pass over the contacts: the normal impulse (accumulated ≥ 0, toward the restitution
+    # target), then friction in the two tangent directions within the friction disc (static while the contact barely
+    # slips or can be stopped inside the static cone, else kinetic), then rolling resistance against the relative
+    # rolling (the twist about the normal excluded), each clamped to its coefficient times the normal impulse. Mirrors
+    # `solve_contacts`.
+    fn solve_contacts(self) {
+        for (var i = 0; i < self.cc.len; i = i + 1) {
+            var c: *ImContactConstraint3d = _im_b3_as_cc(self.cc.at(i));
+            var rel0: ImVec3 = self._contact_relative_velocity(c);
+            var vn: f64 = ImVec3_dot(rel0, c.normal);
+            var vb: f64 = c.velocity_bias;
+            var nm: f64 = c.normal_mass;
+            var ni: f64 = c.normal_impulse;
+            var nd: f64 = vn - vb;
+            var nnd: f64 = -nd;
+            var lambda: f64 = nnd * nm;
+            var new_ni: f64 = _im_max(ni + lambda, 0.0);
+            var applied: f64 = new_ni - ni;
+            c.normal_impulse = new_ni;
+            if (applied != 0.0) {
+                var pn: ImVec3 = ImVec3_scale(c.normal, applied);
+                self._apply_contact_impulse(c, pn);
+            }
+            var fr: f64 = c.friction;
+            var sf: f64 = c.static_friction;
+            if (fr > 0.0 || sf > 0.0) {
+                var rel: ImVec3 = self._contact_relative_velocity(c);
+                var vt1: f64 = ImVec3_dot(rel, c.t1);
+                var vt2: f64 = ImVec3_dot(rel, c.t2);
+                var slip: f64 = _im_hypot(vt1, vt2);
+                var ti1: f64 = c.tangent_impulse1;
+                var ti2: f64 = c.tangent_impulse2;
+                var tm1: f64 = c.tangent_mass1;
+                var tm2: f64 = c.tangent_mass2;
+                var nt1: f64 = ti1 - vt1 * tm1;
+                var nt2: f64 = ti2 - vt2 * tm2;
+                var len: f64 = _im_hypot(nt1, nt2);
+                var nimp: f64 = c.normal_impulse;
+                var max_static: f64 = _im_max(sf * nimp, 0.0);
+                var mu: f64 = fr;
+                if (slip < _IM_B3_STATIC_FRICTION_SLIP_SPEED || len <= max_static) { mu = sf; }
+                var max_friction: f64 = _im_max(mu * nimp, 0.0);
+                if (len > max_friction) {
+                    var scale: f64 = 0.0;
+                    if (len > 0.0) { scale = max_friction / len; }
+                    nt1 = nt1 * scale;
+                    nt2 = nt2 * scale;
+                }
+                var d1: f64 = nt1 - ti1;
+                var d2: f64 = nt2 - ti2;
+                c.tangent_impulse1 = nt1;
+                c.tangent_impulse2 = nt2;
+                var p: ImVec3 = ImVec3_scale(c.t1, d1) + ImVec3_scale(c.t2, d2);
+                if (p.x != 0.0 || p.y != 0.0 || p.z != 0.0) { self._apply_contact_impulse(c, p); }
+            }
+            var rf: f64 = c.rolling_friction;
+            if (rf > 0.0) { self._roll(c, rf); }
+        }
+        return 0;
+    }
+
+    # Contact c's rolling resistance for one pass (part of `solve_contacts`).
+    fn _roll(self, c: *ImContactConstraint3d, rf: f64) {
+        var z: ImVec3 = ImVec3_zero();
+        var wa: ImVec3 = z;
+        var wb: ImVec3 = z;
+        var ba: *ImRigidBody3d = self._body(c.body_a);
+        var bb: *ImRigidBody3d = self._body(c.body_b);
+        if (ba != 0) { wa = ba.angular_velocity; }
+        if (bb != 0) { wb = bb.angular_velocity; }
+        var w0: ImVec3 = wb - wa;
+        var nw: f64 = ImVec3_dot(c.normal, w0);
+        var w_rel: ImVec3 = w0 - ImVec3_scale(c.normal, nw);
+        var speed: f64 = ImVec3_length(w_rel);
+        if (!(speed > _IM_B3_EPSILON)) { return 0; }
+        var dir: ImVec3 = ImVec3_div_scalar(w_rel, speed);
+        var kd: ImVec3 = ImMat3_mul_vec3(c.roll_k, dir);
+        var k: f64 = ImVec3_dot(dir, kd);
+        if (!(k > _IM_B3_EPSILON)) { return 0; }
+        var nimp: f64 = c.normal_impulse;
+        var max_roll: f64 = _im_max(rf * nimp, 0.0);
+        var sk: f64 = speed / k;
+        var new_r: ImVec3 = c.rolling_impulse - ImVec3_scale(dir, sk);
+        var len: f64 = ImVec3_length(new_r);
+        if (len > max_roll) {
+            var s: f64 = 0.0;
+            if (len > 0.0) { s = max_roll / len; }
+            new_r = ImVec3_scale(new_r, s);
+        }
+        var applied: ImVec3 = new_r - c.rolling_impulse;
+        c.rolling_impulse = new_r;
+        var ma: f64 = c.inv_mass_a;
+        var mb: f64 = c.inv_mass_b;
+        if (ma > 0.0 && ba != 0) {
+            var dwa: ImVec3 = ImMat3_mul_vec3(c.inv_i_a, applied);
+            var na: ImVec3 = ba.angular_velocity - dwa;
+            ba.angular_velocity = na;
+        }
+        if (mb > 0.0 && bb != 0) {
+            var dwb: ImVec3 = ImMat3_mul_vec3(c.inv_i_b, applied);
+            var nb: ImVec3 = bb.angular_velocity + dwb;
+            bb.angular_velocity = nb;
+        }
+        return 0;
+    }
+
+    # One split-impulse position pass over the contacts: each accumulates a non-negative pseudo-impulse driving the
+    # pseudo relative normal velocity to erp·max(depth − slop, 0)/dt; pseudo-velocities move positions only. Mirrors
+    # `solve_contact_positions`.
+    fn solve_contact_positions(self, slop: f64, erp: f64, dt: f64) {
+        for (var i = 0; i < self.cc.len; i = i + 1) {
+            var c: *ImContactConstraint3d = _im_b3_as_cc(self.cc.at(i));
+            var depth: f64 = c.depth;
+            var penetration: f64 = _im_max(depth - slop, 0.0);
+            var bias: f64 = erp * penetration / dt;
+            var pwa: ImVec3;
+            var pwb: ImVec3;
+            var pva: ImVec3 = self.body_pseudo_velocity(c.body_a, &pwa);
+            var pvb: ImVec3 = self.body_pseudo_velocity(c.body_b, &pwb);
+            var ba: *ImRigidBody3d = self._body(c.body_a);
+            var bb: *ImRigidBody3d = self._body(c.body_b);
+            var cb: ImVec3 = ImVec3_cross(pwb, c.rb);
+            var ca: ImVec3 = ImVec3_cross(pwa, c.ra);
+            var rv: ImVec3 = ((pvb + cb) - pva) - ca;
+            var vp: f64 = ImVec3_dot(rv, c.normal);
+            var nm: f64 = c.normal_mass;
+            var lambda: f64 = (bias - vp) * nm;
+            var pi: f64 = c.position_impulse;
+            var new_pi: f64 = _im_max(pi + lambda, 0.0);
+            var applied: f64 = new_pi - pi;
+            c.position_impulse = new_pi;
+            if (applied != 0.0) {
+                var p: ImVec3 = ImVec3_scale(c.normal, applied);
+                var ma: f64 = c.inv_mass_a;
+                var mb: f64 = c.inv_mass_b;
+                if (ma > 0.0 && ba != 0) {
+                    var pv_a: ImVec3 = ba.pseudo_velocity - ImVec3_scale(p, ma);
+                    var arm_a: ImVec3 = ImVec3_cross(c.ra, p);
+                    var dwa: ImVec3 = ImMat3_mul_vec3(c.inv_i_a, arm_a);
+                    var pw_a: ImVec3 = ba.pseudo_angular_velocity - dwa;
+                    ba.pseudo_velocity = pv_a;
+                    ba.pseudo_angular_velocity = pw_a;
+                }
+                if (mb > 0.0 && bb != 0) {
+                    var pv_b: ImVec3 = bb.pseudo_velocity + ImVec3_scale(p, mb);
+                    var arm_b: ImVec3 = ImVec3_cross(c.rb, p);
+                    var dwb: ImVec3 = ImMat3_mul_vec3(c.inv_i_b, arm_b);
+                    var pw_b: ImVec3 = bb.pseudo_angular_velocity + dwb;
+                    bb.pseudo_velocity = pv_b;
+                    bb.pseudo_angular_velocity = pw_b;
+                }
+            }
+        }
+        return 0;
+    }
+
+    # Body h's split-impulse pseudo-velocity, its angular part into *w_out (zero for a missing body). Mirrors
+    # `body_pseudo_velocity`.
+    fn body_pseudo_velocity(self, h, w_out): ImVec3 {
+        var w: *ImVec3 = _im_b3_as_v3(w_out);
+        var rb: *ImRigidBody3d = self._body(h);
+        if (rb == 0) {
+            w.x = 0.0;
+            w.y = 0.0;
+            w.z = 0.0;
+            return ImVec3_zero();
+        }
+        var pw: ImVec3 = rb.pseudo_angular_velocity;
+        w.x = pw.x;
+        w.y = pw.y;
+        w.z = pw.z;
+        var pv: ImVec3 = rb.pseudo_velocity;
+        return pv;
+    }
+
+    # Step 10: every contact's pair key (sensors' included) recorded with the contact tracker.
+    fn _record_contacts(self) {
+        var n = self.ct_sorted.len;
+        if (n > 0 && self.ct_keys.reserve(n * 2) == 1) {
+            for (var i = 0; i < n; i = i + 1) {
+                var c: *ImContact3d = _im_b3_as_contact(self.ct_sorted.at(i));
+                var ka, kb = _im_pair_key(c.collider_a, c.collider_b);
+                store64(self.ct_keys.data + i * 16, ka);
+                store64(self.ct_keys.data + i * 16 + 8, kb);
+            }
+            self.contact_tracker.record_substep(self.ct_keys.data, n);
+            return 0;
+        }
+        self.contact_tracker.record_substep(0, 0);
         return 0;
     }
 

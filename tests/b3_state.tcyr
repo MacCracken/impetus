@@ -174,6 +174,24 @@ fn main() {
     assert_eq(vx9b > 0.0, 1, "moves along +x");
     s9b.free();
 
+    test_group("field_addresses");
+    # Cyrius-only: the narrowphase reaches a collider's shape and the state's GJK scratch by computed address.
+    var s9c: ImPhysicsState3d = ImPhysicsState3d_new();
+    var h9c = s9c.add_body(ImBodyDesc_default());
+    var d9c: ImColliderDesc = ImColliderDesc_new(ImColliderShape_capsule(0.7, 0.3));
+    var r9ct, c9c = s9c.add_collider(h9c, d9c);
+    d9c.shape.free();
+    var cp9: *ImCollider3d = _im_b3_as_coll(s9c._colliders().get(c9c));
+    var sp9: *ImColliderShape = _im_b3_coll_shape(cp9);
+    var hh9: f64 = sp9.half_height;
+    var rr9: f64 = sp9.radius;
+    assert_eq(sp9.kind == IM_SHAPE_CAPSULE && hh9 == 0.7 && rr9 == 0.3, 1, "the collider's shape");
+    s9c.gjk.edges.len = 12345;
+    var gk: *ImGjkScratch3d = s9c._gjk();
+    assert_eq(gk.edges.len == 12345 && gk.verts.size == sizeof(ImSupportPoint3d), 1, "the state's GJK scratch");
+    s9c.gjk.edges.len = 0;
+    s9c.free();
+
     test_group("orphans_refused");
     # ADR 0008 #1: a collider or joint for a body that isn't live is refused (Rust stores an orphan).
     var s10: ImPhysicsState3d = ImPhysicsState3d_new();

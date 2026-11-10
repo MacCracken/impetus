@@ -27,8 +27,9 @@ fn _im_b3_wake(rb: *ImRigidBody3d) {
 }
 
 # `bodies`, `colliders` and `joints` are *ImArena words; `body_colliders` is one ImWordList record (three words) per
-# body slot, `list_slots` of them. The rest is scratch reused from step to step: `gjk` the narrowphase's, and `jc`
-# (`jc_len` of `jc_cap` ImJointConstraint records) the joint solver's (src/b3_joints.cyr). Mirrors `PhysicsState3d`.
+# body slot, `list_slots` of them. The rest is scratch reused from step to step: `gjk` the narrowphase's, `jc`
+# (`jc_len` of `jc_cap` ImJointConstraint records) the joint solver's (src/b3_joints.cyr), and `bp_*` the
+# broadphase's, `ct_*` the contacts' and `cc` the contact solver's (src/b3_solver.cyr). Mirrors `PhysicsState3d`.
 struct ImPhysicsState3d {
     bodies;
     colliders;
@@ -40,6 +41,17 @@ struct ImPhysicsState3d {
     jc;
     jc_len;
     jc_cap;
+    bp_grid: ImSpatialHashGrid;
+    bp_tree: ImAabbTree;
+    bp_boxes: ImWordList;
+    bp_dims: ImWordList;
+    bp_pairs: ImPairList;
+    ct_contacts: ImRecordList;
+    ct_sorted: ImRecordList;
+    ct_level: ImWordList;
+    ct_sort: ImWordList;
+    ct_keys: ImWordList;
+    cc: ImRecordList;
 }
 
 # An empty state. Its arenas are 0 when there is no memory (every operation then refuses). Mirrors
@@ -57,7 +69,31 @@ fn ImPhysicsState3d_new(): ImPhysicsState3d {
     s.jc = 0;
     s.jc_len = 0;
     s.jc_cap = 0;
+    s.bp_grid = ImSpatialHashGrid_new(1.0);
+    s.bp_tree = ImAabbTree_new();
+    s.bp_boxes = ImWordList_new();
+    s.bp_dims = ImWordList_new();
+    s.bp_pairs = ImPairList_new();
+    s.ct_contacts = ImRecordList_new(sizeof(ImContact3d));
+    s.ct_sorted = ImRecordList_new(sizeof(ImContact3d));
+    s.ct_level = ImWordList_new();
+    s.ct_sort = ImWordList_new();
+    s.ct_keys = ImWordList_new();
+    s.cc = ImRecordList_new(sizeof(ImContactConstraint3d));
     return s;
+}
+
+# The GJK scratch inside the state at st: after its five words and the tracker.
+#must_use
+fn _im_b3_state_gjk(st): *ImGjkScratch3d { return st + 40 + sizeof(ImContactTracker); }
+
+# 1 for a joint the 3D backend has no physics for: a Revolute or Prismatic joint, or any joint with a motor. Rust 1.4.0
+# accepts them and does nothing with them but the per-joint damping; the port refuses them (ADR 0008 #5).
+#must_use
+fn _im_b3_joint_unsupported(d: *ImJointDesc): i64 {
+    var kind = d.joint_type.kind;
+    if (kind == IM_JOINT_REVOLUTE || kind == IM_JOINT_PRISMATIC || d.has_motor == 1) { return 1; }
+    return 0;
 }
 
 # A joint's keep-test for `ImArena::retain`: 1 unless the joint names the body `ctx`.
@@ -75,6 +111,10 @@ impl ImPhysicsState3d {
     fn _colliders(self): *ImArena { return _im_as_arena(self.colliders); }
     #must_use
     fn _joints(self): *ImArena { return _im_as_arena(self.joints); }
+    # The address of the GJK scratch, the field after the five words and the tracker (Cyrius takes no field addresses;
+    # tests/b3_state.tcyr pins the offset).
+    #must_use
+    fn _gjk(self): *ImGjkScratch3d { return _im_b3_state_gjk(self); }
 
     # The live body record at handle h, or 0.
     #must_use
@@ -189,10 +229,12 @@ impl ImPhysicsState3d {
         return j;
     }
 
-    # Adds a joint: Ok(handle), or Err(IM_ERR_BODY_NOT_FOUND) when either body isn't live (ADR 0008 #1). Mirrors
-    # `add_joint`.
+    # Adds a joint: Ok(handle), Err(IM_ERR_BODY_NOT_FOUND) when either body isn't live (ADR 0008 #1), or
+    # Err(IM_ERR_UNSUPPORTED) for a Revolute or Prismatic joint or any motor, which Rust's 3D backend accepts and
+    # ignores (ADR 0008 #5). Mirrors `add_joint`.
     fn add_joint(self, desc: ImJointDesc): Result {
         if (self._body(desc.body_a) == 0 || self._body(desc.body_b) == 0) { return Err(IM_ERR_BODY_NOT_FOUND); }
+        if (_im_b3_joint_unsupported(&desc) == 1) { return Err(IM_ERR_UNSUPPORTED); }
         var j: ImJoint3d = self._joint_from_desc(&desc);
         var h = self._joints().insert(&j);
         if (h == 0 - 1) { return Err(IM_ERR_PHYSICS); }
@@ -336,10 +378,11 @@ impl ImPhysicsState3d {
         return Ok(0);
     }
 
-    # Places a joint at a given handle: Ok(0), Err(IM_ERR_BODY_NOT_FOUND) (ADR 0008 #1), or Err(IM_ERR_PHYSICS) when
-    # the slot is taken. Mirrors `add_joint_at`.
+    # Places a joint at a given handle: Ok(0), Err(IM_ERR_BODY_NOT_FOUND) (ADR 0008 #1), Err(IM_ERR_UNSUPPORTED) as
+    # for `add_joint` (ADR 0008 #5), or Err(IM_ERR_PHYSICS) when the slot is taken. Mirrors `add_joint_at`.
     fn add_joint_at(self, handle, desc: ImJointDesc): Result {
         if (self._body(desc.body_a) == 0 || self._body(desc.body_b) == 0) { return Err(IM_ERR_BODY_NOT_FOUND); }
+        if (_im_b3_joint_unsupported(&desc) == 1) { return Err(IM_ERR_UNSUPPORTED); }
         var j: ImJoint3d = self._joint_from_desc(&desc);
         if (self._joints().insert_at(handle, &j) == 0) { return Err(IM_ERR_PHYSICS); }
         return Ok(0);
@@ -446,6 +489,17 @@ impl ImPhysicsState3d {
         self.jc = 0;
         self.jc_len = 0;
         self.jc_cap = 0;
+        self.bp_grid.free();
+        self.bp_tree.free();
+        self.bp_boxes.free();
+        self.bp_dims.free();
+        self.bp_pairs.free();
+        self.ct_contacts.free();
+        self.ct_sorted.free();
+        self.ct_level.free();
+        self.ct_sort.free();
+        self.ct_keys.free();
+        self.cc.free();
         return 0;
     }
 }

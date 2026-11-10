@@ -337,22 +337,17 @@ impl ImPhysicsState3d {
         var wa: ImVec3 = z;
         var vb: ImVec3 = z;
         var wb: ImVec3 = z;
-        var ba: *ImRigidBody3d = self._body(c.body_a);
-        var bb: *ImRigidBody3d = self._body(c.body_b);
-        if (ba != 0) {
-            if (pseudo == 1) {
-                va = ba.pseudo_velocity;
-                wa = ba.pseudo_angular_velocity;
-            } else {
+        if (pseudo == 1) {
+            va = self.body_pseudo_velocity(c.body_a, &wa);
+            vb = self.body_pseudo_velocity(c.body_b, &wb);
+        } else {
+            var ba: *ImRigidBody3d = self._body(c.body_a);
+            var bb: *ImRigidBody3d = self._body(c.body_b);
+            if (ba != 0) {
                 va = ba.linear_velocity;
                 wa = ba.angular_velocity;
             }
-        }
-        if (bb != 0) {
-            if (pseudo == 1) {
-                vb = bb.pseudo_velocity;
-                wb = bb.pseudo_angular_velocity;
-            } else {
+            if (bb != 0) {
                 vb = bb.linear_velocity;
                 wb = bb.angular_velocity;
             }

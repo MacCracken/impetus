@@ -1,0 +1,10 @@
+# frame3.cyr — the Rust 3D tests' `frame` helper (rust-old/src/backend_3d/tests.rs), on the library's `step`. Included
+# after tests/lib_3d.cyr by tests/b3_joints.tcyr, tests/b3_contacts.tcyr and tests/impetus_3d.bcyr.
+
+# One sub-step at 1/60 s with 4 velocity and 1 position iterations, slop 0.01, correction 0.2, max velocity 100, the
+# soft constraint at 30 Hz with ζ = 1 and the spatial hash, then `finish_step`: the frame's event count. Mirrors the
+# tests' `frame` (`step_frame` with those settings).
+fn _t3_frame(st: *ImPhysicsState3d, gravity: ImVec3): i64 {
+    st.step(gravity, 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0, 30.0, 1.0, IM_BROADPHASE_SPATIAL_HASH);
+    return st.finish_step();
+}

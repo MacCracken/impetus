@@ -97,7 +97,11 @@ fn _im_sort_rec3(data, n, tmp) {
                 } else {
                     j = j + 1;
                 }
-                memcpy(dst + k * 24, from, 24);
+                # Three word copies: the stdlib's memcpy moves a byte at a time (S5).
+                var to = dst + k * 24;
+                store64(to, load64(from));
+                store64(to + 8, load64(from + 8));
+                store64(to + 16, load64(from + 16));
                 k = k + 1;
             }
             lo = hi;
@@ -107,7 +111,9 @@ fn _im_sort_rec3(data, n, tmp) {
         dst = t;
         width = width * 2;
     }
-    if (src != data) { memcpy(data, src, n * 24); }
+    if (src != data) {
+        for (var w = 0; w < n * 3; w = w + 1) { store64(data + w * 8, load64(src + w * 8)); }
+    }
     return 0;
 }
 

@@ -442,3 +442,53 @@ against its recorded 1.10 µs, and a second run agreed within 2 %.
 - **The gyroscopic step costs 1.21 µs** for a tumbling box, against 1.07 µs for M4's simpler spin.
 
 First numbers, measured and not gated.
+
+## M5 part 3: the 3D step with contacts, and a faster broadphase (2026-11-09)
+
+x86_64 ELF, measured with no other process above half a core. Rust's rows are criterion on the 3D build
+(`cargo bench --all-features -- 'world/step|substep/'`, medians, run on the same quiet machine). The bench history
+holds only the default 2D build. Cyrius runs the same scenes through the backend's `step` and `finish_step`, after
+20–100 warm-up frames.
+
+| Bench | Body | Rust (3D build) | Cyrius | Ratio |
+|---|---|---|---|---|
+| `b3/step_empty` | an empty world's frame (Rust: `world/step_empty`) | 68.7 ns | 389 ns | 5.7× |
+| `b3/step_10_bodies` | 10 balls in rows of 5 (`world/step_10_bodies`) | 4.97 µs | 54.6 µs | 11× |
+| `b3/step_100_bodies` | 100 balls in rows of 10 (`world/step_100_bodies`) | 116 µs | 649 µs | 5.6× |
+| `b3/step_1000_bodies` | 1,000 balls in rows of 32 (`world/step_1000_bodies`) | 1.07 ms | 5.84 ms | 5.4× |
+| `b3/step_100_bodies_substep4` | 100 balls on a floor, 4 sub-steps (`substep/step_100_bodies_substep4`) | 554 µs | 6.27 ms | 11× |
+| `b3/step_stack5_resting` | a settled stack of five boxes, kept awake: OBB face contacts | — | 82.2 µs | — |
+| `b3/frame_chain20 (no contacts)` | part 2's 20-link chain, now through `step`, broadphase included (97.4 µs without) | — | 175 µs | — |
+
+**The broadphase, before and after.** A stage-by-stage timing of `b3/step_100_bodies` put 72 % of the frame in the
+broadphase, two-thirds of that in the spatial hash's `query_pairs`. In 3D a ball covers up to 8 hash cells, so the 100
+balls make 392 (cell, key) records and 1,000 raw pairs, which sort down to 90. Two changes:
+- The record sort moves its 24-byte records with three word copies, not the stdlib's byte-loop `memcpy` (S5).
+- The pair sort inlines the unsigned pair comparison, which had been two levels of calls per compare.
+
+Neither changes an order, and the 2D and 3D corpora pass unchanged on all three targets. Both profiles share the
+broadphase, so 2D gains too. Same quiet machine, `HEAD` against the change:
+
+| Bench | Before | After |
+|---|---|---|
+| `broadphase/spatial_hash_1000_row` | 1.98 ms | 588 µs |
+| `broadphase/aabb_tree_1000_row` | 4.69 ms | 4.65 ms |
+| `b3/step_10_bodies` | 70.7 µs | 54.6 µs |
+| `b3/step_100_bodies` | 921 µs | 649 µs |
+| `b3/step_1000_bodies` | 9.07 ms | 5.84 ms |
+| `b3/step_100_bodies_substep4` | 7.58 ms | 6.27 ms |
+| `b2/step_10_bodies` | 28.5 µs | 21.9 µs |
+| `b2/step_100_bodies` | 348 µs | 253 µs |
+| `b2/step_1000_bodies` | 3.76 ms | 2.33 ms |
+| `world/step_1000_bodies` (2D) | 3.89 ms | 2.48 ms |
+
+**Reading it.**
+- **The large scenes are near the 2D ratios** (5.4–5.6× in 3D). 2D's `world/step_*` are now 5.3× (10 bodies), 2.7×
+  (100) and 2.9× (1,000) against the bench history. After the change, the hash's sorts of 1,000 pairs and 392 records, with one method call per element, are
+  most of the rest of the broadphase. That is codegen, not an algorithm.
+- **The small and sub-stepped scenes are the outliers** (11×). A frame pays fixed costs per body slot (the level array,
+  the box array) and per sub-step. The four sub-steps of a resting floor pile solve many contacts each. Not profiled
+  yet.
+- **The AABB tree didn't move**: its cost is elsewhere (M2a's finding stands).
+- **A loaded machine misleads.** While other benchmark runs held several cores, `b3/step_100_bodies` read 3.07 ms. Quiet,
+  the same code reads 921 µs. These rows were taken only when nothing else ran above half a core.

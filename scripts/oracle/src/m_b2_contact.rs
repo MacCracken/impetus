@@ -326,8 +326,9 @@ pub fn emit() -> Module {
         rows(&mut m, scene(w), &FRAMES);
     }
 
-    // Sensors, layers and kinematic bodies: a ball falling through a sensor onto the ground, a ball
-    // whose mask misses the ground's layer (it falls through), a kinematic paddle sweeping boxes.
+    // Sensors, layers and kinematic bodies: a ball falling through a sensor onto the ground, a ball on
+    // layer 4 with mask 4 (it still lands: the ground's all-layers mask meets its layer, and a pair is
+    // dropped only when neither layer meets the other's mask), a kinematic paddle sweeping boxes.
     {
         let mut w = PhysicsWorld::new(base.clone());
         ground(&mut w, 10.0, &p);

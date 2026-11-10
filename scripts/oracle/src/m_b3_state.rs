@@ -12,7 +12,9 @@
 //!
 //! Class C: a body's rotation is `from_rotation_z` (a `sin_cos`) and a state's is an `atan2`, both correctly rounded
 //! in the port (ADR 0011), so the reference is the corrected oracle; the rest is copies and the mass sums. Rows whose
-//! script adds a collider or joint for a missing body (an orphan, ADR 0008 #1) are `b3::state_script_orphan`.
+//! script adds a collider or joint for a missing body (an orphan, ADR 0008 #1) are `b3::state_script_orphan`; rows
+//! adding a Revolute or Prismatic joint or a motor, which the 3D API refuses (ADR 0008 #5), are
+//! `b3::state_script_unsupported`. No other script adds one.
 
 use std::f64::consts::FRAC_PI_2;
 
@@ -146,6 +148,13 @@ fn run(steps: &[Step]) -> (Vec<Tok>, Vec<Tok>) {
 }
 
 fn row(m: &mut Module, name: &str, steps: &[Step]) {
+    let unsupported = steps.iter().any(|s| match s {
+        Step::AddJoint(d) => {
+            d.motor.is_some() || matches!(d.joint_type, JointType::Revolute { .. } | JointType::Prismatic { .. })
+        }
+        _ => false,
+    });
+    assert_eq!(unsupported, name == "b3::state_script_unsupported", "a script's name must say whether ADR 0008 #5 maps it");
     let (ins, outs) = run(steps);
     m.row(name, Class::C, &ins, &outs);
 }
@@ -243,38 +252,24 @@ fn jh(index: u64, generation: u64) -> JointHandle {
     JointHandle((generation << 32) | index)
 }
 
+/// A seeded joint type the 3D API accepts: no Revolute or Prismatic (ADR 0008 #5; the unsupported scripts cover them).
 fn random_joint_type(rng: &mut Rng) -> JointType {
-    let lim = |rng: &mut Rng| {
-        if rng.int(0, 1) == 1 {
-            Some([rng.uniform(-2.0, 0.0), rng.uniform(0.0, 2.0)])
-        } else {
-            None
-        }
-    };
-    match rng.int(0, 7) {
+    match rng.int(0, 5) {
         0 => JointType::Fixed,
-        1 => JointType::Revolute {
-            anchor: [rng.uniform(-1.0, 1.0), rng.uniform(-1.0, 1.0)],
-            limits: lim(rng),
-        },
-        2 => JointType::Prismatic {
-            axis: [1.0, 0.0],
-            limits: lim(rng),
-        },
-        3 => JointType::Spring {
+        1 => JointType::Spring {
             rest_length: rng.uniform(0.5, 3.0),
             stiffness: rng.uniform(1.0, 100.0),
             damping: rng.uniform(0.0, 5.0),
         },
-        4 => JointType::Distance {
+        2 => JointType::Distance {
             length: rng.uniform(0.5, 3.0),
         },
-        5 => JointType::Wheel {
+        3 => JointType::Wheel {
             axis: [0.0, 1.0],
             stiffness: rng.uniform(1.0, 100.0),
             damping: rng.uniform(0.0, 5.0),
         },
-        6 => JointType::Rope {
+        4 => JointType::Rope {
             max_length: rng.uniform(0.5, 4.0),
         },
         _ => JointType::Mouse {
@@ -360,12 +355,6 @@ fn random_script(rng: &mut Rng, len: usize) -> Vec<Step> {
             let mut d = joint(a, b, random_joint_type(rng));
             d.local_anchor_a = [rng.uniform(-1.0, 1.0), rng.uniform(-1.0, 1.0)];
             d.local_anchor_b = [rng.uniform(-1.0, 1.0), rng.uniform(-1.0, 1.0)];
-            if rng.int(0, 2) == 0 {
-                d.motor = Some(JointMotor {
-                    target_velocity: rng.uniform(-2.0, 2.0),
-                    max_force: rng.uniform(0.0, 50.0),
-                });
-            }
             d.damping = rng.uniform(0.0, 1.0);
             d.break_force = if rng.int(0, 2) == 0 {
                 Some(rng.uniform(10.0, 100.0))
@@ -614,20 +603,17 @@ pub fn emit() -> Module {
 
     // Joints: the reference angle from the bodies' rotations; removals wake both bodies; a body's
     // removal takes its joints and colliders with it.
-    let mut motor = joint(
+    let mut first = joint(
         bh(0, 0),
         bh(1, 0),
-        JointType::Revolute {
-            anchor: [0.0, 0.0],
-            limits: Some([-0.5, 0.5]),
+        JointType::Spring {
+            rest_length: 1.0,
+            stiffness: 20.0,
+            damping: 0.5,
         },
     );
-    motor.motor = Some(JointMotor {
-        target_velocity: 1.5,
-        max_force: 20.0,
-    });
-    motor.break_force = Some(50.0);
-    motor.damping = 0.25;
+    first.break_force = Some(50.0);
+    first.damping = 0.25;
     row(
         &mut m,
         s,
@@ -638,7 +624,7 @@ pub fn emit() -> Module {
             Step::AddCollider(bh(0, 0), coll(ball(0.5), [0.0, 0.0, -0.25], 1.0)),
             Step::AddCollider(bh(1, 0), coll(ball(0.5), [0.0, 0.0, -0.25], 1.0)),
             Step::AddCollider(bh(2, 0), coll(ball(0.5), [0.0, 0.0, -0.25], 1.0)),
-            Step::AddJoint(motor),
+            Step::AddJoint(first),
             Step::AddJoint(joint(
                 bh(1, 0),
                 bh(2, 0),
@@ -726,6 +712,47 @@ pub fn emit() -> Module {
             Step::AddJoint(joint(bh(0, 0), bh(4, 0), JointType::Fixed)),
         ],
     );
+
+    // Joints the 3D API refuses (ADR 0008 #5; Rust accepts them and does nothing with them but their damping): a
+    // Revolute and a Prismatic joint, a motor on a Distance joint, then a Fixed joint, whose handle shows the refused
+    // ones took no slot.
+    let u = "b3::state_script_unsupported";
+    let mut on_distance = joint(bh(0, 0), bh(1, 0), JointType::Distance { length: 1.0 });
+    on_distance.motor = Some(JointMotor {
+        target_velocity: 1.5,
+        max_force: 20.0,
+    });
+    for unsupported in [
+        joint(
+            bh(0, 0),
+            bh(1, 0),
+            JointType::Revolute {
+                anchor: [0.0, 0.0],
+                limits: Some([-0.5, 0.5]),
+            },
+        ),
+        joint(
+            bh(0, 0),
+            bh(1, 0),
+            JointType::Prismatic {
+                axis: [1.0, 0.0],
+                limits: None,
+            },
+        ),
+        on_distance,
+    ] {
+        row(
+            &mut m,
+            u,
+            &[
+                Step::AddBody(desc(dynamic, [0.0, 0.0, 0.5], 0.3)),
+                Step::AddBody(desc(dynamic, [1.0, 0.0, 0.5], -0.4)),
+                Step::AddJoint(unsupported),
+                Step::AddJoint(joint(bh(0, 0), bh(1, 0), JointType::Fixed)),
+                Step::RemoveJoint(jh(0, 0)),
+            ],
+        );
+    }
 
     // Seeded scripts.
     let mut rng = Rng::new(0x5a7e_0003);

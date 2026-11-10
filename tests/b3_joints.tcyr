@@ -1,11 +1,11 @@
-# b3_joints.tcyr — the ported Rust tests of rust-old/src/backend_3d/joints.rs and of the 3D step when nothing touches
-# (M5 part 2): every stepping test of backend_3d/tests.rs whose colliders can't meet (one collider, or mask 0). They
-# step through tests/step3.cyr's contact-free sub-step, which equals Rust's `step_frame` only while the broadphase pairs
-# nothing; its guard (`_t3_touch`) proves that on every frame. Plus Cyrius-only groups: the Prismatic no-op, breaking by
-# explicit force, a Fixed joint on the point block alone, the error-reduction parameter, and a flat heap.
+# b3_joints.tcyr — the ported Rust tests of rust-old/src/backend_3d/joints.rs and the 3D stepping tests without
+# contacts (M5 part 2): every stepping test of backend_3d/tests.rs whose colliders can't meet (one collider, or mask 0),
+# through the library's `step` (part 3; part 2 ran them on a contact-free composition of its stages). Plus Cyrius-only
+# groups: the refused 3D joints (ADR 0008 #5), breaking by explicit force, a Fixed joint on the point block alone, the
+# error-reduction parameter, and a flat heap. The stepping tests with contacts are tests/b3_contacts.tcyr.
 
 include "tests/lib_3d.cyr"
-include "tests/step3.cyr"
+include "tests/frame3.cyr"
 
 var eps: f64 = 0.000001;
 
@@ -16,6 +16,8 @@ fn near(got: f64, want: f64, tol: f64): i64 {
 }
 
 fn v(x: f64, y: f64, z: f64): ImVec3 { return ImVec3_new(x, y, z); }
+
+fn v2(x: f64, y: f64): ImVec2 { return ImVec2_new(x, y); }
 
 # 1 when every entry of m is zero (Rust's `== DMat3::ZERO`).
 fn mat_is_zero(m: ImMat3): i64 {
@@ -84,7 +86,7 @@ fn one_step_velocity(jt: ImJointType, damping: f64, iters): ImVec3 {
     if (jt.kind == IM_JOINT_MOUSE) { ja = b; }
     var z2: ImVec2 = ImVec2_new(0.0, 0.0);
     joint(&st, ja, b, jt, z2, z2, damping, 0, 0.0);
-    _t3_substep(&st, ImVec3_zero(), 0.01, iters, 1, 0.01, 0.2, 100.0, 30.0, 1.0);
+    st.step(ImVec3_zero(), 0.01, iters, 1, 0.01, 0.2, 100.0, 30.0, 1.0, IM_BROADPHASE_SPATIAL_HASH);
     st.finish_step();
     var w: ImVec3 = st._body(b).linear_velocity;
     st.free();
@@ -245,7 +247,9 @@ fn main() {
     test_group("explicit_joint_forces_independent_of_iterations");
     var spring: ImJointType = ImJointType_spring(0.0, 10.0, 0.0);
     var mouse: ImJointType = ImJointType_mouse(v(2.0, 0.0, 0.0), 10.0, 0.0, 100.0);
-    var rev: ImJointType = ImJointType_revolute(z2, 0, 0.0, 0.0);
+    # Rust's third case damps a Revolute joint, a no-op in 3D apart from its damping. The 3D port refuses Revolute
+    # joints (ADR 0008 #5), so a Wheel with a zero axis, which has no rows and no force either, carries the damping.
+    var rev: ImJointType = ImJointType_wheel(z2, 50.0, 2.0);
     var cases_ok = 0;
     for (var k = 0; k < 3; k = k + 1) {
         var jt: ImJointType = spring;
@@ -265,7 +269,7 @@ fn main() {
         var e8: f64 = dist_to(v8, v1);
         if (e1 < 0.000000001 && e8 < 0.000000000001) { cases_ok = cases_ok + 1; }
     }
-    assert_eq(cases_ok, 3, "spring, mouse and revolute damping: the same Δv at 1 and 8 iterations");
+    assert_eq(cases_ok, 3, "spring, mouse and joint damping: the same Δv at 1 and 8 iterations");
 
     test_group("joint_breaks_on_reaction_force");
     var broke = 0;
@@ -281,11 +285,31 @@ fn main() {
     }
     assert_eq(broke, 1, "0.1 N breaks, 1 N holds");
 
-    test_group("prismatic_is_a_no_op");
-    # Cyrius-only: Rust 1.4.0's 3D Prismatic joint has no rows or force; without damping it leaves the ball alone.
-    var pri: ImJointType = ImJointType_prismatic(ImVec2_new(1.0, 0.0), 1, -1.0, 1.0);
-    var vp: ImVec3 = one_step_velocity(pri, 0.0, 4);
-    assert_eq(vp.x == 0.0 && vp.y == 2.0 && vp.z == 0.0, 1, "velocity unchanged");
+    test_group("unsupported_joints_refused");
+    # Cyrius-only (ADR 0008 #5): Rust 1.4.0's 3D backend accepts Revolute and Prismatic joints and motors and does
+    # nothing with them but their damping; the 3D port refuses them, after the missing-body check (#1).
+    var s0: ImPhysicsState3d = ImPhysicsState3d_new();
+    var a0 = body(&s0, IM_BODY_STATIC, zero, 0.0);
+    var b0 = body(&s0, IM_BODY_DYNAMIC, v(1.0, 0.0, 0.0), 0.0);
+    var refused = 0;
+    var ju0: ImJointDesc = ImJointDesc_new(a0, b0, ImJointType_revolute(z2, 0, 0.0, 0.0), z2, z2);
+    var tu0, uu0 = s0.add_joint(ju0);
+    if (is_ok(tu0) == 0 && uu0 == IM_ERR_UNSUPPORTED) { refused = refused + 1; }
+    var ju1: ImJointDesc = ImJointDesc_new(a0, b0, ImJointType_prismatic(v2(1.0, 0.0), 1, -1.0, 1.0), z2, z2);
+    var tu1, uu1 = s0.add_joint(ju1);
+    if (is_ok(tu1) == 0 && uu1 == IM_ERR_UNSUPPORTED) { refused = refused + 1; }
+    var ju2: ImJointDesc = ImJointDesc_new(a0, b0, ImJointType_distance(1.0), z2, z2);
+    ju2.has_motor = 1;
+    ju2.motor = ImJointMotor_new(1.5, 20.0);
+    var tu2, uu2 = s0.add_joint(ju2);
+    if (is_ok(tu2) == 0 && uu2 == IM_ERR_UNSUPPORTED) { refused = refused + 1; }
+    var tu3, uu3 = s0.add_joint_at(_im_arena_handle(5, 0), ju0);
+    if (is_ok(tu3) == 0 && uu3 == IM_ERR_UNSUPPORTED) { refused = refused + 1; }
+    var ju4: ImJointDesc = ImJointDesc_new(a0, 999, ImJointType_revolute(z2, 0, 0.0, 0.0), z2, z2);
+    var tu4, uu4 = s0.add_joint(ju4);
+    assert_eq(refused, 4, "Revolute, Prismatic and a motor refused, by add_joint and add_joint_at");
+    assert_eq(uu4 == IM_ERR_BODY_NOT_FOUND && s0._joints().len() == 0, 1, "a missing body first; nothing stored");
+    s0.free();
 
     test_group("breaks_on_explicit_force");
     # Cyrius-only: a Spring has no rows, so break_joints compares its explicit force: 10 N/m stretched 1 m is 10 N.
@@ -338,7 +362,8 @@ fn main() {
     assert_eq(e_lo == 0.0 && e_hi == 1.0 && e_nan == 0.0, 1, "clamped to [0, 1], NaN to 0");
 
     test_group("flat_heap_joints");
-    # Cyrius-only: after the first frame, stepping joints reuses the constraint scratch: no growth.
+    # Cyrius-only: once the scratch reaches its high-water mark (the joint constraints, and the broadphase's boxes and
+    # hash cells as the chain spreads, within 30 frames), stepping reuses it: no growth.
     var s13: ImPhysicsState3d = ImPhysicsState3d_new();
     var a13 = body(&s13, IM_BODY_STATIC, v(0.0, 10.0, 0.0), 0.0);
     var prev = a13;
@@ -354,7 +379,7 @@ fn main() {
         joint(&s13, prev, h13, jt13, z2, z2, 0.5, 0, 0.0);
         prev = h13;
     }
-    _t3_frame(&s13, g);
+    for (var w13 = 0; w13 < 30; w13 = w13 + 1) { _t3_frame(&s13, g); }
     var heap0 = alloc_used();
     var arena0 = _fl_arena;
     var pos0 = _fl_arena_pos;
@@ -362,11 +387,6 @@ fn main() {
     assert_eq(s13._joints().len(), 6, "every joint still there");
     assert_eq(alloc_used() == heap0 && _fl_arena == arena0 && _fl_arena_pos == pos0, 1, "no growth");
     s13.free();
-
-    test_group("no_pair_could_touch");
-    # Cyrius-only: every frame above ran with no collider pair the broadphase could make, so the contact-free sub-step
-    # was Rust's whole step.
-    assert_eq(_t3_touch, 0, "no frame could have paired two colliders");
 
     return assert_summary();
 }

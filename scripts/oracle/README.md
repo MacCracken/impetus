@@ -64,8 +64,9 @@ harness reads the same files. This README records what is specific to impetus.
 | `b3_narrow` | b3 | M4 | 16,340 | `src/m_b3_narrow.rs` | — |
 | `b3_ray` | b3 | M4 | 4,138 (+ 2 corrected) | `src/m_b3_ray.rs` | — |
 | `b3_body` | b3 | M4 | 234 | `src/m_b3_body.rs` | — |
-| `b3_state` | b3 | M5 | 411 (+ 5 corrected) | `src/m_b3_state.rs` | — |
+| `b3_state` | b3 | M5 | 414 (+ 2 corrected) | `src/m_b3_state.rs` | — |
 | `b3_step` | b3 | M5 | 333 | `src/m_b3_step.rs` | — |
+| `b3_contact` | b3 | M5 | 450 (+ 1 corrected) | `src/m_b3_contact.rs` | — |
 | (private constants) | b2 | M2 | — | — | `src/constants_private.cyr` (`src/t_private.rs`: every library `const` of `aabb_tree.rs`, `spatial_hash.rs`, `backend_2d/joints.rs`, `backend_2d/solver.rs`, `backend_2d/types.rs`, `backend_3d/narrowphase.rs`, `backend_3d/types.rs` and `world.rs`, emitted or excused (a
 function's local `const` counts, as `obb_obb_3d`'s `REL_TOL`); a `[f64; N]` array, which may span lines, becomes N globals `_0` … `_{N-1}`) |
 
@@ -138,7 +139,9 @@ impetus specifics:
   positions, offsets and impulse points, and the backend dump of `src/dump3d.rs` (full quaternions, angular velocity
   vectors and inertia tensors; no manifolds, which the 3D backend doesn't keep). Class C: `set_body_state` rotates
   about z through `sin_cos`, and `get_body_state` returns 2·atan2(q.z, q.w). The arena, pair-list and tracker tokens
-  both dumps write are `src/dumpcore.rs`'s.
+  both dumps write are `src/dumpcore.rs`'s. `b3::state_script_orphan` scripts add a collider or joint for a missing
+  body (ADR 0008 #1), and `b3::state_script_unsupported` ones a Revolute or Prismatic joint or a motor, which the 3D
+  port refuses (ADR 0008 #5); no other script adds one.
 - Single-step rows (`b2_step.tsv`, class S at class C, the 2D build only): inputs are the world config (`flat::config`,
   its `step` the frame index) and the backend dump at frame k, taken after that frame's forces; outputs are the dump at
   k + 1 and the frame's events. M3b's scenes give every collider collision mask 0, so nothing pairs and the contact
@@ -148,7 +151,11 @@ impetus specifics:
   part 2's scenes give every collider mask 0, so the contact stages are empty: integration with the gyroscopic step
   (spins from off-centre impulses, torques and forces at points), the speed cap, every 3D joint path (Fixed with and
   without the angular lock, Distance, Rope, Wheel, Spring, Mouse, the Revolute and Prismatic no-ops with damping),
-  breaking, kinematic drivers, sleep, the solver settings, and 50 seeded scenes.
+  breaking, kinematic drivers, sleep, the solver settings, and 50 seeded scenes. `b3_contact.tsv` (M5 part 3) has the
+  same format, with scenes whose colliders touch: every shape family on the ground under both broadphases, stacks and a
+  pyramid, restitution and the combine rules, friction on slopes and flat ground, rolling resistance, sensors and
+  layers, a kinematic paddle, sleep and wake, the position solver's settings, fast bodies, joints with contacts, and
+  40 seeded scenes in a walled box.
 - World steps (`world_step.tsv`, class S at class C, the 2D build only): the config, then the world's own state
   (`dump2d::world`: the particle and emitter counters, the particles, the emitters with their spawn accumulator, read
   through `serde_json` since the field is crate-private, and the force fields), then the backend dump; outputs are the
@@ -237,9 +244,12 @@ Standard-library Python, run with `-I`. It never calls the oracle:
   the same on MPFR's writes `b3_ray.cr.tsv`;
 - every `b3_body` body is recomputed: `from_desc`, each collider's mass, inertia and centroid, the parallel-axis sum
   of `recompute_mass_properties`, the inverses and R·I⁻¹·Rᵀ;
-- every `b3_step` row is recomputed by a transcription of the 3D sub-step when nothing touches (integration and the
-  gyroscopic step, the joints' forces, rows, velocity and position passes and breaking, sleep, the tracker), bit for
-  bit; it asserts every collider's mask is 0, and on MPFR's hypot writes `b3_step.cr.tsv` (none so far);
+- every `b3_step` and `b3_contact` row is recomputed by a transcription of the 3D sub-step (integration and the
+  gyroscopic step, the joints' forces, rows, velocity and position passes and breaking, the broadphase by brute force
+  as for `b2_contact`, the narrowphase transcription above, wake on contact, the shock-propagation order, the contact
+  solver with friction and rolling resistance, the contact position pass, sleep, the tracker), bit for bit. It asserts
+  every `b3_step` collider's mask is 0, and on MPFR's hypot writes `b3_contact.cr.tsv` (and `b3_step.cr.tsv`, none so
+  far);
 - every `b3_state` script is replayed on a Python model of the 3D state (the arenas, the mass recompute, the joints'
   reference rotation, forces and impulses through R·I⁻¹·Rᵀ, the state's rotation through glibc's atan2), rebuilding
   every result and dump token; the same on MPFR's writes `b3_state.cr.tsv`;

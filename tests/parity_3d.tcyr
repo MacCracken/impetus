@@ -7,7 +7,6 @@
 
 include "tests/ulp.cyr"
 include "tests/lib_3d.cyr"
-include "tests/step3.cyr"
 
 alloc_init();
 
@@ -354,10 +353,12 @@ fn _par_b3_ray(fp, fl): i64 {
 # ── b3_state: the 3D backend's state (src/b3_state.cyr) ─────────────────────────────
 # A row is a script of ops on a fresh ImPhysicsState3d; its outputs are each op's result, then the backend dump in
 # `oracle_dump()`'s order. `b3::state_script_orphan` rows add a collider or a joint for a missing body, which the port
-# refuses (ADR 0008 #1): mapped, and counted.
+# refuses (ADR 0008 #1); `b3::state_script_unsupported` rows add a Revolute or Prismatic joint or a motor, which the 3D
+# port refuses (ADR 0008 #5): both mapped, and counted.
 
 var _par_mapped3 = 0;
 var _par_map_orphan3 = 0;
+var _par_map_unsup3 = 0;
 
 fn _par_got_body3d(rb: *ImRigidBody3d) {
     _par_got_i(rb.handle);
@@ -485,7 +486,9 @@ fn _par_got_state3d(st: *ImPhysicsState3d) {
 fn _par_b3_state(fp, fl): i64 {
     var plain = _par_eq(fp, fl, "b3::state_script");
     var orphan = _par_eq(fp, fl, "b3::state_script_orphan");
-    if (plain == 0 && orphan == 0) { return 0; }
+    var unsup = _par_eq(fp, fl, "b3::state_script_unsupported");
+    if (plain == 0 && orphan == 0 && unsup == 0) { return 0; }
+    var refused_unsup = 0;
     var st: ImPhysicsState3d = ImPhysicsState3d_new();
     var n = _par_in(0);
     var k = 1;
@@ -509,6 +512,7 @@ fn _par_b3_state(fp, fl): i64 {
             k = _par_in_joint_desc_at(k, &jd);
             var t2, v2 = st.add_joint(jd);
             if (is_ok(t2) == 1) { _par_got_i(v2); } else { _par_got_err(v2); refused = 1; }
+            if (is_ok(t2) == 0 && v2 == IM_ERR_UNSUPPORTED) { refused_unsup = 1; }
         } elif (op == 3 || op == 4) {
             var fb = _par_in(k);
             var vec: ImVec3 = ImVec3_zero();
@@ -577,17 +581,20 @@ fn _par_b3_state(fp, fl): i64 {
         _par_mapped3 = 8;
         _par_map_orphan3 = _par_map_orphan3 + 1;
     }
+    if (unsup == 1 && refused_unsup == 1) {
+        _par_mapped3 = 8;
+        _par_map_unsup3 = _par_map_unsup3 + 1;
+    }
     return 1;
 }
 
 # ── dispatch and hooks ──────────────────────────────────────────────────────────────
 
-# ── M5b: single steps ───────────────────────────────────────────────────────────────
+# ── M5b–c: single steps ─────────────────────────────────────────────────────────────
 # A `b3::step` row is the config, then a 3D backend dump; the port loads the dump into an ImPhysicsState3d (every
-# arena slot, generation and free list as dumped), steps it as PhysicsWorld::step does (a sub-step per sub_steps, then
-# `finish_step`), and writes the dump and the frame's events. Until the contact pipeline arrives (part 3) the sub-step
-# is tests/step3.cyr's contact-free composition: every b3_step collider has mask 0, and step3's guard fails the row if
-# the broadphase could have paired two colliders.
+# arena slot, generation and free list as dumped), steps it as PhysicsWorld::step does (the library's `step` per
+# sub-step, then `finish_step`), and writes the dump and the frame's events. b3_step's scenes pair nothing (every
+# collider has mask 0); b3_contact's touch.
 
 # A 3D backend dump at token k into st (fresh): the token after it.
 fn _par_load_state3d(st: *ImPhysicsState3d, k0): i64 {
@@ -711,20 +718,15 @@ fn _par_b3_step(fp, fl): i64 {
     var ts: f64 = cfg.timestep;
     var subf: f64 = f64_from(sub);
     var dt: f64 = ts / subf;
-    _t3_touch = 0;
     for (var s = 0; s < sub; s = s + 1) {
-        _t3_substep(&st, cfg.gravity, dt, cfg.velocity_iterations, cfg.position_iterations, cfg.position_slop,
-          cfg.position_correction, cfg.max_velocity, cfg.constraint_frequency, cfg.constraint_damping_ratio);
+        st.step(cfg.gravity, dt, cfg.velocity_iterations, cfg.position_iterations, cfg.position_slop,
+          cfg.position_correction, cfg.max_velocity, cfg.constraint_frequency, cfg.constraint_damping_ratio,
+          cfg.broadphase);
     }
     var ne = st.finish_step();
-    if (_t3_touch == 0) {
-        _par_got_state3d(&st);
-        _par_got_seq(ne);
-        for (var e = 0; e < ne; e = e + 1) { _par_got_event(st.contact_tracker.event(e)); }
-    } else {
-        # A pair the contact-free sub-step can't handle: no outputs, so the row fails visibly.
-        println("  b3::step: the broadphase could pair two colliders; the contact-free sub-step doesn't apply");
-    }
+    _par_got_state3d(&st);
+    _par_got_seq(ne);
+    for (var e = 0; e < ne; e = e + 1) { _par_got_event(st.contact_tracker.event(e)); }
     st.free();
     return 1;
 }
@@ -734,6 +736,7 @@ fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_mapped3 = 0;
     if (_par_eq(mp, ml, "b3_state") == 1) { return _par_b3_state(fp, fl); }
     if (_par_eq(mp, ml, "b3_step") == 1) { return _par_b3_step(fp, fl); }
+    if (_par_eq(mp, ml, "b3_contact") == 1) { return _par_b3_step(fp, fl); }
     if (_par_eq(mp, ml, "b3_body") == 1) { return _par_b3_body(fp, fl); }
     if (_par_eq(mp, ml, "b3_math") == 1) { return _par_b3_math(fp, fl); }
     if (_par_eq(mp, ml, "b3_narrow") == 1) { return _par_b3_narrow(fp, fl); }
@@ -755,6 +758,7 @@ fn _par_c_bound(fp, fl): i64 {
     if (_par_eq(fp, fl, "b3::raycast") == 1) { return 0; }
     if (_par_eq(fp, fl, "b3::state_script") == 1) { return 0; }
     if (_par_eq(fp, fl, "b3::state_script_orphan") == 1) { return 0; }
+    if (_par_eq(fp, fl, "b3::state_script_unsupported") == 1) { return 0; }
     if (_par_eq(fp, fl, "b3::step") == 1) { return 0; }
     if (_par_eq(fp, fl, "DQuat::from_rotation_x") == 1) { return 0; }
     if (_par_eq(fp, fl, "DQuat::from_rotation_y") == 1) { return 0; }
@@ -782,6 +786,9 @@ fn _par_module_done(mp, ml) {
         print("  ADR 0008 #1 orphans: ", 23);
         fmt_int(_par_map_orphan3);
         println(" scripts add a collider or joint for a missing body, which the port refuses, accepted (ADR 8)");
+        print("  ADR 0008 #5 unsupported: ", 27);
+        fmt_int(_par_map_unsup3);
+        println(" scripts add a Revolute or Prismatic joint or a motor, which the 3D port refuses, accepted (ADR 8)");
         return 0;
     }
     if (_par_eq(mp, ml, "b3_math") != 1) { return 0; }

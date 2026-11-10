@@ -7,6 +7,7 @@ b2_ray
 b2_state
 b2_step
 b3_body
+b3_contact
 b3_math
 b3_narrow
 b3_ray

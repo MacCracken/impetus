@@ -123,6 +123,16 @@ var _IM_B3_MIN_MASS: f64 = 0.000001;
 # Rust: `MIN_INERTIA: f64 = 1e-10`
 var _IM_B3_MIN_INERTIA: f64 = 0.0000000001;
 
+# ── rust-old/src/backend_3d/solver.rs ──
+
+# Velocity below which a contact is "not sliding" and static friction applies.
+# Rust: `STATIC_FRICTION_SLIP_SPEED: f64 = 0.01`
+var _IM_B3_STATIC_FRICTION_SLIP_SPEED: f64 = 0.01;
+
+# Approach speed below which restitution is ignored (prevents jitter).
+# Rust: `RESTITUTION_VELOCITY_THRESHOLD: f64 = 1.0`
+var _IM_B3_RESTITUTION_VELOCITY_THRESHOLD: f64 = 1.0;
+
 # ── rust-old/src/world.rs ──
 
 # MAX_SNAPSHOT_INDEX is not carried: the snapshot code's public cap on restored handle indices, carried with M6.

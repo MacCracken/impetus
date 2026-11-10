@@ -69,6 +69,11 @@ fn sources() -> Vec<Source> {
             excused: &[],
         },
         Source {
+            file: "backend_3d/solver.rs",
+            prefix: "_IM_B3_",
+            excused: &[],
+        },
+        Source {
             file: "world.rs",
             prefix: "_IM_",
             excused: &[(

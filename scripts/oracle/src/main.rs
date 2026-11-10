@@ -51,6 +51,8 @@ mod m_b2_step;
 #[cfg(feature = "b3")]
 mod m_b3_body;
 #[cfg(feature = "b3")]
+mod m_b3_contact;
+#[cfg(feature = "b3")]
 mod m_b3_math;
 #[cfg(feature = "b3")]
 mod m_b3_narrow;
@@ -98,7 +100,10 @@ fn owns(name: &str) -> bool {
 /// The 3D build's golden emitters, in file-name order.
 #[cfg(feature = "b3")]
 fn b3_modules() -> Vec<tsv::Module> {
-    vec![m_b3_body::emit(), m_b3_math::emit(), m_b3_narrow::emit(), m_b3_ray::emit(), m_b3_state::emit(), m_b3_step::emit()]
+    vec![
+        m_b3_body::emit(),
+        m_b3_contact::emit(),
+        m_b3_math::emit(), m_b3_narrow::emit(), m_b3_ray::emit(), m_b3_state::emit(), m_b3_step::emit()]
 }
 
 #[cfg(not(feature = "b3"))]

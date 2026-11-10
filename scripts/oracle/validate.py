@@ -700,8 +700,8 @@ def corrections(module, rows):
                 seen = list(dict.fromkeys(log))
                 out.append((fn, " ".join(ins), " ".join(toks), "oracle (dump); " + "; ".join(seen)))
             continue
-        elif module == "b3_step":
-            toks = _Step3d(_logged_hypot(log)).step(ins)
+        elif module in ("b3_step", "b3_contact"):
+            toks = _Step3d(_logged_hypot(log)).step(ins, module)
             if not _same_tokens(outs, toks):
                 seen = list(dict.fromkeys(log))
                 out.append((fn, " ".join(ins), " ".join(toks), "oracle (dump); " + "; ".join(seen)))
@@ -3373,6 +3373,7 @@ PRIVATE_SOURCES = (
     ("backend_2d/types.rs", "_IM_B2_", {"FALLBACK"}),
     ("backend_3d/narrowphase.rs", "_IM_B3_", set()),
     ("backend_3d/types.rs", "_IM_B3_", set()),
+    ("backend_3d/solver.rs", "_IM_B3_", set()),
     ("world.rs", "_IM_", {"MAX_SNAPSHOT_INDEX"}),
 )
 PRIVATE_CONST = re.compile(r"^\s*(?:pub(?:\((?:super|crate)\))?\s+)?const\s+(\w+)\s*:\s*([\w(),\[\]; ]+?)\s*=\s*(.+?);")
@@ -5003,7 +5004,7 @@ def _b3_state_row(ins, sin, cos, atan2):
 def check_b3_state(rows):
     """Replays every 3D state script on the model, on glibc's sin, cos and atan2."""
     for fn, cls, ins, outs, note in rows:
-        if fn not in ("b3::state_script", "b3::state_script_orphan"):
+        if fn not in ("b3::state_script", "b3::state_script_orphan", "b3::state_script_unsupported"):
             fail(f"b3_state: unknown function {fn}")
             continue
         want = _b3_state_row(ins, _glibc("sin"), _glibc("cos"), _LIBM.atan2)
@@ -5138,13 +5139,20 @@ def _b3_dump_parse(t, k):
         st["bodies"].slots[b["handle"] & 0xFFFFFFFF][3] = b
         k += 62
     c0 = k
-    _, k = _dump_arena(t, k)
+    st["colls"], k = _dump_arena(t, k)
     nc = int(t[k][2:])
     k += 1
     st["masks"] = []
     for _ in range(nc):
-        _, k2 = _b3_shape(t, k + 2)
-        st["masks"].append(tok_i(t[k2 + 13]))
+        h = _st_word(t[k])
+        shape, k2 = _b3_shape(t, k + 2)
+        mt = t[k2 + 3:k2 + 10]
+        c = {"handle": h, "body": _st_word(t[k + 1]), "shape": shape, "off": F(k2, 3),
+             "fric": tok_f(mt[0]), "rest": tok_f(mt[1]), "sfric": None if mt[3] == "n:" else tok_f(mt[3]),
+             "roll": tok_f(mt[4]), "fc": mt[5], "rc": mt[6], "sensor": tok_i(t[k2 + 10]) == 1,
+             "layer": tok_i(t[k2 + 12]), "mask": tok_i(t[k2 + 13])}
+        st["masks"].append(c["mask"])
+        st["colls"].slots[h & 0xFFFFFFFF][3] = c
         k = k2 + 14
     st["coll_tokens"] = t[c0:k]
     st["joints"], k = _dump_arena(t, k)
@@ -5204,6 +5212,71 @@ def _b3_dump_emit(st):
             out += [_st_h(a), _st_h(b)]
     out += [f"i:{int(tr['recorded'])}"]
     return out
+
+
+B3_SLIP = 0.01
+B3_RESTITUTION_THRESHOLD = 1.0
+_INF3 = (math.inf, math.inf, math.inf)
+_NINF3 = (-math.inf, -math.inf, -math.inf)
+
+
+def _v_min3(a, b):
+    return tuple(rust_min(x, y) for x, y in zip(a, b))
+
+
+def _v_max3(a, b):
+    return tuple(rust_max(x, y) for x, y in zip(a, b))
+
+
+def _b3_world_aabb(shape, off, pos, rot):
+    """Collider3d::world_aabb: (min, max)."""
+    wp = _v_add(pos, _q_mul_vec3(rot, off))
+    k = shape[0]
+    if k == "Ball":
+        r = (shape[1],) * 3
+        return _v_sub(wp, r), _v_add(wp, r)
+    if k == "Box":
+        e = shape[1]
+        corners = [(-e[0], -e[1], -e[2]), (e[0], -e[1], -e[2]), (-e[0], e[1], -e[2]), (e[0], e[1], -e[2]),
+                   (-e[0], -e[1], e[2]), (e[0], -e[1], e[2]), (-e[0], e[1], e[2]), (e[0], e[1], e[2])]
+        lo, hi = _INF3, _NINF3
+        for c in corners:
+            wc = _v_add(wp, _q_mul_vec3(rot, c))
+            lo, hi = _v_min3(lo, wc), _v_max3(hi, wc)
+        return lo, hi
+    if k == "Capsule":
+        axis = _q_mul_vec3(rot, (0.0, shape[1], 0.0))
+        a = tuple(abs(x) for x in axis)
+        r = (shape[2],) * 3
+        return _v_sub(_v_sub(wp, a), r), _v_add(_v_add(wp, a), r)
+    if k in ("TriMesh", "ConvexHull"):
+        lo, hi = _INF3, _NINF3
+        for p in shape[1]:
+            wv = _v_add(wp, _q_mul_vec3(rot, p))
+            lo, hi = _v_min3(lo, wv), _v_max3(hi, wv)
+        return (wp, wp) if lo[0] > hi[0] else (lo, hi)
+    if k == "Segment":
+        wa, wb = _v_add(wp, _q_mul_vec3(rot, shape[1])), _v_add(wp, _q_mul_vec3(rot, shape[2]))
+        return _v_min3(wa, wb), _v_max3(wa, wb)
+    heights, scale = shape[1], shape[2]
+    w = scale[0] * float(max(len(heights), 1) - 1)
+    h_min, h_max = math.inf, -math.inf
+    for h in heights:
+        h_min, h_max = rust_min(h_min, h), rust_max(h_max, h)
+    return (wp[0], wp[1] + h_min * scale[1], wp[2]), (wp[0] + w, wp[1] + h_max * scale[1], wp[2] + scale[2])
+
+
+def _b3_sanitize(x):
+    """solver.rs `sanitize_coefficient`."""
+    return 0.0 if math.isnan(x) else rust_clamp(x, 0.0, sys.float_info.max)
+
+
+def _b3_orthonormal_pair(a):
+    ax, ay, az = a
+    sign = rust_signum(az)
+    k = _np_div(-1.0, sign + az)
+    m = ax * ay * k
+    return (1.0 + sign * ax * ax * k, sign * m, -sign * ax), (m, sign + ay * ay * k, -ay)
 
 
 class _Step3d:
@@ -5482,6 +5555,221 @@ class _Step3d:
                 st["joints"].remove(h)
         return out
 
+    # ── solver.rs: the contact stages ──
+
+    @staticmethod
+    def broadphase(st, dt):
+        """The kept pairs, sorted: brute force over every collider pair (as for b2_contact: both broadphases report a
+        superset of the overlapping swept boxes, in sorted order, and the overlap test keeps exactly those)."""
+        bodies, colls = st["bodies"], st["colls"]
+        boxes = {}
+        for h, c in colls.values():
+            b = bodies.get(c["body"])
+            if b is None:
+                continue
+            lo, hi = _b3_world_aabb(c["shape"], c["off"], b["pos"], b["rot"])
+            vel = _v_scale(b["vel"], dt)
+            boxes[h] = (_v_min3(lo, _v_add(lo, vel)), _v_max3(hi, _v_add(hi, vel)))
+        hs = sorted(boxes)
+        pairs = []
+        for i, ha in enumerate(hs):
+            for hb in hs[i + 1:]:
+                ca, cb = colls.get(ha), colls.get(hb)
+                if ca["body"] == cb["body"]:
+                    continue
+                ba, bb = bodies.get(ca["body"]), bodies.get(cb["body"])
+                if ba["type"] == "e:BodyType.Static" and bb["type"] == "e:BodyType.Static":
+                    continue
+                if ca["sensor"] and cb["sensor"]:
+                    continue
+                if (ca["layer"] & cb["mask"]) == 0 and (cb["layer"] & ca["mask"]) == 0:
+                    continue
+                (alo, ahi), (blo, bhi) = boxes[ha], boxes[hb]
+                if all(alo[i] <= bhi[i] and ahi[i] >= blo[i] for i in range(3)):
+                    pairs.append((ha, hb))
+        return pairs
+
+    @staticmethod
+    def narrowphase(st, pairs):
+        out = []
+        for ha, hb in pairs:
+            ca, cb = st["colls"].get(ha), st["colls"].get(hb)
+            ba, bb = st["bodies"].get(ca["body"]), st["bodies"].get(cb["body"])
+            pa = _v_add(ba["pos"], _q_mul_vec3(ba["rot"], ca["off"]))
+            pb = _v_add(bb["pos"], _q_mul_vec3(bb["rot"], cb["off"]))
+            r = _contact_3d(ca["shape"], pa, ba["rot"], cb["shape"], pb, bb["rot"])
+            if r is not None:
+                out.append({"ca": ha, "cb": hb, "ba": ca["body"], "bb": cb["body"], "n": r[0], "d": r[1], "p": r[2]})
+        return out
+
+    @staticmethod
+    def wake(st, contacts):
+        def moving(b):
+            return (b is not None and not b["sleeping"] and _b3_dyn(b)
+                    and (_v_length(b["vel"]) > B3_SLEEP_V or _v_length(b["w"]) > B3_SLEEP_V))
+        for c in contacts:
+            ba, bb = st["bodies"].get(c["ba"]), st["bodies"].get(c["bb"])
+            a_sl, b_sl = ba is not None and ba["sleeping"], bb is not None and bb["sleeping"]
+            a_mv, b_mv = moving(ba), moving(bb)
+            if a_sl and b_mv:
+                ba["sleeping"], ba["sleep_timer"] = False, 0.0
+            if b_sl and a_mv:
+                bb["sleeping"], bb["sleep_timer"] = False, 0.0
+
+    @staticmethod
+    def shock_order(st, contacts):
+        level = {}
+        for h, b in st["bodies"].values():
+            if b["type"] == "e:BodyType.Static" or not _b3_dyn(b):
+                level[h] = 0
+        changed = True
+        while changed:
+            changed = False
+            for c in contacts:
+                la, lb = level.get(c["ba"]), level.get(c["bb"])
+                if la is not None and lb is None:
+                    level[c["bb"]], changed = la + 1, True
+                elif la is None and lb is not None:
+                    level[c["ba"]], changed = lb + 1, True
+                elif la is not None and lb is not None:
+                    if la + 1 < lb:
+                        level[c["bb"]], changed = la + 1, True
+                    elif lb + 1 < la:
+                        level[c["ba"]], changed = lb + 1, True
+        big = 0xFFFFFFFF
+        return sorted(contacts, key=lambda c: min(level.get(c["ba"], big), level.get(c["bb"], big)))
+
+    def prepare_contacts(self, st, contacts):
+        out = []
+        for ct in contacts:
+            ca, cb = st["colls"].get(ct["ca"]), st["colls"].get(ct["cb"])
+            if ca is None or cb is None or ca["sensor"] or cb["sensor"]:
+                continue
+            ba, bb = st["bodies"].get(ct["ba"]), st["bodies"].get(ct["bb"])
+            if ba is None or bb is None:
+                continue
+            (ma, ia), (mb, ib) = self.solver_mass(ba), self.solver_mass(bb)
+            if ma == 0.0 and mb == 0.0:
+                continue
+            rcp = _np_div(1.0, _v_length(ct["n"]))
+            n = _v_scale(ct["n"], rcp) if _v_rcp_ok(rcp) else _ZV
+            if (n[0] == 0.0 and n[1] == 0.0 and n[2] == 0.0) or not _v_finite(ct["p"]):
+                continue
+            restitution = _b3_sanitize(_combine2(ca["rc"], cb["rc"], ca["rest"], cb["rest"]))
+            friction = _b3_sanitize(_combine2(ca["fc"], cb["fc"], ca["fric"], cb["fric"]))
+            sa = ca["sfric"] if ca["sfric"] is not None else ca["fric"] * 1.5
+            sb = cb["sfric"] if cb["sfric"] is not None else cb["fric"] * 1.5
+            static = _b3_sanitize(_combine2(ca["fc"], cb["fc"], sa, sb))
+            rolling = _b3_sanitize((ca["roll"] + cb["roll"]) * 0.5)
+            ra, rb = _v_sub(ct["p"], ba["pos"]), _v_sub(ct["p"], bb["pos"])
+            t1, t2 = _b3_orthonormal_pair(n)
+
+            def eff(d):
+                ka, kb = _v_cross(ra, d), _v_cross(rb, d)
+                return ma + mb + _v_dot(ka, _m_mul_vec3(ia, ka)) + _v_dot(kb, _m_mul_vec3(ib, kb))
+
+            inv = lambda k: _np_div(1.0, k) if k > B3_EPSILON else 0.0
+            rel = _v_sub(_v_sub(_v_add(bb["vel"], _v_cross(bb["w"], rb)), ba["vel"]), _v_cross(ba["w"], ra))
+            vn0 = _v_dot(rel, n)
+            out.append({"a": ct["ba"], "b": ct["bb"], "n": n, "t": (t1, t2), "ra": ra, "rb": rb, "ma": ma, "mb": mb,
+                        "ia": ia, "ib": ib, "nm": inv(eff(n)), "tm": (inv(eff(t1)), inv(eff(t2))),
+                        "roll_k": _m_add(ia, ib),
+                        "bias": -restitution * vn0 if vn0 < -B3_RESTITUTION_THRESHOLD else 0.0,
+                        "f": friction, "sf": static, "rf": rolling, "depth": ct["d"], "ni": 0.0, "ti": [0.0, 0.0],
+                        "ri": _ZV, "pi": 0.0})
+        return out
+
+    @staticmethod
+    def crel(st, c):
+        def vw(h):
+            b = st["bodies"].get(h)
+            return (_ZV, _ZV) if b is None else (b["vel"], b["w"])
+        (va, wa), (vb, wb) = vw(c["a"]), vw(c["b"])
+        return _v_sub(_v_sub(_v_add(vb, _v_cross(wb, c["rb"])), va), _v_cross(wa, c["ra"]))
+
+    @staticmethod
+    def capply(st, c, p):
+        if c["ma"] > 0.0:
+            b = st["bodies"].get(c["a"])
+            if b is not None:
+                b["vel"] = _v_sub(b["vel"], _v_scale(p, c["ma"]))
+                b["w"] = _v_sub(b["w"], _m_mul_vec3(c["ia"], _v_cross(c["ra"], p)))
+        if c["mb"] > 0.0:
+            b = st["bodies"].get(c["b"])
+            if b is not None:
+                b["vel"] = _v_add(b["vel"], _v_scale(p, c["mb"]))
+                b["w"] = _v_add(b["w"], _m_mul_vec3(c["ib"], _v_cross(c["rb"], p)))
+
+    def solve_contacts(self, st, cs):
+        for c in cs:
+            vn = _v_dot(self.crel(st, c), c["n"])
+            lam = -(vn - c["bias"]) * c["nm"]
+            new = rust_max(c["ni"] + lam, 0.0)
+            applied = new - c["ni"]
+            c["ni"] = new
+            if applied != 0.0:
+                self.capply(st, c, _v_scale(c["n"], applied))
+            if c["f"] > 0.0 or c["sf"] > 0.0:
+                rel = self.crel(st, c)
+                vt = (_v_dot(rel, c["t"][0]), _v_dot(rel, c["t"][1]))
+                slip = self.hypot(vt[0], vt[1])
+                nt = [c["ti"][0] - vt[0] * c["tm"][0], c["ti"][1] - vt[1] * c["tm"][1]]
+                ln = self.hypot(nt[0], nt[1])
+                max_static = rust_max(c["sf"] * c["ni"], 0.0)
+                mu = c["sf"] if (slip < B3_SLIP or ln <= max_static) else c["f"]
+                max_f = rust_max(mu * c["ni"], 0.0)
+                if ln > max_f:
+                    sc = _np_div(max_f, ln) if ln > 0.0 else 0.0
+                    nt = [nt[0] * sc, nt[1] * sc]
+                d = (nt[0] - c["ti"][0], nt[1] - c["ti"][1])
+                c["ti"] = nt
+                p = _v_add(_v_scale(c["t"][0], d[0]), _v_scale(c["t"][1], d[1]))
+                if not (p[0] == 0.0 and p[1] == 0.0 and p[2] == 0.0):
+                    self.capply(st, c, p)
+            if c["rf"] > 0.0:
+                ba, bb = st["bodies"].get(c["a"]), st["bodies"].get(c["b"])
+                wa = _ZV if ba is None else ba["w"]
+                wb = _ZV if bb is None else bb["w"]
+                w_rel = _v_sub(wb, wa)
+                w_rel = _v_sub(w_rel, _v_scale(c["n"], _v_dot(c["n"], w_rel)))
+                speed = _v_length(w_rel)
+                if speed > B3_EPSILON:
+                    d = _v_div(w_rel, speed)
+                    k = _v_dot(d, _m_mul_vec3(c["roll_k"], d))
+                    if k > B3_EPSILON:
+                        max_roll = rust_max(c["rf"] * c["ni"], 0.0)
+                        new_r = _v_sub(c["ri"], _v_scale(d, _np_div(speed, k)))
+                        ln = _v_length(new_r)
+                        if ln > max_roll:
+                            new_r = _v_scale(new_r, _np_div(max_roll, ln) if ln > 0.0 else 0.0)
+                        applied = _v_sub(new_r, c["ri"])
+                        c["ri"] = new_r
+                        if c["ma"] > 0.0 and ba is not None:
+                            ba["w"] = _v_sub(ba["w"], _m_mul_vec3(c["ia"], applied))
+                        if c["mb"] > 0.0 and bb is not None:
+                            bb["w"] = _v_add(bb["w"], _m_mul_vec3(c["ib"], applied))
+
+    @staticmethod
+    def solve_contact_positions(st, cs, slop, erp, dt):
+        for c in cs:
+            bias = _np_div(erp * rust_max(c["depth"] - slop, 0.0), dt)
+            ba, bb = st["bodies"].get(c["a"]), st["bodies"].get(c["b"])
+            pva, pwa = (_ZV, _ZV) if ba is None else (ba["pv"], ba["pw"])
+            pvb, pwb = (_ZV, _ZV) if bb is None else (bb["pv"], bb["pw"])
+            vp = _v_dot(_v_sub(_v_sub(_v_add(pvb, _v_cross(pwb, c["rb"])), pva), _v_cross(pwa, c["ra"])), c["n"])
+            new = rust_max(c["pi"] + (bias - vp) * c["nm"], 0.0)
+            applied = new - c["pi"]
+            c["pi"] = new
+            if applied == 0.0:
+                continue
+            p = _v_scale(c["n"], applied)
+            if c["ma"] > 0.0 and ba is not None:
+                ba["pv"] = _v_sub(ba["pv"], _v_scale(p, c["ma"]))
+                ba["pw"] = _v_sub(ba["pw"], _m_mul_vec3(c["ia"], _v_cross(c["ra"], p)))
+            if c["mb"] > 0.0 and bb is not None:
+                bb["pv"] = _v_add(bb["pv"], _v_scale(p, c["mb"]))
+                bb["pw"] = _v_add(bb["pw"], _m_mul_vec3(c["ib"], _v_cross(c["rb"], p)))
+
     # ── solver.rs ──
 
     def substep(self, st, cfg, dt):
@@ -5490,7 +5778,12 @@ class _Step3d:
             _b3_integrate_velocities(b, cfg["g"], dt, cfg["maxv"])
             b["world"] = _b3_inv_world(b)
         cs = self.prepare_joints(st, dt)
+        contacts = self.narrowphase(st, self.broadphase(st, dt))
+        self.wake(st, contacts)
+        contacts = self.shock_order(st, contacts)
+        cc = self.prepare_contacts(st, contacts)
         for _ in range(cfg["iters"]):
+            self.solve_contacts(st, cc)
             self.solve_velocities(st, cs, dt)
         self.break_joints(st, cs, dt)
         for b in bodies:
@@ -5498,6 +5791,7 @@ class _Step3d:
         if dt > 0.0:
             erp = _b3_error_reduction(cfg["freq"], cfg["ratio"], cfg["corr"], dt)
             for _ in range(cfg["piters"]):
+                self.solve_contact_positions(st, cc, cfg["slop"], erp, dt)
                 self.solve_positions(st, cs, erp, dt)
         for b in bodies:
             _b3_integrate_positions(b, dt)
@@ -5510,21 +5804,23 @@ class _Step3d:
                     b["sleeping"], b["vel"], b["w"] = True, _ZV, _ZV
             else:
                 b["sleep_timer"], b["sleeping"] = 0.0, False
+        st["manifolds"] = [{"ca": min(c["ca"], c["cb"]), "cb": max(c["ca"], c["cb"])} for c in contacts]
         _Step2d.record(st)
 
-    def step(self, ins):
-        """The output tokens of a b3_step row."""
+    def step(self, ins, module="b3_step"):
+        """The output tokens of a b3_step or b3_contact row."""
         cfg = {"dt": tok_f(ins[0]), "g": (tok_f(ins[1]), tok_f(ins[2]), tok_f(ins[3])), "iters": tok_i(ins[4]),
-               "piters": tok_i(ins[5]), "corr": tok_f(ins[9]), "maxv": tok_f(ins[10]), "sub": tok_i(ins[11]),
-               "freq": tok_f(ins[12]), "ratio": tok_f(ins[13])}
+               "piters": tok_i(ins[5]), "slop": tok_f(ins[8]), "corr": tok_f(ins[9]), "maxv": tok_f(ins[10]),
+               "sub": tok_i(ins[11]), "freq": tok_f(ins[12]), "ratio": tok_f(ins[13])}
         st, k = _b3_dump_parse(ins, 16)
         if k != len(ins):
-            fail(f"b3_step: {len(ins) - k} input tokens left over")
-        if any(m != 0 for m in st["masks"]):
-            fail("b3_step: a scene has a collider that can pair (mask != 0)")
-        tr = st["tracker"]
-        if tr["prev"] or tr["current"] or tr["seen"]:
-            fail("b3_step: a row's dump has contacts")
+            fail(f"{module}: {len(ins) - k} input tokens left over")
+        if module == "b3_step":
+            if any(m != 0 for m in st["masks"]):
+                fail("b3_step: a scene has a collider that can pair (mask != 0)")
+            tr = st["tracker"]
+            if tr["prev"] or tr["current"] or tr["seen"]:
+                fail("b3_step: a row's dump has contacts")
         sub = max(cfg["sub"], 1)
         dt = cfg["dt"] / float(sub)
         for _ in range(sub):
@@ -5535,18 +5831,18 @@ class _Step3d:
         return _b3_dump_emit(st) + _events_tokens(ev)
 
 
-def check_b3_step(rows):
+def check_b3_step(rows, module="b3_step"):
     """Recomputes every 3D single-step row on glibc's hypot."""
     model = _Step3d(_glibc_hypot)
     for i, (fn, cls, ins, outs, note) in enumerate(rows):
         if fn != "b3::step":
-            fail(f"b3_step: unknown function {fn}")
+            fail(f"{module}: unknown function {fn}")
             continue
-        want = model.step(ins)
+        want = model.step(ins, module)
         if not _same_tokens(outs, want):
             first = next((n for n, (a, b) in enumerate(zip(outs, want)) if not _same_tokens([a], [b])),
                          min(len(outs), len(want)))
-            fail(f"b3_step: row {i}: the transcription differs at output {first} of {len(outs)}: "
+            fail(f"{module}: row {i}: the transcription differs at output {first} of {len(outs)}: "
                  f"{' '.join(outs[first:first + 3])} vs {' '.join(want[first:first + 3])}")
     return len(rows)
 
@@ -5567,7 +5863,7 @@ def main():
         rows = read_module(golden / f"{name}.tsv")
         total += len(rows)
         if name in ("math", "spring", "b2_narrow", "b2_ray", "b2_step", "b2_contact", "world_step", "b3_math",
-                    "b3_body", "b3_ray", "b3_state", "b3_step"):
+                    "b3_body", "b3_ray", "b3_state", "b3_step", "b3_contact"):
             check_corrections(root, name, golden / f"{name}.tsv", rows)
         if name == "constants":
             check_constants(root, rows)
@@ -5594,6 +5890,8 @@ def main():
             print(f"b2_narrow: {check_b2_narrow(rows)} rows recomputed (a transcription on Python's libm)")
         elif name == "b3_state":
             print(f"b3_state: {check_b3_state(rows)} scripts replayed on a model of the 3D state")
+        elif name == "b3_contact":
+            print(f"b3_contact: {check_b3_step(rows, name)} single steps recomputed (contacts, joints, sleep)")
         elif name == "b3_step":
             print(f"b3_step: {check_b3_step(rows)} single steps recomputed (integration, gyroscopic step, joints, "
                   f"sleep)")

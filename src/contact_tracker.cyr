@@ -228,10 +228,18 @@ fn _im_pairs_sort(data, n, tmp) {
                     if (j >= hi) {
                         take_i = 1;
                     } else {
+                        # `_im_pair_cmp(i, j) <= 0`, inlined (unsigned words compared with their sign bits flipped):
+                        # the comparison is the hot loop of every broadphase query.
                         var pi = src + i * 16;
                         var pj = src + j * 16;
-                        if (_im_pair_cmp(load64(pi), load64(pi + 8), load64(pj), load64(pj + 8)) <= 0) {
+                        var a0 = load64(pi) ^ 0x8000000000000000;
+                        var b0 = load64(pj) ^ 0x8000000000000000;
+                        if (a0 < b0) {
                             take_i = 1;
+                        } elif (a0 == b0) {
+                            var a1 = load64(pi + 8) ^ 0x8000000000000000;
+                            var b1 = load64(pj + 8) ^ 0x8000000000000000;
+                            if (a1 <= b1) { take_i = 1; }
                         }
                     }
                 }
@@ -253,7 +261,9 @@ fn _im_pairs_sort(data, n, tmp) {
         dst = t;
         width = width * 2;
     }
-    if (src != data) { memcpy(data, src, n * 16); }
+    if (src != data) {
+        for (var w = 0; w < n * 2; w = w + 1) { store64(data + w * 8, load64(src + w * 8)); }
+    }
     return 0;
 }
 

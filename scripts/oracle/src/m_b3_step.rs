@@ -24,13 +24,13 @@ use crate::grids::Rng;
 use crate::tsv::{Class, Module, Tok};
 
 /// A scene: a built world, and what it applies before each frame: a force (with or without a point) and a torque.
-struct Scene {
-    world: PhysicsWorld,
-    push: Option<(BodyHandle, Force)>,
-    twist: Option<(BodyHandle, f64)>,
+pub struct Scene {
+    pub world: PhysicsWorld,
+    pub push: Option<(BodyHandle, Force)>,
+    pub twist: Option<(BodyHandle, f64)>,
 }
 
-fn scene(world: PhysicsWorld) -> Scene {
+pub fn scene(world: PhysicsWorld) -> Scene {
     Scene {
         world,
         push: None,
@@ -110,8 +110,8 @@ const S: BodyType = BodyType::Static;
 const D: BodyType = BodyType::Dynamic;
 const K: BodyType = BodyType::Kinematic;
 
-/// Runs a scene to the last frame asked, emitting a row for each frame k in `frames`.
-fn rows(m: &mut Module, mut sc: Scene, frames: &[u64]) {
+/// Runs a scene to the last frame asked, emitting a row for each frame k in `frames` (shared with `m_b3_contact`).
+pub fn rows(m: &mut Module, mut sc: Scene, frames: &[u64]) {
     let last = frames.iter().copied().max().unwrap_or(0);
     let cfg = sc.world.config().clone();
     for k in 0..=last {

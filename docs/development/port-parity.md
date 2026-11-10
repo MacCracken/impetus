@@ -927,6 +927,72 @@ fails when either drifts from `cyrius.cyml`.
 - **Result:** 3D **28,762 ok, 0 failed, 10 accepted (ADR 11: 7)** over 6 modules; 2D unchanged at **98,873 ok**.
   The same on x86_64 ELF, x86_64 PE and aarch64: every b3_step row at 0 ulp on each, so the bits are equal. Surface parity is 632 across 28 modules; `backend_3d/solver` stays pending until part 3.
 
+## 22. M5c: the 3D contacts and `step` (2026-11-09)
+
+- **The modules.** `src/b3_solver.cyr` now holds all of `backend_3d/solver.rs`:
+  - the broadphase: each collider's world AABB swept along its body's velocity, the spatial hash (cell size from the
+    largest extents) or the AABB tree, then Rust's filters and the overlap test, in candidate order;
+  - the narrowphase stage through M4's `generate_contact_3d` on the state's GJK scratch;
+  - wake on contact;
+  - the shock-propagation order, a stable counting sort on the lower level of each contact's bodies;
+  - `prepare_contacts` (the combine rules, `sanitize_coefficient`, the restitution target), `solve_contacts` (the
+    normal impulse, two-direction friction with the static cone, rolling resistance), `solve_contact_positions`;
+  - `step` and `body_pseudo_velocity`.
+
+  `STATIC_FRICTION_SLIP_SPEED` and `RESTITUTION_VELOCITY_THRESHOLD` are generated. Cyrius takes no field addresses, so
+  a collider's shape and the state's GJK scratch are reached by computed address. Two helpers do it, and
+  `tests/b3_state.tcyr` pins both offsets. A shape copy would be a 184-byte byte-loop `memcpy` per pair.
+- **`b3_step` through `step`.** The harness now runs the library's `step`, and `tests/step3.cyr`'s composition is
+  gone. All 333 contact-free rows still match at 0 ulp, so the whole step with an empty broadphase equals part 2's
+  stages.
+- **`b3_contact.tsv`**, 450 rows:
+  - for each broadphase, a ball, a box, a box at an angle, a cube hull (GJK + EPA) and a lying capsule dropped on the
+    ground;
+  - a stack of five boxes and a pyramid of six (the shock-propagation levels);
+  - restitution at 0.9, 0.6 and 0 on fast drops, and the Max, Multiply and Min combine rules;
+  - friction on a slope at three settings (one a static override), a box shoved and a ball spun along flat ground,
+    rolling resistance;
+  - capsules standing and crossing, a ball on a segment and on a hull, a box on a lying capsule, an offset collider, a
+    tumbling box;
+  - a sensor, a ball whose layer and mask meet nothing on the ground, two overlapping sensors, a kinematic paddle;
+  - a box falling asleep and a ball dropped later waking it;
+  - the position solver's settings (Baumgarte at two factors, a stiff soft constraint, more slop, more iterations,
+    four sub-steps) and a push every frame;
+  - fast bodies (the swept boxes), joints with contacts;
+  - 40 seeded scenes in a walled box.
+
+  Class C. 449 rows are 0 ulp (176,143 floats). In the other, glibc rounds one friction `hypot` 1 ulp low, which ends
+  64 ulp off the oracle in a few outputs; the port equals the corrected oracle (`b3_contact.cr.tsv`). Perturbing the
+  restitution target by 1e-7 fails 5 rows.
+- **The transcription.** `validate.py` adds the contact stages to its 3D sub-step: a 3D `world_aabb`, the broadphase
+  by brute force (as for `b2_contact`: both broadphases report a superset of the overlapping boxes in sorted order),
+  M4's narrowphase transcription, wake, the order, and the contact solver. It reproduces all 450 rows on glibc, and
+  on MPFR writes the one correction.
+- **ADR 0008 #5, which part 1 missed.** The ADR says the 3D profile's `add_joint` refuses Revolute and Prismatic
+  joints and motors with `Err(IM_ERR_UNSUPPORTED)`; Rust 1.4.0 accepts them and does nothing with them but their
+  damping. Part 1 accepted them as Rust does. Now `add_joint` and `add_joint_at` refuse them, after the missing-body
+  check. `b3_state.tsv`'s seeded scripts no longer draw them, and three `b3::state_script_unsupported` scripts are
+  mapped and counted, as the orphans are. The corpus is now 414 scripts with 2 corrected rows (the seeds changed),
+  every plain script at 0 ulp. Rust's `explicit_joint_forces_independent_of_iterations` damps a Revolute joint, so its
+  port damps a Wheel with a zero axis, which also has no rows and no force: the same Δv. The step rows load dumps
+  directly and still hold Revolute and Prismatic joints, so they keep pinning how the step treats them.
+- **A faster shared broadphase.** Timing the 3D step stage by stage put most of a frame in the spatial hash's
+  `query_pairs`. Its record sort now moves words instead of byte-copying records, and its pair sort compares inline
+  (`src/spatial_hash.cyr`, `src/contact_tracker.cyr`). Neither changes an order. Both profiles use them, and the 2D
+  corpus (98,873 ok) and the 3D one pass unchanged on all three targets.
+- **A comment fixed.** Writing the layer scene showed that `b2_contact`'s "a ball whose mask misses the ground's layer
+  (it falls through)" lands: a pair is dropped only when neither layer meets the other's mask, and the ground's mask
+  is all layers. The 2D emitter's comment now says so; its data is unchanged. The 3D scene gives its ground layer 1
+  and mask 1, so its ball does fall through.
+- **Rust tests.** `tests/b3_contacts.tcyr` ports the 10 stepping tests with contacts: collision events, the tracker
+  on removal, the spatial hash's pair and no false pair, the split impulse's per-step fraction, restitution at any
+  iteration count, kinetic and static friction, bad coefficients, and a box at rest off centre. Cyrius-only groups
+  cover the two broadphases stepping to the same bits, Started, Ongoing and Stopped, a sensor, the layer filter,
+  sleep and wake on contact, and a flat heap: 23 assertions. `tests/b3_joints.tcyr` now steps through `step` (31
+  assertions, with the #5 refusals). Its flat-heap check warms for 30 frames, the broadphase's high-water mark.
+- **Result:** 3D **29,214 ok, 0 failed, 11 accepted (ADR 11: 5, ADR 0008: 6)** over 7 modules; 2D unchanged at
+  **98,873 ok**. The same on x86_64 ELF, x86_64 PE and aarch64. Surface parity is 637 across 29 modules, every 3D backend module but the tests file.
+
 ## How to reproduce
 
 ```sh

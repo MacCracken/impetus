@@ -35,11 +35,10 @@ MODULES = [
     "aabb_tree", "spatial_hash", "backend_2d/types", "backend_2d/narrowphase",
     "backend_2d/raycast", "backend_2d/state", "backend_2d/joints", "backend_2d/solver",
     "particle", "world", "backend_3d/types", "backend_3d/narrowphase", "backend_3d/raycast",
-    "backend_3d/state", "backend_3d/joints",
+    "backend_3d/state", "backend_3d/joints", "backend_3d/solver",
 ]
 PENDING_MODULES = {
     "backend_2d/tests": "M3",
-    "backend_3d/solver": "M5 part 3 (part 2 has the contact-free stages)",
     "backend_3d/tests": "M5", "serialize": "M6",
 }
 DEFERRED_MODULES = {"bridge": "until a Cyrius consumer exists (port plan §3.2)"}
@@ -93,7 +92,7 @@ FN_RENAMES = {
         "is_identity_quat", "closest_point_on_segment_3d", "capsule_endpoints_3d", "closest_points_segments_3d",
         "generate_contact_3d", "gjk_epa_shapes", "sphere_sphere", "sphere_obb", "aabb_aabb_3d", "capsule_sphere_3d",
         "capsule_capsule_3d", "capsule_box_3d", "obb_obb_3d", "segment_sphere_3d", "segment_box_3d",
-        "convex_hull_sphere_3d", "ray_sphere", "ray_aabb_3d", "ray_capsule",
+        "convex_hull_sphere_3d", "ray_sphere", "ray_aabb_3d", "ray_capsule", "solver_mass", "error_reduction",
     )},
 }
 # Rust field -> the Cyrius fields that carry it (Option<T> is a presence flag plus the value).
@@ -111,7 +110,8 @@ FIELD_RENAMES = {
     ("ContactManifold", "points"): ["points", "point_count"],
 }
 # The Cyrius prefix of a module's crate-internal constants (scripts/oracle/src/t_private.rs).
-PRIVATE_PREFIX = {"backend_2d/types": "_IM_B2_", "backend_3d/types": "_IM_B3_", "backend_3d/narrowphase": "_IM_B3_"}
+PRIVATE_PREFIX = {"backend_2d/types": "_IM_B2_", "backend_3d/types": "_IM_B3_", "backend_3d/narrowphase": "_IM_B3_",
+                  "backend_3d/solver": "_IM_B3_"}
 PENDING_CONSTS = {"MAX_SNAPSHOT_INDEX": "M6, with the snapshot module"}
 # Rust functions whose Cyrius owner arrives with a later milestone: counted, listed, never silently dropped.
 PENDING_FNS = {

@@ -1,0 +1,366 @@
+# b3_contacts.tcyr — the ported Rust tests of the 3D contact pipeline (rust-old/src/backend_3d/solver.rs, M5 part 3):
+# the stepping tests of backend_3d/tests.rs with contacts (collision events, the tracker on removal, the spatial hash,
+# split-impulse correction, restitution, kinetic and static friction, bad coefficients, a box at rest off centre).
+# Plus Cyrius-only groups: the two broadphases agree, the event sequence, sensors and layers, sleep and wake on contact,
+# and a flat heap.
+
+include "tests/lib_3d.cyr"
+include "tests/frame3.cyr"
+
+fn near(got: f64, want: f64, tol: f64): i64 {
+    var d: f64 = f64_abs(got - want);
+    if (d < tol) { return 1; }
+    return 0;
+}
+
+fn v(x: f64, y: f64, z: f64): ImVec3 { return ImVec3_new(x, y, z); }
+
+# The Rust tests' `desc`: shape with the default material, every layer and mask; collider added to body h.
+fn collider(st: *ImPhysicsState3d, h, shape: ImColliderShape, mat: ImPhysicsMaterial): i64 {
+    var d: ImColliderDesc = ImColliderDesc_new(shape);
+    d.material = mat;
+    var t, c = st.add_collider(h, d);
+    d.shape.free();
+    return c;
+}
+
+fn body(st: *ImPhysicsState3d, t, pos: ImVec3, vel: ImVec3): i64 {
+    var d: ImBodyDesc = ImBodyDesc_default();
+    d.body_type = t;
+    d.position = pos;
+    d.linear_velocity = vel;
+    return st.add_body(d);
+}
+
+# The Rust tests' `ground`: a static 100 × 1 × 100 box at the origin, its top at y = 0.5.
+fn ground(st: *ImPhysicsState3d, mat: ImPhysicsMaterial): i64 {
+    var g = body(st, IM_BODY_STATIC, ImVec3_zero(), ImVec3_zero());
+    collider(st, g, ImColliderShape_box(50.0, 0.5, 50.0), mat);
+    return g;
+}
+
+# The Rust tests' `sliding_box`: a unit box at (0, 1, 0) moving at vx, its rotation fixed.
+fn sliding_box(st: *ImPhysicsState3d, vx: f64): i64 {
+    var d: ImBodyDesc = ImBodyDesc_default();
+    d.position = v(0.0, 1.0, 0.0);
+    d.linear_velocity = v(vx, 0.0, 0.0);
+    d.fixed_rotation = 1;
+    var b = st.add_body(d);
+    collider(st, b, ImColliderShape_box(0.5, 0.5, 0.5), ImPhysicsMaterial_default());
+    return b;
+}
+
+# The Rust tests' `step_with`: one 1/60 s frame with the given iterations, slop, correction and constraint frequency.
+fn step_with(st: *ImPhysicsState3d, g: ImVec3, vel_it, pos_it, slop: f64, corr: f64, freq: f64) {
+    st.step(g, 1.0 / 60.0, vel_it, pos_it, slop, corr, 100.0, freq, 1.0, IM_BROADPHASE_SPATIAL_HASH);
+    st.finish_step();
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    var g: ImVec3 = v(0.0, -9.81, 0.0);
+    var zero: ImVec3 = ImVec3_zero();
+    var dm: ImPhysicsMaterial = ImPhysicsMaterial_default();
+
+    test_group("sphere_collision_3d");
+    var s1: ImPhysicsState3d = ImPhysicsState3d_new();
+    ground(&s1, dm);
+    var b1 = body(&s1, IM_BODY_DYNAMIC, v(0.0, 2.0, 0.0), zero);
+    collider(&s1, b1, ImColliderShape_ball(0.5), dm);
+    var found = 0;
+    for (var f1 = 0; f1 < 120 && found == 0; f1 = f1 + 1) {
+        if (_t3_frame(&s1, g) > 0) { found = 1; }
+    }
+    assert_eq(found, 1, "collision events");
+    s1.free();
+
+    test_group("remove_cleans_collision_pairs_3d");
+    var s2: ImPhysicsState3d = ImPhysicsState3d_new();
+    var a2 = body(&s2, IM_BODY_STATIC, zero, zero);
+    collider(&s2, a2, ImColliderShape_ball(1.0), dm);
+    var b2 = body(&s2, IM_BODY_DYNAMIC, v(0.5, 0.0, 0.0), zero);
+    collider(&s2, b2, ImColliderShape_ball(1.0), dm);
+    _t3_frame(&s2, zero);
+    assert_eq(s2.contact_tracker.has_previous_contacts(), 1, "touching");
+    s2.remove_body(b2);
+    assert_eq(s2.contact_tracker.has_previous_contacts(), 0, "the pair goes with the body");
+    s2.free();
+
+    test_group("spatial_hash_3d_finds_pair");
+    var grid: ImSpatialHashGrid = ImSpatialHashGrid_new(2.0);
+    var pairs: ImPairList = ImPairList_new();
+    grid.insert_3d(0, zero, v(1.0, 1.0, 1.0));
+    grid.insert_3d(1, v(0.5, 0.5, 0.5), v(1.5, 1.5, 1.5));
+    grid.query_pairs(&pairs);
+    assert_eq(pairs.contains(0, 1), 1, "the overlapping pair");
+    grid.free();
+
+    test_group("spatial_hash_3d_no_false_pair");
+    var grid2: ImSpatialHashGrid = ImSpatialHashGrid_new(1.0);
+    grid2.insert_3d(0, zero, v(0.5, 0.5, 0.5));
+    grid2.insert_3d(1, v(10.0, 10.0, 10.0), v(10.5, 10.5, 10.5));
+    pairs.clear();
+    grid2.query_pairs(&pairs);
+    assert_eq(pairs.len, 0, "none");
+    grid2.free();
+    pairs.free();
+
+    test_group("baumgarte_position_correction_is_per_step_fraction");
+    # depth 0.1, slop 0, correction 0.2: one step separates by 0.02, whatever the position iterations and contacts.
+    var baum_ok = 0;
+    for (var q = 0; q < 3; q = q + 1) {
+        var iters = 1;
+        if (q > 0) { iters = 4; }
+        var s3: ImPhysicsState3d = ImPhysicsState3d_new();
+        ground(&s3, dm);
+        var b3 = body(&s3, IM_BODY_DYNAMIC, v(0.0, 0.9, 0.0), zero);
+        collider(&s3, b3, ImColliderShape_ball(0.5), dm);
+        if (q == 2) { collider(&s3, b3, ImColliderShape_ball(0.5), dm); }
+        step_with(&s3, zero, 4, iters, 0.0, 0.2, 0.0);
+        var rb3: *ImRigidBody3d = s3._body(b3);
+        var y3: f64 = rb3.position.y;
+        var moved: f64 = y3 - 0.9;
+        var sp3: f64 = ImVec3_length(rb3.linear_velocity);
+        if (near(moved, 0.02, 0.000001) == 1 && sp3 < 0.000000001) { baum_ok = baum_ok + 1; }
+        s3.free();
+    }
+    assert_eq(baum_ok, 3, "0.02 at 1 and 4 iterations and with two colliders, no velocity left");
+
+    test_group("restitution_independent_of_iteration_count");
+    var rest_ok = 0;
+    for (var it = 1; it <= 6; it = it + 1) {
+        for (var ei = 0; ei < 2; ei = ei + 1) {
+            var e: f64 = 0.5;
+            if (ei == 1) { e = 1.0; }
+            var bouncy: ImPhysicsMaterial = ImPhysicsMaterial_default();
+            bouncy.restitution = e;
+            var s4: ImPhysicsState3d = ImPhysicsState3d_new();
+            ground(&s4, bouncy);
+            var b4 = body(&s4, IM_BODY_DYNAMIC, v(0.0, 0.95, 0.0), v(0.0, -10.0, 0.0));
+            collider(&s4, b4, ImColliderShape_ball(0.5), bouncy);
+            step_with(&s4, zero, it, 1, 0.01, 0.2, 30.0);
+            var vy4: f64 = s4._body(b4).linear_velocity.y;
+            if (near(vy4, 10.0 * e, 0.000001) == 1) { rest_ok = rest_ok + 1; }
+            s4.free();
+        }
+    }
+    assert_eq(rest_ok, 12, "vy = 10·e at 1 to 6 iterations");
+
+    test_group("kinetic_friction_decelerates_at_mu_g");
+    var s5: ImPhysicsState3d = ImPhysicsState3d_new();
+    ground(&s5, dm);
+    var b5 = sliding_box(&s5, 5.0);
+    for (var f5 = 0; f5 < 30; f5 = f5 + 1) { _t3_frame(&s5, g); }
+    var v5: ImVec3 = s5._body(b5).linear_velocity;
+    var want5: f64 = 5.0 - 0.5 * 9.81 * 0.5;
+    var vz5: f64 = f64_abs(v5.z);
+    assert_eq(near(v5.x, want5, 0.1), 1, "vx = 5 − μg·t");
+    assert_eq(vz5 < 0.000000001, 1, "no sideways drift");
+    s5.free();
+
+    test_group("static_friction_holds_below_threshold");
+    # μ = 0.5, static 0.75: a 0.6·m·g push must not start a slide.
+    var s6: ImPhysicsState3d = ImPhysicsState3d_new();
+    ground(&s6, dm);
+    var b6 = sliding_box(&s6, 0.0);
+    var rb6: *ImRigidBody3d = s6._body(b6);
+    rb6.position.y = 0.99;
+    var m6: f64 = rb6.mass;
+    for (var f6 = 0; f6 < 60; f6 = f6 + 1) {
+        s6.apply_force(b6, ImForce_new(0.6 * m6 * 9.81, 0.0, 0.0));
+        _t3_frame(&s6, g);
+    }
+    var x6: f64 = f64_abs(s6._body(b6).position.x);
+    assert_eq(x6 < 0.001, 1, "it stays put");
+    s6.free();
+
+    test_group("bad_friction_coefficients_do_not_panic");
+    var nan: f64 = _im_cr_from_word(0x7ff8000000000000);
+    var inf: f64 = _im_cr_from_word(0x7ff0000000000000);
+    var finite_ok = 0;
+    for (var mi = 0; mi < 3; mi = mi + 1) {
+        var mu: f64 = -1.0;
+        if (mi == 1) { mu = nan; }
+        if (mi == 2) { mu = inf; }
+        var bad: ImPhysicsMaterial = ImPhysicsMaterial_default();
+        bad.friction = mu;
+        bad.has_static_friction = 1;
+        bad.static_friction = mu;
+        bad.restitution = mu;
+        bad.rolling_friction = mu;
+        for (var gi = 0; gi < 2; gi = gi + 1) {
+            var gy: f64 = -9.81;
+            if (gi == 1) { gy = 0.0; }
+            var s7: ImPhysicsState3d = ImPhysicsState3d_new();
+            ground(&s7, bad);
+            var b7 = sliding_box(&s7, 3.0);
+            s7._body(b7).position.y = 0.99;
+            for (var f7 = 0; f7 < 10; f7 = f7 + 1) { _t3_frame(&s7, v(0.0, gy, 0.0)); }
+            var rb7: *ImRigidBody3d = s7._body(b7);
+            if (ImVec3_is_finite(rb7.position) == 1 && ImVec3_is_finite(rb7.linear_velocity) == 1) {
+                finite_ok = finite_ok + 1;
+            }
+            s7.free();
+        }
+    }
+    assert_eq(finite_ok, 6, "finite for −1, NaN and ∞, with and without gravity");
+
+    test_group("box_resting_off_centre_on_ground_stays_upright");
+    var s8: ImPhysicsState3d = ImPhysicsState3d_new();
+    ground(&s8, dm);
+    var b8 = body(&s8, IM_BODY_DYNAMIC, v(3.0, 1.0, 2.0), zero);
+    collider(&s8, b8, ImColliderShape_box(0.5, 0.5, 0.5), dm);
+    s8._body(b8).rotation = ImQuat_from_rotation_y(0.3);
+    for (var f8 = 0; f8 < 180; f8 = f8 + 1) { _t3_frame(&s8, g); }
+    var rb8: *ImRigidBody3d = s8._body(b8);
+    var up: ImVec3 = ImQuat_mul_vec3(rb8.rotation, v(0.0, 1.0, 0.0));
+    var upy: f64 = up.y;
+    var w8: f64 = ImVec3_length(rb8.angular_velocity);
+    var p8: ImVec3 = rb8.position;
+    assert_eq(upy > 0.9999, 1, "upright");
+    assert_eq(w8 < 0.001, 1, "not spinning");
+    assert_eq(near(p8.y, 1.0, 0.03) + near(p8.x, 3.0, 0.001) + near(p8.z, 2.0, 0.001), 3, "where it was put");
+    s8.free();
+
+    test_group("broadphases_agree");
+    # Cyrius-only: the spatial hash and the AABB tree pair the same colliders, so a pile steps to the same bits.
+    var same = 1;
+    var s9: ImPhysicsState3d = ImPhysicsState3d_new();
+    var s10: ImPhysicsState3d = ImPhysicsState3d_new();
+    ground(&s9, dm);
+    ground(&s10, dm);
+    for (var k = 0; k < 8; k = k + 1) {
+        var x: f64 = f64_from(k % 3) * 0.7 - 0.7;
+        var y: f64 = 0.6 + f64_from(k) * 0.9;
+        var zz: f64 = f64_from(k % 2) * 0.3;
+        var h9 = body(&s9, IM_BODY_DYNAMIC, v(x, y, zz), zero);
+        var h10 = body(&s10, IM_BODY_DYNAMIC, v(x, y, zz), zero);
+        if (k % 2 == 0) {
+            collider(&s9, h9, ImColliderShape_box(0.4, 0.4, 0.4), dm);
+            collider(&s10, h10, ImColliderShape_box(0.4, 0.4, 0.4), dm);
+        } else {
+            collider(&s9, h9, ImColliderShape_ball(0.4), dm);
+            collider(&s10, h10, ImColliderShape_ball(0.4), dm);
+        }
+    }
+    for (var f9 = 0; f9 < 120; f9 = f9 + 1) {
+        s9.step(g, 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0, 30.0, 1.0, IM_BROADPHASE_SPATIAL_HASH);
+        s10.step(g, 1.0 / 60.0, 4, 1, 0.01, 0.2, 100.0, 30.0, 1.0, IM_BROADPHASE_AABB_TREE);
+        var e9 = s9.finish_step();
+        var e10 = s10.finish_step();
+        if (e9 != e10) { same = 0; }
+    }
+    var ba9: *ImArena = s9._bodies();
+    for (var q9 = 0; q9 < ba9.slot_count(); q9 = q9 + 1) {
+        var hq = ba9.slot_handle(q9);
+        var p9: ImVec3 = s9._body(hq).position;
+        var p10: ImVec3 = s10._body(hq).position;
+        if (_im_bits(p9.x) != _im_bits(p10.x) || _im_bits(p9.y) != _im_bits(p10.y)) { same = 0; }
+        if (_im_bits(p9.z) != _im_bits(p10.z)) { same = 0; }
+    }
+    assert_eq(same, 1, "the same events and positions, bit for bit");
+    s9.free();
+    s10.free();
+
+    test_group("events_sensors_and_layers");
+    # Cyrius-only: Started, then Ongoing, then Stopped once the bodies part; a sensor reports without pushing; a ball on
+    # layer 2 with mask 2 falls through a ground on layer 1 with mask 1 without events (a pair is dropped only when
+    # neither layer meets the other's mask).
+    var s11: ImPhysicsState3d = ImPhysicsState3d_new();
+    var a11 = body(&s11, IM_BODY_STATIC, zero, zero);
+    var ca11 = collider(&s11, a11, ImColliderShape_ball(1.0), dm);
+    var b11 = body(&s11, IM_BODY_DYNAMIC, v(1.5, 0.0, 0.0), v(3.0, 0.0, 0.0));
+    var cb11 = collider(&s11, b11, ImColliderShape_ball(1.0), dm);
+    var n1 = _t3_frame(&s11, zero);
+    var k1 = s11.contact_tracker.event(0).kind;
+    var n2 = _t3_frame(&s11, zero);
+    var k2 = s11.contact_tracker.event(0).kind;
+    var stopped = 0;
+    for (var f11 = 0; f11 < 60 && stopped == 0; f11 = f11 + 1) {
+        var n11 = _t3_frame(&s11, zero);
+        if (n11 == 1 && s11.contact_tracker.event(0).kind == IM_EVENT_STOPPED) { stopped = 1; }
+    }
+    assert_eq(n1 == 1 && k1 == IM_EVENT_STARTED && n2 == 1 && k2 == IM_EVENT_ONGOING, 1, "Started, then Ongoing");
+    assert_eq(stopped, 1, "then Stopped");
+    s11.free();
+    var s12: ImPhysicsState3d = ImPhysicsState3d_new();
+    var gnd = body(&s12, IM_BODY_STATIC, zero, zero);
+    var gd: ImColliderDesc = ImColliderDesc_new(ImColliderShape_box(50.0, 0.5, 50.0));
+    gd.collision_layer = 1;
+    gd.collision_mask = 1;
+    var tgd, cgd = s12.add_collider(gnd, gd);
+    gd.shape.free();
+    var sensor: ImColliderDesc = ImColliderDesc_new(ImColliderShape_box(1.0, 0.25, 1.0));
+    sensor.is_sensor = 1;
+    var sb12 = body(&s12, IM_BODY_STATIC, v(0.0, 2.0, 0.0), zero);
+    var tsn, csn = s12.add_collider(sb12, sensor);
+    sensor.shape.free();
+    var b12 = body(&s12, IM_BODY_DYNAMIC, v(0.0, 3.0, 0.0), zero);
+    collider(&s12, b12, ImColliderShape_ball(0.3), dm);
+    var miss: ImColliderDesc = ImColliderDesc_new(ImColliderShape_ball(0.3));
+    miss.collision_layer = 2;
+    miss.collision_mask = 2;
+    var b13 = body(&s12, IM_BODY_DYNAMIC, v(3.0, 1.0, 0.0), zero);
+    var tms, cms = s12.add_collider(b13, miss);
+    miss.shape.free();
+    var sensed = 0;
+    var miss_events = 0;
+    for (var f12 = 0; f12 < 90; f12 = f12 + 1) {
+        var n12 = _t3_frame(&s12, g);
+        for (var e12 = 0; e12 < n12; e12 = e12 + 1) {
+            var ev: *ImCollisionEvent = s12.contact_tracker.event(e12);
+            if (ev.collider_a == csn || ev.collider_b == csn) { sensed = 1; }
+            if (ev.collider_a == cms || ev.collider_b == cms) { miss_events = miss_events + 1; }
+        }
+    }
+    var y12: f64 = s12._body(b12).position.y;
+    var y13: f64 = s12._body(b13).position.y;
+    assert_eq(sensed, 1, "the sensor reports the ball");
+    assert_eq(near(y12, 0.8, 0.05), 1, "which passes through it to the ground");
+    assert_eq(miss_events == 0 && y13 < -5.0, 1, "the masked ball falls through, silently");
+    s12.free();
+
+    test_group("sleep_and_wake_on_contact");
+    # Cyrius-only: a box at rest falls asleep; a ball dropped onto it wakes it.
+    var s14: ImPhysicsState3d = ImPhysicsState3d_new();
+    ground(&s14, dm);
+    var bx14 = body(&s14, IM_BODY_DYNAMIC, v(0.0, 1.0, 0.0), zero);
+    collider(&s14, bx14, ImColliderShape_box(0.5, 0.5, 0.5), dm);
+    for (var f14 = 0; f14 < 90; f14 = f14 + 1) { _t3_frame(&s14, g); }
+    var slept = s14._body(bx14).is_sleeping;
+    var bl14 = body(&s14, IM_BODY_DYNAMIC, v(0.1, 3.0, 0.0), v(0.0, -4.0, 0.0));
+    collider(&s14, bl14, ImColliderShape_ball(0.3), dm);
+    var woke = 0;
+    for (var f14b = 0; f14b < 60; f14b = f14b + 1) {
+        _t3_frame(&s14, g);
+        if (s14._body(bx14).is_sleeping == 0) { woke = 1; }
+    }
+    assert_eq(slept, 1, "asleep at rest");
+    assert_eq(woke, 1, "woken by the ball");
+    s14.free();
+
+    test_group("flat_heap_contacts");
+    # Cyrius-only: once a settling pile's scratch reaches its high-water mark, stepping it doesn't grow the heap.
+    var s15: ImPhysicsState3d = ImPhysicsState3d_new();
+    ground(&s15, dm);
+    for (var k15 = 0; k15 < 10; k15 = k15 + 1) {
+        var y15: f64 = 0.5 + f64_from(k15) * 1.01;
+        var x15: f64 = f64_from(k15 % 2) * 0.05;
+        var h15 = body(&s15, IM_BODY_DYNAMIC, v(x15, y15, 0.0), zero);
+        collider(&s15, h15, ImColliderShape_box(0.5, 0.5, 0.5), dm);
+    }
+    for (var w15 = 0; w15 < 120; w15 = w15 + 1) { _t3_frame(&s15, g); }
+    var heap0 = alloc_used();
+    var arena0 = _fl_arena;
+    var pos0 = _fl_arena_pos;
+    for (var f15 = 0; f15 < 200; f15 = f15 + 1) { _t3_frame(&s15, g); }
+    assert_eq(alloc_used() == heap0 && _fl_arena == arena0 && _fl_arena_pos == pos0, 1, "no growth");
+    s15.free();
+
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

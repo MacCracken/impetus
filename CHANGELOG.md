@@ -459,6 +459,31 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
   - Surface parity is 632/632 across 28 modules.
   - **3D: 28,762 ok, 0 failed, 10 accepted (ADR 11: 7)**; 2D unchanged at **98,873 ok**. The same on x86_64 ELF,
     x86_64 PE and aarch64.
+- **Cyrius port, M5 part 3: the 3D contacts and `step`** (`docs/development/port-parity.md` §22):
+  - `src/b3_solver.cyr` completes `backend_3d/solver.rs`:
+    - the broadphase (swept boxes, the spatial hash or the AABB tree);
+    - the narrowphase stage on the state's GJK scratch;
+    - wake on contact and the shock-propagation order;
+    - the contact solver: restitution, two-direction friction with the static cone, rolling resistance, and the
+      split-impulse position pass;
+    - `step` itself.
+
+    The solver's two private constants are generated. The step's working sets are scratch the state reuses.
+  - The golden `b3_contact.tsv` holds 450 single steps with contacts. It covers every shape family under both
+    broadphases, stacks, restitution and the combine rules, friction, rolling, sensors and layers, kinematics, sleep and
+    wake, the solver settings, fast bodies, joints with contacts and 40 seeded scenes. 449 match at 0 ulp. In the other,
+    glibc misrounds one friction `hypot`, and the port matches the corrected oracle (`b3_contact.cr.tsv`). The 333
+    `b3_step` rows now run through `step` too, still all 0 ulp. `validate.py` transcribes the contact stages and
+    reproduces every row.
+  - 23 assertions in `tests/b3_contacts.tcyr`: the 10 Rust stepping tests with contacts, plus Cyrius-only groups for
+    the broadphases agreeing bit for bit, the event sequence, sensors and layers, sleep and wake, and a flat heap.
+    `tests/b3_joints.tcyr` runs on `step`, and `tests/step3.cyr` is gone.
+  - **ADR 0008 #5, which part 1 missed**: the 3D `add_joint` and `add_joint_at` now refuse Revolute and Prismatic joints
+    and motors with `Err(IM_ERR_UNSUPPORTED)`. `b3_state.tsv` (414 scripts) maps three
+    `b3::state_script_unsupported` scripts, and its seeded scripts no longer draw those joints.
+  - Surface parity is 637/637 across 29 modules.
+  - **3D: 29,214 ok, 0 failed, 11 accepted (ADR 11: 5, ADR 0008: 6)**; 2D unchanged at **98,873 ok**.
+    The same on x86_64 ELF, x86_64 PE and aarch64..
 
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
@@ -536,6 +561,14 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
 - **The 3D joints and the contact-free step, first numbers** (Cyrius only; Rust times its 3D step whole, broadphase
   included, so the comparison comes with part 3's `step`): a tumbling box's gyroscopic velocity step 1.21 µs; one
   sub-step's joint work on a 20-link chain 59.9 µs (3 µs a joint); that chain's whole contact-free frame 97.4 µs.
+- **The 3D step against Rust, and a faster broadphase for both profiles** (`docs/benchmarks-rust-v-cyrius.md`;
+  measured with nothing else running, Rust on its 3D build):
+  - `world/step_*` in 3D: empty 68.7 ns → 389 ns, 10 bodies 4.97 → 54.6 µs, 100 bodies 116 → 649 µs, 1,000 bodies
+    1.07 → 5.84 ms; `substep/step_100_bodies_substep4` 554 µs → 6.27 ms.
+  - The spatial hash's record sort now moves words instead of byte-copying 24-byte records (S5), and its pair sort
+    compares inline. The orders are unchanged. `broadphase/spatial_hash_1000_row` 1.98 ms → 588 µs; the 3D
+    `step_1000_bodies` 9.07 → 5.84 ms; the 2D `b2/step_1000_bodies` 3.76 → 2.33 ms and `world/step_1000_bodies`
+    3.89 → 2.48 ms.
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde
