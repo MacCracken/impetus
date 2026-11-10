@@ -1,114 +1,159 @@
 # Roadmap
 
-## History
+Planned work for impetus. Done work is recorded in the [CHANGELOG](../../CHANGELOG.md), and the current state in
+[`state.md`](state.md). Version numbers are assigned when work is scheduled.
 
-| Version | Description |
-|---------|-------------|
-| 0.1–0.10 | Scaffold, 2D backend, 3D backend, serialization, spring API, kiran bridge |
-| 0.11–0.20 | Production hardening, arena storage, determinism, joints, manifolds, islands |
-| 0.21–0.23 | Multi-point manifolds, static/dynamic friction, sub-stepping, particles |
-| 1.0 | Split impulse, block solver, shock propagation, soft constraints, GJK+EPA, speculative contacts, dynamic AABB tree, full 3x3 inertia tensor |
-| 1.1 | XPBD solver (2D), one-shot manifold generation (Sutherland-Hodgman clipping), contact point reduction (area maximization), gyroscopic torque (3D), SolverKind config, audit fixes (div-by-zero guards, panic removal) |
-| 1.2 | Cross-crate bridges: dravya, sharira, ushma |
-| 1.3 | sharira bridge additions (muscle torque, cylinder inertia, gait GRF, CoM gravity) |
-| 1.4 | Rust 1.99 / hisab 1.4; audit and repair sweep — contact normal orientation, polygon clipping, solver (restitution, block solver, warm start, split impulse), velocity-level joints, sub-step forces/events, 3D world-space inertia, GJK/EPA/SAT fixes, mass properties, sleep/islands, balanced AABB tree, validated config and snapshot restore, exact springs |
-| 2.0 | The Cyrius port of 1.4.0 as two bundles (2D, 3D); fallible `add_collider` / `add_joint`, the full 3D body state, 3D revolute/prismatic/motors and XPBD refused (ADR 0008); complete snapshots with a checksummed binary form and JSON (ADR 0013); correctly rounded transcendentals, so results are bit-identical across targets (ADR 0011) |
+Two rules shape every item:
+- **Ported code keeps parity.** A change to behavior that `rust-old/` defines diverges from the oracle, so it needs
+  an ADR first.
+- **New physics has no oracle.** It lands with reference tests (analytic cases, conservation, published results)
+  rather than golden rows.
 
-**2.0 is the Cyrius port.** Rust 1.4.0 is the final Rust release and stays in `rust-old/` as the
-parity oracle; see [`impetus-port-plan.md`](impetus-port-plan.md),
-[ADR 0007](../adr/0007-cyrius-port-hisab-first.md) and, for code moving from the Rust crate, the
-[migration guide](../guides/migration-2.0.md). The 2.0 breaking items below that change only the API
-landed in the port ([ADR 0008](../adr/0008-port-api-divergences.md)). The ones that are new physics, and
-the themed sections, continue in Cyrius after 2.0 (port plan §9), with reference tests, since no oracle
-covers them.
+## Correctness and API
 
-Planned sections below are grouped by theme; version numbers are assigned when work is scheduled.
+- [ ] **No aborts in the JSON writers.** Move `src/fmtf.cyr` and `src/json.cyr` onto `str_builder`'s `_a` calls,
+  which return -1 when a grow fails, and return `Err(IM_ERR_SERIALIZE)`. Today the writers exit the process on out of
+  memory, the one abort left in the library (port plan §8).
+- [ ] **Validate shapes and materials at `add_collider`:** negative extents, non-finite values, empty hulls. It
+  diverges from Rust 1.4.0, which accepts them, so it needs an ADR.
+- [ ] **Typed accessors for record lists.** `collision_events`, `particles` and `force_fields` return a pointer and
+  a count, so a consumer needs its own cast function to read a record (the migration guide shows it). An accessor
+  per list, like `world.collision_event(i)`, would remove that.
+- [ ] **JSON limits, when bayan lands S3 and S4** (see [Upstream](#upstream)): read integers above `i64::MAX` (handles
+  whose slot was reused more than 2^31 times) and ignore repeated unknown keys as serde does. This closes the corpus's
+  6 pending rows.
 
-## Collision Completeness
+## Bridges
+
+The Rust crate's `bridge.rs` (17 functions; its 27 tests are deferred in the [ledger](rust-test-ledger.md)), ported
+as `src/bridge.cyr` one partner at a time, each when a Cyrius consumer needs it. Parity comes from the Rust bridge
+tests in `rust-old/`.
+
+- [ ] **dravya:** impact force and contact area → stress at the collision point; deformation velocity → strain
+  rate.
+- [ ] **sharira:** joint torques and angular velocities → locomotion forces; body mass → inertia tensor; muscle
+  torque, cylinder inertia, gait ground-reaction force, centre-of-mass gravity.
+- [ ] **ushma:** friction coefficient and sliding velocity → heat generation rate; collision energy → temperature
+  change.
+
+## 3D completeness
+
+What the 3D profile still lacks against 2D.
+
+- [ ] **3D islands and island sleep.** Island-atomic sleep, sleeping bodies as infinite mass in the solver, waking
+  neighbours on removal, as 2D does.
+- [ ] **3D revolute, prismatic and motors.** The 3D `add_joint` refuses them with `IM_ERR_UNSUPPORTED` (ADR 0008
+  #5); implementing them lifts the refusal, in `add_joint` and in `restore`.
+- [ ] **Consistent joint frames:** the prismatic and wheel axis in body A's frame in 3D, as in 2D.
+- [ ] **3D overlap queries.** `overlap_sphere` and `overlap_aabb` return no colliders in 3D.
+- [ ] **ConvexHull raycast (3D).** It needs hull faces; 3D hulls are point clouds (a 3D convex hull, hisab H6).
+
+## Collision completeness
 
 Handle every geometry a game throws at you.
 
-- [ ] **Conservative advancement CCD** — exact time-of-impact for fast convex pairs; complement speculative contacts for bullet-through-paper scenarios
-- [ ] **Compound shapes** — multiple colliders fused into a single rigid shape for mass/inertia; faster than multi-collider bodies for complex objects
-- [ ] **Shape casting** — sweep a shape along a direction, return first hit with normal and TOI; character controllers, projectile prediction
-- [ ] **Heightfield collision (2D/3D)** — efficient terrain narrowphase via grid cell lookup (Heightfield and TriMesh colliders currently generate no contacts)
-- [ ] **ConvexHull raycast (3D)** — needs hull faces; 3D hulls are point clouds today
-- [ ] **Convex decomposition integration** — use hisab's `convex_decompose()` to auto-generate convex hull sets from concave meshes at load time
-- [ ] **Point-in-shape queries** — fast inside/outside test for all shape types; pick detection, spawn validation, trigger checks
+- [ ] **Conservative advancement CCD:** exact time of impact for fast convex pairs, alongside speculative contacts
+  for bullet-through-paper cases (on hisab's `time_of_impact` / `swept_aabb` once hisab is on the step path).
+- [ ] **Compound shapes:** several colliders fused into one rigid shape for mass and inertia; faster than
+  multi-collider bodies for complex objects.
+- [ ] **Shape casting:** sweep a shape along a direction and return the first hit with its normal and time of
+  impact; character controllers, projectile prediction.
+- [ ] **Heightfield and trimesh contacts (2D and 3D).** Both are accepted as colliders and generate no contacts.
+  Heightfields want a grid-cell narrowphase.
+- [ ] **Convex decomposition:** hisab's `convex_decompose()` to build convex hull sets from concave meshes at load
+  time.
+- [ ] **Point-in-shape queries:** an inside/outside test for every shape type; picking, spawn validation, triggers.
 
-## Performance & Scalability
-
-Make 10k+ body scenes real-time.
-
-- [ ] **GJK simplex caching** — persist simplex between frames per contact pair; skip GJK warm-up, ~2x narrowphase speedup for stable contacts
-- [ ] **Incremental broadphase** — persist AABB tree across frames, update only moved bodies; O(log n) per move instead of O(n) rebuild
-- [ ] **Contact cache compaction** — arena-allocate manifold points contiguously for cache-friendly iteration; reduce pointer chasing in solver hot loop
-- [ ] **Parallel island solving** — solve independent simulation islands on separate threads via rayon (feature-gated); linear speedup for disjoint object groups
-- [ ] **Multi-level spatial hash** — hierarchical grid with 2–3 cell sizes; eliminates large-object-in-small-cell problem without switching to AABB tree
-- [ ] **Velocity Verlet integration** — symplectic integrator with better energy conservation than semi-implicit Euler; configurable per-world
-
-## Joints & Constraints
+## Joints and constraints
 
 Every mechanical connection a game or sim needs.
 
-- [ ] **3D revolute, prismatic and motors** — accepted today but have no effect in the 3D backend
-- [ ] **XPBD parity** — prismatic, wheel and mouse joints, motors, limits and `break_force` under `SolverKind::Xpbd`; per-point (not per-manifold) contact projection; restitution from pre-solve velocity
-- [ ] **Cone-twist joint** — 3D ball-socket with angular limits; ragdoll shoulders, hips
-- [ ] **Weld joint** — zero-DOF rigid connection; breakable structures, compound objects
-- [ ] **Gear joint** — couples rotation of two revolute joints at a ratio; gearboxes, clock mechanisms
-- [ ] **Pulley joint** — two anchor points with a rope length constraint; elevators, counterweights
-- [ ] **Slider-crank** — combined prismatic + revolute for engine pistons, linkages
-- [ ] **Joint soft limits** — spring-damper resistance at angular/linear limits instead of hard stops
+- [ ] **XPBD**, if a consumer asks. 2.0 refuses `IM_SOLVER_XPBD` (ADR 0008 #6). A port needs what Rust's XPBD
+  lacked: prismatic, wheel and mouse joints, motors, limits and `break_force`; per-point contact projection;
+  restitution from the pre-solve velocity.
+- [ ] **Cone-twist joint:** a 3D ball-socket with angular limits; ragdoll shoulders and hips.
+- [ ] **Weld joint:** a zero-DOF rigid connection; breakable structures, compound objects.
+- [ ] **Gear joint:** couples two revolute joints at a ratio; gearboxes, clock mechanisms.
+- [ ] **Pulley joint:** two anchors with a shared rope length; elevators, counterweights.
+- [ ] **Slider-crank:** prismatic and revolute combined; engine pistons, linkages.
+- [ ] **Joint soft limits:** spring-damper resistance at angular and linear limits instead of hard stops.
 
-## Forces & Environment
+## Forces and environment
 
 Rich environmental effects without leaving the physics engine.
 
-- [ ] **Buoyancy volumes** — AABB regions that apply upward force proportional to submerged volume; water, lava, mud
-- [ ] **Conveyor surfaces** — surface velocity on static bodies; conveyor belts, moving floors, escalators
-- [ ] **Anisotropic friction** — direction-dependent friction coefficients; ice rinks, brushed surfaces, rails
-- [ ] **Vortex force fields** — rotational force with configurable falloff; tornadoes, whirlpools, fan blasts
-- [ ] **Turbulence fields** — Perlin-noise-driven force perturbation; wind gusts, atmospheric effects
-- [ ] **Particle-particle interaction** — N-body forces between particles; flocking, magnetic dust, attraction/repulsion swarms
+- [ ] **Buoyancy volumes:** AABB regions with an upward force proportional to the submerged volume; water, lava,
+  mud.
+- [ ] **Conveyor surfaces:** surface velocity on static bodies; belts, moving floors, escalators.
+- [ ] **Anisotropic friction:** direction-dependent friction; ice rinks, brushed surfaces, rails.
+- [ ] **Vortex force fields:** rotational force with configurable falloff; tornadoes, whirlpools, fans.
+- [ ] **Turbulence fields:** noise-driven force perturbation; wind gusts.
+- [ ] **Particle-particle interaction:** N-body forces between particles; flocking, magnetic dust, swarms.
 
-## Developer Experience
+## Performance and scalability
+
+Make 10k+ body scenes real-time, and close the gap to Rust 1.4.0: the median benchmark is 10× Rust's in 2D and 13×
+in 3D, and a whole step 2.6–11× and 5.7–17× ([the record](../benchmarks-rust-v-cyrius.md)).
+
+- [ ] **Speed work with the ecosystem.** Once kiran and soorat are in Cyrius, the benchmark record and the upstream
+  issues (port plan §8: S5's byte-loop `memcpy`, f64 values in integer registers, the 2.5× cost of struct-value
+  kernels) are the input to compiler, ganita and hisab tuning.
+- [ ] **Incremental broadphase:** keep the AABB tree across frames and update only moved bodies. The rebuild is
+  4.73 ms of the 1,000-body tree step's 5.69 ms.
+- [ ] **hisab on the step path,** once S1 or H9 lands: hisab's 3D math, GJK/EPA and `detect_islands` in place of
+  impetus's own ([ADR 0012](../adr/0012-impetus-owned-3d-math-stopgap.md)), with `[deps.hisab]` back in production
+  scope ([ADR 0007](../adr/0007-cyrius-port-hisab-first.md)).
+- [ ] **GJK simplex caching:** keep each contact pair's simplex between frames to skip the GJK warm-up.
+- [ ] **Contact cache compaction:** manifold points stored contiguously, for cache-friendly solver loops.
+- [ ] **Parallel island solving:** independent islands on worker threads, with results merged in island order so
+  stepping stays deterministic.
+- [ ] **Multi-level spatial hash:** two or three cell sizes, so a large object in a small-cell grid needs no AABB
+  tree.
+- [ ] **Velocity Verlet integration:** a symplectic integrator with better energy conservation than semi-implicit
+  Euler, chosen per world.
+
+## Developer experience
 
 Make impetus the obvious choice for anyone writing a game or sim in Cyrius.
 
-- [ ] **Debug stats API** — expose per-frame counters: broadphase pairs, narrowphase tests, solver iterations, active/sleeping bodies, island count
-- [ ] **Debug wireframe data** — emit AABB, contact point, contact normal, joint anchor geometry for external renderers; zero rendering deps
-- [ ] **Profiling spans** — sakshi spans on broadphase, narrowphase, solver, integration, sleep, behind a level (Rust's `tracing`; no instrumentation exists yet)
-- [ ] **Deterministic replay** — record input forces/impulses per frame, replay with bit-exact results; network sync, testing, bug repro
-- [ ] **Migration guide** — rapier-to-impetus, nphysics-to-impetus API mapping docs
-- [ ] **Cookbook examples** — platformer, top-down, billiards, ragdoll, stacking, breakable, vehicle, chain
+- [ ] **Profiling spans:** sakshi spans on broadphase, narrowphase, solver, integration and sleep, behind a level.
+  No module logs yet.
+- [ ] **Debug stats API:** per-frame counters for broadphase pairs, narrowphase tests, solver iterations, active and
+  sleeping bodies, and islands.
+- [ ] **Debug wireframe data:** AABBs, contact points and normals, and joint anchors for an external renderer, with
+  no rendering dependency.
+- [ ] **Deterministic replay:** record each frame's forces and impulses, then replay them to the same bits; network
+  sync, testing, bug reports. A replay can start from a snapshot, which restores exactly.
+- [ ] **Migration guides** from other engines (rapier, nphysics): API mapping docs.
+- [ ] **Cookbook examples:** platformer, top-down, billiards, ragdoll, stacking, breakable, vehicle, chain, in
+  `docs/guides/`, where `scripts/doc_examples.py` runs their code.
 
-## Cross-Crate Bridges
+## Upstream
 
-- [x] `bridge.rs` module — primitive-value conversions for cross-crate physics (no deps on sibling crates) — 1.2
-- [x] **dravya bridge**: impact force (N), contact area (m²) → stress at collision point; deformation velocity → strain rate — 1.2
-- [x] **sharira bridge**: joint torques (Nm), angular velocities (rad/s) → locomotion forces; body mass (kg) → inertia tensor — 1.2/1.3
-- [x] **ushma bridge**: friction coefficient, sliding velocity → heat generation rate (W); collision energy → temperature delta — 1.2
+Open issues impetus filed, and what each unblocks here. The measurements behind them are in the port plan, §8.
 
-## 2.0 — Breaking Cleanup (deferred from the 1.4 audit)
+| Issue | Where | Unblocks |
+|---|---|---|
+| S1: a scoped allocator for `alloc` | cyrius, `2026-11-09-no-scoped-allocator-for-alloc.md` | hisab on the step path |
+| H9: allocator-scoped calls | hisab, `2026-11-09-allocator-scoped-calls.md` | the same, as hisab's alternative to S1 |
+| S3: JSON integers above `i64::MAX` | bayan, `2026-11-09-json-integer-above-i64-max-refuses-the-document.md` | 3 pending rows; JSON for large handles |
+| S4: an opt-in duplicate-key policy | bayan, `2026-11-09-json-duplicate-key-has-no-opt-in-for-ignored-members.md` | 3 pending rows; serde's handling of repeated keys |
+| S5: byte-loop `memcpy` | cyrius, `2026-11-02-memcpy-memset-byte-loops-dominate-frame-copies.md` | faster arena, shape and snapshot copies (87 of a 2D capture's 145 µs) |
+| A field store from a struct call copies its argument | cyrius, `2026-11-09-field-store-of-struct-call-copies-a-field-argument.md` | dropping the workaround and `surface_parity.py`'s guard for it |
+| Correctly rounded transcendentals | ganita, `2026-11-09-correctly-rounded-exp-sin-cos-hypot.md` | retiring `src/crmath.cyr` for ganita's, at the same bits |
 
-Each item needs a public-API or snapshot-format change, so it waits for a major release.
+- [ ] **File the gaps still unfiled** (port plan §8): a shortest round-trip f64 printer in the stdlib, seeded from
+  `src/fmtf.cyr` (S2); derive features for serde-shaped JSON, which would let `src/json.cyr` move to `#derive`; the
+  stdlib math and collection asks, a stable sort among them; hisab H1–H8.
 
-- [x] **Complete snapshots** (the Cyrius port, M6, [ADR 0013](../adr/0013-complete-snapshots.md)) — force fields, contact manifolds and warm-start impulses, sleep state, and arena slot generations + free-list order, so a restored world steps bit-identically and allocates the same handles (regression tests `restore_replaces_force_fields`, `restore_preserves_handle_allocation` are `#[ignore]`d until then). Bitcode is not self-describing, so this changes the format.
-- [x] **3D orientation in `BodyState` / `BodySnapshot`** (the Cyrius port, ADR 0008 #4 and M6) — full quaternion and angular velocity; today 3D get/set/snapshot keep only rotation about Z
-- [x] **Fallible `add_collider` / `add_joint`** — return `Result` instead of storing orphans for missing bodies (the Cyrius port, ADR 0008 #1)
-- [ ] **Validate shapes and materials at `add_collider`** — negative extents, non-finite values; 2.0 accepts what Rust 1.4.0 accepted
-- [x] **Remove deprecated `PhysicsWorld::restore`** in favour of `try_restore` (the Cyrius port: one fallible `restore`, ADR 0008 #2)
-- [ ] **Consistent joint frames** (new physics, after 2.0) — prismatic/wheel axis in body A's frame in 3D as in 2D
-- [ ] **3D islands** (new physics, after 2.0) — island-atomic sleep, sleeping bodies as infinite mass in the solver, waking neighbours on removal (2D does all three)
-- [x] **Cross-platform determinism** (the Cyrius port, ADR 0008 #7 and [ADR 0011](../adr/0011-correctly-rounded-exp-sin-cos.md)) — every transcendental the step calls is impetus's own and correctly rounded, so results are bit-identical on x86_64 Linux, x86_64 Windows and aarch64
-- [x] **XPBD** refused by validation rather than shipped experimental (the Cyrius port, ADR 0008 #6); XPBD parity stays in Joints & Constraints, demand-gated
-- [x] **3D Revolute / Prismatic / motors** refused in 3D rather than accepted and ignored (the Cyrius port, ADR 0008 #5); implementing them is new physics, after 2.0
+## Retiring `rust-old/`
 
----
+- [ ] Once the bridges are ported or dropped: archive the golden corpus and its generators, close the Rust-test
+  ledger, and remove `rust-old/`, as tanmatra did.
 
-## Out of Scope (separate AGNOS crates)
+## Out of scope (separate AGNOS libraries)
 
-- Fluid simulation (SPH, Navier-Stokes) → fluidity crate
-- Soft body / deformable meshes → separate crate
-- Cloth / rope (mass-spring networks) → separate crate
-- Electromagnetism, optics, quantum → separate science crates
+- Fluid simulation (SPH, Navier-Stokes) → fluidity
+- Soft bodies and deformable meshes → a separate library
+- Cloth and rope as mass-spring networks → a separate library
+- Electromagnetism, optics, quantum → the science libraries

@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Changed
+- **docs:** the roadmap holds only planned work, by theme: correctness and API, the bridges, 3D completeness,
+  collision, joints, forces, performance, developer experience, the open upstream issues with what each unblocks, and
+  retiring `rust-old/`. Its history table and completed items are gone, since this CHANGELOG records them. Port plan
+  §9 and `state.md`'s "Next" list are folded into it, so `state.md` records only the current state.
+
 ## [2.0.0] - 2026-11-10
 
 **impetus is a Cyrius library.** 2.0.0 ports the Rust crate 1.4.0 to Cyrius 6.7.18, on two bundles:

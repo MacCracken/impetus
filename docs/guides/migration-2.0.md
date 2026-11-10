@@ -272,7 +272,7 @@ on one target restores on the others and steps on to the same bits.
 - XPBD (#6), the deprecated `restore` without a `Result` (#2), and bitcode and 1.4.0's snapshot JSON (#3).
 - The `oracle` feature (port tooling, never public API).
 - The bridges to dravya, sharira and ushma (`bridge.rs`). They come back, with their Rust tests, once a Cyrius
-  consumer needs them (port plan §9).
+  consumer needs them ([roadmap](../development/roadmap.md)).
 
 ## Known limitations
 

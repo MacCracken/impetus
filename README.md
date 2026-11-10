@@ -152,7 +152,8 @@ Snapshots and JSON are in both bundles; Rust's `serialize` feature has no counte
 - **Speed:** the median benchmark is about 10× Rust 1.4.0's in 2D and 13× in 3D, and a whole step is 2.6–11× and
   5.7–17× ([the record](docs/benchmarks-rust-v-cyrius.md)). These are first numbers; the upstream issues behind
   them are filed (port plan §8).
-- **Not yet ported:** the dravya, sharira and ushma bridges, which wait for a Cyrius consumer (port plan §9).
+- **Not yet ported:** the dravya, sharira and ushma bridges, which wait for a Cyrius consumer
+  ([roadmap](docs/development/roadmap.md)).
 
 ## Where it sits
 
