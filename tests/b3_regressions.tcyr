@@ -1,0 +1,40 @@
+# b3_regressions.tcyr — the integration and regression tests on the 3D profile (M5 part 4): tests/regression_cases.cyr's
+# 21 (the 9 tests of rust-old/tests/integration.rs and the 12 of rust-old/tests/regressions.rs that Rust runs on both
+# backends), then regressions.rs's one 3D-only test, as class R references (port plan §5). Not ported: its three
+# snapshot tests (M6).
+
+include "tests/lib_3d.cyr"
+include "tests/regression_cases.cyr"
+
+# substeps_are_honoured_in_3d: a ball (every layer and mask bit) after one step of a default world at `sub` sub-steps:
+# its y.
+fn fall(sub): f64 {
+    var c: ImWorldConfig = ImWorldConfig_default();
+    c.sub_steps = sub;
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(c);
+    var b = w.add_body(ImBodyDesc_default());
+    coll(&w, b, ImColliderShape_ball(0.5));
+    w.step();
+    var s: ImBodyState = state(&w, b);
+    var y: f64 = s.position.y;
+    w.free();
+    return y;
+}
+
+# Runs the regression tests.
+fn main() {
+    alloc_init();
+    regression_cases();
+
+    # ── regressions.rs, 3D only ──
+    test_group("substeps_are_honoured_in_3d");
+    var y1: f64 = fall(1);
+    var y4: f64 = fall(4);
+    assert_eq(y1 != y4, 1, "four sub-steps fall a different distance from one");
+
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

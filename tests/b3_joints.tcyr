@@ -9,14 +9,17 @@ include "tests/frame3.cyr"
 
 var eps: f64 = 0.000001;
 
+# 1 when |got − want| < tol.
 fn near(got: f64, want: f64, tol: f64): i64 {
     var d: f64 = f64_abs(got - want);
     if (d < tol) { return 1; }
     return 0;
 }
 
+# The vector (x, y, z).
 fn v(x: f64, y: f64, z: f64): ImVec3 { return ImVec3_new(x, y, z); }
 
+# The vector (x, y).
 fn v2(x: f64, y: f64): ImVec2 { return ImVec2_new(x, y); }
 
 # 1 when every entry of m is zero (Rust's `== DMat3::ZERO`).
@@ -27,6 +30,7 @@ fn mat_is_zero(m: ImMat3): i64 {
     return 0;
 }
 
+# |p − q|.
 fn dist_to(p: ImVec3, q: ImVec3): f64 {
     var l: f64 = ImVec3_length(p - q);
     return l;
@@ -93,6 +97,7 @@ fn one_step_velocity(jt: ImJointType, damping: f64, iters): ImVec3 {
     return w;
 }
 
+# Runs the 3D joint tests.
 fn main() {
     alloc_init();
     var g: ImVec3 = v(0.0, -9.81, 0.0);

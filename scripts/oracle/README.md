@@ -67,6 +67,7 @@ harness reads the same files. This README records what is specific to impetus.
 | `b3_state` | b3 | M5 | 414 (+ 2 corrected) | `src/m_b3_state.rs` | — |
 | `b3_step` | b3 | M5 | 333 | `src/m_b3_step.rs` | — |
 | `b3_contact` | b3 | M5 | 450 (+ 1 corrected) | `src/m_b3_contact.rs` | — |
+| `b3_world` | b3 | M5 | 190 | `src/m_b3_world.rs` | — |
 | (private constants) | b2 | M2 | — | — | `src/constants_private.cyr` (`src/t_private.rs`: every library `const` of `aabb_tree.rs`, `spatial_hash.rs`, `backend_2d/joints.rs`, `backend_2d/solver.rs`, `backend_2d/types.rs`, `backend_3d/narrowphase.rs`, `backend_3d/types.rs` and `world.rs`, emitted or excused (a
 function's local `const` counts, as `obb_obb_3d`'s `REL_TOL`); a `[f64; N]` array, which may span lines, becomes N globals `_0` … `_{N-1}`) |
 
@@ -157,9 +158,11 @@ impetus specifics:
   layers, a kinematic paddle, sleep and wake, the position solver's settings, fast bodies, joints with contacts, and
   40 seeded scenes in a walled box.
 - World steps (`world_step.tsv`, class S at class C, the 2D build only): the config, then the world's own state
-  (`dump2d::world`: the particle and emitter counters, the particles, the emitters with their spawn accumulator, read
+  (`dumpcore::world`: the particle and emitter counters, the particles, the emitters with their spawn accumulator, read
   through `serde_json` since the field is crate-private, and the force fields), then the backend dump; outputs are the
-  same three after `step()`, then the frame's events.
+  same three after `step()`, then the frame's events. `b3_world.tsv` (M5 part 4, the 3D build only) has the same
+  format with the 3D dump. Rust's 3D world turns bodies about z only, so its scenes reach other orientations by
+  spinning weightless dynamic bodies with an off-centre impulse before the first frame.
 - `Spring::step` rows (`spring.tsv`) carry a note `[<regime> S=<n>]`: the regime the transition took
   and its **sensitivity**, the most the two outputs move, in ulps, when one exp, sin or cos result
   on the path moves by one ulp. `m_spring.rs` computes it from a transcription of `transition` and
@@ -231,7 +234,8 @@ Standard-library Python, run with `-I`. It never calls the oracle:
   every `b2_step` collider's mask is 0;
 - every `world_step` row is recomputed: the backend frame as above, then the particles (spawns with the R3 spread and
   the cap, gravity, fields through pow, drag, damping, collisions, sub-emitters, removal) on glibc's sin, cos and pow
-  (ctypes; MPFR's for the corrected oracle);
+  (ctypes; MPFR's for the corrected oracle). Every `b3_world` row is recomputed the same way over the 3D frame below,
+  with the 3D particle collisions (`particle_vs_collider_3d`: every non-sensor collider, no bounding-box pre-check);
 - every `b2_state` script is replayed on a Python model of the arenas (Rust's free list and generations) and the
   state, rebuilding every result and dump token;
 - every `b2_mass` body is recomputed: its own `shape_props` and `polygon_mass_props` in Rust's operation order,

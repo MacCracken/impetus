@@ -4,7 +4,7 @@
 //! collisions with the colliders, sub-emitters, removal of the dead).
 //!
 //! A row is the world config (`flat::config`, its `step` the frame count so far), the world's own state
-//! (`dump2d::world`: the particle and emitter counters, the particles, emitters and force fields) and
+//! (`dumpcore::world`: the particle and emitter counters, the particles, emitters and force fields) and
 //! the backend dump (`dump2d::backend`), taken after that frame's applied forces; its outputs are the
 //! same three after `step()`, then the frame's collision events. Class C: the radial field divides by a
 //! `powf`, the sub-emitters spread by `cos` and `sin`, and the backend rotates and normalises; the
@@ -17,6 +17,7 @@ use impetus::{
 };
 
 use crate::dump2d;
+use crate::dumpcore;
 use crate::flat;
 use crate::grids::Rng;
 use crate::shapes::{ball, bx, capsule, ellipse_hull, segment};
@@ -69,7 +70,7 @@ fn scene(world: PhysicsWorld) -> Scene {
 fn tokens(w: &PhysicsWorld) -> Vec<Tok> {
     let d = w.oracle_dump();
     let mut t = flat::config(&d.config);
-    t.extend(dump2d::world(&d));
+    t.extend(dumpcore::world(&d));
     t.extend(dump2d::backend(&d.backend));
     t
 }

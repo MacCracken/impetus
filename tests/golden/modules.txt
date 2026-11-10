@@ -13,6 +13,7 @@ b3_narrow
 b3_ray
 b3_state
 b3_step
+b3_world
 broadphase
 config
 constants

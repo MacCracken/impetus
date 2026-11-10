@@ -8,7 +8,8 @@
 # M4 part 3: the raycast. M5 part 1: the 3D state, Rust's bodies/* and forces/apply_* loops (Rust's own numbers from the
 # 3D build), and get_body_state, which reads the rotation back through the correctly rounded atan2. M5 part 2: the
 # gyroscopic velocity step, a 20-link chain's joint work for one sub-step, and its whole frame (mask 0, so no
-# contacts). M5 part 3: Rust's `world/step_*` scenes on the 3D build, through the library's `step`.
+# contacts). M5 part 3: Rust's `world/step_*` scenes on the 3D build. M5 part 4: those scenes through ImPhysicsWorld
+# (as Rust's rows run), and Rust's `particles/*` rows on the 3D world.
 
 include "tests/lib_3d.cyr"
 include "tests/frame3.cyr"
@@ -88,6 +89,7 @@ fn spinning_box(): ImRigidBody3d {
     return b;
 }
 
+# A tumbling box's gyroscopic step and its integration.
 fn bench_body() {
     var b: ImRigidBody3d = spinning_box();
     var w: ImVec3 = ImVec3_new(0.2, 8.0, 0.3);
@@ -116,6 +118,7 @@ fn bench_body() {
     return 0;
 }
 
+# A box's mass recompute and a rotated box's world AABB.
 fn bench_mass_and_aabb() {
     var b: ImRigidBody3d = spinning_box();
     var c: ImCollider3d = ImCollider3d_from_desc(0, 0, ImColliderDesc_new(ImColliderShape_box(1.0, 0.5, 0.25)));
@@ -333,6 +336,7 @@ fn bench_state3(name, which) {
     return 0;
 }
 
+# Rust's bodies/* and forces/apply_* rows on the 3D state, and get_body_state.
 fn bench_states3() {
     bench_state3("bodies/add_body (3D)", 0);
     bench_state3("bodies/add_remove_body (3D)", 1);
@@ -375,6 +379,7 @@ fn chain20(st: *ImPhysicsState3d, warm) {
     return 0;
 }
 
+# The 3D step's parts: the gyroscopic velocity step, a 20-link chain's joint work and its contact-free frame.
 fn bench_step3() {
     var g: ImVec3 = ImVec3_new(0.0, -9.81, 0.0);
     var dt: f64 = 1.0 / 60.0;
@@ -426,36 +431,19 @@ fn bench_step3() {
     return 0;
 }
 
-# One world frame as PhysicsWorld::step runs the 3D backend: `sub_steps` sub-steps of the library's `step` with the
-# config's settings, then `finish_step` (the frame counter and the empty particle pass aside).
-fn b3_frame(st: *ImPhysicsState3d, cfg: *ImWorldConfig): i64 {
-    var sub = cfg.sub_steps;
-    if (sub < 1) { sub = 1; }
-    var ts: f64 = cfg.timestep;
-    var subf: f64 = f64_from(sub);
-    var dt: f64 = ts / subf;
-    for (var s = 0; s < sub; s = s + 1) {
-        st.step(cfg.gravity, dt, cfg.velocity_iterations, cfg.position_iterations, cfg.position_slop,
-          cfg.position_correction, cfg.max_velocity, cfg.constraint_frequency, cfg.constraint_damping_ratio,
-          cfg.broadphase);
-    }
-    return st.finish_step();
-}
-
-# Rust's world/step_N_bodies scene on the 3D build: n dynamic balls of radius 0.5 in rows of `per` (1 apart, rows 2
-# apart, z = 0), falling together; with `floor` 1, substep/step_100_bodies_substep4's static floor (a box of half
-# extents 50, 0.5, 0) under balls lifted by 1. Stepped `warm` frames, then timed `reps` frames.
-fn bench_step3_balls(name, n, per, floor, cfg: *ImWorldConfig, warm, reps) {
-    var st: ImPhysicsState3d = ImPhysicsState3d_new();
+# Rust's world/step_N_bodies scene on the 3D build, through the world (M5 part 4): n dynamic balls of radius 0.5 in
+# rows of `per` (1 apart, rows 2 apart, z = 0), falling together; with `floor` 1, substep/step_100_bodies_substep4's
+# static floor (a box of half extents 50, 0.5, 0) under balls lifted by 1. Stepped `warm` frames, then timed `reps`.
+fn bench_step3_balls(name, n, per, floor, cfg: ImWorldConfig, warm, reps) {
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
     var lift: f64 = 0.0;
     if (floor == 1) {
         var fd: ImBodyDesc = ImBodyDesc_default();
         fd.body_type = IM_BODY_STATIC;
         fd.position = ImVec3_new(0.0, -0.5, 0.0);
-        var fh = st.add_body(fd);
+        var fh = w.add_body(fd);
         var fc: ImColliderDesc = ImColliderDesc_new(ImColliderShape_box(50.0, 0.5, 0.0));
-        var tf, cf = st.add_collider(fh, fc);
-        fc.shape.free();
+        var tf, cf = w.add_collider(fh, fc);
         lift = 1.0;
     }
     for (var i = 0; i < n; i = i + 1) {
@@ -463,70 +451,126 @@ fn bench_step3_balls(name, n, per, floor, cfg: *ImWorldConfig, warm, reps) {
         var x: f64 = f64_from(i % per);
         var y: f64 = f64_from(i / per) * 2.0 + lift;
         d.position = ImVec3_new(x, y, 0.0);
-        var h = st.add_body(d);
-        var cd: ImColliderDesc = ImColliderDesc_new(ImColliderShape_ball(0.5));
-        var t, c = st.add_collider(h, cd);
-        cd.shape.free();
+        var h = w.add_body(d);
+        var t, c = w.add_collider(h, ImColliderDesc_new(ImColliderShape_ball(0.5)));
     }
-    for (var w = 0; w < warm; w = w + 1) { b3_frame(&st, cfg); }
+    for (var k = 0; k < warm; k = k + 1) { w.step(); }
     var bn = bench_new(name);
     bench_batch_start(bn);
-    for (var r = 0; r < reps; r = r + 1) { g_sink = b3_frame(&st, cfg); }
+    for (var r = 0; r < reps; r = r + 1) { w.step(); }
     bench_batch_stop(bn, reps);
     bench_report(bn);
-    st.free();
+    w.free();
     return 0;
 }
 
-# The 3D step with contacts (M5 part 3): Rust's world/step_* and substep rows' scenes through the backend, and a
-# settled stack of five boxes (the OBB SAT's face contacts, kept awake by a nudge every frame).
+# A fresh 3D world with n particles of radius 0.05 in rows of `per`, 2 apart from y = 5 (Rust's
+# particles/step_N_particles), one step timed per sample.
+fn bench_fresh_particles3(name, n, per, reps) {
+    var bn = bench_new(name);
+    for (var r = 0; r < reps; r = r + 1) {
+        var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+        for (var i = 0; i < n; i = i + 1) {
+            var x: f64 = f64_from(i % per);
+            var y: f64 = f64_from(i / per) * 2.0 + 5.0;
+            var p: ImParticle = ImParticle_new(ImVec3_new(x, y, 0.0), ImVec3_zero(), 100.0);
+            p.with_radius(0.05);
+            w.spawn_particle(p);
+        }
+        bench_start(bn);
+        w.step();
+        bench_stop(bn);
+        w.free();
+    }
+    bench_report(bn);
+    return 0;
+}
+
+# The 3D world (M5 parts 3–4): Rust's world/step_*, substep and particles/* rows on its 3D build, through
+# ImPhysicsWorld, and a settled stack of five boxes (the OBB SAT's face contacts, kept awake by a nudge every frame).
 fn bench_step3_world() {
-    var cfg: ImWorldConfig = ImWorldConfig_default();
-    var st: ImPhysicsState3d = ImPhysicsState3d_new();
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
     var be = bench_new("b3/step_empty");
     bench_batch_start(be);
-    for (var r = 0; r < 100000; r = r + 1) { g_sink = b3_frame(&st, &cfg); }
+    for (var r = 0; r < 100000; r = r + 1) { w.step(); }
     bench_batch_stop(be, 100000);
     bench_report(be);
-    st.free();
-    bench_step3_balls("b3/step_10_bodies", 10, 5, 0, &cfg, 100, 2000);
-    bench_step3_balls("b3/step_100_bodies", 100, 10, 0, &cfg, 100, 200);
-    bench_step3_balls("b3/step_1000_bodies", 1000, 32, 0, &cfg, 20, 20);
+    w.free();
+    bench_step3_balls("b3/step_10_bodies", 10, 5, 0, ImWorldConfig_default(), 100, 2000);
+    bench_step3_balls("b3/step_100_bodies", 100, 10, 0, ImWorldConfig_default(), 100, 200);
+    bench_step3_balls("b3/step_1000_bodies", 1000, 32, 0, ImWorldConfig_default(), 20, 20);
     var c4: ImWorldConfig = ImWorldConfig_default();
     c4.sub_steps = 4;
-    bench_step3_balls("b3/step_100_bodies_substep4", 100, 10, 1, &c4, 100, 100);
-    var sk: ImPhysicsState3d = ImPhysicsState3d_new();
+    bench_step3_balls("b3/step_100_bodies_substep4", 100, 10, 1, c4, 100, 100);
+    var sk: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
     var gd: ImBodyDesc = ImBodyDesc_default();
     gd.body_type = IM_BODY_STATIC;
     gd.position = ImVec3_new(0.0, -0.5, 0.0);
     var g = sk.add_body(gd);
-    var gc: ImColliderDesc = ImColliderDesc_new(ImColliderShape_box(20.0, 0.5, 20.0));
-    var tg, cg = sk.add_collider(g, gc);
-    gc.shape.free();
+    var tg, cg = sk.add_collider(g, ImColliderDesc_new(ImColliderShape_box(20.0, 0.5, 20.0)));
     var top = 0;
     for (var i = 0; i < 5; i = i + 1) {
         var d: ImBodyDesc = ImBodyDesc_default();
         var y: f64 = 0.5 + f64_from(i);
         d.position = ImVec3_new(0.0, y, 0.0);
         top = sk.add_body(d);
-        var bc: ImColliderDesc = ImColliderDesc_new(ImColliderShape_box(0.5, 0.5, 0.5));
-        var tb, cb = sk.add_collider(top, bc);
-        bc.shape.free();
+        var tb, cb = sk.add_collider(top, ImColliderDesc_new(ImColliderShape_box(0.5, 0.5, 0.5)));
     }
-    for (var w = 0; w < 120; w = w + 1) { b3_frame(&sk, &cfg); }
+    for (var k = 0; k < 120; k = k + 1) { sk.step(); }
     var nudge: ImForce = ImForce_new(0.0, 0.0, 0.0001);
     var bs = bench_new("b3/step_stack5_resting");
     bench_batch_start(bs);
     for (var q = 0; q < 2000; q = q + 1) {
         sk.apply_force(top, nudge);
-        g_sink = b3_frame(&sk, &cfg);
+        sk.step();
     }
     bench_batch_stop(bs, 2000);
     bench_report(bs);
     sk.free();
+    bench_fresh_particles3("b3/particles/step_100_particles", 100, 10, 2000);
+    bench_fresh_particles3("b3/particles/step_1000_particles", 1000, 32, 200);
+    # A floor and 100 falling particles, stepped on and on as criterion does (they expire at 10 s).
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var fd: ImBodyDesc = ImBodyDesc_default();
+    fd.body_type = IM_BODY_STATIC;
+    var fh = w.add_body(fd);
+    var tf, cf = w.add_collider(fh, ImColliderDesc_new(ImColliderShape_box(50.0, 0.5, 0.0)));
+    for (var j = 0; j < 100; j = j + 1) {
+        var px: f64 = f64_from(j % 10);
+        var py: f64 = f64_from(j / 10) + 1.0;
+        var p: ImParticle = ImParticle_new(ImVec3_new(px, py, 0.0), ImVec3_new(0.0, -2.0, 0.0), 10.0);
+        p.with_radius(0.05).with_restitution(0.5);
+        w.spawn_particle(p);
+    }
+    var bf = bench_new("b3/particles/step_100_particles_with_floor");
+    bench_batch_start(bf);
+    for (var r2 = 0; r2 < 100000; r2 = r2 + 1) { w.step(); }
+    bench_batch_stop(bf, 100000);
+    bench_report(bf);
+    w.free();
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var bsp = bench_new("b3/particles/spawn_particle");
+    bench_batch_start(bsp);
+    for (var r3 = 0; r3 < 100000; r3 = r3 + 1) {
+        g_sink = w.spawn_particle(ImParticle_new(ImVec3_zero(), ImVec3_new(1.0, 2.0, 0.0), 3.0));
+    }
+    bench_batch_stop(bsp, 100000);
+    bench_report(bsp);
+    w.free();
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var em: ImParticleEmitter = ImParticleEmitter_new(ImVec3_zero(), ImVec3_new(0.0, 10.0, 0.0), 100.0);
+    em.with_lifetime(0.5);
+    w.add_emitter(em);
+    var bm = bench_new("b3/particles/emitter_step");
+    bench_batch_start(bm);
+    for (var r4 = 0; r4 < 100000; r4 = r4 + 1) { w.step(); }
+    bench_batch_stop(bm, 100000);
+    bench_report(bm);
+    w.free();
     return 0;
 }
 
+# Runs the 3D benches.
 fn main() {
     alloc_init();
     bench_math3();

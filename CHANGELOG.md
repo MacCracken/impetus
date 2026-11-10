@@ -483,7 +483,35 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     `b3::state_script_unsupported` scripts, and its seeded scripts no longer draw those joints.
   - Surface parity is 637/637 across 29 modules.
   - **3D: 29,214 ok, 0 failed, 11 accepted (ADR 11: 5, ADR 0008: 6)**; 2D unchanged at **98,873 ok**.
-    The same on x86_64 ELF, x86_64 PE and aarch64..
+    The same on x86_64 ELF, x86_64 PE and aarch64.
+- **Cyrius port, M5 part 4: the 3D world, closing M5** (`docs/development/port-parity.md` §23):
+  - `src/world.cyr` is now shared by both profiles, as port plan §4 step 3 intended. Each profile's own world file
+    comes before it with the storage over its backend, the constructor, the sub-step, the particle collisions and the
+    overlap queries: `src/b2_world.cyr` (M3's 2D code, moved unchanged) and the new `src/b3_world.cyr`. The 3D world
+    is Rust's 3D `PhysicsWorld`:
+    - every sub-step runs sequential impulses, whatever the config's solver kind (`ImPhysicsWorld_try_new` still
+      refuses XPBD, ADR 0008 #6);
+    - particles test every non-sensor collider with no bounding-box pre-check, against balls, boxes, capsules and
+      segments, as Rust's `particle_vs_collider_3d` does (no contact with hulls, meshes or heightfields);
+    - `overlap_sphere` and `overlap_aabb` return no colliders, as Rust's 3D world does.
+
+    Each collider's centre is computed once a step rather than for every particle, the same value from the same
+    operations.
+  - The golden `b3_world.tsv` holds 190 world steps in 3D. It covers emitters, fields off the z = 0 plane, every 3D
+    shape (turned, offset, sensor, hull), particles streamed along z into faces, tumbling bodies spun about skew axes,
+    a kinematic paddle, sub-emitters, joints, contacts beside particles, sub-steps and 30 seeded scenes. **All 190 at
+    0 ulp** on the first run, and none needs a correction. `validate.py` transcribes the 3D particle collisions and
+    reproduces every row.
+  - The tests Rust runs on both backends now run on both profiles from one source: `tests/world_cases.cyr` (the
+    world and particle tests) and `tests/regression_cases.cyr` (the 9 integration and 12 shared regression tests).
+    `tests/world.tcyr` and `tests/regressions.tcyr` run them on 2D, with the 14 2D-only regressions. The new
+    `tests/b3_world.tcyr` (74 assertions) and `tests/b3_regressions.tcyr` (29) run them on 3D, with Cyrius-only groups
+    for the 3D particle contacts, sensors, hulls and offset colliders, the empty overlaps, the unread solver kind, the
+    world against the backend's own step and a flat heap, and with Rust's 3D-only `substeps_are_honoured_in_3d`.
+  - The oracle's world-state tokens moved to the shared `dumpcore.rs`, and the parity harness's to
+    `tests/parity_types.cyr`.
+  - Surface parity is 637/637 across 29 modules, with the 3 snapshot functions pending M6.
+  - **3D: 29,404 ok, 0 failed, 11 accepted (ADR 11: 5, ADR 0008: 6)**; 2D unchanged at **98,873 ok**.
 
 ### Performance
 - **Correctly rounded exp, sin and cos** (ADR 0011): phase 1 takes exp from 2.6 µs to 97 ns and
@@ -569,6 +597,16 @@ can drive the oracle (M0 step 0), and simulation behaviour is unchanged.
     compares inline. The orders are unchanged. `broadphase/spatial_hash_1000_row` 1.98 ms → 588 µs; the 3D
     `step_1000_bodies` 9.07 → 5.84 ms; the 2D `b2/step_1000_bodies` 3.76 → 2.33 ms and `world/step_1000_bodies`
     3.89 → 2.48 ms.
+- **The 3D world against Rust** (`docs/benchmarks-rust-v-cyrius.md`; measured with nothing else running, Rust on its
+  3D build):
+  - `world/step_*` now through the world: empty 70.5 → 424 ns, 10 bodies 4.96 → 56.3 µs, 100 bodies 115 → 663 µs,
+    1,000 bodies 1.08 → 6.00 ms; `substep/step_100_bodies_substep4` 550 µs → 6.17 ms. The world adds about 35 ns a
+    frame over the backend.
+  - `particles/*` on the 3D world: `step_100_particles` 1.90 → 9.90 µs, `step_1000_particles` 6.39 → 94.0 µs,
+    `spawn_particle` 19.9 → 714 ns, `emitter_step` 505 ns → 18.5 µs, as in 2D.
+  - `step_100_particles_with_floor` 338 ns → 2.85 µs (8.4×, 2D's is 4.3×). Its particles soon expire, so it times a
+    frame with one static box, and 1.84 µs of that frame is the 3D broadphase's rebuild for the one box. Recorded as a
+    finding.
 - **Cyrius port, M1b** (first numbers, `docs/benchmarks-rust-v-cyrius.md`; Rust 1.4.0 → Cyrius):
   `spring_1d_step` 4.98 → 28.5 ns (5.7×), `spring_2d_step` 6.04 → 59.5 ns (9.9×),
   `spring_settle_frames` 1.47 → 1.80 µs (1.2×), then 1.86 µs (1.26×) on the correctly rounded exp; `quantity_display` 81 → 830 ns (10×); serde

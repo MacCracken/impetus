@@ -993,6 +993,84 @@ fails when either drifts from `cyrius.cyml`.
 - **Result:** 3D **29,214 ok, 0 failed, 11 accepted (ADR 11: 5, ADR 0008: 6)** over 7 modules; 2D unchanged at
   **98,873 ok**. The same on x86_64 ELF, x86_64 PE and aarch64. Surface parity is 637 across 29 modules, every 3D backend module but the tests file.
 
+## 23. M5d: the 3D world; M5 done (2026-11-10)
+
+- **One world, two profiles.** Port plan §4 step 3 makes `world.cyr` shared, but M3 wrote it over the 2D backend. It
+  is now split. `src/world.cyr` is the part both profiles share: the step's frame counter and sub-step loop, the
+  particles' spawn, integration, sub-emitters and removal, and every accessor. Each profile's file comes before it
+  and holds what touches its backend:
+  - the `ImPhysicsWorld` storage over that backend, and `ImPhysicsWorld_new`;
+  - `_substep` (the 2D one passes the solver kind; the 3D backend has only sequential impulses);
+  - `_collide_particles`;
+  - `overlap_sphere` and `overlap_aabb`.
+
+  `src/b2_world.cyr` is M3's 2D code, moved unchanged (the 2D corpus passes as before). `src/b3_world.cyr` ports
+  Rust's 3D paths: `particle_vs_local_box` and `particle_vs_rounded_segment` with N = 3, and
+  `particle_vs_collider_3d`. A Cyrius struct can take a second `impl` block, so the shared methods and the profile's
+  methods are one type's.
+- **Rust's 3D world, not 2D's.** Three behaviours differ from the 2D world, and the port keeps each:
+  - the config's solver kind is never read: an unvalidated XPBD config steps as sequential impulses
+    (`ImPhysicsWorld_try_new` still refuses it, ADR 0008 #6);
+  - particles test every non-sensor collider with no bounding-box pre-check (a pre-check on rounded boxes could
+    reject a pair the exact test accepts);
+  - the overlap queries return no colliders ("3D overlap not implemented yet").
+
+  Rust computes a collider's centre for every particle; the port computes it once a step per collider. That is the
+  same value from the same operations, since no body moves while particles collide. Each sum runs x, y, z from the
+  left, which is what Rust 1.99's `Iterator::sum` does, folding from −0.0.
+- **`b3_world.tsv`**, 190 rows, `world_step.tsv`'s layout with the 3D dump:
+  - an emitter over a floor with spread on every axis, an inactive emitter and two with no valid rate; a fast
+    emitter at two sub-steps;
+  - radial fields on rings in all three coordinate planes (falloffs 1 and 2, repulsion, a reach limit, a particle at
+    the centre); a directional box thin in z, with a radial field;
+  - collisions with every shape: boxes plain and turned, a ball, a turned capsule, a segment across z, a hull (no
+    contact), a sensor, an offset box on a turned body, at restitutions 0, 0.3 and 1, and a particle inside a box, one
+    of radius 0 and one meeting a z face;
+  - streams along z into a box face, a ball, a turned box and a tumbling box, so every frame has hits with a z normal;
+  - bodies spun about skew axes by an off-centre impulse, with gravity scale 0, under an emitter's particles. Rust's
+    3D world builds bodies turned about z only, so this is how the corpus reaches other orientations;
+  - a kinematic paddle with an offset collider, sub-emitters, a ball landing beside a field's particles, a pushed box,
+    a distance-joint pendulum and a spring pair under a shower;
+  - 30 seeded scenes at 1 to 3 sub-steps in either broadphase.
+
+  Class C, bound 0 by the rule (§5): the world adds only crmath's `pow`, `sin` and `cos` to the 3D step. **All 190
+  rows are 0 ulp** (97,299 floats) on the first run. MPFR agrees with glibc on every call in them, so there is no
+  correction file. Perturbing the z restitution term by 1e-7 fails 9 rows, and using the rotation for its inverse in
+  the box test fails 13. The z-stream scene was added after the first mutation failed only 2 rows (most hits are on
+  floors, whose normals have no z).
+- **The transcription.** `validate.py`'s particle step is now a class both step models share, each supplying its own
+  `collide_particles`. The 3D model adds `frame` (the sub-steps and `finish_step`), `world_step`, and the three 3D
+  contact functions. It reproduces all 190 rows on glibc.
+- **Rust tests on both profiles.** Rust's `--all-features` build runs `world.rs`'s tests, `integration.rs` and the
+  shared regressions on its 3D world, from the same source as on 2D. The port now does the same:
+  - `tests/world_cases.cyr` holds the 24 world tests, the 8 particle tests and the shared Cyrius-only groups;
+  - `tests/regression_cases.cyr` holds the 9 integration tests and the 12 shared regressions.
+
+  `tests/world.tcyr` (55 assertions) and `tests/regressions.tcyr` (44) run them on 2D, the latter with its 14
+  2D-only tests. `tests/b3_world.tcyr` runs them on 3D with 19 Cyrius-only assertions:
+  - the contact for each shape, turned and off the origin;
+  - particles against a sensor, a hull and an offset collider in a world;
+  - the empty overlaps;
+  - the unread solver kind, bit for bit;
+  - 60 frames of three sub-steps through the world against the backend's own `step` at a third of the timestep, bit
+    for bit;
+  - a flat heap with contacts, joints, an emitter and a field.
+
+  That is 74 assertions. `tests/b3_regressions.tcyr` runs the 21 shared cases with Rust's 3D-only
+  `substeps_are_honoured_in_3d` (29 assertions).
+- **Shared plumbing.** The oracle's world-state tokens moved from `dump2d.rs` to `dumpcore.rs`. The harness's
+  particle, emitter and field readers and writers moved to `tests/parity_types.cyr`, with `_par_got_config` and
+  `_par_in_f`.
+- **The audit's docs step.** `cyrius audit` exits 1 when a public function has no doc comment directly above it, and
+  the committed tree had 44: test helpers and `main`s, three constructors in `src/`, and `ImCollider3d_from_desc`,
+  whose comment part 3 separated from it by inserting `_im_b3_coll_shape` between them. The earlier parts read the
+  audit's output and missed its exit code. All 44 now have one, and the audit exits 0.
+- **Not done: ADR 0008 #4.** The ADR gives the 3D `BodyState` a full quaternion and angular-velocity vector. Part 1
+  ported Rust's rotation about z, and that is unchanged here. The world only passes the state through, so #4 changes
+  `src/b3_state.cyr` and the shared `ImBodyState` alone. It pairs with M6's `BodySnapshot`.
+- **Result:** 3D **29,404 ok, 0 failed, 11 accepted (ADR 11: 5, ADR 0008: 6)** over 8 modules; 2D unchanged at
+  **98,873 ok**. The same on x86_64 ELF, x86_64 PE and aarch64. Surface parity is 637 across 29 modules.
+
 ## How to reproduce
 
 ```sh

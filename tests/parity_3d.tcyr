@@ -731,12 +731,32 @@ fn _par_b3_step(fp, fl): i64 {
     return 1;
 }
 
+# ── M5d: world steps ────────────────────────────────────────────────────────────────
+# A `b3::world_step` row is world_step's with the 3D backend: the config, the world's own state and the 3D backend
+# dump; the port loads all three into an ImPhysicsWorld, steps it, and writes them again with the frame's events.
+fn _par_b3_world(fp, fl): i64 {
+    if (_par_eq(fp, fl, "b3::world_step") != 1) { return 0; }
+    var cfg: ImWorldConfig = _par_in_config(0);
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    var k = _par_load_world(&w, 16);
+    _par_load_state3d(w.backend, k);
+    w.step();
+    _par_got_world_own(&w);
+    _par_got_state3d(w.backend);
+    var ev, n = w.collision_events();
+    _par_got_seq(n);
+    for (var e = 0; e < n; e = e + 1) { _par_got_event(ev + e * sizeof(ImCollisionEvent)); }
+    w.free();
+    return 1;
+}
+
 fn _par_dispatch(mp, ml, fp, fl): i64 {
     _par_got_n = 0;
     _par_mapped3 = 0;
     if (_par_eq(mp, ml, "b3_state") == 1) { return _par_b3_state(fp, fl); }
     if (_par_eq(mp, ml, "b3_step") == 1) { return _par_b3_step(fp, fl); }
     if (_par_eq(mp, ml, "b3_contact") == 1) { return _par_b3_step(fp, fl); }
+    if (_par_eq(mp, ml, "b3_world") == 1) { return _par_b3_world(fp, fl); }
     if (_par_eq(mp, ml, "b3_body") == 1) { return _par_b3_body(fp, fl); }
     if (_par_eq(mp, ml, "b3_math") == 1) { return _par_b3_math(fp, fl); }
     if (_par_eq(mp, ml, "b3_narrow") == 1) { return _par_b3_narrow(fp, fl); }
@@ -751,7 +771,8 @@ fn _par_shadows(mp, ml, fp, fl, cls) {
 }
 
 # The class-C bound for a function, in ulps; -1 when none is set. The rotations are built on crmath's correctly
-# rounded sin_cos (ADR 0011), so the bound is 0 against the corrected oracle (ADR 0012).
+# rounded sin_cos (ADR 0011), and the world's fields and sub-emitters on its pow, sin and cos, so the bound is 0
+# against the corrected oracle (ADR 0012).
 #must_use
 fn _par_c_bound(fp, fl): i64 {
     if (_par_eq(fp, fl, "b3::body") == 1) { return 0; }
@@ -760,6 +781,7 @@ fn _par_c_bound(fp, fl): i64 {
     if (_par_eq(fp, fl, "b3::state_script_orphan") == 1) { return 0; }
     if (_par_eq(fp, fl, "b3::state_script_unsupported") == 1) { return 0; }
     if (_par_eq(fp, fl, "b3::step") == 1) { return 0; }
+    if (_par_eq(fp, fl, "b3::world_step") == 1) { return 0; }
     if (_par_eq(fp, fl, "DQuat::from_rotation_x") == 1) { return 0; }
     if (_par_eq(fp, fl, "DQuat::from_rotation_y") == 1) { return 0; }
     if (_par_eq(fp, fl, "DQuat::from_rotation_z") == 1) { return 0; }

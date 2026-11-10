@@ -301,6 +301,7 @@ fn bench_atan2_cr() {
     return 0;
 }
 
+# The correctly rounded exp.
 fn bench_exp_cr() {
     var b = bench_new("math/exp_cr");
     var x: f64 = -0.3;
@@ -591,6 +592,7 @@ fn bench_state(name, which) {
     return 0;
 }
 
+# Rust's bodies/* and forces/apply_* rows on the 2D state.
 fn bench_states() {
     bench_state("bodies/add_body", 0);
     bench_state("bodies/add_remove_body", 1);

@@ -700,6 +700,12 @@ def corrections(module, rows):
                 seen = list(dict.fromkeys(log))
                 out.append((fn, " ".join(ins), " ".join(toks), "oracle (dump); " + "; ".join(seen)))
             continue
+        elif module == "b3_world":
+            toks = _Step3d(_logged_hypot(log), prim["sin"], prim["cos"], _logged_pow(log)).world_step(ins)
+            if not _same_tokens(outs, toks):
+                seen = list(dict.fromkeys(log))
+                out.append((fn, " ".join(ins), " ".join(toks), "oracle (dump); " + "; ".join(seen)))
+            continue
         elif module in ("b3_step", "b3_contact"):
             toks = _Step3d(_logged_hypot(log)).step(ins, module)
             if not _same_tokens(outs, toks):
@@ -2350,7 +2356,87 @@ def _union(a, b):
     return sorted(set(a) | set(b))
 
 
-class _Step2d:
+class _WorldParticles:
+    """`step_particles`, the same for both backends but for `collide_particles`: the step class supplies pw, sin, cos
+    and its own collide_particles."""
+
+    def particles(self, w, st, cfg):
+        """`step_particles`: spawn, integrate, collide, sub-emitters, remove the dead."""
+        dt, g = cfg["dt"], cfg["g3"]
+        ps = w["particles"]
+        new = []
+        for e in w["emitters"]:
+            if not e["active"] or not (e["rate"] > 0.0 and math.isfinite(e["rate"])):
+                continue
+            e["acc"] += dt
+            interval = 1.0 / e["rate"]
+            spawned = 0
+            while e["acc"] >= interval:
+                if spawned >= WORLD_MAX_SPAWNS:
+                    e["acc"] = 0.0
+                    break
+                spawned += 1
+                e["acc"] -= interval
+                n = float(w["next_p"])
+                sp = [((0.5 + n * a) % 1.0) * 2.0 - 1.0 for a in WORLD_R3]
+                vel = [e["vel"][c] + e["spread"][c] * sp[c] for c in range(3)]
+                new.append({"h": w["next_p"], "pos": list(e["pos"]), "vel": vel, "life": e["life"],
+                            "radius": rust_max(e["radius"], 0.0), "drag": 0.0, "rest": e["rest"], "gs": e["gs"],
+                            "damp": e["damp"], "sub": None})
+                w["next_p"] = (w["next_p"] + 1) & 0xFFFFFFFFFFFFFFFF
+        ps.extend(new)
+        for p in ps:
+            if not p["life"] > 0.0:
+                continue
+            v = p["vel"]
+            for c in range(3):
+                v[c] += g[c] * p["gs"] * dt
+            for f in w["fields"]:
+                if f["kind"] == "Radial":
+                    d = [f["center"][c] - p["pos"][c] for c in range(3)]
+                    dist_sq = d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+                    dist = rust_sqrt(dist_sq)
+                    if dist < 1e-10 or (f["radius"] > 0.0 and dist > f["radius"]):
+                        continue
+                    mag = _np_div(f["strength"], self.pw(dist_sq + WORLD_SOFT * WORLD_SOFT, f["falloff"] * 0.5))
+                    for c in range(3):
+                        v[c] += (d[c] / dist) * mag * dt
+                else:
+                    q = p["pos"]
+                    if all(f["min"][c] <= q[c] <= f["max"][c] for c in range(3)):
+                        for c in range(3):
+                            v[c] += f["force"][c] * dt
+            if p["drag"] > 0.0:
+                speed_sq = v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
+                if speed_sq > 1e-20:
+                    speed = rust_sqrt(speed_sq)
+                    factor = rust_min(p["drag"] * speed_sq * dt, speed)
+                    for c in range(3):
+                        v[c] -= (v[c] / speed) * factor
+            df = _np_div(1.0, 1.0 + dt * p["damp"])
+            for c in range(3):
+                v[c] *= df
+            for c in range(3):
+                p["pos"][c] += v[c] * dt
+            p["life"] -= dt
+        self.collide_particles(ps, st)
+        subs = []
+        for p in ps:
+            if not p["life"] > 0.0 and p["sub"] is not None:
+                count, speed, life, radius, gs, rest = p["sub"]
+                for i in range(count):
+                    angle = (float(i) / float(count)) * (2.0 * math.pi)
+                    subs.append({"pos": list(p["pos"]), "vel": [self.cos(angle) * speed, self.sin(angle) * speed, 0.0],
+                                 "life": life, "radius": rust_max(radius, 0.0), "drag": 0.0, "rest": rest, "gs": gs,
+                                 "damp": 0.0, "sub": None})
+        for c in subs:
+            c["h"] = w["next_p"]
+            w["next_p"] = (w["next_p"] + 1) & 0xFFFFFFFFFFFFFFFF
+            ps.append(c)
+        w["particles"] = [p for p in ps if p["life"] > 0.0]
+
+
+class _Step2d(_WorldParticles):
     """The sequential-impulse step (contacts, joints, integration, islands and sleep) on the given sin,
     cos and hypot."""
 
@@ -3194,81 +3280,6 @@ class _Step2d:
         conf = list(ins[:16])
         conf[7] = f"i:{tok_i(ins[7]) + 1}"
         return conf + _world_emit(w) + _dump_emit(st) + _events_tokens(ev)
-
-    def particles(self, w, st, cfg):
-        """`step_particles`: spawn, integrate, collide, sub-emitters, remove the dead."""
-        dt, g = cfg["dt"], cfg["g3"]
-        ps = w["particles"]
-        new = []
-        for e in w["emitters"]:
-            if not e["active"] or not (e["rate"] > 0.0 and math.isfinite(e["rate"])):
-                continue
-            e["acc"] += dt
-            interval = 1.0 / e["rate"]
-            spawned = 0
-            while e["acc"] >= interval:
-                if spawned >= WORLD_MAX_SPAWNS:
-                    e["acc"] = 0.0
-                    break
-                spawned += 1
-                e["acc"] -= interval
-                n = float(w["next_p"])
-                sp = [((0.5 + n * a) % 1.0) * 2.0 - 1.0 for a in WORLD_R3]
-                vel = [e["vel"][c] + e["spread"][c] * sp[c] for c in range(3)]
-                new.append({"h": w["next_p"], "pos": list(e["pos"]), "vel": vel, "life": e["life"],
-                            "radius": rust_max(e["radius"], 0.0), "drag": 0.0, "rest": e["rest"], "gs": e["gs"],
-                            "damp": e["damp"], "sub": None})
-                w["next_p"] = (w["next_p"] + 1) & 0xFFFFFFFFFFFFFFFF
-        ps.extend(new)
-        for p in ps:
-            if not p["life"] > 0.0:
-                continue
-            v = p["vel"]
-            for c in range(3):
-                v[c] += g[c] * p["gs"] * dt
-            for f in w["fields"]:
-                if f["kind"] == "Radial":
-                    d = [f["center"][c] - p["pos"][c] for c in range(3)]
-                    dist_sq = d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
-                    dist = rust_sqrt(dist_sq)
-                    if dist < 1e-10 or (f["radius"] > 0.0 and dist > f["radius"]):
-                        continue
-                    mag = _np_div(f["strength"], self.pw(dist_sq + WORLD_SOFT * WORLD_SOFT, f["falloff"] * 0.5))
-                    for c in range(3):
-                        v[c] += (d[c] / dist) * mag * dt
-                else:
-                    q = p["pos"]
-                    if all(f["min"][c] <= q[c] <= f["max"][c] for c in range(3)):
-                        for c in range(3):
-                            v[c] += f["force"][c] * dt
-            if p["drag"] > 0.0:
-                speed_sq = v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
-                if speed_sq > 1e-20:
-                    speed = rust_sqrt(speed_sq)
-                    factor = rust_min(p["drag"] * speed_sq * dt, speed)
-                    for c in range(3):
-                        v[c] -= (v[c] / speed) * factor
-            df = _np_div(1.0, 1.0 + dt * p["damp"])
-            for c in range(3):
-                v[c] *= df
-            for c in range(3):
-                p["pos"][c] += v[c] * dt
-            p["life"] -= dt
-        self.collide_particles(ps, st)
-        subs = []
-        for p in ps:
-            if not p["life"] > 0.0 and p["sub"] is not None:
-                count, speed, life, radius, gs, rest = p["sub"]
-                for i in range(count):
-                    angle = (float(i) / float(count)) * (2.0 * math.pi)
-                    subs.append({"pos": list(p["pos"]), "vel": [self.cos(angle) * speed, self.sin(angle) * speed, 0.0],
-                                 "life": life, "radius": rust_max(radius, 0.0), "drag": 0.0, "rest": rest, "gs": gs,
-                                 "damp": 0.0, "sub": None})
-        for c in subs:
-            c["h"] = w["next_p"]
-            w["next_p"] = (w["next_p"] + 1) & 0xFFFFFFFFFFFFFFFF
-            ps.append(c)
-        w["particles"] = [p for p in ps if p["life"] > 0.0]
 
     def collide_particles(self, ps, st):
         """`collide_particles` (2D)."""
@@ -5279,12 +5290,75 @@ def _b3_orthonormal_pair(a):
     return (1.0 + sign * ax * ax * k, sign * m, -sign * ax), (m, sign + ay * ay * k, -ay)
 
 
-class _Step3d:
-    """The 3D backend's sub-step when nothing touches, transcribed from rust-old (types.rs, joints.rs, solver.rs) in
-    glam's operation order; hypot (a Wheel's break test) is the given one."""
+def _pv3_box(local, radius, he):
+    """`particle_vs_local_box` in 3D."""
+    e = [abs(h) for h in he]
+    d = [local[i] - rust_clamp(local[i], -e[i], e[i]) for i in range(3)]
+    dist_sq = 0.0
+    for i in range(3):
+        dist_sq += d[i] * d[i]
+    if all(abs(local[i]) <= e[i] for i in range(3)):
+        pen, axis = math.inf, 0
+        for i in range(3):
+            q = e[i] - abs(local[i])
+            if q < pen:
+                pen, axis = q, i
+        n = [0.0, 0.0, 0.0]
+        n[axis] = 1.0 if local[axis] >= 0.0 else -1.0
+        return tuple(n), pen + radius
+    dist = rust_sqrt(dist_sq)
+    if dist < radius and dist > 1e-12:
+        return tuple(x / dist for x in d), radius - dist
+    return None
 
-    def __init__(self, hypot):
+
+def _pv3_segment(pos, r, a, b, sr):
+    """`particle_vs_rounded_segment` in 3D (each sum from the left, as `Iterator::sum` folds from -0.0)."""
+    ab = [b[i] - a[i] for i in range(3)]
+    ap = [pos[i] - a[i] for i in range(3)]
+    len_sq = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2]
+    t = 0.0 if len_sq < 1e-20 else rust_clamp(_np_div(ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2], len_sq), 0.0, 1.0)
+    d = [pos[i] - (a[i] + ab[i] * t) for i in range(3)]
+    dist = rust_sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+    overlap = r + sr - dist
+    if overlap > 0.0 and dist > 1e-12:
+        return tuple(x / dist for x in d), overlap
+    return None
+
+
+def _pv3_collider(pos, r, shape, bpos, brot, off):
+    """`particle_vs_collider_3d`: (normal, depth) or None."""
+    center = _v_add(bpos, _q_mul_vec3(brot, off))
+    k = shape[0]
+    if k == "Ball":
+        return _pv3_segment(pos, r, center, center, shape[1])
+    if k == "Box":
+        local = _q_mul_vec3(_q_inv(brot), _v_sub(pos, center))
+        res = _pv3_box(local, r, shape[1])
+        if res is None:
+            return None
+        n, depth = res
+        return _q_mul_vec3(brot, n), depth
+    if k == "Capsule":
+        axis = _q_mul_vec3(brot, (0.0, shape[1], 0.0))
+        return _pv3_segment(pos, r, _v_sub(center, axis), _v_add(center, axis), shape[2])
+    if k == "Segment":
+        wa = _v_add(center, _q_mul_vec3(brot, shape[1]))
+        wb = _v_add(center, _q_mul_vec3(brot, shape[2]))
+        return _pv3_segment(pos, r, wa, wb, 0.0)
+    return None
+
+
+class _Step3d(_WorldParticles):
+    """The 3D backend's step, transcribed from rust-old (types.rs, joints.rs, solver.rs) in glam's operation order,
+    and the 3D world's (world.rs); hypot (friction and a Wheel's break test) is the given one, and so are the world's
+    sin, cos (sub-emitters) and pow (radial fields)."""
+
+    def __init__(self, hypot, sin=None, cos=None, pw=None):
         self.hypot = hypot
+        self.sin = (lambda x: _sin_cos(x)[0]) if sin is None else sin
+        self.cos = (lambda x: _sin_cos(x)[1]) if cos is None else cos
+        self.pw = _glibc_pow if pw is None else pw
 
     # ── joints.rs ──
 
@@ -5821,14 +5895,63 @@ class _Step3d:
             tr = st["tracker"]
             if tr["prev"] or tr["current"] or tr["seen"]:
                 fail("b3_step: a row's dump has contacts")
+        ev = self.frame(st, cfg)
+        return _b3_dump_emit(st) + _events_tokens(ev)
+
+    def frame(self, st, cfg):
+        """The backend's part of PhysicsWorld::step (3D): the sub-steps, then finish_step's events."""
         sub = max(cfg["sub"], 1)
         dt = cfg["dt"] / float(sub)
         for _ in range(sub):
             self.substep(st, cfg, dt)
         for _, b in st["bodies"].values():
             b["force"], b["torque"] = _ZV, _ZV
-        ev = _Step2d.finish(st)
-        return _b3_dump_emit(st) + _events_tokens(ev)
+        return _Step2d.finish(st)
+
+    # ── the world (world.rs, 3D) ──
+
+    def world_step(self, ins):
+        """The output tokens of a b3_world row: the config with its frame counter advanced, the world's own state,
+        the 3D backend, the events. The 3D backend reads no solver kind."""
+        cfg = {"dt": tok_f(ins[0]), "g": (tok_f(ins[1]), tok_f(ins[2]), tok_f(ins[3])), "iters": tok_i(ins[4]),
+               "piters": tok_i(ins[5]), "slop": tok_f(ins[8]), "corr": tok_f(ins[9]), "maxv": tok_f(ins[10]),
+               "sub": tok_i(ins[11]), "freq": tok_f(ins[12]), "ratio": tok_f(ins[13])}
+        cfg["g3"] = cfg["g"]
+        w, k = _world_parse(ins, 16)
+        st, k = _b3_dump_parse(ins, k)
+        if k != len(ins):
+            fail(f"b3_world: {len(ins) - k} input tokens left over")
+        ev = self.frame(st, cfg)
+        self.particles(w, st, cfg)
+        conf = list(ins[:16])
+        conf[7] = f"i:{tok_i(ins[7]) + 1}"
+        return conf + _world_emit(w) + _b3_dump_emit(st) + _events_tokens(ev)
+
+    def collide_particles(self, ps, st):
+        """`collide_particles` (3D): every live particle with a radius against every non-sensor collider, in slot
+        order, with no bounding-box pre-check."""
+        bodies = st["bodies"]
+        for p in ps:
+            pr = p["radius"]
+            if not p["life"] > 0.0 or pr <= 0.0:
+                continue
+            for _, c in st["colls"].values():
+                if c["sensor"]:
+                    continue
+                b = bodies.get(c["body"])
+                if b is None:
+                    continue
+                hit = _pv3_collider(tuple(p["pos"]), pr, c["shape"], b["pos"], b["rot"], c["off"])
+                if hit is None:
+                    continue
+                n, depth = hit
+                for i in range(3):
+                    p["pos"][i] += n[i] * depth
+                v = p["vel"]
+                vdn = v[0] * n[0] + v[1] * n[1] + v[2] * n[2]
+                if vdn < 0.0:
+                    for i in range(3):
+                        v[i] -= (1.0 + p["rest"]) * vdn * n[i]
 
 
 def check_b3_step(rows, module="b3_step"):
@@ -5843,6 +5966,22 @@ def check_b3_step(rows, module="b3_step"):
             first = next((n for n, (a, b) in enumerate(zip(outs, want)) if not _same_tokens([a], [b])),
                          min(len(outs), len(want)))
             fail(f"{module}: row {i}: the transcription differs at output {first} of {len(outs)}: "
+                 f"{' '.join(outs[first:first + 3])} vs {' '.join(want[first:first + 3])}")
+    return len(rows)
+
+
+def check_b3_world(rows):
+    """Recomputes every 3D world step on glibc's sin, cos, hypot and pow."""
+    model = _Step3d(_glibc_hypot)
+    for i, (fn, cls, ins, outs, note) in enumerate(rows):
+        if fn != "b3::world_step":
+            fail(f"b3_world: unknown function {fn}")
+            continue
+        want = model.world_step(ins)
+        if not _same_tokens(outs, want):
+            first = next((n for n, (a, b) in enumerate(zip(outs, want)) if not _same_tokens([a], [b])),
+                         min(len(outs), len(want)))
+            fail(f"b3_world: row {i}: the transcription differs at output {first} of {len(outs)}: "
                  f"{' '.join(outs[first:first + 3])} vs {' '.join(want[first:first + 3])}")
     return len(rows)
 
@@ -5863,7 +6002,7 @@ def main():
         rows = read_module(golden / f"{name}.tsv")
         total += len(rows)
         if name in ("math", "spring", "b2_narrow", "b2_ray", "b2_step", "b2_contact", "world_step", "b3_math",
-                    "b3_body", "b3_ray", "b3_state", "b3_step", "b3_contact"):
+                    "b3_body", "b3_ray", "b3_state", "b3_step", "b3_contact", "b3_world"):
             check_corrections(root, name, golden / f"{name}.tsv", rows)
         if name == "constants":
             check_constants(root, rows)
@@ -5892,6 +6031,8 @@ def main():
             print(f"b3_state: {check_b3_state(rows)} scripts replayed on a model of the 3D state")
         elif name == "b3_contact":
             print(f"b3_contact: {check_b3_step(rows, name)} single steps recomputed (contacts, joints, sleep)")
+        elif name == "b3_world":
+            print(f"b3_world: {check_b3_world(rows)} 3D world steps recomputed (the backend, then particles)")
         elif name == "b3_step":
             print(f"b3_step: {check_b3_step(rows)} single steps recomputed (integration, gyroscopic step, joints, "
                   f"sleep)")

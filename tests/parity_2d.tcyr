@@ -191,35 +191,7 @@ fn _par_math(fp, fl): i64 {
 var _par_mapped = 0;
 var _par_map_xpbd = 0;
 
-# The config tokens' reader, `_par_in_config`, is tests/parity_types.cyr's (shared with the 3D step rows).
-fn _par_got_config(c: ImWorldConfig) {
-    var ts: f64 = c.timestep;
-    var gx: f64 = c.gravity.x;
-    var gy: f64 = c.gravity.y;
-    var gz: f64 = c.gravity.z;
-    var slop: f64 = c.position_slop;
-    var corr: f64 = c.position_correction;
-    var mv: f64 = c.max_velocity;
-    var fq: f64 = c.constraint_frequency;
-    var dr: f64 = c.constraint_damping_ratio;
-    _par_got_f(ts);
-    _par_got_f(gx);
-    _par_got_f(gy);
-    _par_got_f(gz);
-    _par_got_i(c.velocity_iterations);
-    _par_got_i(c.position_iterations);
-    _par_got_i(c.deterministic);
-    _par_got_i(c.step);
-    _par_got_f(slop);
-    _par_got_f(corr);
-    _par_got_f(mv);
-    _par_got_i(c.sub_steps);
-    _par_got_f(fq);
-    _par_got_f(dr);
-    _par_got_enum("BroadphaseKind.", broadphase_kind_name(c.broadphase));
-    _par_got_enum("SolverKind.", solver_kind_name(c.solver));
-    return 0;
-}
+# The config tokens' reader and writer (`_par_in_config`, `_par_got_config`) are tests/parity_types.cyr's.
 
 fn _par_config(fp, fl): i64 {
     if (_par_eq(fp, fl, "WorldConfig::default") == 1) {
@@ -686,12 +658,6 @@ fn _par_b2_ray(fp, fl): i64 {
     return 1;
 }
 
-# Input token k as an f64 (for an f64 argument).
-fn _par_in_f(k): f64 {
-    var x: f64 = _par_in(k);
-    return x;
-}
-
 # ── M3a: the 2D backend's state ─────────────────────────────────────────────────────
 # A row is a script of ops on a fresh ImPhysicsState2d; its outputs are each op's result, then the
 # backend dump in `oracle_dump()`'s order. `b2::state_script_orphan` rows add a collider or a joint for a
@@ -1113,174 +1079,10 @@ fn _par_b2_step(fp, fl): i64 {
 # particles, emitters and force fields) and the backend dump; the port loads all three into an
 # ImPhysicsWorld, steps it, and writes them again with the frame's events.
 
-# A particle at token k (flat::particle's layout) into *p: the token after it.
-fn _par_in_particle(k, p: *ImParticle): i64 {
-    var q: ImParticle = ImParticle_new(_par_in_v3(k + 1), _par_in_v3(k + 4), _par_in_f(k + 7));
-    q.handle = _par_in(k);
-    q.radius = _par_in_f(k + 8);
-    q.drag = _par_in_f(k + 9);
-    q.restitution = _par_in_f(k + 10);
-    q.gravity_scale = _par_in_f(k + 11);
-    q.damping = _par_in_f(k + 12);
-    var next = k + 14;
-    if (_par_in_is_none(k + 13) == 0) {
-        q.has_on_death_emit = 1;
-        q.on_death_emit = ImSubEmitter_new(_par_in(k + 13), _par_in_f(k + 14), _par_in_f(k + 15), _par_in_f(k + 16),
-          _par_in_f(k + 17), _par_in_f(k + 18));
-        next = k + 19;
-    }
-    memcpy(p, &q, sizeof(ImParticle));
-    return next;
-}
-
-# An emitter at token k (flat::emitter's layout) into *e: the token after it.
-fn _par_in_emitter(k, e: *ImParticleEmitter): i64 {
-    var m: ImParticleEmitter = ImParticleEmitter_new(_par_in_v3(k + 1), _par_in_v3(k + 4), _par_in_f(k + 10));
-    m.handle = _par_in(k);
-    m.velocity_spread = _par_in_v3(k + 7);
-    m.particle_lifetime = _par_in_f(k + 11);
-    m.particle_radius = _par_in_f(k + 12);
-    m.particle_restitution = _par_in_f(k + 13);
-    m.particle_gravity_scale = _par_in_f(k + 14);
-    m.particle_damping = _par_in_f(k + 15);
-    m.active = _par_in(k + 16);
-    m.accumulator = _par_in_f(k + 17);
-    memcpy(e, &m, sizeof(ImParticleEmitter));
-    return k + 18;
-}
-
-# A force field at token k (flat::force_field's layout) into *f: the token after it.
-fn _par_in_force_field(k, f: *ImForceField): i64 {
-    var g: ImForceField;
-    var next = k + 10;
-    if (_par_in_enum_is(k, "ForceField.", "Radial") == 1) {
-        g = ImForceField_radial(_par_in_v3(k + 1), _par_in_f(k + 4), _par_in_f(k + 5), _par_in_f(k + 6));
-        next = k + 7;
-    } else {
-        g = ImForceField_directional(_par_in_v3(k + 1), _par_in_v3(k + 4), _par_in_v3(k + 7));
-    }
-    memcpy(f, &g, sizeof(ImForceField));
-    return next;
-}
-
-# The world's own state at token k into w (fresh): the token after it.
-fn _par_load_world(w: *ImPhysicsWorld, k0): i64 {
-    var k = k0;
-    w.next_particle_id = _par_in(k);
-    w.next_emitter_id = _par_in(k + 1);
-    k = k + 2;
-    var np = _par_in(k);
-    k = k + 1;
-    var p: ImParticle;
-    for (var i = 0; i < np; i = i + 1) {
-        k = _par_in_particle(k, &p);
-        w.particles.push(&p);
-    }
-    var ne = _par_in(k);
-    k = k + 1;
-    var e: ImParticleEmitter;
-    for (var j = 0; j < ne; j = j + 1) {
-        k = _par_in_emitter(k, &e);
-        w.emitters.push(&e);
-    }
-    var nf = _par_in(k);
-    k = k + 1;
-    var f: ImForceField;
-    for (var q = 0; q < nf; q = q + 1) {
-        k = _par_in_force_field(k, &f);
-        w.force_fields.push(&f);
-    }
-    return k;
-}
-
-fn _par_got_sub_emitter(s: *ImSubEmitter) {
-    _par_got_i(s.count);
-    var sa: f64 = s.speed;
-    var sb: f64 = s.lifetime;
-    var sc: f64 = s.radius;
-    var sd: f64 = s.gravity_scale;
-    var se: f64 = s.restitution;
-    _par_got_f(sa);
-    _par_got_f(sb);
-    _par_got_f(sc);
-    _par_got_f(sd);
-    _par_got_f(se);
-    return 0;
-}
-
-fn _par_got_particle(p: *ImParticle) {
-    _par_got_i(p.handle);
-    _par_got_v3(p.position);
-    _par_got_v3(p.velocity);
-    var pa: f64 = p.lifetime;
-    var pb: f64 = p.radius;
-    var pc: f64 = p.drag;
-    var pd: f64 = p.restitution;
-    var pe: f64 = p.gravity_scale;
-    var pf: f64 = p.damping;
-    _par_got_f(pa);
-    _par_got_f(pb);
-    _par_got_f(pc);
-    _par_got_f(pd);
-    _par_got_f(pe);
-    _par_got_f(pf);
-    if (p.has_on_death_emit == 1) { _par_got_sub_emitter(p.on_death_emit); } else { _par_got_none(); }
-    return 0;
-}
-
-fn _par_got_emitter(e: *ImParticleEmitter) {
-    _par_got_i(e.handle);
-    _par_got_v3(e.position);
-    _par_got_v3(e.velocity);
-    _par_got_v3(e.velocity_spread);
-    var ea: f64 = e.rate;
-    var eb: f64 = e.particle_lifetime;
-    var ec: f64 = e.particle_radius;
-    var ed: f64 = e.particle_restitution;
-    var ee: f64 = e.particle_gravity_scale;
-    var ef: f64 = e.particle_damping;
-    var eg: f64 = e.accumulator;
-    _par_got_f(ea);
-    _par_got_f(eb);
-    _par_got_f(ec);
-    _par_got_f(ed);
-    _par_got_f(ee);
-    _par_got_f(ef);
-    _par_got_i(e.active);
-    _par_got_f(eg);
-    return 0;
-}
-
-fn _par_got_force_field(f: *ImForceField) {
-    _par_got_enum("ForceField.", force_field_kind_name(f.kind));
-    if (f.kind == IM_FORCE_FIELD_RADIAL) {
-        _par_got_v3(f.center);
-        var fa: f64 = f.strength;
-        var fb: f64 = f.falloff;
-        var fc: f64 = f.radius;
-        _par_got_f(fa);
-        _par_got_f(fb);
-        _par_got_f(fc);
-    } else {
-        _par_got_v3(f.force);
-        _par_got_v3(f.min);
-        _par_got_v3(f.max);
-    }
-    return 0;
-}
+# The world's own tokens (the particles, emitters and fields) are read and written by tests/parity_types.cyr.
 
 fn _par_got_world(w: *ImPhysicsWorld) {
-    _par_got_config(w.config);
-    _par_got_i(w.next_particle_id);
-    _par_got_i(w.next_emitter_id);
-    _par_got_seq(w.particles.len);
-    for (var i = 0; i < w.particles.len; i = i + 1) { _par_got_particle(_im_as_particle(w.particles.at(i))); }
-    _par_got_seq(w.emitters.len);
-    for (var j = 0; j < w.emitters.len; j = j + 1) { _par_got_emitter(_im_as_emitter(w.emitters.at(j))); }
-    _par_got_seq(w.force_fields.len);
-    for (var q = 0; q < w.force_fields.len; q = q + 1) {
-        _par_got_force_field(_im_as_force_field(w.force_fields.at(q)));
-    }
+    _par_got_world_own(w);
     _par_got_state(w.backend);
     return 0;
 }

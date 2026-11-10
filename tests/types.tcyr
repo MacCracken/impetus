@@ -17,42 +17,49 @@ fn same(a, b): i64 {
     return 0;
 }
 
+# d's JSON text, as a Str.
 fn body_desc_text(d: ImBodyDesc): i64 {
     var sb = str_builder_new();
     d.to_json(sb);
     return text_of_builder(sb);
 }
 
+# s's JSON text, as a Str.
 fn body_state_text(s: ImBodyState): i64 {
     var sb = str_builder_new();
     s.to_json(sb);
     return text_of_builder(sb);
 }
 
+# s's JSON text, as a Str.
 fn shape_text(s: ImColliderShape): i64 {
     var sb = str_builder_new();
     s.to_json(sb);
     return text_of_builder(sb);
 }
 
+# d's JSON text, as a Str.
 fn collider_desc_text(d: ImColliderDesc): i64 {
     var sb = str_builder_new();
     d.to_json(sb);
     return text_of_builder(sb);
 }
 
+# j's JSON text, as a Str.
 fn joint_type_text(j: ImJointType): i64 {
     var sb = str_builder_new();
     j.to_json(sb);
     return text_of_builder(sb);
 }
 
+# d's JSON text, as a Str.
 fn joint_desc_text(d: ImJointDesc): i64 {
     var sb = str_builder_new();
     d.to_json(sb);
     return text_of_builder(sb);
 }
 
+# e's JSON text, as a Str.
 fn event_text(e: ImCollisionEvent): i64 {
     var sb = str_builder_new();
     e.to_json(sb);

@@ -20,8 +20,10 @@ fn vnear(a: ImVec3, b: ImVec3, tol: f64): i64 {
     return 0;
 }
 
+# The vector (x, y, z).
 fn v(x: f64, y: f64, z: f64): ImVec3 { return ImVec3_new(x, y, z); }
 
+# The identity rotation.
 fn ident(): ImQuat { return ImQuat_identity(); }
 
 # The hull of the eight corners ±h, in the Rust test's order (x outermost, z innermost).
@@ -81,10 +83,11 @@ fn normal_a_to_b(sa: *ImColliderShape, pa: ImVec3, sb: *ImColliderShape, pb: ImV
     return ok;
 }
 
-# The Rust test's LCG, in [−2, 2): seed ← seed·6364136223846793005 + 1442695040888963407 (wrapping), then the top 53
-# bits as a fraction.
+# The LCG's state.
 var lcg: i64 = 0x2545F4914F6CDD1D;
 
+# The Rust test's LCG, in [−2, 2): seed ← seed·6364136223846793005 + 1442695040888963407 (wrapping), then the top 53
+# bits as a fraction.
 fn rnd(): f64 {
     lcg = lcg * 6364136223846793005 + 1442695040888963407;
     var top = (lcg >> 11) & 0x1FFFFFFFFFFFFF;
@@ -108,6 +111,7 @@ fn seg_dist(a: ImVec3, b: ImVec3, c: ImVec3, d: ImVec3): f64 {
     return best;
 }
 
+# Runs the 3D narrowphase tests.
 fn main() {
     alloc_init();
     var sc: ImGjkScratch3d = ImGjkScratch3d_new();

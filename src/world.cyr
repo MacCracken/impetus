@@ -1,217 +1,24 @@
-# world.cyr — the physics world (port of rust-old/src/world.rs, its 2D paths).
+# world.cyr — the physics world (port of rust-old/src/world.rs), shared by both profiles.
 #
-# ImPhysicsWorld owns the config, the 2D backend (src/b2_state.cyr and the step of src/b2_solver.cyr),
-# the particles, emitters and force fields, and the particle-id and emitter-id counters. `step` is
-# Rust's: the frame counter, `sub_steps` backend sub-steps of timestep / sub_steps, `finish_step`, then
-# the particles at the full timestep (emitters spawn, integration under gravity, fields, drag and
-# damping, collisions with the colliders, sub-emitters for the particles that died, then the dead
-# removed). Every expression keeps Rust's operation order; pow, sin, cos and sin_cos are the correctly
+# ImPhysicsWorld owns the config, the backend, the particles, emitters and force fields, and the particle-id and
+# emitter-id counters. Its storage, constructor and the steps that touch the backend come first, from the
+# profile's own file: src/b2_world.cyr over the 2D backend, src/b3_world.cyr over the 3D one. This file is the
+# rest, the same for both. `step` is Rust's: the frame counter, `sub_steps` backend sub-steps of timestep /
+# sub_steps, `finish_step`, then the particles at the full timestep (emitters spawn, integration under gravity,
+# fields, drag and damping, collisions with the colliders, sub-emitters for the particles that died, then the
+# dead removed). Every expression keeps Rust's operation order; pow, sin, cos and sin_cos are the correctly
 # rounded ones (ADR 0011).
 #
-# The API follows Rust's, with ADR 0008's changes: `add_collider` and `add_joint` return a Result
-# (#1); the config is not validated by `ImPhysicsWorld_new` (`ImPhysicsWorld_try_new` validates, and
-# refuses XPBD, #6). Slices come back as (address, count). The last step's events are the backend
-# tracker's, which nothing changes between steps. Particle and emitter ids are words; Rust's u64 ids
-# convert to f64 for the R3 spread as the same value below 2^63. Particles, emitters and fields live
-# in world-owned buffers, the particle collision scratch too, all reused from step to step.
-# Snapshots (`snapshot`, `restore`) arrive with M6.
+# The API follows Rust's, with ADR 0008's changes: `add_collider` and `add_joint` return a Result (#1; in 3D,
+# `add_joint` also refuses Revolute, Prismatic and motors, #5); the config is not validated by
+# `ImPhysicsWorld_new` (`ImPhysicsWorld_try_new` validates, and refuses XPBD, #6). Slices come back as (address,
+# count). The last step's events are the backend tracker's, which nothing changes between steps. Particle and
+# emitter ids are words; Rust's u64 ids convert to f64 for the R3 spread as the same value below 2^63.
+# Particles, emitters and fields live in world-owned buffers, the particle collision scratch too, all reused from
+# step to step. Snapshots (`snapshot`, `restore`) arrive with M6.
 
-# ── storage ─────────────────────────────────────────────────────────────────────────
-
-#must_use
-fn _im_as_particle(p): *ImParticle { return p; }
-#must_use
-fn _im_as_emitter(p): *ImParticleEmitter { return p; }
-#must_use
-fn _im_as_force_field(p): *ImForceField { return p; }
 #must_use
 fn _im_as_config(p): *ImWorldConfig { return p; }
-
-# ── particle against collider ───────────────────────────────────────────────────────
-# Each writes (normal from the shape to the particle, depth) into out as f64 words and returns 1, or
-# returns 0 for no contact.
-
-# A particle of `radius` centred at (lx, ly) in the frame of a box of half extents (hx, hy) centred at
-# the origin: a centre inside is pushed out through the nearest face. Mirrors `particle_vs_local_box`.
-fn _im_particle_vs_local_box(lx: f64, ly: f64, radius: f64, hx: f64, hy: f64, out): i64 {
-    var ex: f64 = f64_abs(hx);
-    var ey: f64 = f64_abs(hy);
-    var nex: f64 = -ex;
-    var ney: f64 = -ey;
-    var cx: f64 = _im_clamp(lx, nex, ex);
-    var cy: f64 = _im_clamp(ly, ney, ey);
-    var dx: f64 = lx - cx;
-    var dy: f64 = ly - cy;
-    var dist_sq: f64 = 0.0;
-    dist_sq = dist_sq + dx * dx;
-    dist_sq = dist_sq + dy * dy;
-    var alx: f64 = f64_abs(lx);
-    var aly: f64 = f64_abs(ly);
-    if (alx <= ex && aly <= ey) {
-        var zero: f64 = 0.0;
-        var pen: f64 = 1.0 / zero;
-        var axis = 0;
-        var p0: f64 = ex - alx;
-        if (p0 < pen) { pen = p0; }
-        var p1: f64 = ey - aly;
-        if (p1 < pen) {
-            pen = p1;
-            axis = 1;
-        }
-        var nx: f64 = 0.0;
-        var ny: f64 = 0.0;
-        if (axis == 0) {
-            nx = 1.0;
-            if (!(lx >= 0.0)) { nx = 0.0 - 1.0; }
-        } else {
-            ny = 1.0;
-            if (!(ly >= 0.0)) { ny = 0.0 - 1.0; }
-        }
-        var depth: f64 = pen + radius;
-        store64(out, nx);
-        store64(out + 8, ny);
-        store64(out + 16, depth);
-        return 1;
-    }
-    var dist: f64 = f64_sqrt(dist_sq);
-    if (dist < radius && dist > 0.000000000001) {
-        var ux: f64 = dx / dist;
-        var uy: f64 = dy / dist;
-        var d2: f64 = radius - dist;
-        store64(out, ux);
-        store64(out + 8, uy);
-        store64(out + 16, d2);
-        return 1;
-    }
-    return 0;
-}
-
-# A particle of `radius` at (px, py) against a disc of `shape_radius` swept along a–b (a point when a
-# = b). Mirrors `particle_vs_rounded_segment`.
-fn _im_particle_vs_rounded_segment(px: f64, py: f64, radius: f64, ax: f64, ay: f64, bx: f64, by: f64,
-  shape_radius: f64, out): i64 {
-    var abx: f64 = bx - ax;
-    var aby: f64 = by - ay;
-    var apx: f64 = px - ax;
-    var apy: f64 = py - ay;
-    var len_sq: f64 = abx * abx + aby * aby;
-    var t: f64 = 0.0;
-    if (!(len_sq < 0.00000000000000000001)) {
-        var dot: f64 = apx * abx + apy * aby;
-        var q: f64 = dot / len_sq;
-        t = _im_clamp(q, 0.0, 1.0);
-    }
-    var dx: f64 = px - (ax + abx * t);
-    var dy: f64 = py - (ay + aby * t);
-    var dd: f64 = dx * dx + dy * dy;
-    var dist: f64 = f64_sqrt(dd);
-    var overlap: f64 = radius + shape_radius - dist;
-    if (overlap > 0.0 && dist > 0.000000000001) {
-        var ux: f64 = dx / dist;
-        var uy: f64 = dy / dist;
-        store64(out, ux);
-        store64(out + 8, uy);
-        store64(out + 16, overlap);
-        return 1;
-    }
-    return 0;
-}
-
-# A particle of `radius` at (px, py) against shape s at (sx, sy) rotated by rot: balls, boxes, capsules
-# (along local y) and segments; no contact with hulls, meshes or heightfields. Mirrors
-# `particle_vs_collider_2d`.
-fn _im_particle_vs_collider_2d(px: f64, py: f64, radius: f64, s: *ImColliderShape, sx: f64, sy: f64,
-  rot: f64, out): i64 {
-    var sn, cs = _im_sin_cos(rot);
-    var sv: f64 = sn;
-    var cv: f64 = cs;
-    var k = s.kind;
-    if (k == IM_SHAPE_BALL) {
-        var br: f64 = s.radius;
-        return _im_particle_vs_rounded_segment(px, py, radius, sx, sy, sx, sy, br, out);
-    }
-    if (k == IM_SHAPE_BOX) {
-        var dx: f64 = px - sx;
-        var dy: f64 = py - sy;
-        var lx: f64 = cv * dx + sv * dy;
-        var ly: f64 = -sv * dx + cv * dy;
-        var hx: f64 = s.half_extents.x;
-        var hy: f64 = s.half_extents.y;
-        if (_im_particle_vs_local_box(lx, ly, radius, hx, hy, out) == 0) { return 0; }
-        var nx: f64 = load64(out);
-        var ny: f64 = load64(out + 8);
-        var wx: f64 = cv * nx - sv * ny;
-        var wy: f64 = sv * nx + cv * ny;
-        store64(out, wx);
-        store64(out + 8, wy);
-        return 1;
-    }
-    if (k == IM_SHAPE_CAPSULE) {
-        var hh: f64 = s.half_height;
-        var cr: f64 = s.radius;
-        var ax: f64 = sx + sv * hh;
-        var ay: f64 = sy - cv * hh;
-        var bx: f64 = sx - sv * hh;
-        var by: f64 = sy + cv * hh;
-        return _im_particle_vs_rounded_segment(px, py, radius, ax, ay, bx, by, cr, out);
-    }
-    if (k == IM_SHAPE_SEGMENT) {
-        var a0: f64 = s.a.x;
-        var a1: f64 = s.a.y;
-        var b0: f64 = s.b.x;
-        var b1: f64 = s.b.y;
-        var wax: f64 = sx + cv * a0 - sv * a1;
-        var way: f64 = sy + sv * a0 + cv * a1;
-        var wbx: f64 = sx + cv * b0 - sv * b1;
-        var wby: f64 = sy + sv * b0 + cv * b1;
-        return _im_particle_vs_rounded_segment(px, py, radius, wax, way, wbx, wby, 0.0, out);
-    }
-    return 0;
-}
-
-# ── the world ───────────────────────────────────────────────────────────────────────
-
-# `config` stays the first field (`config()` returns the world's address as the config's).
-struct ImPhysicsWorld {
-    config: ImWorldConfig;
-    next_particle_id;
-    next_emitter_id;
-    backend: ImPhysicsState2d;
-    particles: ImRecordList;
-    emitters: ImRecordList;
-    force_fields: ImRecordList;
-    infos: ImRecordList;
-}
-
-# The collision scratch: one record per collider a particle can hit, built each step.
-struct ImParticleTarget {
-    collider;
-    x: f64;
-    y: f64;
-    rotation: f64;
-    min_x: f64;
-    min_y: f64;
-    max_x: f64;
-    max_y: f64;
-}
-
-#must_use
-fn _im_as_target(p): *ImParticleTarget { return p; }
-
-# A world over `config`, not validated (see ImPhysicsWorld_try_new). Mirrors `PhysicsWorld::new`.
-#must_use
-fn ImPhysicsWorld_new(config: ImWorldConfig): ImPhysicsWorld {
-    var w: ImPhysicsWorld;
-    w.config = config;
-    w.next_particle_id = 0;
-    w.next_emitter_id = 0;
-    w.backend = ImPhysicsState2d_new();
-    w.particles = ImRecordList_new(sizeof(ImParticle));
-    w.emitters = ImRecordList_new(sizeof(ImParticleEmitter));
-    w.force_fields = ImRecordList_new(sizeof(ImForceField));
-    w.infos = ImRecordList_new(sizeof(ImParticleTarget));
-    return w;
-}
 
 # A world over `config` into out once `config_validate`-style validation passes: Ok(0), or the
 # validation's Err (IM_ERR_INVALID_CONFIG, or IM_ERR_UNSUPPORTED for XPBD, ADR 0008 #6). Mirrors
@@ -225,8 +32,8 @@ fn ImPhysicsWorld_try_new(config: ImWorldConfig, out: *ImPhysicsWorld): Result {
 }
 
 impl ImPhysicsWorld {
-    # One fixed timestep: the frame counter, the backend's sub-steps and the frame's events, then the
-    # particles. Mirrors `PhysicsWorld::step` (2D).
+    # One fixed timestep: the frame counter, the backend's sub-steps (the profile's `_substep`) and the frame's
+    # events, then the particles. Mirrors `PhysicsWorld::step`.
     fn step(self) {
         self.config.step = self.config.step + 1;
         var sub = self.config.sub_steps;
@@ -234,12 +41,7 @@ impl ImPhysicsWorld {
         var ts: f64 = self.config.timestep;
         var sf: f64 = f64_from(sub);
         var dt: f64 = ts / sf;
-        for (var s = 0; s < sub; s = s + 1) {
-            self.backend.step(self.config.gravity, dt, self.config.velocity_iterations,
-              self.config.position_iterations, self.config.position_slop, self.config.position_correction,
-              self.config.max_velocity, self.config.constraint_frequency, self.config.constraint_damping_ratio,
-              self.config.broadphase, self.config.solver);
-        }
+        for (var s = 0; s < sub; s = s + 1) { self._substep(dt); }
         self.backend.finish_step();
         self._step_particles();
         return 0;
@@ -384,87 +186,6 @@ impl ImPhysicsWorld {
         return 0;
     }
 
-    # Pushes every live particle with a radius out of the non-sensor colliders it overlaps, in collider
-    # slot order (each test from the particle's current position), reflecting the approaching part of
-    # its velocity with its restitution. Mirrors `collide_particles` (2D).
-    fn _collide_particles(self) {
-        var ca: *ImArena = self.backend._colliders();
-        self.infos.len = 0;
-        if (self.infos.reserve(ca.len()) == 0) { return 0; }
-        for (var s = 0; s < ca.slot_count(); s = s + 1) {
-            var h = ca.slot_handle(s);
-            if (h != 0 - 1) {
-                var c: *ImCollider2d = _im_b2_as_coll(ca.get(h));
-                var rb: *ImRigidBody2d = self.backend._body(c.body);
-                if (c.is_sensor == 0 && rb != 0) {
-                    var rot: f64 = rb.rotation;
-                    var sn, cs = _im_sin_cos(rot);
-                    var sv: f64 = sn;
-                    var cv: f64 = cs;
-                    var ox: f64 = c.offset.x;
-                    var oy: f64 = c.offset.y;
-                    var bx: f64 = rb.position.x;
-                    var by: f64 = rb.position.y;
-                    var cx: f64 = bx + cv * ox - sv * oy;
-                    var cy: f64 = by + sv * ox + cv * oy;
-                    var ab: ImAabb2d = c.world_aabb(rb.position, rb.rotation);
-                    var t: *ImParticleTarget = _im_as_target(self.infos.at(self.infos.len));
-                    t.collider = c;
-                    t.x = cx;
-                    t.y = cy;
-                    t.rotation = rot;
-                    t.min_x = ab.min.x;
-                    t.min_y = ab.min.y;
-                    t.max_x = ab.max.x;
-                    t.max_y = ab.max.y;
-                    self.infos.len = self.infos.len + 1;
-                }
-            }
-        }
-        var hit[24];
-        for (var i = 0; i < self.particles.len; i = i + 1) {
-            var p: *ImParticle = _im_as_particle(self.particles.at(i));
-            var pr: f64 = p.radius;
-            if (p.is_alive() == 1 && !(pr <= 0.0)) {
-                for (var k = 0; k < self.infos.len; k = k + 1) {
-                    var g: *ImParticleTarget = _im_as_target(self.infos.at(k));
-                    var px: f64 = p.position.x;
-                    var py: f64 = p.position.y;
-                    var x0: f64 = g.min_x;
-                    var y0: f64 = g.min_y;
-                    var x1: f64 = g.max_x;
-                    var y1: f64 = g.max_y;
-                    if (!(px + pr < x0 || px - pr > x1 || py + pr < y0 || py - pr > y1)) {
-                        var gx: f64 = g.x;
-                        var gy: f64 = g.y;
-                        var gr: f64 = g.rotation;
-                        var gc: *ImCollider2d = _im_b2_as_coll(g.collider);
-                        if (_im_particle_vs_collider_2d(px, py, pr, gc.shape, gx, gy, gr, &hit) == 1) {
-                            var nx: f64 = load64(&hit);
-                            var ny: f64 = load64(&hit + 8);
-                            var depth: f64 = load64(&hit + 16);
-                            var qx: f64 = px + nx * depth;
-                            var qy: f64 = py + ny * depth;
-                            var pz: f64 = p.position.z;
-                            p.position = ImVec3_new(qx, qy, pz);
-                            var vx: f64 = p.velocity.x;
-                            var vy: f64 = p.velocity.y;
-                            var vz: f64 = p.velocity.z;
-                            var vdn: f64 = vx * nx + vy * ny;
-                            if (vdn < 0.0) {
-                                var rest: f64 = p.restitution;
-                                vx = vx - (1.0 + rest) * vdn * nx;
-                                vy = vy - (1.0 + rest) * vdn * ny;
-                                p.velocity = ImVec3_new(vx, vy, vz);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return 0;
-    }
-
     # The particle step at the full timestep. Mirrors `step_particles`.
     fn _step_particles(self) {
         var dt: f64 = self.config.timestep;
@@ -566,16 +287,6 @@ impl ImPhysicsWorld {
     # The first hit on a collider whose layer meets `mask`: 1, or 0 for none. Mirrors `raycast_filtered`.
     fn raycast_filtered(self, origin: ImVec3, direction: ImVec3, max_dist: f64, mask, out: *ImRayHit): i64 {
         return self.backend.raycast_filtered(origin, direction, max_dist, mask, out);
-    }
-
-    # The colliders overlapping a disc, into out. Mirrors `overlap_sphere`.
-    fn overlap_sphere(self, center: ImVec3, radius: f64, out: *ImWordList): i64 {
-        return self.backend.overlap_sphere(center, radius, out);
-    }
-
-    # The colliders overlapping a box, into out. Mirrors `overlap_aabb`.
-    fn overlap_aabb(self, min: ImVec3, max: ImVec3, out: *ImWordList): i64 {
-        return self.backend.overlap_aabb(min, max, out);
     }
 
     # The last step's collision events: `var ev, n = world.collision_events();`, n ImCollisionEvent

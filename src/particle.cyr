@@ -247,3 +247,13 @@ impl ImParticleEmitter {
         return self;
     }
 }
+
+# ── record casts ────────────────────────────────────────────────────────────────────
+# The world keeps particles, emitters and fields in record lists (src/world.cyr); these type a record's address.
+
+#must_use
+fn _im_as_particle(p): *ImParticle { return p; }
+#must_use
+fn _im_as_emitter(p): *ImParticleEmitter { return p; }
+#must_use
+fn _im_as_force_field(p): *ImForceField { return p; }

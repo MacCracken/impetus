@@ -100,25 +100,3 @@ pub fn backend(d: &Backend2dDump) -> Vec<Tok> {
     tracker(&mut t, &d.tracker);
     t
 }
-
-/// The world's own state before its backend: the particle and emitter counters, then the particles,
-/// emitters and force fields in storage order.
-pub fn world(d: &impetus::oracle::WorldDump) -> Vec<Tok> {
-    let mut t = vec![
-        i(i64::try_from(d.next_particle_id).unwrap_or(i64::MAX)),
-        i(i64::try_from(d.next_emitter_id).unwrap_or(i64::MAX)),
-    ];
-    t.push(Tok::V(d.particles.len()));
-    for p in &d.particles {
-        t.extend(flat::particle(p));
-    }
-    t.push(Tok::V(d.emitters.len()));
-    for e in &d.emitters {
-        t.extend(flat::emitter(e));
-    }
-    t.push(Tok::V(d.force_fields.len()));
-    for x in &d.force_fields {
-        t.extend(flat::force_field(x));
-    }
-    t
-}

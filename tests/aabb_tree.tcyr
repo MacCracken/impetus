@@ -13,8 +13,9 @@ fn has(pl: *ImPairList, a, b): i64 {
     return pl.contains(a, b);
 }
 
-# A deterministic pseudo-random number in [0, 1), the Rust test's LCG.
+# The LCG's state.
 var _s = 12345;
+# A deterministic pseudo-random number in [0, 1), the Rust test's LCG.
 fn rnd(): f64 {
     _s = _s * 6364136223846793005 + 1442695040888963407;
     var u = (_s >> 11) & 9007199254740991;

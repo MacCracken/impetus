@@ -57,6 +57,7 @@ fn spin(b: *ImRigidBody3d) {
     return (e, lm);
 }
 
+# Runs the 3D type tests.
 fn main() {
     alloc_init();
     var eps: f64 = 0.0000000001;

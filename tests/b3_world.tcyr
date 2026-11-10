@@ -1,0 +1,256 @@
+# b3_world.tcyr — the world on the 3D profile (M5 part 4): tests/world_cases.cyr (the tests Rust runs on both
+# backends; its `--all-features` build runs them on the 3D world), then Cyrius-only tests: the 3D particle-collider
+# contacts on each shape, particles against 3D bodies in a world (a sensor, a hull, an offset collider), the 3D
+# overlap queries' empty answer, the solver kind left unread, the world's frame against the backend's own step, and
+# a flat heap.
+
+include "tests/lib_3d.cyr"
+include "tests/world_cases.cyr"
+
+# The contact of a particle of radius r at p with shape s centred at c, rotated by q: 1 with (normal, depth) in
+# out's four words, or 0.
+fn hit3(p: ImVec3, r: f64, s: *ImColliderShape, c: ImVec3, q: ImQuat, out): i64 {
+    var inv: ImQuat = ImQuat_inverse(q);
+    return _im_particle_vs_collider_3d(p, r, s, c, q, inv, out);
+}
+
+# 1 when out's (normal, depth) is within 1e-9 of (nx, ny, nz, d).
+fn hit_is(out, nx: f64, ny: f64, nz: f64, d: f64): i64 {
+    var e: f64 = 0.000000001;
+    var gx: f64 = load64(out);
+    var gy: f64 = load64(out + 8);
+    var gz: f64 = load64(out + 16);
+    var gd: f64 = load64(out + 24);
+    if (near(gx, nx, e) == 1 && near(gy, ny, e) == 1 && near(gz, nz, e) == 1 && near(gd, d, e) == 1) { return 1; }
+    return 0;
+}
+
+# A body of type t at p rotated rot about z, with a collider of shape s at offset off (a sensor when sensor = 1).
+fn body3(w: *ImPhysicsWorld, t, p: ImVec3, rot: f64, s: ImColliderShape, off: ImVec3, sensor): i64 {
+    var d: ImBodyDesc = ImBodyDesc_default();
+    d.body_type = t;
+    d.position = p;
+    d.rotation = rot;
+    var h = w.add_body(d);
+    var cd: ImColliderDesc = ImColliderDesc_new(s);
+    cd.offset = off;
+    cd.is_sensor = sensor;
+    var tc, c = w.add_collider(h, cd);
+    return h;
+}
+
+# A ball falling onto a box, in a world over cfg, after n frames: the ball body's record copied to out.
+fn drop_ball(cfg: ImWorldConfig, n, out) {
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(cfg);
+    var z: ImVec3 = ImVec3_zero();
+    body3(&w, IM_BODY_STATIC, ImVec3_new(0.0, -0.5, 0.0), 0.0, ImColliderShape_box(5.0, 0.5, 5.0), z, 0);
+    var b = body3(&w, IM_BODY_DYNAMIC, ImVec3_new(0.2, 1.5, -0.1), 0.3, ImColliderShape_box(0.4, 0.3, 0.5), z, 0);
+    w.apply_impulse(b, ImImpulse_at_point(0.1, 0.0, 0.2, 0.4, 1.7, 0.1));
+    steps(&w, n);
+    memcpy(out, w.backend._body(b), sizeof(ImRigidBody3d));
+    w.free();
+    return 0;
+}
+
+# Runs the 3D world tests.
+fn main() {
+    alloc_init();
+    world_cases();
+    var z: ImVec3 = ImVec3_zero();
+    var i0: ImQuat = ImQuat_identity();
+    var hit[32];
+
+    test_group("particle_vs_3d_shapes");
+    var c: ImVec3 = ImVec3_new(1.0, 2.0, 3.0);
+    var qx: ImQuat = ImQuat_from_rotation_x(_IM_PI / 2.0);
+    var qy: ImQuat = ImQuat_from_rotation_y(_IM_PI / 2.0);
+    # A box turned a quarter about x: its local y (half extent 0.5) is world z, its local z (2) world −y.
+    var box: ImColliderShape = ImColliderShape_box(1.0, 0.5, 2.0);
+    var h1 = hit3(ImVec3_new(1.0, 2.0, 3.6), 0.2, &box, c, qx, &hit);
+    assert_eq(h1 == 1 && hit_is(&hit, 0.0, 0.0, 1.0, 0.1) == 1, 1, "outside a turned box: out through world z");
+    var h2 = hit3(ImVec3_new(1.0, 2.0, 3.3), 0.05, &box, c, qx, &hit);
+    assert_eq(h2 == 1 && hit_is(&hit, 0.0, 0.0, 1.0, 0.25) == 1, 1, "inside: out through the nearest face");
+    var h3 = hit3(ImVec3_new(1.0, 2.0, 3.8), 0.2, &box, c, qx, &hit);
+    assert_eq(h3, 0, "clear of the box");
+    var ball: ImColliderShape = ImColliderShape_ball(1.0);
+    var h4 = hit3(ImVec3_new(1.0, 2.0, 1.9), 0.2, &ball, c, i0, &hit);
+    assert_eq(h4 == 1 && hit_is(&hit, 0.0, 0.0, -1.0, 0.1) == 1, 1, "a ball, from below in z");
+    var h4c = hit3(c, 0.2, &ball, c, i0, &hit);
+    assert_eq(h4c, 0, "at a ball's centre: no direction, no contact");
+    # A capsule turned a quarter about x: its axis is world z.
+    var cap: ImColliderShape = ImColliderShape_capsule(1.0, 0.25);
+    var h5 = hit3(ImVec3_new(1.0, 2.3, 3.5), 0.1, &cap, c, qx, &hit);
+    assert_eq(h5 == 1 && hit_is(&hit, 0.0, 1.0, 0.0, 0.05) == 1, 1, "a capsule's side");
+    var h6 = hit3(ImVec3_new(1.0, 2.0, 4.3), 0.1, &cap, c, qx, &hit);
+    assert_eq(h6 == 1 && hit_is(&hit, 0.0, 0.0, 1.0, 0.05) == 1, 1, "a capsule's end cap");
+    # A segment along local x, turned a quarter about y: world −z.
+    var seg: ImColliderShape = ImColliderShape_segment(ImVec3_new(-1.0, 0.0, 0.0), ImVec3_new(1.0, 0.0, 0.0));
+    var h7 = hit3(ImVec3_new(1.0, 2.05, 3.5), 0.1, &seg, c, qy, &hit);
+    assert_eq(h7 == 1 && hit_is(&hit, 0.0, 1.0, 0.0, 0.05) == 1, 1, "a turned segment");
+    var h8 = hit3(ImVec3_new(2.05, 2.0, 3.0), 0.1, &seg, c, qy, &hit);
+    assert_eq(h8, 0, "beside the turned segment, where the unturned one would be hit");
+    # An octahedron of half-diagonal 0.8: ±0.8 on each axis.
+    var pts[144];
+    for (var pi = 0; pi < 18; pi = pi + 1) { store64(&pts + pi * 8, 0.0); }
+    for (var ax = 0; ax < 3; ax = ax + 1) {
+        store64(&pts + (ax * 2 * 3 + ax) * 8, 0.8);
+        store64(&pts + ((ax * 2 + 1) * 3 + ax) * 8, -0.8);
+    }
+    var oct: ImColliderShape = ImColliderShape_convex_hull(&pts, 6);
+    var h9 = hit3(c, 0.5, &oct, c, i0, &hit);
+    assert_eq(h9, 0, "no contact with a hull");
+    oct.free();
+
+    test_group("particles_against_3d_bodies");
+    # Particles falling on a static ball (bouncing off with a z component), a sensor (ignored), a hull (ignored) and
+    # a box offset on a body turned about z (hit where the offset puts it, not at the body).
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    body3(&w, IM_BODY_STATIC, ImVec3_new(0.0, 1.0, 0.0), 0.0, ImColliderShape_ball(0.5), z, 0);
+    body3(&w, IM_BODY_STATIC, ImVec3_new(3.0, 1.0, 0.0), 0.0, ImColliderShape_ball(0.5), z, 1);
+    body3(&w, IM_BODY_STATIC, ImVec3_new(6.0, 1.0, 0.0), 0.0, ImColliderShape_convex_hull(&pts, 6), z, 0);
+    body3(&w, IM_BODY_STATIC, ImVec3_new(9.0, 1.0, 0.0), _IM_PI / 2.0, ImColliderShape_box(0.5, 0.1, 0.5),
+      ImVec3_new(1.0, 0.0, 0.0), 0);
+    var pa: ImParticle = ImParticle_new(ImVec3_new(0.0, 3.0, 0.3), z, 10.0);
+    pa.with_radius(0.05).with_restitution(1.0);
+    var ha = w.spawn_particle(pa);
+    var pb: ImParticle = ImParticle_new(ImVec3_new(3.0, 3.0, 0.0), z, 10.0);
+    pb.with_radius(0.05);
+    var hb = w.spawn_particle(pb);
+    var pc: ImParticle = ImParticle_new(ImVec3_new(6.0, 3.0, 0.0), z, 10.0);
+    pc.with_radius(0.05);
+    var hc = w.spawn_particle(pc);
+    # Where the offset box would be were its body not turned: (10, 1).
+    var pd: ImParticle = ImParticle_new(ImVec3_new(10.0, 3.0, 0.0), z, 10.0);
+    pd.with_radius(0.05);
+    var hd = w.spawn_particle(pd);
+    steps(&w, 50);
+    var qa: *ImParticle = find(&w, ha);
+    var avz: f64 = qa.velocity.z;
+    var ady: f64 = qa.position.y - 1.0;
+    var adz: f64 = qa.position.z;
+    var adx: f64 = qa.position.x;
+    var adist: f64 = f64_sqrt(adx * adx + ady * ady + adz * adz);
+    assert_eq(avz > 0.0 && adist > 0.5, 1, "off the ball, moving away in z");
+    var qb: *ImParticle = find(&w, hb);
+    var qc: *ImParticle = find(&w, hc);
+    var by: f64 = qb.position.y;
+    var cy: f64 = qc.position.y;
+    assert_eq(by < 0.4 && cy < 0.4, 1, "through the sensor and the hull");
+    var qd: *ImParticle = find(&w, hd);
+    var dy: f64 = qd.position.y;
+    assert_eq(dy < 0.4, 1, "nothing at the body's own position");
+    w.free();
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    body3(&w, IM_BODY_STATIC, ImVec3_new(9.0, 1.0, 0.0), _IM_PI / 2.0, ImColliderShape_box(0.5, 0.1, 0.5),
+      ImVec3_new(1.0, 0.0, 0.0), 0);
+    var pe: ImParticle = ImParticle_new(ImVec3_new(9.0, 3.0, 0.0), z, 10.0);
+    pe.with_radius(0.05);
+    var he = w.spawn_particle(pe);
+    steps(&w, 120);
+    var qe: *ImParticle = find(&w, he);
+    var ey: f64 = qe.position.y;
+    # The offset box: centre (9, 2) once turned, top face at y = 2.5 (its local x half extent, turned onto y).
+    assert_eq(near(ey, 2.55, 0.01), 1, "rests on the offset box's top, at y = 2.5 + r");
+    w.free();
+
+    test_group("overlaps_empty_in_3d");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    body3(&w, IM_BODY_STATIC, z, 0.0, ImColliderShape_ball(1.0), z, 0);
+    var ol: ImWordList = ImWordList_new();
+    ol.push(77);
+    var o1 = w.overlap_sphere(z, 2.0, &ol);
+    var n1 = ol.len;
+    ol.push(77);
+    var o2 = w.overlap_aabb(ImVec3_new(-1.0, -1.0, -1.0), ImVec3_new(1.0, 1.0, 1.0), &ol);
+    assert_eq(o1 == 1 && n1 == 0 && o2 == 1 && ol.len == 0, 1, "no colliders, the list cleared (Rust's 3D world)");
+    ol.free();
+    w.free();
+
+    test_group("solver_kind_unread_in_3d");
+    var si[1024];
+    var xp[1024];
+    var cx: ImWorldConfig = ImWorldConfig_default();
+    cx.solver = IM_SOLVER_XPBD;
+    drop_ball(ImWorldConfig_default(), 90, &si);
+    drop_ball(cx, 90, &xp);
+    assert_eq(sizeof(ImRigidBody3d) <= 1024 && memeq(&si, &xp, sizeof(ImRigidBody3d)) == 1, 1,
+      "an unvalidated XPBD config steps as sequential impulses, bit for bit");
+
+    test_group("world_frame_is_the_backend_step");
+    # Three sub-steps through the world against the backend's own step at a third of the timestep, then
+    # finish_step: the same bodies, bit for bit.
+    var c3: ImWorldConfig = ImWorldConfig_default();
+    c3.sub_steps = 3;
+    w = ImPhysicsWorld_new(c3);
+    var st: ImPhysicsState3d = ImPhysicsState3d_new();
+    var bodies[64];
+    for (var k = 0; k < 4; k = k + 1) {
+        var kd: ImBodyDesc = ImBodyDesc_default();
+        var kx: f64 = f64_from(k) * 0.7;
+        var ky: f64 = 0.6 + f64_from(k) * 0.55;
+        kd.position = ImVec3_new(kx, ky, 0.1);
+        kd.rotation = 0.2 * f64_from(k);
+        if (k == 0) { kd.body_type = IM_BODY_STATIC; }
+        var kc: ImColliderDesc = ImColliderDesc_new(ImColliderShape_box(0.6, 0.25, 0.4));
+        if (k == 0) { kc = ImColliderDesc_new(ImColliderShape_box(5.0, 0.25, 5.0)); }
+        var wh = w.add_body(kd);
+        var sh = st.add_body(kd);
+        w.add_collider(wh, kc);
+        st.add_collider(sh, kc);
+        store64(&bodies + k * 8, wh);
+    }
+    var ts: f64 = c3.timestep;
+    var dt3: f64 = ts / 3.0;
+    var same = 1;
+    for (var f = 0; f < 60; f = f + 1) {
+        w.step();
+        for (var s3 = 0; s3 < 3; s3 = s3 + 1) {
+            st.step(c3.gravity, dt3, c3.velocity_iterations, c3.position_iterations, c3.position_slop,
+              c3.position_correction, c3.max_velocity, c3.constraint_frequency, c3.constraint_damping_ratio,
+              c3.broadphase);
+        }
+        var ne = st.finish_step();
+        var wev, wn = w.collision_events();
+        if (wn != ne) { same = 0; }
+        for (var q = 0; q < 4; q = q + 1) {
+            var bh = load64(&bodies + q * 8);
+            if (memeq(w.backend._body(bh), st._body(bh), sizeof(ImRigidBody3d)) != 1) { same = 0; }
+        }
+    }
+    assert_eq(same == 1 && w.current_step() == 60, 1, "60 frames of three sub-steps, bit for bit");
+    st.free();
+    w.free();
+
+    test_group("flat_heap_3d_world");
+    # Bodies in contact (a stack, a tumbling box, a spring pair), an emitter's particles hitting them and a field:
+    # after warm-up the world reuses its storage.
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    body3(&w, IM_BODY_STATIC, ImVec3_new(0.0, -0.5, 0.0), 0.0, ImColliderShape_box(8.0, 0.5, 8.0), z, 0);
+    for (var b = 0; b < 3; b = b + 1) {
+        var yb: f64 = 0.5 + f64_from(b);
+        body3(&w, IM_BODY_DYNAMIC, ImVec3_new(0.0, yb, 0.0), 0.0, ImColliderShape_box(0.5, 0.5, 0.5), z, 0);
+    }
+    var tb = body3(&w, IM_BODY_DYNAMIC, ImVec3_new(3.0, 2.0, 1.0), 0.0, ImColliderShape_capsule(0.4, 0.3), z, 0);
+    w.apply_impulse(tb, ImImpulse_at_point(0.0, 0.5, 0.4, 3.3, 2.2, 0.8));
+    var s1 = body3(&w, IM_BODY_DYNAMIC, ImVec3_new(-3.0, 2.0, 0.0), 0.0, ImColliderShape_ball(0.3), z, 0);
+    var s2 = body3(&w, IM_BODY_DYNAMIC, ImVec3_new(-2.0, 2.0, 0.5), 0.0, ImColliderShape_ball(0.3), z, 0);
+    var z2: ImVec2 = ImVec2_new(0.0, 0.0);
+    w.add_joint(ImJointDesc_new(s1, s2, ImJointType_spring(0.8, 30.0, 1.0), z2, z2));
+    var fe: ImParticleEmitter = ImParticleEmitter_new(ImVec3_new(0.0, 4.0, 0.0), ImVec3_new(0.0, -1.0, 0.0), 120.0);
+    fe.with_spread(ImVec3_new(3.0, 0.5, 2.0)).with_lifetime(1.5).with_radius(0.05);
+    w.add_emitter(fe);
+    w.add_force_field(ImForceField_radial(ImVec3_new(0.0, 1.0, 0.0), 1.0, 1.5, 0.0));
+    steps(&w, 180);
+    var arena0 = _fl_arena;
+    var pos0 = _fl_arena_pos;
+    steps(&w, 240);
+    assert_eq(_fl_arena == arena0 && _fl_arena_pos == pos0, 1, "no growth");
+    assert_eq(w.particle_count() > 80, 1, "particles live");
+    w.free();
+
+    return assert_summary();
+}
+
+var exit_code = main();
+if (exit_code > 0) { exit_code = 1; }
+sys_exit_group(exit_code);

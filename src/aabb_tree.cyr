@@ -98,6 +98,7 @@ impl ImWordList {
 # A growable buffer of fixed-size records: `len` of `size` bytes at `data`, room for `cap`.
 struct ImRecordList { data; len; cap; size; }
 
+# An empty list of `size`-byte records.
 #must_use
 fn ImRecordList_new(size): ImRecordList {
     var l: ImRecordList;

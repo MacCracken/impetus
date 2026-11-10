@@ -14,8 +14,9 @@ fn same(a: f64, b: f64): i64 {
     return 0;
 }
 
-# A seeded xorshift64 step.
+# The xorshift state.
 var _seed = 88172645463325252;
+# A seeded xorshift64 step.
 fn next_word(): i64 {
     var x = _seed;
     x = x ^ (x << 13);

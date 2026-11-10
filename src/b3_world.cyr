@@ -1,0 +1,305 @@
+# b3_world.cyr — the 3D profile's part of the physics world (port of rust-old/src/world.rs, its 3D paths).
+#
+# The world's storage over the 3D backend (ImPhysicsState3d), its constructor, and the three steps that touch the
+# backend: a sub-step (`_substep`, with no solver kind: the 3D backend always runs sequential impulses), the
+# particles against the colliders (`_collide_particles`) and the overlap queries, which Rust's 3D world doesn't
+# implement (both return no colliders). Everything else about the world is shared with the 2D profile and comes
+# after this file (src/world.cyr). src/b2_world.cyr is the 2D counterpart; a bundle has exactly one of them.
+#
+# Rust tests a particle against every non-sensor collider with no bounding-box pre-check, computing the collider's
+# centre (body position + body rotation · offset) for each pair. The port computes it once a step per collider,
+# the same value from the same operations, since nothing moves a body while the particles collide.
+
+# ── particle against collider ───────────────────────────────────────────────────────
+# Each writes (normal from the shape to the particle as three f64 words, then the depth) into out and returns 1, or
+# returns 0 for no contact.
+
+# A particle of `radius` centred at l in the frame of a box of half extents he centred at the origin: a centre
+# inside is pushed out through the nearest face (the first axis of least penetration). Mirrors
+# `particle_vs_local_box` (N = 3).
+fn _im_b3_particle_vs_local_box(l: ImVec3, radius: f64, he: ImVec3, out): i64 {
+    var lx: f64 = l.x;
+    var ly: f64 = l.y;
+    var lz: f64 = l.z;
+    var ex: f64 = f64_abs(he.x);
+    var ey: f64 = f64_abs(he.y);
+    var ez: f64 = f64_abs(he.z);
+    var nex: f64 = -ex;
+    var ney: f64 = -ey;
+    var nez: f64 = -ez;
+    var cx: f64 = _im_clamp(lx, nex, ex);
+    var cy: f64 = _im_clamp(ly, ney, ey);
+    var cz: f64 = _im_clamp(lz, nez, ez);
+    var dx: f64 = lx - cx;
+    var dy: f64 = ly - cy;
+    var dz: f64 = lz - cz;
+    var dist_sq: f64 = 0.0;
+    dist_sq = dist_sq + dx * dx;
+    dist_sq = dist_sq + dy * dy;
+    dist_sq = dist_sq + dz * dz;
+    var alx: f64 = f64_abs(lx);
+    var aly: f64 = f64_abs(ly);
+    var alz: f64 = f64_abs(lz);
+    if (alx <= ex && aly <= ey && alz <= ez) {
+        var zero: f64 = 0.0;
+        var pen: f64 = 1.0 / zero;
+        var axis = 0;
+        var p0: f64 = ex - alx;
+        if (p0 < pen) { pen = p0; }
+        var p1: f64 = ey - aly;
+        if (p1 < pen) {
+            pen = p1;
+            axis = 1;
+        }
+        var p2: f64 = ez - alz;
+        if (p2 < pen) {
+            pen = p2;
+            axis = 2;
+        }
+        var nx: f64 = 0.0;
+        var ny: f64 = 0.0;
+        var nz: f64 = 0.0;
+        if (axis == 0) {
+            nx = 1.0;
+            if (!(lx >= 0.0)) { nx = 0.0 - 1.0; }
+        } elif (axis == 1) {
+            ny = 1.0;
+            if (!(ly >= 0.0)) { ny = 0.0 - 1.0; }
+        } else {
+            nz = 1.0;
+            if (!(lz >= 0.0)) { nz = 0.0 - 1.0; }
+        }
+        var depth: f64 = pen + radius;
+        store64(out, nx);
+        store64(out + 8, ny);
+        store64(out + 16, nz);
+        store64(out + 24, depth);
+        return 1;
+    }
+    var dist: f64 = f64_sqrt(dist_sq);
+    if (dist < radius && dist > 0.000000000001) {
+        var ux: f64 = dx / dist;
+        var uy: f64 = dy / dist;
+        var uz: f64 = dz / dist;
+        var d2: f64 = radius - dist;
+        store64(out, ux);
+        store64(out + 8, uy);
+        store64(out + 16, uz);
+        store64(out + 24, d2);
+        return 1;
+    }
+    return 0;
+}
+
+# A particle of `radius` at p against a sphere of `shape_radius` swept along a–b (a point when a = b). Each sum runs
+# x, y, z from the left, as Rust's `Iterator::sum` folds from −0.0. Mirrors `particle_vs_rounded_segment` (N = 3).
+fn _im_b3_particle_vs_rounded_segment(p: ImVec3, radius: f64, a: ImVec3, b: ImVec3, shape_radius: f64, out): i64 {
+    var ax: f64 = a.x;
+    var ay: f64 = a.y;
+    var az: f64 = a.z;
+    var px: f64 = p.x;
+    var py: f64 = p.y;
+    var pz: f64 = p.z;
+    var abx: f64 = b.x - ax;
+    var aby: f64 = b.y - ay;
+    var abz: f64 = b.z - az;
+    var apx: f64 = px - ax;
+    var apy: f64 = py - ay;
+    var apz: f64 = pz - az;
+    var len_sq: f64 = abx * abx + aby * aby + abz * abz;
+    var t: f64 = 0.0;
+    if (!(len_sq < 0.00000000000000000001)) {
+        var dot: f64 = apx * abx + apy * aby + apz * abz;
+        var q: f64 = dot / len_sq;
+        t = _im_clamp(q, 0.0, 1.0);
+    }
+    var dx: f64 = px - (ax + abx * t);
+    var dy: f64 = py - (ay + aby * t);
+    var dz: f64 = pz - (az + abz * t);
+    var dd: f64 = dx * dx + dy * dy + dz * dz;
+    var dist: f64 = f64_sqrt(dd);
+    var overlap: f64 = radius + shape_radius - dist;
+    if (overlap > 0.0 && dist > 0.000000000001) {
+        var ux: f64 = dx / dist;
+        var uy: f64 = dy / dist;
+        var uz: f64 = dz / dist;
+        store64(out, ux);
+        store64(out + 8, uy);
+        store64(out + 16, uz);
+        store64(out + 24, overlap);
+        return 1;
+    }
+    return 0;
+}
+
+# A particle of `radius` at p against shape s centred at `center` (its body's position + rotation · offset) with
+# its body's rotation rot (inv its inverse): balls, boxes, capsules (along local y) and segments; no contact with
+# hulls, meshes or heightfields. Mirrors `particle_vs_collider_3d`.
+fn _im_particle_vs_collider_3d(p: ImVec3, radius: f64, s: *ImColliderShape, center: ImVec3, rot: ImQuat,
+  inv: ImQuat, out): i64 {
+    var k = s.kind;
+    if (k == IM_SHAPE_BALL) {
+        var br: f64 = s.radius;
+        return _im_b3_particle_vs_rounded_segment(p, radius, center, center, br, out);
+    }
+    if (k == IM_SHAPE_BOX) {
+        var rel: ImVec3 = ImVec3_sub(p, center);
+        var local: ImVec3 = ImQuat_mul_vec3(inv, rel);
+        var he: ImVec3 = s.half_extents;
+        if (_im_b3_particle_vs_local_box(local, radius, he, out) == 0) { return 0; }
+        var nx: f64 = load64(out);
+        var ny: f64 = load64(out + 8);
+        var nz: f64 = load64(out + 16);
+        var n: ImVec3 = ImQuat_mul_vec3(rot, ImVec3_new(nx, ny, nz));
+        var wx: f64 = n.x;
+        var wy: f64 = n.y;
+        var wz: f64 = n.z;
+        store64(out, wx);
+        store64(out + 8, wy);
+        store64(out + 16, wz);
+        return 1;
+    }
+    if (k == IM_SHAPE_CAPSULE) {
+        var hh: f64 = s.half_height;
+        var cr: f64 = s.radius;
+        var axis: ImVec3 = ImQuat_mul_vec3(rot, ImVec3_new(0.0, hh, 0.0));
+        var lo: ImVec3 = ImVec3_sub(center, axis);
+        var hi: ImVec3 = ImVec3_add(center, axis);
+        return _im_b3_particle_vs_rounded_segment(p, radius, lo, hi, cr, out);
+    }
+    if (k == IM_SHAPE_SEGMENT) {
+        var ra: ImVec3 = ImQuat_mul_vec3(rot, s.a);
+        var rb: ImVec3 = ImQuat_mul_vec3(rot, s.b);
+        var wa: ImVec3 = ImVec3_add(center, ra);
+        var wb: ImVec3 = ImVec3_add(center, rb);
+        return _im_b3_particle_vs_rounded_segment(p, radius, wa, wb, 0.0, out);
+    }
+    return 0;
+}
+
+# ── the world's storage ─────────────────────────────────────────────────────────────
+
+# `config` stays the first field (`config()` returns the world's address as the config's).
+struct ImPhysicsWorld {
+    config: ImWorldConfig;
+    next_particle_id;
+    next_emitter_id;
+    backend: ImPhysicsState3d;
+    particles: ImRecordList;
+    emitters: ImRecordList;
+    force_fields: ImRecordList;
+    infos: ImRecordList;
+}
+
+# The collision scratch: one record per collider a particle can hit, built each step.
+struct ImParticleTarget3d {
+    collider;
+    center: ImVec3;
+    rotation: ImQuat;
+    inverse: ImQuat;
+}
+
+#must_use
+fn _im_as_target3(p): *ImParticleTarget3d { return p; }
+
+# A world over `config`, not validated (see ImPhysicsWorld_try_new). Mirrors `PhysicsWorld::new`.
+#must_use
+fn ImPhysicsWorld_new(config: ImWorldConfig): ImPhysicsWorld {
+    var w: ImPhysicsWorld;
+    w.config = config;
+    w.next_particle_id = 0;
+    w.next_emitter_id = 0;
+    w.backend = ImPhysicsState3d_new();
+    w.particles = ImRecordList_new(sizeof(ImParticle));
+    w.emitters = ImRecordList_new(sizeof(ImParticleEmitter));
+    w.force_fields = ImRecordList_new(sizeof(ImForceField));
+    w.infos = ImRecordList_new(sizeof(ImParticleTarget3d));
+    return w;
+}
+
+impl ImPhysicsWorld {
+    # One backend sub-step of dt; the config's solver kind is not read (the 3D backend has only sequential
+    # impulses). The sub-step loop of `PhysicsWorld::step` (3D).
+    fn _substep(self, dt: f64) {
+        self.backend.step(self.config.gravity, dt, self.config.velocity_iterations, self.config.position_iterations,
+          self.config.position_slop, self.config.position_correction, self.config.max_velocity,
+          self.config.constraint_frequency, self.config.constraint_damping_ratio, self.config.broadphase);
+        return 0;
+    }
+
+    # Pushes every live particle with a radius out of the non-sensor colliders it overlaps, in collider slot order
+    # (each test from the particle's current position), reflecting the approaching part of its velocity with its
+    # restitution. Mirrors `collide_particles` (3D).
+    fn _collide_particles(self) {
+        var ca: *ImArena = self.backend._colliders();
+        self.infos.len = 0;
+        if (self.infos.reserve(ca.len()) == 0) { return 0; }
+        for (var s = 0; s < ca.slot_count(); s = s + 1) {
+            var h = ca.slot_handle(s);
+            if (h != 0 - 1) {
+                var c: *ImCollider3d = _im_b3_as_coll(ca.get(h));
+                var rb: *ImRigidBody3d = self.backend._body(c.body);
+                if (c.is_sensor == 0 && rb != 0) {
+                    var turned: ImVec3 = ImQuat_mul_vec3(rb.rotation, c.offset);
+                    var center: ImVec3 = ImVec3_add(rb.position, turned);
+                    var rot: ImQuat = rb.rotation;
+                    var inv: ImQuat = ImQuat_inverse(rot);
+                    var t: *ImParticleTarget3d = _im_as_target3(self.infos.at(self.infos.len));
+                    t.collider = c;
+                    t.center = center;
+                    t.rotation = rot;
+                    t.inverse = inv;
+                    self.infos.len = self.infos.len + 1;
+                }
+            }
+        }
+        var hit[32];
+        for (var i = 0; i < self.particles.len; i = i + 1) {
+            var p: *ImParticle = _im_as_particle(self.particles.at(i));
+            var pr: f64 = p.radius;
+            if (p.is_alive() == 1 && !(pr <= 0.0)) {
+                for (var k = 0; k < self.infos.len; k = k + 1) {
+                    var g: *ImParticleTarget3d = _im_as_target3(self.infos.at(k));
+                    var gc: *ImCollider3d = _im_b3_as_coll(g.collider);
+                    var pos: ImVec3 = p.position;
+                    if (_im_particle_vs_collider_3d(pos, pr, _im_b3_coll_shape(gc), g.center, g.rotation, g.inverse,
+                        &hit) == 1) {
+                        var nx: f64 = load64(&hit);
+                        var ny: f64 = load64(&hit + 8);
+                        var nz: f64 = load64(&hit + 16);
+                        var depth: f64 = load64(&hit + 24);
+                        var qx: f64 = pos.x + nx * depth;
+                        var qy: f64 = pos.y + ny * depth;
+                        var qz: f64 = pos.z + nz * depth;
+                        p.position = ImVec3_new(qx, qy, qz);
+                        var vx: f64 = p.velocity.x;
+                        var vy: f64 = p.velocity.y;
+                        var vz: f64 = p.velocity.z;
+                        var vdn: f64 = vx * nx + vy * ny + vz * nz;
+                        if (vdn < 0.0) {
+                            var rest: f64 = p.restitution;
+                            vx = vx - (1.0 + rest) * vdn * nx;
+                            vy = vy - (1.0 + rest) * vdn * ny;
+                            vz = vz - (1.0 + rest) * vdn * nz;
+                            p.velocity = ImVec3_new(vx, vy, vz);
+                        }
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+
+    # No colliders: Rust's 3D world has no overlap queries ("3D overlap not implemented yet") and returns an empty
+    # list. out is cleared; 1. Mirrors `overlap_sphere` (3D).
+    fn overlap_sphere(self, center: ImVec3, radius: f64, out: *ImWordList): i64 {
+        out.len = 0;
+        return 1;
+    }
+
+    # No colliders, as `overlap_sphere`. Mirrors `overlap_aabb` (3D).
+    fn overlap_aabb(self, min: ImVec3, max: ImVec3, out: *ImWordList): i64 {
+        out.len = 0;
+        return 1;
+    }
+}

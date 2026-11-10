@@ -25,10 +25,12 @@ fn hf(h, w): f64 {
 # ── the world: an ImPhysicsState2d of static bodies, one collider each ──
 var W_PTR = 0;
 
+# The test world.
 fn w_state(): *ImPhysicsState2d {
     return W_PTR;
 }
 
+# Replaces the test world with an empty one (allocating it the first time, freeing the old one after).
 fn w_reset() {
     if (W_PTR == 0) {
         W_PTR = fl_alloc(sizeof(ImPhysicsState2d));

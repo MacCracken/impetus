@@ -492,3 +492,35 @@ broadphase, so 2D gains too. Same quiet machine, `HEAD` against the change:
 - **The AABB tree didn't move**: its cost is elsewhere (M2a's finding stands).
 - **A loaded machine misleads.** While other benchmark runs held several cores, `b3/step_100_bodies` read 3.07 ms. Quiet,
   the same code reads 921 µs. These rows were taken only when nothing else ran above half a core.
+
+## M5 part 4: the 3D world and its particles (2026-11-10)
+
+x86_64 ELF, measured with nothing else above half a core. Rust's rows are criterion on the 3D build (`cargo bench
+--all-features -- 'world/step|substep/|particles/'`, medians, rerun in the same quiet session). The `b3/step_*` rows
+now run through `ImPhysicsWorld`, as Rust's do; part 3 ran them through the backend's `step` and `finish_step`. The
+`b3/particles/*` rows are M3 part 4's scenes on the 3D world.
+
+| Bench | Body | Rust (3D build) | Cyrius | Ratio |
+|---|---|---|---|---|
+| `b3/step_empty` | an empty world's step (`world/step_empty`) | 70.5 ns | 424 ns | 6.0× |
+| `b3/step_10_bodies` | 10 balls in rows of 5 (`world/step_10_bodies`) | 4.96 µs | 56.3 µs | 11× |
+| `b3/step_100_bodies` | 100 balls in rows of 10 (`world/step_100_bodies`) | 115 µs | 663 µs | 5.7× |
+| `b3/step_1000_bodies` | 1,000 balls in rows of 32 (`world/step_1000_bodies`) | 1.08 ms | 6.00 ms | 5.6× |
+| `b3/step_100_bodies_substep4` | 100 balls on a floor, 4 sub-steps (`substep/step_100_bodies_substep4`) | 550 µs | 6.17 ms | 11× |
+| `b3/step_stack5_resting` | a settled stack of five boxes, kept awake | — | 82.2 µs | — |
+| `b3/particles/step_100_particles` | a fresh world's first step, 100 particles (`particles/step_100_particles`) | 1.90 µs | 9.90 µs | 5.2× |
+| `b3/particles/step_1000_particles` | the same with 1,000 | 6.39 µs | 94.0 µs | 15× |
+| `b3/particles/step_100_particles_with_floor` | a floor and 100 falling particles, stepped on | 338 ns | 2.85 µs | 8.4× |
+| `b3/particles/spawn_particle` | spawn one particle | 19.9 ns | 714 ns | 36× |
+| `b3/particles/emitter_step` | an emitter at 100/s, lifetime 0.5 | 505 ns | 18.5 µs | 37× |
+
+**Reading it.**
+- **The world costs about 35 ns a frame over the backend.** `b3/step_empty` went from 389 ns (part 3, the backend) to
+  424 ns: the frame counter and an empty particle pass. The body scenes are within 3 % of part 3's.
+- **The particle rows match 2D's** (M3 part 4: 9.92 µs, 93.0 µs, 694 ns, 18.5 µs). The particle code is shared, and
+  its slow rows are S5's record copies, as recorded there.
+- **The floor row is a broadphase finding.** Its particles expire after 600 of its 100,000 frames, so it times a
+  world with one static box. A one-off probe split that frame: 2.42 µs is the backend's sub-step, 1.84 µs of it the
+  broadphase's rebuild for that one box; the world adds 0.28 µs. Rust's whole frame takes 338 ns. That fixed cost is
+  a small part of the 10-body frame's 56 µs, so part 3's 11× rows are still unexplained. Recorded as a finding, not
+  acted on (speed is measured, not gated).

@@ -245,7 +245,6 @@ struct ImCollider3d {
     collision_mask;
 }
 
-# A collider of `body` from its descriptor, with a copy of its shape (freed by `free`). Mirrors `Collider3d::from_desc`.
 # The address of collider c's shape, the field after its two words (handle, body): Cyrius takes no field addresses,
 # and the 3D narrowphase reads shapes through pointers (a shape copy is a 184-byte byte-loop memcpy, S5). The
 # parameter is untyped: arithmetic on a `*ImCollider3d` would step whole records.
@@ -253,6 +252,7 @@ struct ImCollider3d {
 #must_use
 fn _im_b3_coll_shape(c): *ImColliderShape { return c + 16; }
 
+# A collider of `body` from its descriptor, with a copy of its shape (freed by `free`). Mirrors `Collider3d::from_desc`.
 #must_use
 fn ImCollider3d_from_desc(handle, body, desc: ImColliderDesc): ImCollider3d {
     var c: ImCollider3d;

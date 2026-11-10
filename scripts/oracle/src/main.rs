@@ -62,6 +62,8 @@ mod m_b3_ray;
 mod m_b3_state;
 #[cfg(feature = "b3")]
 mod m_b3_step;
+#[cfg(feature = "b3")]
+mod m_b3_world;
 mod m_broadphase;
 mod m_config;
 mod m_constants;
@@ -103,7 +105,8 @@ fn b3_modules() -> Vec<tsv::Module> {
     vec![
         m_b3_body::emit(),
         m_b3_contact::emit(),
-        m_b3_math::emit(), m_b3_narrow::emit(), m_b3_ray::emit(), m_b3_state::emit(), m_b3_step::emit()]
+        m_b3_math::emit(), m_b3_narrow::emit(), m_b3_ray::emit(), m_b3_state::emit(), m_b3_step::emit(),
+        m_b3_world::emit()]
 }
 
 #[cfg(not(feature = "b3"))]

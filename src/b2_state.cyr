@@ -40,6 +40,7 @@ fn _im_b2_wake(rb: *ImRigidBody2d) {
 # updates them; the state removes those of removed colliders.
 struct ImManifoldStore { data; len; cap; }
 
+# An empty manifold store.
 #must_use
 fn ImManifoldStore_new(): ImManifoldStore {
     var s: ImManifoldStore;

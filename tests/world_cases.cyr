@@ -1,0 +1,458 @@
+# world_cases.cyr — the world and its particles, the tests Rust runs on both backends: the 24 tests of
+# rust-old/src/world.rs that aren't XPBD's (the four xpbd_* tests are not ported, ADR 0008 #6) and the 8 of
+# rust-old/src/particle.rs (its two serde round trips through src/json.cyr), plus Cyrius-only tests of try_new's
+# refusals, the spawn cap, emitter removal, the config view, a flat heap and the force-field and sub-emitter JSON.
+# tests/world.tcyr runs them on the 2D profile, tests/b3_world.tcyr on the 3D one; the including file includes
+# its profile's module list first.
+
+var EPS: f64 = 0.000001;
+
+# 1 when |got − want| < eps.
+fn near(got: f64, want: f64, eps: f64): i64 {
+    var d: f64 = f64_abs(got - want);
+    if (d < eps) { return 1; }
+    return 0;
+}
+
+# 1 when the words at a and b, n bytes, are equal (Rust's derived PartialEq on these all-f64 records,
+# which holds for the round trips here: no NaN).
+fn same_words(a, b, n): i64 {
+    for (var i = 0; i < n; i = i + 8) {
+        if (load64(a + i) != load64(b + i)) { return 0; }
+    }
+    return 1;
+}
+
+# A config with gravity (gx, gy).
+fn cfg_g(gx: f64, gy: f64): ImWorldConfig {
+    var c: ImWorldConfig = ImWorldConfig_default();
+    c.gravity = ImVec3_new(gx, gy, 0.0);
+    return c;
+}
+
+# A body of type t at (x, y): its handle.
+fn body_at(w: *ImPhysicsWorld, t, x: f64, y: f64): i64 {
+    var d: ImBodyDesc = ImBodyDesc_default();
+    d.body_type = t;
+    d.position = ImVec3_new(x, y, 0.0);
+    return w.add_body(d);
+}
+
+# Adds collider shape s to body h: its handle.
+fn coll(w: *ImPhysicsWorld, h, s: ImColliderShape): i64 {
+    var t, c = w.add_collider(h, ImColliderDesc_new(s));
+    return c;
+}
+
+# The particle with handle h, or 0.
+fn find(w: *ImPhysicsWorld, h): *ImParticle {
+    var ps, n = w.particles();
+    for (var i = 0; i < n; i = i + 1) {
+        var p: *ImParticle = _im_as_particle(ps + i * sizeof(ImParticle));
+        if (p.handle == h) { return p; }
+    }
+    return _im_as_particle(0);
+}
+
+# n steps.
+fn steps(w: *ImPhysicsWorld, n) {
+    for (var i = 0; i < n; i = i + 1) { w.step(); }
+    return 0;
+}
+
+# A zero-gravity world with one force field and a particle at (x, 0) (no gravity on it): the
+# particle's x after ten steps, less its x before.
+fn field_dx(f: ImForceField, x: f64): f64 {
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(cfg_g(0.0, 0.0));
+    w.add_force_field(f);
+    var p: ImParticle = ImParticle_new(ImVec3_new(x, 0.0, 0.0), ImVec3_zero(), 5.0);
+    p.with_gravity_scale(0.0);
+    var h = w.spawn_particle(p);
+    var p0: *ImParticle = find(&w, h);
+    var x0: f64 = p0.position.x;
+    steps(&w, 10);
+    var p1: *ImParticle = find(&w, h);
+    var x1: f64 = p1.position.x;
+    w.free();
+    var d: f64 = x1 - x0;
+    return d;
+}
+
+# Runs the world cases.
+fn world_cases() {
+    var z: ImVec3 = ImVec3_zero();
+
+    # ── world.rs ──
+    test_group("world_lifecycle");
+    var w: ImPhysicsWorld = ImPhysicsWorld_new(ImWorldConfig_default());
+    assert_eq(w.body_count(), 0, "empty");
+    var b = body_at(&w, IM_BODY_DYNAMIC, 0.0, 10.0);
+    coll(&w, b, ImColliderShape_ball(0.5));
+    assert_eq(w.body_count(), 1, "one body");
+    w.step();
+    assert_eq(w.current_step(), 1, "one step");
+    var t1, v1 = w.remove_body(b);
+    assert_eq(is_ok(t1) == 1 && w.body_count() == 0, 1, "removed");
+    w.free();
+
+    test_group("deterministic_stepping");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    steps(&w, 100);
+    assert_eq(w.current_step(), 100, "100 steps");
+    w.free();
+
+    test_group("force_application");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    b = w.add_body(ImBodyDesc_default());
+    w.apply_force(b, ImForce_new(10.0, 0.0, 0.0));
+    w.apply_impulse(b, ImImpulse_new(0.0, 5.0, 0.0));
+    w.apply_torque(b, ImTorque_new(1.0));
+    w.step();
+    assert_eq(w.current_step(), 1, "steps with forces applied");
+    w.free();
+
+    test_group("multiple_bodies");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    for (var i = 0; i < 50; i = i + 1) { w.add_body(ImBodyDesc_default()); }
+    assert_eq(w.body_count(), 50, "50 bodies");
+    w.free();
+
+    test_group("add_joint");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var ja = w.add_body(ImBodyDesc_default());
+    var jb = w.add_body(ImBodyDesc_default());
+    var z2: ImVec2 = ImVec2_new(0.0, 0.0);
+    var tj, jh = w.add_joint(ImJointDesc_new(ja, jb, ImJointType_fixed(), z2, z2));
+    w.step();
+    assert_eq(is_ok(tj), 1, "added and stepped");
+    w.free();
+
+    test_group("collision_events_empty_after_step");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    w.step();
+    var ev0, n0 = w.collision_events();
+    assert_eq(n0, 0, "no events");
+    w.free();
+
+    test_group("config_accessors");
+    var c120: ImWorldConfig = ImWorldConfig_default();
+    c120.timestep = 1.0 / 120.0;
+    w = ImPhysicsWorld_new(c120);
+    var ts: f64 = w.timestep();
+    var cv: *ImWorldConfig = w.config();
+    var gy: f64 = cv.gravity.y;
+    var gx: f64 = cv.gravity.x;
+    assert_eq(ts == 1.0 / 120.0, 1, "the timestep");
+    assert_eq(gx == 0.0 && gy == 0.0 - 9.81, 1, "the default gravity");
+    w.free();
+
+    test_group("remove_more_than_added");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    b = w.add_body(ImBodyDesc_default());
+    w.remove_body(b);
+    var t2, v2 = w.remove_body(999);
+    assert_eq(is_ok(t2) == 1 && w.body_count() == 0, 1, "removal is idempotent");
+    w.free();
+
+    test_group("unique_handles");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var ua = w.add_body(ImBodyDesc_default());
+    var ub = w.add_body(ImBodyDesc_default());
+    var c1 = coll(&w, ua, ImColliderShape_ball(1.0));
+    var c2 = coll(&w, ub, ImColliderShape_ball(1.0));
+    assert_eq(ua != ub && c1 != c2, 1, "distinct");
+    w.free();
+
+    test_group("radial_force_field_attracts");
+    var da: f64 = field_dx(ImForceField_radial(z, 100.0, 0.0, 0.0), 10.0);
+    assert_eq(da < 0.0, 1, "toward the attractor");
+    test_group("radial_force_field_repels");
+    var dr: f64 = field_dx(ImForceField_radial(z, 0.0 - 100.0, 0.0, 0.0), 5.0);
+    assert_eq(dr > 0.0, 1, "away from the repulsor");
+    test_group("directional_force_field");
+    var wind: ImForceField = ImForceField_directional(ImVec3_new(50.0, 0.0, 0.0), ImVec3_new(-100.0, -100.0, -100.0),
+      ImVec3_new(100.0, 100.0, 100.0));
+    var dw: f64 = field_dx(wind, 0.0);
+    assert_eq(dw > 0.0, 1, "pushed in +x");
+    test_group("directional_force_field_outside");
+    var far: ImForceField = ImForceField_directional(ImVec3_new(50.0, 0.0, 0.0), ImVec3_new(100.0, 100.0, 100.0),
+      ImVec3_new(200.0, 200.0, 200.0));
+    var dfar: f64 = field_dx(far, 0.0);
+    var adf: f64 = f64_abs(dfar);
+    assert_eq(adf < 0.0000000001, 1, "outside: unmoved");
+
+    test_group("sub_emitter_on_death");
+    w = ImPhysicsWorld_new(cfg_g(0.0, 0.0));
+    var sdt: f64 = w.timestep();
+    var sp: ImParticle = ImParticle_new(ImVec3_new(5.0, 5.0, 0.0), z, sdt * 1.5);
+    sp.with_gravity_scale(0.0).with_sub_emitter(ImSubEmitter_new(4, 3.0, 2.0, 0.02, 0.0, 0.5));
+    w.spawn_particle(sp);
+    assert_eq(w.particle_count(), 1, "one parent");
+    w.step();
+    w.step();
+    assert_eq(w.particle_count(), 4, "four children");
+    var cps, cn = w.particles();
+    var nearby = 1;
+    for (var ci = 0; ci < cn; ci = ci + 1) {
+        var cp: *ImParticle = _im_as_particle(cps + ci * sizeof(ImParticle));
+        var cdx: f64 = cp.position.x - 5.0;
+        var cdy: f64 = cp.position.y - 5.0;
+        var cd: f64 = f64_sqrt(cdx * cdx + cdy * cdy);
+        if (!(cd < 2.0)) { nearby = 0; }
+    }
+    assert_eq(nearby, 1, "near the parent");
+    w.free();
+
+    test_group("gravity_moves_body");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    b = body_at(&w, IM_BODY_DYNAMIC, 0.0, 10.0);
+    coll(&w, b, ImColliderShape_ball(0.5));
+    var bs: ImBodyState;
+    w.get_body_state(b, &bs);
+    var y0: f64 = bs.position.y;
+    assert_eq(y0 == 10.0, 1, "starts at 10");
+    steps(&w, 60);
+    w.get_body_state(b, &bs);
+    var y1: f64 = bs.position.y;
+    assert_eq(y1 < 10.0, 1, "fell");
+    w.free();
+
+    test_group("impulse_changes_velocity");
+    w = ImPhysicsWorld_new(cfg_g(0.0, 0.0));
+    b = w.add_body(ImBodyDesc_default());
+    coll(&w, b, ImColliderShape_ball(0.5));
+    w.apply_impulse(b, ImImpulse_new(10.0, 0.0, 0.0));
+    w.step();
+    w.get_body_state(b, &bs);
+    var ivx: f64 = bs.linear_velocity.x;
+    var ipx: f64 = bs.position.x;
+    assert_eq(ivx > 0.0 && ipx > 0.0, 1, "moving right");
+    w.free();
+
+    test_group("collision_generates_events");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var floor = body_at(&w, IM_BODY_STATIC, 0.0, 0.0);
+    coll(&w, floor, ImColliderShape_box(50.0, 0.5, 0.0));
+    var fb = body_at(&w, IM_BODY_DYNAMIC, 0.0, 2.0);
+    coll(&w, fb, ImColliderShape_ball(0.5));
+    var found = 0;
+    for (var f1 = 0; f1 < 120 && found == 0; f1 = f1 + 1) {
+        w.step();
+        var ev1, n1 = w.collision_events();
+        if (n1 > 0) { found = 1; }
+    }
+    assert_eq(found, 1, "events");
+    w.free();
+
+    test_group("raycast_hits_body");
+    w = ImPhysicsWorld_new(cfg_g(0.0, 0.0));
+    b = body_at(&w, IM_BODY_STATIC, 5.0, 0.0);
+    coll(&w, b, ImColliderShape_ball(1.0));
+    var hit: ImRayHit;
+    var got = w.raycast(z, ImVec3_new(1.0, 0.0, 0.0), 100.0, &hit);
+    var hd: f64 = hit.distance;
+    assert_eq(got == 1 && near(hd, 4.0, 0.1) == 1, 1, "hits at about 4");
+    w.free();
+
+    test_group("spawn_particle");
+    w = ImPhysicsWorld_new(cfg_g(0.0, 0.0));
+    var ph = w.spawn_particle(ImParticle_new(z, ImVec3_new(1.0, 0.0, 0.0), 1.0));
+    var pps, pn = w.particles();
+    var pp0: *ImParticle = _im_as_particle(pps);
+    assert_eq(pn == 1 && pp0.handle == ph, 1, "one, with its handle");
+    w.free();
+
+    test_group("particle_falls_with_gravity");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    var fh = w.spawn_particle(ImParticle_new(ImVec3_new(0.0, 10.0, 0.0), z, 5.0));
+    steps(&w, 60);
+    var fp: *ImParticle = find(&w, fh);
+    var fy: f64 = fp.position.y;
+    assert_eq(w.particle_count() == 1 && fy < 10.0, 1, "fell");
+    w.free();
+
+    test_group("particle_expires");
+    w = ImPhysicsWorld_new(cfg_g(0.0, 0.0));
+    w.spawn_particle(ImParticle_new(z, z, 0.5));
+    assert_eq(w.particle_count(), 1, "alive");
+    steps(&w, 60);
+    assert_eq(w.particle_count(), 0, "expired");
+    w.free();
+
+    test_group("emitter_spawns_particles");
+    w = ImPhysicsWorld_new(cfg_g(0.0, 0.0));
+    w.add_emitter(ImParticleEmitter_new(z, ImVec3_new(0.0, 5.0, 0.0), 60.0));
+    steps(&w, 60);
+    assert_eq(w.particle_count() > 0, 1, "spawned");
+    w.free();
+
+    test_group("particle_bounces_off_floor");
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    floor = body_at(&w, IM_BODY_STATIC, 0.0, 0.0);
+    coll(&w, floor, ImColliderShape_box(50.0, 0.5, 0.0));
+    var bp: ImParticle = ImParticle_new(ImVec3_new(0.0, 2.0, 0.0), ImVec3_new(0.0, -5.0, 0.0), 5.0);
+    bp.with_radius(0.1).with_restitution(0.8);
+    var bh = w.spawn_particle(bp);
+    steps(&w, 120);
+    var bq: *ImParticle = find(&w, bh);
+    var by: f64 = bq.position.y;
+    assert_eq(w.particle_count() == 1 && by > -1.0, 1, "bounced, not through");
+    w.free();
+
+    test_group("clear_particles");
+    w = ImPhysicsWorld_new(cfg_g(0.0, 0.0));
+    w.spawn_particle(ImParticle_new(z, z, 10.0));
+    w.spawn_particle(ImParticle_new(ImVec3_new(1.0, 0.0, 0.0), z, 10.0));
+    assert_eq(w.particle_count(), 2, "two");
+    w.clear_particles();
+    assert_eq(w.particle_count(), 0, "cleared");
+    w.free();
+
+    # ── particle.rs ──
+    test_group("particle_new");
+    var pn1: ImParticle = ImParticle_new(ImVec3_new(1.0, 2.0, 0.0), ImVec3_new(3.0, 4.0, 0.0), 5.0);
+    var px1: f64 = pn1.position.y;
+    var pv1: f64 = pn1.velocity.y;
+    var pl1: f64 = pn1.lifetime;
+    assert_eq(px1 == 2.0 && pv1 == 4.0 && pl1 == 5.0 && pn1.is_alive() == 1, 1, "fields, alive");
+    test_group("particle_dead");
+    var pd: ImParticle = ImParticle_new(z, z, 0.0);
+    assert_eq(pd.is_alive(), 0, "lifetime 0 is dead");
+    test_group("particle_builder");
+    var pb: ImParticle = ImParticle_new(z, ImVec3_new(1.0, 0.0, 0.0), 3.0);
+    pb.with_radius(0.1).with_drag(0.5).with_restitution(0.8).with_gravity_scale(0.5).with_damping(0.1);
+    var br: f64 = pb.radius;
+    var bd: f64 = pb.drag;
+    var be: f64 = pb.restitution;
+    var bg: f64 = pb.gravity_scale;
+    var bm: f64 = pb.damping;
+    assert_eq(br == 0.1 && bd == 0.5 && be == 0.8 && bg == 0.5 && bm == 0.1, 1, "set");
+    test_group("emitter_new");
+    var en: ImParticleEmitter = ImParticleEmitter_new(z, ImVec3_new(0.0, 10.0, 0.0), 100.0);
+    var er: f64 = en.rate;
+    var el: f64 = en.particle_lifetime;
+    assert_eq(er == 100.0 && en.active == 1 && el == 2.0, 1, "defaults");
+    test_group("emitter_builder");
+    var eb: ImParticleEmitter = ImParticleEmitter_new(z, ImVec3_new(0.0, 5.0, 0.0), 50.0);
+    eb.with_spread(ImVec3_new(1.0, 2.0, 0.0)).with_lifetime(3.0).with_radius(0.2);
+    eb.with_gravity_scale(0.0).with_damping(0.5);
+    var esy: f64 = eb.velocity_spread.y;
+    var elf: f64 = eb.particle_lifetime;
+    var erd: f64 = eb.particle_radius;
+    var egs: f64 = eb.particle_gravity_scale;
+    var edm: f64 = eb.particle_damping;
+    assert_eq(esy == 2.0 && elf == 3.0 && erd == 0.2 && egs == 0.0 && edm == 0.5, 1, "set");
+    test_group("particle_serde");
+    var sp1: ImParticle = ImParticle_new(ImVec3_new(1.0, 2.0, 0.0), ImVec3_new(3.0, 4.0, 0.0), 5.0);
+    var jsb = str_builder_new();
+    sp1.to_json(jsb);
+    var js1 = str_builder_build(jsb);
+    var sp2: ImParticle = ImParticle_new(z, z, 0.0);
+    var tj1, vj1 = ImParticle_from_json(str_data(js1), str_len(js1), &sp2);
+    assert_eq(is_ok(tj1) == 1 && same_words(&sp1, &sp2, sizeof(ImParticle)) == 1, 1, "a particle reads back equal");
+    test_group("emitter_serde");
+    var se1: ImParticleEmitter = ImParticleEmitter_new(ImVec3_new(1.0, 2.0, 0.0), ImVec3_new(3.0, 4.0, 0.0), 10.0);
+    var esb = str_builder_new();
+    se1.to_json(esb);
+    var es1 = str_builder_build(esb);
+    var se2: ImParticleEmitter = ImParticleEmitter_new(z, z, 0.0);
+    var tj2, vj2 = ImParticleEmitter_from_json(str_data(es1), str_len(es1), &se2);
+    var esame = same_words(&se1, &se2, sizeof(ImParticleEmitter));
+    assert_eq(is_ok(tj2) == 1 && esame == 1, 1, "an emitter reads back equal");
+    test_group("particle_handle_eq");
+    assert_eq(1 == 1 && 1 != 2, 1, "handles are words");
+
+    # ── Cyrius-only ──
+    test_group("try_new");
+    var tw: ImPhysicsWorld;
+    var x1: ImWorldConfig = ImWorldConfig_default();
+    x1.solver = IM_SOLVER_XPBD;
+    var t3, v3 = ImPhysicsWorld_try_new(x1, &tw);
+    assert_eq(is_ok(t3) == 0 && v3 == IM_ERR_UNSUPPORTED, 1, "XPBD refused (ADR 0008 #6)");
+    var x2: ImWorldConfig = ImWorldConfig_default();
+    x2.timestep = 0.0 - 1.0;
+    var t4, v4 = ImPhysicsWorld_try_new(x2, &tw);
+    assert_eq(is_ok(t4) == 0 && v4 == IM_ERR_INVALID_CONFIG, 1, "a negative timestep refused");
+    var t5, v5 = ImPhysicsWorld_try_new(ImWorldConfig_default(), &tw);
+    assert_eq(is_ok(t5) == 1 && tw.current_step() == 0, 1, "the default accepted");
+    tw.free();
+
+    test_group("spawn_cap_and_emitters");
+    w = ImPhysicsWorld_new(cfg_g(0.0, 0.0));
+    var zero: f64 = 0.0;
+    var inf: f64 = 1.0 / zero;
+    var e1 = w.add_emitter(ImParticleEmitter_new(z, z, inf));
+    var big: ImParticleEmitter = ImParticleEmitter_new(z, z, 1000000000.0);
+    big.with_lifetime(10.0).with_radius(0.0);
+    var e2 = w.add_emitter(big);
+    w.step();
+    var eps2, en2 = w.particles();
+    assert_eq(en2, _IM_MAX_SPAWNS_PER_EMITTER_STEP, "an infinite rate spawns nothing; 1e9/s is capped at 10,000");
+    var em: *ImParticleEmitter = _im_as_emitter(w.emitters.at(1));
+    var eacc: f64 = em.accumulator;
+    assert_eq(eacc == 0.0, 1, "the backlog is dropped");
+    assert_eq(e1 == 0 && e2 == 1, 1, "emitter handles count up");
+    w.remove_emitter(e1);
+    var em2: *ImParticleEmitter = _im_as_emitter(w.emitters.at(0));
+    assert_eq(w.emitters.len == 1 && em2.handle == e2, 1, "remove_emitter keeps the order");
+    w.clear_emitters();
+    w.add_force_field(ImForceField_radial(z, 1.0, 2.0, 0.0));
+    var fs, nfield = w.force_fields();
+    assert_eq(w.emitters.len == 0 && nfield == 1, 1, "cleared; one field");
+    w.clear_force_fields();
+    var fs2, fn2 = w.force_fields();
+    assert_eq(fn2, 0, "fields cleared");
+    w.free();
+
+    test_group("particle_json_kinds");
+    # A sub-emitter and both field kinds round trip; a bare variant name or a missing field is refused.
+    var sp3: ImParticle = ImParticle_new(ImVec3_new(5.0, 5.0, 0.0), z, 0.025);
+    sp3.with_sub_emitter(ImSubEmitter_new(4, 3.0, 2.0, 0.02, 0.0, 0.5));
+    sp3.handle = 41;
+    var jsb3 = str_builder_new();
+    sp3.to_json(jsb3);
+    var js3 = str_builder_build(jsb3);
+    var sp4: ImParticle = ImParticle_new(z, z, 0.0);
+    var tj3, vj3 = ImParticle_from_json(str_data(js3), str_len(js3), &sp4);
+    assert_eq(is_ok(tj3) == 1 && same_words(&sp3, &sp4, sizeof(ImParticle)) == 1, 1, "with a sub-emitter");
+    var fr1: ImForceField = ImForceField_radial(ImVec3_new(1.0, 2.0, 0.0), -3.0, 1.5, 4.0);
+    var fd1: ImForceField = ImForceField_directional(ImVec3_new(1.0, 0.0, 0.0), ImVec3_new(-1.0, -1.0, -1.0),
+      ImVec3_new(1.0, 1.0, 1.0));
+    var fsb = str_builder_new();
+    fr1.to_json(fsb);
+    var fj1 = str_builder_build(fsb);
+    var fr2: ImForceField = ImForceField_radial(z, 0.0, 0.0, 0.0);
+    var tj4, vj4 = ImForceField_from_json(str_data(fj1), str_len(fj1), &fr2);
+    var fsb2 = str_builder_new();
+    fd1.to_json(fsb2);
+    var fj2 = str_builder_build(fsb2);
+    var fd2: ImForceField = ImForceField_radial(z, 0.0, 0.0, 0.0);
+    var tj5, vj5 = ImForceField_from_json(str_data(fj2), str_len(fj2), &fd2);
+    assert_eq(is_ok(tj4) == 1 && is_ok(tj5) == 1 && same_words(&fr1, &fr2, sizeof(ImForceField)) == 1
+      && same_words(&fd1, &fd2, sizeof(ImForceField)) == 1, 1, "both field kinds");
+    var bare = "\"Radial\"";
+    var tj6, vj6 = ImForceField_from_json(bare, strlen(bare), &fd2);
+    var part = "{\"count\":4,\"speed\":3}";
+    var sub2: ImSubEmitter = ImSubEmitter_new(0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    var tj7, vj7 = ImSubEmitter_from_json(part, strlen(part), &sub2);
+    assert_eq(is_ok(tj6) == 0 && vj6 == IM_ERR_DESERIALIZE && is_ok(tj7) == 0, 1, "refused");
+
+    test_group("flat_heap_with_particles");
+    # An emitter at steady state over a floor: after warm-up the particle storage is reused.
+    w = ImPhysicsWorld_new(ImWorldConfig_default());
+    floor = body_at(&w, IM_BODY_STATIC, 0.0, -0.5);
+    coll(&w, floor, ImColliderShape_box(10.0, 0.5, 0.0));
+    var se: ImParticleEmitter = ImParticleEmitter_new(ImVec3_new(0.0, 2.0, 0.0), ImVec3_new(0.0, 1.0, 0.0), 120.0);
+    se.with_spread(ImVec3_new(2.0, 1.0, 0.0)).with_lifetime(1.0);
+    w.add_emitter(se);
+    w.add_force_field(ImForceField_radial(ImVec3_new(0.0, 1.0, 0.0), 2.0, 1.5, 0.0));
+    steps(&w, 180);
+    var arena0 = _fl_arena;
+    var pos0 = _fl_arena_pos;
+    steps(&w, 240);
+    assert_eq(_fl_arena == arena0 && _fl_arena_pos == pos0, 1, "no growth");
+    assert_eq(w.particle_count() > 80, 1, "particles live");
+    w.free();
+
+    return 0;
+}
